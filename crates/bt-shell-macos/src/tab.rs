@@ -1046,7 +1046,7 @@ impl TerminalTab {
     /// one runs there, else the first running pane's in tree order; `None`
     /// when no pane runs one (`Session::activity`). A pane on the alternate
     /// screen counts as running none (`tabs::ring_running`): a full-screen
-    /// program gets no ring. The ring, its step and the bar's clock come
+    /// program gets no ring. The ring's turn and the bar's clock come
     /// from it; the summary card reads the pane itself. A leaf lock and an
     /// atomic per pane, no `Term` — the screen is the one the pane last
     /// drew (`Session::alt_screen`).

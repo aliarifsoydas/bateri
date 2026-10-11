@@ -52,14 +52,18 @@
 //! [`CARD_DELAY`] the tab's summary card opens below it (`tabs::card_lines`);
 //! with a card open, the next chip's comes at once.
 //!
-//! **The clock.** A running ring steps once a second and the open card's
-//! running time counts: one delayed wake per bar
-//! ([`TabBar::arm_clock`]), set only while `tabs::Clock` says something on
-//! a visible bar changes with time, at the duration counter's own next tick
-//! (`bt_core::next_tick`). It is AppKit's redraw of a few views, never a
-//! pane's frame: nothing here touches a pane's `Waker`. It stops when no
-//! command runs, when the window is not visible and — for the rings, not
-//! the card's seconds — under Reduce Motion, where the ring stands still.
+//! **The clock.** A running ring turns by itself — a Core Animation turn on
+//! the window server's side, set once and left to run ([`Glyph`]) — so the
+//! app is not woken to move it. The bar's one delayed wake
+//! ([`TabBar::arm_clock`]) is for what is *not* motion: the open card's
+//! running time, which counts on the duration counter's own tick
+//! (`bt_core::next_tick`), and the hour, where a ring's pace changes and its
+//! turn is set again; `tabs::Clock` says when. It is AppKit's redraw of a few
+//! views, never a pane's frame: nothing here touches a pane's `Waker`. It
+//! stops when nothing runs, when the window is not visible — the turns are
+//! taken off the rings too, and set again at the right angle when the window
+//! comes back — and, for the rings but not the card's seconds, under Reduce
+//! Motion, where the ring stands still at the top.
 //!
 //! **A tab is dragged** by its chip. A press that moves past the slop along the
 //! strip lifts the chip: it follows the pointer at once, the others slide to
@@ -127,14 +131,16 @@ use objc2_foundation::{
     NSArray, NSNotification, NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
     NSUserDefaults, ns_string,
 };
-use objc2_quartz_core::CAMediaTimingFunction;
+use objc2_quartz_core::{
+    CABasicAnimation, CALayer, CAMediaTiming, CAMediaTimingFunction, CATransaction,
+};
 
 use crate::app;
 use crate::arrange;
 use crate::tab_drag;
 use crate::tabs::{
-    self, BUTTON, Bar, Card, CardCommand, Clock, Drag, FADE, Grip, Indicator, Over,
-    RING_STEP_DEGREES, Strip, TAB_RADIUS, Tone,
+    self, BUTTON, Bar, Card, CardCommand, Clock, Drag, FADE, Grip, Indicator, Over, Strip,
+    TAB_RADIUS, Tone, Turn,
 };
 use crate::window::{TerminalWindow, is_dark_background};
 
@@ -708,8 +714,15 @@ impl CloseButton {
 
 pub(crate) struct GlyphIvars {
     shown: Cell<Option<Indicator>>,
-    /// The running ring's step (`tabs::ring_step`).
-    step: Cell<u8>,
+    /// The running ring's arc, a layer of its own that the turn is played on: the glyph's
+    /// own backing layer is AppKit's (its anchor is a corner, and AppKit resets what it sets).
+    arc: Retained<CALayer>,
+    /// The pace of the turn playing on the arc (one whole turn takes this long), `None` while the
+    /// arc stands still. A ring set again at the same pace is left alone: setting the turn anew
+    /// at every layout would make it jump back.
+    turning: Cell<Option<Duration>>,
+    /// What the arc's picture was drawn in: its colour and the scale of the screen it is on.
+    arc_ink: Cell<Option<(u32, f64)>>,
     /// The transfer is a download: the arrow points down.
     down: Cell<bool>,
     palette: Cell<Option<Palette>>,
@@ -738,6 +751,13 @@ define_class!(
             None
         }
 
+        /// The glyph moved to a screen of another scale (or into a window): the arc's picture
+        /// is drawn again at it.
+        #[unsafe(method(viewDidChangeBackingProperties))]
+        fn view_did_change_backing_properties(&self) {
+            self.ink_arc();
+        }
+
         /// The glyph in a [`GLYPH_SIDE`] square, in its role.
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
@@ -749,7 +769,7 @@ define_class!(
             let role = palette.tone(tabs::list_dot(indicator), 0);
             match indicator {
                 Indicator::Question => draw_question(role),
-                Indicator::Running => draw_ring(iv.step.get(), role, palette),
+                Indicator::Running => draw_track(palette),
                 Indicator::Finished => draw_tick(role),
                 Indicator::Failed => draw_dot(role),
                 Indicator::Uploading => draw_arrow(iv.down.get(), role),
@@ -788,26 +808,33 @@ fn draw_question(color: u32) {
     dot.fill();
 }
 
-/// "Running": a faint ring and a quarter arc in `accent`, turned
-/// `tabs::RING_STEP_DEGREES` per step clockwise from the top.
-fn draw_ring(step: u8, color: u32, palette: Palette) {
-    let at = NSPoint::new(GLYPH_SIDE / 2.0, GLYPH_SIDE / 2.0);
-    let radius = GLYPH_SIDE / 2.0 - 1.4;
+/// "Running": the ring's centre and radius in the glyph's square.
+fn ring_circle() -> (NSPoint, f64) {
+    (
+        NSPoint::new(GLYPH_SIDE / 2.0, GLYPH_SIDE / 2.0),
+        GLYPH_SIDE / 2.0 - 1.4,
+    )
+}
+
+/// "Running": the faint ring under the turning arc, in the bar's track colour. The arc itself is
+/// not drawn here — it turns, so it is a layer of its own ([`draw_arc`]).
+fn draw_track(palette: Palette) {
+    let (at, radius) = ring_circle();
     let track = NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
         NSPoint::new(at.x - radius, at.y - radius),
         NSSize::new(2.0 * radius, 2.0 * radius),
     ));
     stroke(&track, 1.6, palette.track);
-    // The view is flipped: angles grow clockwise on screen and −90° is the
-    // top.
-    let start = -90.0 + f64::from(step) * RING_STEP_DEGREES;
+}
+
+/// "Running": the quarter arc in `accent`, resting at the top and running clockwise from there —
+/// the picture the turning layer carries. Drawn in a flipped square like the glyph's own, where
+/// angles grow clockwise on screen and −90° is the top.
+fn draw_arc(color: u32) {
+    let (at, radius) = ring_circle();
     let arc = NSBezierPath::bezierPath();
     arc.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise(
-        at,
-        radius,
-        start,
-        start + 90.0,
-        false,
+        at, radius, -90.0, 0.0, false,
     );
     stroke(&arc, 1.6, Tint::of(color, 1.0));
 }
@@ -849,11 +876,27 @@ fn draw_arrow(down: bool, color: u32) {
     stroke(&path, 1.6, Tint::of(color, 1.0));
 }
 
+/// The key the turn is played under on the arc's layer.
+fn turn_key() -> &'static NSString {
+    ns_string!("turn")
+}
+
 impl Glyph {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let arc = CALayer::new();
+        // The arc's own layer: its anchor is the middle (a view's backing layer's is a corner), so
+        // a turn about z is a turn about the ring's centre. Hidden until the ring runs.
+        arc.setBounds(NSRect::new(
+            NSPoint::ZERO,
+            NSSize::new(GLYPH_SIDE, GLYPH_SIDE),
+        ));
+        arc.setPosition(NSPoint::new(GLYPH_SIDE / 2.0, GLYPH_SIDE / 2.0));
+        arc.setHidden(true);
         let this = Self::alloc(mtm).set_ivars(GlyphIvars {
             shown: Cell::new(None),
-            step: Cell::new(0),
+            arc: arc.clone(),
+            turning: Cell::new(None),
+            arc_ink: Cell::new(None),
             down: Cell::new(false),
             palette: Cell::new(None),
         });
@@ -862,19 +905,113 @@ impl Glyph {
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
         // Said through the chip, after its title.
         this.setAccessibilityElement(false);
+        this.setWantsLayer(true);
+        this.hang_arc();
         this
     }
 
-    fn set(&self, shown: Option<Indicator>, step: u8, down: bool, palette: Palette) {
+    /// Hangs the arc's layer in the glyph's backing layer, if it is not there: AppKit makes that
+    /// layer itself and may make it anew, and a ring whose arc hangs nowhere shows no arc.
+    fn hang_arc(&self) {
+        let arc = &self.ivars().arc;
+        if arc.superlayer().is_none()
+            && let Some(layer) = self.layer()
+        {
+            layer.addSublayer(arc);
+        }
+    }
+
+    /// Shows `shown` in the glyph's square. `turn` is how the running ring goes round
+    /// (`tabs::ring_turn`) and is read only for a running ring: `None` for a ring that stands still
+    /// — Reduce Motion, a window nobody sees.
+    fn set(&self, shown: Option<Indicator>, turn: Option<Turn>, down: bool, palette: Palette) {
         let iv = self.ivars();
         let indicator = iv.shown.replace(shown) != shown;
-        let turned = iv.step.replace(step) != step;
         let flipped = iv.down.replace(down) != down;
         let repainted = iv.palette.replace(Some(palette)) != Some(palette);
-        if indicator || turned || flipped || repainted {
+        if indicator || flipped || repainted {
             self.setNeedsDisplay(true);
         }
         self.setHidden(shown.is_none());
+        let running = shown == Some(Indicator::Running);
+        // The layer's own properties move without Core Animation's 0.25 s of implicit fading.
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        iv.arc.setHidden(!running);
+        CATransaction::commit();
+        if running {
+            self.hang_arc();
+            self.ink_arc();
+        }
+        self.turn(turn.filter(|_| running));
+    }
+
+    /// The arc's picture, in the colour `accent` has in the bar and at the scale of the screen the
+    /// glyph is on; drawn again only when one of the two changed.
+    fn ink_arc(&self) {
+        let iv = self.ivars();
+        let (Some(palette), true) = (iv.palette.get(), iv.shown.get() == Some(Indicator::Running))
+        else {
+            return;
+        };
+        let color = palette.tone(tabs::list_dot(Indicator::Running), 0);
+        let scale = self
+            .window()
+            .map_or(2.0, |window| window.backingScaleFactor());
+        if iv.arc_ink.replace(Some((color, scale))) == Some((color, scale)) {
+            return;
+        }
+        let draw = RcBlock::new(move |_rect: NSRect| -> Bool {
+            draw_arc(color);
+            Bool::YES
+        });
+        let image = NSImage::imageWithSize_flipped_drawingHandler(
+            NSSize::new(GLYPH_SIDE, GLYPH_SIDE),
+            true,
+            &draw,
+        );
+        let picture = image.layerContentsForContentsScale(scale);
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        iv.arc.setContentsScale(scale);
+        // SAFETY: what `NSImage::layerContentsForContentsScale` returns is what `contents` takes.
+        unsafe { iv.arc.setContents(Some(&picture)) };
+        CATransaction::commit();
+    }
+
+    /// Plays the turn on the arc, or takes it off. The window server carries it round at an even
+    /// pace with the app asleep; it is set only when the pace changes, the arc was standing still
+    /// or the animation is gone — set again at every layout it would jump back to its start.
+    fn turn(&self, turn: Option<Turn>) {
+        let iv = self.ivars();
+        let Some(turn) = turn else {
+            if iv.turning.take().is_some() {
+                iv.arc.removeAnimationForKey(turn_key());
+            }
+            return;
+        };
+        // SAFETY: reading the animation a layer holds, on the main thread.
+        let playing = unsafe { iv.arc.animationForKey(turn_key()) }.is_some();
+        if playing && iv.turning.get() == Some(turn.period) {
+            return;
+        }
+        let from = turn.phase * std::f64::consts::TAU;
+        let round =
+            CABasicAnimation::animationWithKeyPath(Some(ns_string!("transform.rotation.z")));
+        // SAFETY: plain `NSNumber`s, what a rotation takes. In the glyph's flipped space a
+        // positive angle goes clockwise on screen.
+        unsafe {
+            round.setFromValue(Some(&NSNumber::numberWithDouble(from)));
+            round.setToValue(Some(&NSNumber::numberWithDouble(
+                from + std::f64::consts::TAU,
+            )));
+        }
+        round.setDuration(turn.period.as_secs_f64());
+        round.setRepeatCount(f32::INFINITY);
+        let even = CAMediaTimingFunction::functionWithControlPoints(0.0, 0.0, 1.0, 1.0);
+        round.setTimingFunction(Some(&even));
+        iv.arc.addAnimation_forKey(&round, Some(turn_key()));
+        iv.turning.set(Some(turn.period));
     }
 }
 
@@ -1322,7 +1459,7 @@ impl Chip {
         let Look {
             title,
             indicator,
-            step,
+            turn,
             down,
             lines,
             hint,
@@ -1446,7 +1583,7 @@ impl Chip {
                 NSSize::new(GLYPH_SIDE, GLYPH_SIDE),
             ));
         }
-        iv.glyph.set(indicator, *step, *down, palette);
+        iv.glyph.set(indicator, *turn, *down, palette);
         self.set_hint(hint, size, palette);
         iv.close.set(!single && hovered, palette, motion.close);
         iv.close.setHidden(single);
@@ -1492,8 +1629,8 @@ impl Chip {
 struct Look<'a> {
     title: &'a str,
     indicator: Option<Indicator>,
-    /// The running ring's step.
-    step: u8,
+    /// How the running ring goes round; `None` stands it still (`tabs::ring_turn`).
+    turn: Option<Turn>,
     /// A transfer's arrow points down.
     down: bool,
     lines: Lines,
@@ -2195,8 +2332,8 @@ pub(crate) struct Label {
     pub(crate) title: String,
     /// What its chip shows left of the title (`TerminalTab::indicator`).
     pub(crate) indicator: Option<Indicator>,
-    /// How long its running command has run (`TerminalTab::running_for`):
-    /// the ring's step and the bar's clock.
+    /// How long its running command has run (`TerminalTab::running_for`), when it was read:
+    /// the angle a ring is set turning from and the bar's clock.
     pub(crate) running: Option<Duration>,
     /// A transfer flowing in it (`TerminalTab::upload`).
     pub(crate) upload: Option<Upload>,
@@ -2814,6 +2951,10 @@ impl TabBar {
         ));
         let (chips, reflow) = self.chips_for(&shown.tabs);
         let reduce = self.reduce_motion();
+        // A window nobody sees turns no ring: the turns are off and come back at the right angle.
+        let visible = self
+            .terminal_window()
+            .is_some_and(|window| window.window_visible());
         let motion = Motion::of(reduce);
         let glide = iv.glide.take();
         let slide = ((reflow || revealed || glide) && motion.reflow > 0.0).then_some(motion.reflow);
@@ -2842,9 +2983,10 @@ impl TabBar {
             let look = Look {
                 title: &title,
                 indicator: label.indicator.filter(|_| !naming),
-                step: label
+                turn: label
                     .running
-                    .map_or(0, |elapsed| tabs::ring_step(elapsed, reduce)),
+                    .filter(|_| visible)
+                    .and_then(|elapsed| tabs::ring_turn(elapsed, reduce)),
                 down: label.upload.is_some_and(|upload| upload.down),
                 lines: Lines {
                     top: mark,
@@ -3542,12 +3684,13 @@ impl TabBar {
     // ─── The clock ───────────────────────────────────────────────────────
 
     /// Sets the bar's one delayed wake from what changes with time on it
-    /// (`tabs::Clock::delay`): the running rings of several tabs on a
-    /// visible window outside Reduce Motion, and the open card's running
-    /// time. A wake already due sooner is kept; one due later gives way —
-    /// `after` cannot be cancelled, so a wake that is not wanted any more is
-    /// made stale by the generation and does nothing when it comes. Nothing
-    /// to show: no wake.
+    /// (`tabs::Clock::delay`): the open card's running time and, for the
+    /// running rings of several tabs on a visible window outside Reduce
+    /// Motion, the hour where a ring's pace changes (the rings turn by
+    /// themselves in between, [`Glyph`]). A wake already due sooner is kept;
+    /// one due later gives way — `after` cannot be cancelled, so a wake that
+    /// is not wanted any more is made stale by the generation and does
+    /// nothing when it comes. Nothing to show: no wake.
     pub(crate) fn arm_clock(&self) {
         let iv = self.ivars();
         let visible = self
@@ -3600,7 +3743,8 @@ impl TabBar {
 
     /// The wake came: if it is the live one, every tab's running time is
     /// read again (`TerminalWindow::running_times`, a leaf lock per pane),
-    /// the rings step, the open card's time moves and the next wake is set.
+    /// a ring whose pace changed is set turning anew, the open card's time
+    /// moves and the next wake is set.
     fn clock_fired(&self, generation: u64) {
         let iv = self.ivars();
         if iv.clock.get() != generation {

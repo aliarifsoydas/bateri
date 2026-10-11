@@ -606,9 +606,10 @@ define_class!(
             for tab in self.tabs() {
                 tab.apply_visibility(visible);
             }
-            // The bar's clock runs only while the window is seen: a window
-            // coming back steps its rings to now and sets it again, one
-            // going away lets it lapse.
+            // The bar's clock and its rings' turns run only while the window
+            // is seen: a window coming back sets its rings turning from now
+            // and the clock again, one going away takes the turns off and
+            // lets the clock lapse.
             self.refresh_bar();
         }
 
@@ -1744,7 +1745,8 @@ impl TerminalWindow {
     }
 
     /// Every tab's running time (`TerminalTab::running_for`) — the bar's
-    /// clock steps its rings with these, without reading titles again.
+    /// clock sets its rings and the card's seconds from these, without
+    /// reading titles again.
     pub(crate) fn running_times(&self) -> Vec<(u64, Option<Duration>)> {
         self.tabs()
             .iter()

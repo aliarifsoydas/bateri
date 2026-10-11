@@ -114,7 +114,7 @@ pub use shell::{
     HighlightColor, HighlightStyle, ProgramBar, ProgramTone, Reconnect, RemoteKind,
     RemoteSetupFault, RemoteStats, RemoteTarget, STATS_HISTORY, ShellPhase, ShellState, SignIn,
     StatsForm, Transfer, TransferAction, TransferControls, TransferTone, TtyModes, counter_period,
-    decode_percent, next_tick, running_counter,
+    counter_tier_end, decode_percent, next_tick, running_counter,
 };
 pub use wake::Wake;
 

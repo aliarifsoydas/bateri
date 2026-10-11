@@ -33,6 +33,11 @@ of every installed copy. A version without a section is not released.
 - **The dock's two lines are a point thick.** The line above the input row
   and the one above the folder row were a single pixel, which looked faint
   on a Retina display; they now keep the same weight at every scale.
+- **The running ring in a tab now turns smoothly.** It used to jump a twelfth
+  of a turn every second, which read as stuttering; it now goes round at an
+  even pace (twelve seconds a turn, twelve minutes once a command has run for
+  an hour), and picks up at the right angle when a minimized or hidden window
+  comes back. It still stands still under Reduce Motion.
 
 ### Fixed
 

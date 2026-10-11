@@ -1146,20 +1146,37 @@ pub fn ring_running(
     }
 }
 
-/// The step the running ring shows for a command that has run `elapsed`: one step per tick of the
-/// command's duration counter (`bt_core::counter_period`, the tiers `bt_core::next_tick` wakes
-/// on — a second, from an hour on a minute), twelve to a turn. Under Reduce Motion the ring
-/// stands still at its first step.
-pub fn ring_step(elapsed: Duration, reduce_motion: bool) -> u8 {
-    if reduce_motion {
-        return 0;
-    }
-    let period = bt_core::counter_period(elapsed).as_secs().max(1);
-    ((elapsed.as_secs() / period) % 12) as u8
+/// One counter period's worth of the running ring's turn: the ring goes round once in this many
+/// periods ([`ring_turn`]).
+const PERIODS_PER_TURN: u32 = 12;
+
+/// How the running ring turns now.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Turn {
+    /// How long one whole turn takes.
+    pub period: Duration,
+    /// How far round the ring is, as a share of a turn: `0.0..1.0`, clockwise from the top.
+    pub phase: f64,
 }
 
-/// The ring's turn for [`ring_step`], degrees clockwise from the top.
-pub const RING_STEP_DEGREES: f64 = 30.0;
+/// The turn of the running ring for a command that has run `elapsed`: one whole turn per twelve
+/// periods of the command's duration counter (`bt_core::counter_period` — a second, from an hour
+/// on a minute), so twelve seconds a turn at first and twelve minutes after the hour, always
+/// at the same even pace; `phase` is where in the turn the command's age puts it. The ring is
+/// handed to the window server to turn at that pace ([`Clock::delay`] wakes the bar only where the
+/// period changes), not stepped from here. Under Reduce Motion it does not turn: `None`, the ring
+/// stands still at the top.
+pub fn ring_turn(elapsed: Duration, reduce_motion: bool) -> Option<Turn> {
+    if reduce_motion {
+        return None;
+    }
+    let period = bt_core::counter_period(elapsed) * PERIODS_PER_TURN;
+    let whole = period.as_secs_f64();
+    Some(Turn {
+        period,
+        phase: elapsed.as_secs_f64() % whole / whole,
+    })
+}
 
 /// What the bar's one delayed wake is set from ([`Clock::delay`]).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1175,13 +1192,17 @@ pub struct Clock {
 }
 
 impl Clock {
-    /// When the bar must look again, `None` for never: the nearest moment a running ring or the
-    /// open card's running time changes what it shows — `bt_core::next_tick`, the duration
-    /// counter's own clock, so both step on the counter's tick.
+    /// When the bar must look again, `None` for never: the nearest moment something it shows
+    /// changes with time — where a running ring's turn changes pace (`bt_core::counter_tier_end`:
+    /// the hour, where it slows to a twelfth) or the open card's running time changes
+    /// (`bt_core::next_tick`, the duration counter's own clock).
     ///
-    /// **Two arms, one wake.** The rings turn only while the window is visible and Reduce Motion is
-    /// off; the card's seconds are text, not motion, so they go on under Reduce Motion — still
-    /// only while the window is visible. No running command and no card: no wake, the bar is idle.
+    /// **Two arms, one wake.** A ring turns by itself between its pace changes, so it asks for no
+    /// wake per step; the rings need the one at the hour only while the window is visible and
+    /// Reduce Motion is off (a ring that is not turning has no pace to change). The card's
+    /// seconds are text, not motion, so they go on under Reduce Motion — still only while the
+    /// window is visible. No running command before its hour and no card: no wake, the bar is
+    /// idle.
     pub fn delay(&self) -> Option<Duration> {
         if !self.visible {
             return None;
@@ -1190,7 +1211,7 @@ impl Clock {
             .running
             .iter()
             .filter(|_| !self.reduce_motion)
-            .map(|&elapsed| bt_core::next_tick(elapsed));
+            .filter_map(|&elapsed| bt_core::counter_tier_end(elapsed));
         rings.chain(self.card.map(bt_core::next_tick)).min()
     }
 }
@@ -2503,24 +2524,26 @@ mod tests {
         );
     }
 
-    /// One step a second, twelve to a turn; a minute a step from an hour on, where the counter
-    /// moves once a minute; still under Reduce Motion.
+    /// One turn per twelve counter periods: twelve seconds, and twelve minutes from the hour on,
+    /// where the counter moves once a minute; the phase is the command's age within the turn;
+    /// still under Reduce Motion.
     #[test]
-    fn the_ring_steps_with_the_counter() {
+    fn the_ring_turns_at_the_counters_pace() {
         let secs = Duration::from_secs;
-        assert_eq!(ring_step(Duration::from_millis(900), false), 0);
-        assert_eq!(ring_step(secs(1), false), 1);
-        assert_eq!(ring_step(Duration::from_millis(11_999), false), 11);
-        assert_eq!(ring_step(secs(12), false), 0, "a whole turn");
-        assert_eq!(ring_step(secs(3599), false), 11);
-        assert_eq!(ring_step(secs(3600), false), 0);
-        assert_eq!(ring_step(secs(3660), false), 1, "a minute a step");
-        assert_eq!(ring_step(secs(3661), false), 1, "not a second");
-        assert_eq!(ring_step(secs(5), true), 0, "Reduce Motion: still");
-        assert_eq!(
-            f64::from(ring_step(secs(3), false)) * RING_STEP_DEGREES,
-            90.0
-        );
+        let turn = |elapsed, reduce| ring_turn(elapsed, reduce).expect("a turning ring");
+        assert_eq!(turn(Duration::ZERO, false).period, secs(12));
+        assert_eq!(turn(secs(3599), false).period, secs(12));
+        assert_eq!(turn(secs(3600), false).period, secs(720), "twelve minutes");
+        assert_eq!(turn(secs(86_400), false).period, secs(720));
+        assert_eq!(turn(Duration::ZERO, false).phase, 0.0);
+        assert_eq!(turn(secs(3), false).phase, 0.25, "a quarter in");
+        assert_eq!(turn(secs(12), false).phase, 0.0, "a whole turn");
+        assert_eq!(turn(Duration::from_millis(1_500), false).phase, 0.125);
+        assert_eq!(turn(secs(3600), false).phase, 0.0, "the hour starts a turn");
+        assert_eq!(turn(secs(3600 + 180), false).phase, 0.25);
+        let almost = turn(Duration::from_millis(11_999), false).phase;
+        assert!((0.0..1.0).contains(&almost), "{almost}");
+        assert_eq!(ring_turn(secs(5), true), None, "Reduce Motion: still");
     }
 
     fn clock(visible: bool, reduce_motion: bool, running: &[u64], card: Option<u64>) -> Clock {
@@ -2535,21 +2558,28 @@ mod tests {
         }
     }
 
-    /// The bar's clock: set only while something on a visible bar changes with time, at the
-    /// nearest tick of the duration counters.
+    /// The bar's clock: set only while something on a visible bar changes with time — a ring at
+    /// the hour where its pace changes (it turns by itself between), the open card's seconds at
+    /// the counter's tick.
     #[test]
-    fn the_clock_runs_only_while_a_visible_ring_turns_or_a_card_counts() {
+    fn the_clock_wakes_for_a_rings_pace_and_a_cards_seconds() {
         let ms = Duration::from_millis;
+        let hour = 3_600_000;
         assert_eq!(clock(true, false, &[], None).delay(), None, "nothing runs");
         assert_eq!(
-            clock(true, false, &[300], None).delay(),
-            Some(ms(700)),
-            "to the counter's first second"
+            clock(true, false, &[2_400], None).delay(),
+            Some(ms(hour - 2_400)),
+            "a ring turns by itself: the next wake is the hour's"
         );
         assert_eq!(
-            clock(true, false, &[2_400, 5_900], None).delay(),
-            Some(ms(100)),
+            clock(true, false, &[2_400, 900_000], None).delay(),
+            Some(ms(hour - 900_000)),
             "the nearest of the running tabs"
+        );
+        assert_eq!(
+            clock(true, false, &[hour + 20_000], None).delay(),
+            None,
+            "past the hour the pace never changes again"
         );
         assert_eq!(
             clock(false, false, &[2_400], Some(2_400)).delay(),
@@ -2559,22 +2589,27 @@ mod tests {
         assert_eq!(
             clock(true, true, &[2_400], None).delay(),
             None,
-            "Reduce Motion stops the rings"
+            "Reduce Motion: no ring turns, no pace to change"
         );
         assert_eq!(
             clock(true, true, &[2_400], Some(2_400)).delay(),
             Some(ms(600)),
-            "but not the open card's seconds, which are text"
+            "but the open card's seconds, which are text, go on"
         );
         assert_eq!(
             clock(true, false, &[1_200], Some(4_900)).delay(),
             Some(ms(100)),
-            "the card's tick is nearer"
+            "the card's tick is nearer than the hour"
         );
         assert_eq!(
-            clock(true, false, &[3_600_000 + 20_000], None).delay(),
+            clock(true, false, &[hour - 40], Some(4_900)).delay(),
+            Some(ms(40)),
+            "the hour, when it is nearer than the card's tick"
+        );
+        assert_eq!(
+            clock(true, false, &[hour + 20_000], Some(hour + 20_000)).delay(),
             Some(Duration::from_secs(40)),
-            "an hour on: the counter's minute"
+            "an hour on, the card's counter still moves once a minute"
         );
     }
 

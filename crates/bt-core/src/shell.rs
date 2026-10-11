@@ -3397,9 +3397,9 @@ pub(crate) enum Precision {
 /// second, not 16 ms.
 ///
 /// **Two consumers, one copy:** the counter's frame clock (`Cursor::next_tick`)
-/// and the tab bar's running ring, whose step is meant to land on the same
-/// tick as the counter it stands for — so it asks here rather than keeping a
-/// second idea of "the next second".
+/// and the tab bar's open summary card, whose running time is meant to change
+/// on the same tick as the counter it stands for — so it asks here rather than
+/// keeping a second idea of "the next second".
 pub fn next_tick(elapsed: Duration) -> Duration {
     if elapsed < COUNTER_FLOOR {
         return COUNTER_FLOOR - elapsed;
@@ -3414,8 +3414,8 @@ pub fn next_tick(elapsed: Duration) -> Duration {
 
 /// How long one visible step of a running counter lasts at `elapsed`: a
 /// second, and a minute from the hour tier on — [`next_tick`]'s period and
-/// the tab bar's ring's step (`elapsed / period` ticks), one copy of the
-/// tiers.
+/// the tab bar's running ring's turn (twelve periods to a turn), one copy of
+/// the tiers.
 ///
 /// **A separate resolution per tier.** In the hour tier the text (`1h 07m`)
 /// changes once a minute; waking every second would have an hour draw 3540
@@ -3423,11 +3423,24 @@ pub fn next_tick(elapsed: Duration) -> Duration {
 /// violate the "content must genuinely change" condition we just wrote into the
 /// module header.
 pub fn counter_period(elapsed: Duration) -> Duration {
-    if elapsed.as_secs() < 3600 {
+    if elapsed < COUNTER_HOUR {
         Duration::from_secs(1)
     } else {
         Duration::from_secs(60)
     }
+}
+
+/// Where [`counter_period`] changes: the seconds tier ends and the minutes tier begins.
+const COUNTER_HOUR: Duration = Duration::from_secs(3600);
+
+/// The time left until [`counter_period`] next changes — the end of the seconds tier — or `None`
+/// once the minutes tier, the last, is reached. The tab bar's running ring turns once per twelve
+/// periods and is set again where the period changes, so it asks here rather than keeping its own
+/// idea of "the hour".
+pub fn counter_tier_end(elapsed: Duration) -> Option<Duration> {
+    COUNTER_HOUR
+        .checked_sub(elapsed)
+        .filter(|left| !left.is_zero())
 }
 
 /// A running command's counter text for `elapsed` — whole seconds, then the
@@ -8224,6 +8237,22 @@ mod tests {
 
         // Below the boundary it is still once a second: `59m 59s` changes every second.
         assert_eq!(next_tick(Duration::from_secs(3599)), Duration::from_secs(1));
+    }
+
+    /// The seconds tier ends at the hour, where [`counter_period`] changes, and the minutes tier
+    /// is the last: nothing is left to wait for after it.
+    #[test]
+    fn the_period_changes_once_at_the_hour() {
+        let secs = Duration::from_secs;
+        assert_eq!(counter_tier_end(Duration::ZERO), Some(secs(3600)));
+        assert_eq!(
+            counter_tier_end(Duration::from_millis(3_599_250)),
+            Some(Duration::from_millis(750))
+        );
+        assert_eq!(counter_period(Duration::from_millis(3_599_999)), secs(1));
+        assert_eq!(counter_tier_end(secs(3600)), None);
+        assert_eq!(counter_period(secs(3600)), secs(60));
+        assert_eq!(counter_tier_end(secs(7200)), None);
     }
 
     /// A lost `D` is not written to the **next** block.
