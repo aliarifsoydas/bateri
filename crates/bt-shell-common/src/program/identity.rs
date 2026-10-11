@@ -1,0 +1,1081 @@
+//! Which program a pane runs, as a tab's icon needs to know it.
+//!
+//! The question is not the guide bar's ([`super::find`]: does the program read
+//! the keyboard itself, and what does its bar say). A coding agent is a program
+//! the bar deliberately does not know — `node …/claude` is no REPL — and the
+//! icon exists to name exactly that, together with the editor, the monitor, the
+//! build and the other things a pane spends its time in. One table of names
+//! ([`ROWS`]) and one decision over three sources, none of which ever reads a
+//! title (a program sets its own):
+//!
+//! 1. **The program's own name** ([`from_app`]): the `app=` of `OSC 7501`, which
+//!    the ledger keeps for this lookup alone. Case does not matter.
+//! 2. **The foreground group** ([`find`], deciding in [`from_group`]): the
+//!    processes' names, and for an interpreter the script it runs — `node
+//!    …/bin/claude`, npm's `…/node_modules/@openai/codex/bin/codex.js`, `python3
+//!    …/bin/kimi` — so the same program is known where the kernel names the
+//!    process after the interpreter (macOS) and where it names it after the
+//!    script (Linux). A language REPL, a database client, a container session
+//!    and a root or nested shell are the guide bar's own: [`super::classify`]
+//!    says which, nothing is copied.
+//! 3. **The command line** ([`from_line`]): the shell's own words for the
+//!    command, which is all a remote session offers (the process table there
+//!    shows `ssh`) and all there is in the instant a command starts, before the
+//!    process has executed. Wrappers are looked through (`VAR=…`, `env`, `sudo`,
+//!    `npx`, `bunx`, `uvx`, `exec`, `time`, `nohup`); the rest is read as an argv,
+//!    by the same decision as a process's.
+//!
+//! [`decide`] orders them: the program's own word, then the process table, then
+//! the command line, else the shell — or the server, in a remote session.
+//!
+//! **Only the script's name is taken from an argv.** The command line of a
+//! process carries passwords ([`crate::jobs::ProcArgs`]); here it is compared
+//! against the table and dropped — nothing of it is kept, shown or printed, and
+//! no environment variable is asked for.
+
+use super::{
+    Family, Member, PythonRuns, ancestors_in, base, classify, command_below, first_positional,
+    node_script, python_line, shell,
+};
+use crate::jobs::{self, ProcArgs, ProcessTable, ShellParent};
+
+/// A coding agent the icon draws by its own mark. [`Self::Other`] is every agent
+/// without one (aider, goose, amp) and shares a generic mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Agent {
+    ClaudeCode,
+    Codex,
+    OpenCode,
+    Antigravity,
+    GeminiCli,
+    Pi,
+    Herdr,
+    CursorCli,
+    CopilotCli,
+    QwenCode,
+    KimiCli,
+    Other,
+}
+
+/// What a pane runs, as far as an icon tells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    /// The pane's shell, a nested one, or nothing the table knows.
+    Shell,
+    /// `ssh` or `mosh`, or a remote session that runs nothing known: the
+    /// server.
+    Remote,
+    Agent(Agent),
+    Editor,
+    /// A language's REPL (a row of `INTERPRETERS`).
+    Repl,
+    /// A database client's session.
+    Database,
+    /// A container's or a cluster's session.
+    Container,
+    /// A system monitor.
+    Monitor,
+    /// A git interface.
+    Git,
+    /// A build, a test run or a package manager's task.
+    Task,
+    /// A document or pager.
+    Pager,
+    /// A file manager.
+    Files,
+    /// A shell running as root (`sudo -i`, `su`).
+    Root,
+}
+
+/// One kind's names: what a process, a script or a command is called, and what
+/// a program reports as its `app`. The single table — a new program is a name
+/// in a row.
+struct Row {
+    kind: Kind,
+    /// Process, script, package and command names, lowercase and with `-` for
+    /// `_` ([`normalized`]).
+    names: &'static [&'static str],
+    /// `OSC 7501`'s `app` names, the same way. Only agents report.
+    apps: &'static [&'static str],
+}
+
+/// Shells are not here, nor are the REPLs, the clients and the container
+/// sessions: the guide bar's own tables say which names those are
+/// ([`shell::is_shell`], [`classify`]) and the icon reads them. `cursor` is an
+/// `app` but no name — the command of that name opens the editor, not the
+/// agent.
+const ROWS: [Row; 19] = [
+    Row {
+        kind: Kind::Agent(Agent::ClaudeCode),
+        names: &["claude", "claude-code"],
+        apps: &["claude", "claude-code"],
+    },
+    Row {
+        kind: Kind::Agent(Agent::Codex),
+        names: &["codex"],
+        apps: &["codex"],
+    },
+    Row {
+        kind: Kind::Agent(Agent::OpenCode),
+        names: &["opencode", "opencode-ai"],
+        apps: &["opencode"],
+    },
+    Row {
+        kind: Kind::Agent(Agent::Antigravity),
+        names: &["antigravity"],
+        apps: &["antigravity"],
+    },
+    Row {
+        kind: Kind::Agent(Agent::GeminiCli),
+        names: &["gemini", "gemini-cli"],
+        apps: &["gemini", "gemini-cli"],
+    },
+    Row {
+        kind: Kind::Agent(Agent::Pi),
+        names: &["pi"],
+        apps: &["pi"],
+    },
+    Row {
+        kind: Kind::Agent(Agent::Herdr),
+        names: &["herdr"],
+        apps: &["herdr"],
+    },
+    Row {
+        kind: Kind::Agent(Agent::CursorCli),
+        names: &["cursor-agent"],
+        apps: &["cursor", "cursor-agent"],
+    },
+    Row {
+        kind: Kind::Agent(Agent::CopilotCli),
+        names: &["copilot"],
+        apps: &["copilot", "github-copilot"],
+    },
+    Row {
+        kind: Kind::Agent(Agent::QwenCode),
+        names: &["qwen", "qwen-code"],
+        apps: &["qwen", "qwen-code"],
+    },
+    Row {
+        kind: Kind::Agent(Agent::KimiCli),
+        names: &["kimi", "kimi-cli"],
+        apps: &["kimi", "kimi-cli"],
+    },
+    Row {
+        kind: Kind::Agent(Agent::Other),
+        names: &["aider", "goose", "amp"],
+        apps: &[],
+    },
+    Row {
+        kind: Kind::Remote,
+        names: &["ssh", "mosh", "mosh-client"],
+        apps: &[],
+    },
+    Row {
+        kind: Kind::Editor,
+        names: &[
+            "vim", "nvim", "vi", "view", "helix", "hx", "nano", "micro", "emacs", "kak",
+        ],
+        apps: &[],
+    },
+    Row {
+        kind: Kind::Monitor,
+        names: &[
+            "htop", "btop", "top", "glances", "bpytop", "btm", "nvtop", "atop",
+        ],
+        apps: &[],
+    },
+    Row {
+        kind: Kind::Git,
+        names: &["lazygit", "tig", "gitui"],
+        apps: &[],
+    },
+    Row {
+        kind: Kind::Task,
+        names: &[
+            "cargo", "make", "gmake", "npm", "pnpm", "yarn", "pytest", "go", "just", "ninja",
+            "cmake",
+        ],
+        apps: &[],
+    },
+    Row {
+        kind: Kind::Pager,
+        names: &["man", "less", "bat", "more", "most"],
+        apps: &[],
+    },
+    Row {
+        kind: Kind::Files,
+        names: &["yazi", "ranger", "nnn", "lf", "mc", "vifm"],
+        apps: &[],
+    },
+];
+
+/// File extensions a script's name loses before the lookup (`codex.js`).
+const SCRIPT_EXTENSIONS: [&str; 5] = ["js", "mjs", "cjs", "ts", "py"];
+
+/// A name as the table spells it: ASCII lowercase, `-` for `_` (a Python module
+/// `kimi_cli` is the package `kimi-cli`).
+fn normalized(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch == '_' {
+                '-'
+            } else {
+                ch.to_ascii_lowercase()
+            }
+        })
+        .collect()
+}
+
+/// The kind a process, script, package or command name has; a shell by the
+/// guide bar's own list.
+fn by_name(name: &str) -> Option<Kind> {
+    let name = normalized(name);
+    if shell::is_shell(&name) {
+        return Some(Kind::Shell);
+    }
+    ROWS.iter()
+        .find(|row| row.names.contains(&name.as_str()))
+        .map(|row| row.kind)
+}
+
+/// The program that reported itself as `app` (`OSC 7501`); `None` for a name
+/// the table does not know — the report is then no help, not a reason to guess.
+pub fn from_app(app: &str) -> Option<Kind> {
+    let app = normalized(app);
+    ROWS.iter()
+        .find(|row| row.apps.contains(&app.as_str()))
+        .map(|row| row.kind)
+}
+
+/// The npm package a path is inside (`…/node_modules/@openai/codex/bin/x.js` →
+/// `codex`, `…/node_modules/npm/bin/npm-cli.js` → `npm`): a script is often
+/// named for its entry (`cli.js`), its package is what the program is called.
+fn package_of(path: &str) -> Option<&str> {
+    let parts: Vec<&str> = path.split('/').collect();
+    let at = parts.iter().rposition(|part| *part == "node_modules")?;
+    let first = parts.get(at + 1)?;
+    if first.starts_with('@') {
+        parts.get(at + 2).copied()
+    } else {
+        Some(first)
+    }
+}
+
+/// The kind an interpreter's script is: its file name without the extension,
+/// else its package.
+fn of_script(script: &str) -> Option<Kind> {
+    let file = base(script);
+    let stem = match file.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() && SCRIPT_EXTENSIONS.contains(&extension) => {
+            stem
+        }
+        _ => file,
+    };
+    by_name(stem).or_else(|| package_of(script).and_then(by_name))
+}
+
+/// One process of the foreground group, as the decision reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Process {
+    /// The process's name as the table gives it (the kernel's: the interpreter's
+    /// on macOS, the script's on Linux).
+    pub name: String,
+    /// The group's member the guide bar's [`classify`] reads: a record only for
+    /// the names it can use (interpreters, clients, shells, tools).
+    pub member: Member,
+}
+
+/// Whether a decision reads a process of this name by its record: an
+/// interpreter or a client, a shell, a tool or an elevator.
+fn wanted(name: &str) -> bool {
+    Family::of_name(name).is_some() || shell::is_candidate(name)
+}
+
+impl Process {
+    /// A process of the group; the record is kept only when the name is one a
+    /// decision reads it for, and its user with it.
+    pub fn new(
+        pid: u32,
+        parent: Option<u32>,
+        name: String,
+        uid: Option<u32>,
+        record: Option<ProcArgs>,
+    ) -> Self {
+        let candidate = wanted(&name).then(|| super::Candidate {
+            name: name.clone(),
+            uid,
+            record,
+        });
+        Self {
+            name,
+            member: Member {
+                pid,
+                parent,
+                candidate,
+            },
+        }
+    }
+
+    /// `pid` as the table has it; `None` when its name is unreadable. The
+    /// record is the **argv alone**, no variable asked for.
+    fn read(pid: u32, table: &impl ProcessTable) -> Option<Self> {
+        let name = table.name(pid)?;
+        let (uid, record) = if wanted(&name) {
+            (table.uid(pid), table.procargs(pid, &[]))
+        } else {
+            (None, None)
+        };
+        Some(Self::new(pid, table.parent(pid), name, uid, record))
+    }
+
+    /// The effective user, when the record was read.
+    fn uid(&self) -> Option<u32> {
+        self.member.candidate.as_ref().and_then(|c| c.uid)
+    }
+}
+
+/// What a process is by its name, else by the script an interpreter runs.
+/// The guide bar's families (a REPL, a client, a container) are not decided
+/// here ([`of_family`]).
+fn of_process(process: &Process) -> Option<Kind> {
+    if let Some(kind) = by_name(&process.name) {
+        return Some(kind);
+    }
+    let record = process.member.candidate.as_ref()?.record.as_ref()?;
+    let args = record.args.get(1..).unwrap_or_default();
+    match Family::of_name(&process.name)? {
+        Family::Node => node_script(args).and_then(|(script, _)| of_script(script)),
+        Family::Python => match python_line(args).1 {
+            PythonRuns::Script(script, _) => of_script(script),
+            PythonRuns::Module(module, _) => by_name(module.split('.').next().unwrap_or(module)),
+            PythonRuns::Nothing | PythonRuns::Code => None,
+        },
+        Family::Bun if matches!(first_positional(args, &[]), Some("run" | "test")) => {
+            Some(Kind::Task)
+        }
+        _ => None,
+    }
+}
+
+/// The kind a guide-bar family is. No wildcard: a new family is a decision.
+fn of_family(family: Family) -> Kind {
+    match family {
+        Family::Python | Family::Node | Family::Bun | Family::Deno | Family::Ruby => Kind::Repl,
+        Family::Database(_) => Kind::Database,
+        Family::Container | Family::Kubernetes => Kind::Container,
+        Family::Root => Kind::Root,
+        Family::Nested(_) => Kind::Shell,
+    }
+}
+
+/// The first of `hits` with no other hit above it in the group: a tool that
+/// started another (`lazygit` its editor, `man` its pager) is the one named.
+fn topmost(members: &[Member], hits: &[(u32, Kind)]) -> Option<Kind> {
+    hits.iter()
+        .find(|(pid, _)| {
+            !ancestors_in(members, *pid)
+                .iter()
+                .any(|up| hits.iter().any(|(other, _)| other == up))
+        })
+        .map(|&(_, kind)| kind)
+}
+
+/// The foreground group's kind; `None` when nothing in it is known.
+///
+/// **An agent first**: the programs an agent runs share its group (`git`, a
+/// test run, a `python3` it started), and none of them is what the pane is
+/// doing. Then the guide bar's own answer ([`classify`] — a root shell, a REPL, a
+/// client, a container session, a nested shell), then any other known name, the
+/// outermost of them.
+pub fn from_group(group: &[Process]) -> Option<Kind> {
+    let members: Vec<Member> = group.iter().map(|p| p.member.clone()).collect();
+    let named: Vec<(u32, Kind)> = group
+        .iter()
+        .filter_map(|p| Some((p.member.pid, of_process(p)?)))
+        .collect();
+    let agents: Vec<(u32, Kind)> = named
+        .iter()
+        .copied()
+        .filter(|(_, kind)| matches!(kind, Kind::Agent(_)))
+        .collect();
+    if let Some(kind) = topmost(&members, &agents) {
+        return Some(kind);
+    }
+    if let Some(program) = classify(&members, None) {
+        return Some(of_family(program.family));
+    }
+    topmost(&members, &named)
+}
+
+/// What the process table says about a pane's foreground ([`find`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seen {
+    /// No answer yet — ask again on the next output: the shell itself holds the
+    /// terminal (the command has not executed), the group cannot be read, or
+    /// sudo runs nothing yet.
+    Waiting,
+    /// The group is read and nothing in it is known.
+    Nothing,
+    Kind(Kind),
+}
+
+/// The pane's foreground group, read from the process table on the main
+/// thread (system calls only, like [`super::find`]) and decided by
+/// [`from_group`]. While sudo or `su` holds the terminal the answer is the
+/// command it runs, as the guide bar's is: the elevator's own processes are
+/// nothing a pane does.
+pub fn find(parent: ShellParent, child: u32, table: &impl ProcessTable) -> Seen {
+    let Some(shell) = jobs::shell_pid(parent, child, table) else {
+        return Seen::Waiting;
+    };
+    let Some(groups) = table
+        .groups(shell)
+        .filter(|groups| groups.foreground != 0 && groups.foreground != groups.own)
+    else {
+        return Seen::Waiting;
+    };
+    let mut pids = table.members(groups.foreground);
+    pids.sort_unstable();
+    let mut group: Vec<Process> = pids
+        .into_iter()
+        .filter_map(|pid| Process::read(pid, table))
+        .collect();
+    let elevators: Vec<u32> = group
+        .iter()
+        .filter(|p| shell::ELEVATORS.contains(&p.name.as_str()) && p.uid() == Some(0))
+        .map(|p| p.member.pid)
+        .collect();
+    if !elevators.is_empty() {
+        let Some(command) = command_below(&elevators, table) else {
+            return Seen::Waiting;
+        };
+        group = Process::read(command, table).into_iter().collect();
+    }
+    if group.is_empty() {
+        return Seen::Waiting;
+    }
+    from_group(&group).map_or(Seen::Nothing, Seen::Kind)
+}
+
+/// What a command line is, once its wrappers are looked through.
+enum Command {
+    /// The command and its arguments.
+    Argv(Vec<String>),
+    /// A root shell: `sudo -i`, `sudo -s`, `su`.
+    Elevated,
+}
+
+/// The first command of a line as words: split on blanks, quotes and a
+/// backslash honoured, ended at the first unquoted control operator (`|`, `;`,
+/// `&`, `<`, `>`, a parenthesis). Not a shell — what a lookup needs of one.
+fn words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some(open), _) if ch == open => quote = None,
+            (Some('"'), '\\') => {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+            }
+            (Some(_), _) => word.push(ch),
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                started = true;
+            }
+            (None, '\\') => {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                    started = true;
+                }
+            }
+            (None, _) if ch.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            (None, '|' | ';' | '&' | '<' | '>' | '(' | ')') => break,
+            (None, _) => {
+                word.push(ch);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    words
+}
+
+/// `NAME=value`: a variable set for the command.
+fn is_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// The index after the options at `at`; the ones in `valued` take the next
+/// word as their value unless it is attached with `=`, `--` ends them.
+fn after_options(words: &[String], mut at: usize, valued: &[&str]) -> usize {
+    while let Some(word) = words.get(at) {
+        if word == "--" {
+            return at + 1;
+        }
+        if !word.starts_with('-') || word == "-" {
+            break;
+        }
+        let name = word.split_once('=').map_or(word.as_str(), |(name, _)| name);
+        at += 1 + usize::from(valued.contains(&name) && !word.contains('='));
+    }
+    at.min(words.len())
+}
+
+const ENV_VALUED: [&str; 7] = [
+    "-u",
+    "--unset",
+    "-C",
+    "--chdir",
+    "-S",
+    "--split-string",
+    "-P",
+];
+const TIME_VALUED: [&str; 4] = ["-f", "--format", "-o", "--output"];
+/// sudo's options that take a value.
+const SUDO_VALUED: [&str; 19] = [
+    "-u",
+    "--user",
+    "-g",
+    "--group",
+    "-h",
+    "--host",
+    "-p",
+    "--prompt",
+    "-C",
+    "--close-from",
+    "-D",
+    "--chdir",
+    "-R",
+    "--chroot",
+    "-r",
+    "--role",
+    "-t",
+    "--type",
+    "-T",
+];
+/// The package runners' options that take a value (`npx -p pkg`, `uvx --from
+/// pkg`).
+const RUNNER_VALUED: [&str; 7] = [
+    "-p",
+    "--package",
+    "-c",
+    "--call",
+    "--from",
+    "--with",
+    "--python",
+];
+
+/// A runner's package spec as the command it installs: `@scope/name@1.2` →
+/// `name`.
+fn package_command(spec: &str) -> &str {
+    let unscoped = spec.rsplit('/').next().unwrap_or(spec);
+    unscoped.split('@').next().unwrap_or(unscoped)
+}
+
+/// Looks through the wrappers in front of a command (`VAR=…`, `env`, `sudo`,
+/// `exec`, `time`, `nohup`, and the package runners `npx`, `bunx`, `uvx`).
+/// `None` when no command is left (a bare `sudo`, an assignment alone).
+fn command_of(words: &[String]) -> Option<Command> {
+    let mut at = 0;
+    loop {
+        let word = words.get(at)?;
+        if is_assignment(word) {
+            at += 1;
+            continue;
+        }
+        let start = at + 1;
+        match base(word) {
+            "env" => at = after_options(words, start, &ENV_VALUED),
+            "exec" => at = after_options(words, start, &["-a"]),
+            "time" => at = after_options(words, start, &TIME_VALUED),
+            "nohup" => at = start,
+            "sudo" => {
+                at = after_options(words, start, &SUDO_VALUED);
+                if at >= words.len() {
+                    // No command: a root shell if one was asked for.
+                    let shell_asked = words[start..at].iter().any(|option| {
+                        option == "--login"
+                            || option == "--shell"
+                            || (option.starts_with('-')
+                                && !option.starts_with("--")
+                                && option.contains(['i', 's']))
+                    });
+                    return shell_asked.then_some(Command::Elevated);
+                }
+            }
+            "su" => return Some(Command::Elevated),
+            "npx" | "bunx" | "uvx" => {
+                let package = after_options(words, start, &RUNNER_VALUED);
+                let spec = words.get(package)?;
+                let mut argv = vec![package_command(spec).to_owned()];
+                argv.extend(words[package + 1..].iter().cloned());
+                return Some(Command::Argv(argv));
+            }
+            _ => return Some(Command::Argv(words[at..].to_vec())),
+        }
+    }
+}
+
+/// The kind the first command of a shell line is; `None` when it is none the
+/// table knows (or the line holds no command). The line is read as an argv and
+/// decided as a process is ([`from_group`]): `python3` is a REPL, `python3
+/// build.py` is not, `node …/claude` is the agent.
+pub fn from_line(line: &str) -> Option<Kind> {
+    match command_of(&words(line))? {
+        Command::Elevated => Some(Kind::Root),
+        Command::Argv(argv) => {
+            let name = base(argv.first()?).to_owned();
+            let record = ProcArgs {
+                exec: String::new(),
+                args: argv,
+                env: Vec::new(),
+            };
+            from_group(&[Process::new(0, None, name, None, Some(record))])
+        }
+    }
+}
+
+/// The pane's kind from what is known, in the order of trust: the program's
+/// own word, the process table, the command line; else the shell. In a remote
+/// session the process table shows only the local `ssh`, so it is not asked
+/// (`group` is ignored) and a command nothing knows leaves the server.
+pub fn decide(app: Option<Kind>, group: Option<Kind>, line: Option<Kind>, remote: bool) -> Kind {
+    let group = if remote { None } else { group };
+    app.or(group)
+        .or(line)
+        .unwrap_or(if remote { Kind::Remote } else { Kind::Shell })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::tests::{Table, login_shell};
+
+    const AGENTS: [(&str, Agent); 12] = [
+        ("claude", Agent::ClaudeCode),
+        ("codex", Agent::Codex),
+        ("opencode", Agent::OpenCode),
+        ("antigravity", Agent::Antigravity),
+        ("gemini", Agent::GeminiCli),
+        ("pi", Agent::Pi),
+        ("herdr", Agent::Herdr),
+        ("cursor-agent", Agent::CursorCli),
+        ("copilot", Agent::CopilotCli),
+        ("qwen", Agent::QwenCode),
+        ("kimi", Agent::KimiCli),
+        ("aider", Agent::Other),
+    ];
+
+    fn seen(table: &Table) -> Seen {
+        find(ShellParent::Login, 100, table)
+    }
+
+    fn kind(kind: Kind) -> Seen {
+        Seen::Kind(kind)
+    }
+
+    fn agent(agent: Agent) -> Kind {
+        Kind::Agent(agent)
+    }
+
+    #[test]
+    fn every_agent_is_known_by_its_own_name() {
+        for (name, which) in AGENTS {
+            assert_eq!(by_name(name), Some(agent(which)), "{name}");
+            let table = login_shell(200).run(200, 101, 200, &[name]);
+            assert_eq!(seen(&table), kind(agent(which)), "{name}");
+            let installed: &'static str =
+                Box::leak(format!("/Users/me/.local/bin/{name}").into_boxed_str());
+            let table = login_shell(200).run(200, 101, 200, &[installed]);
+            assert_eq!(seen(&table), kind(agent(which)), "{installed}");
+            assert_eq!(from_line(name), Some(agent(which)), "{name} typed");
+        }
+    }
+
+    #[test]
+    fn an_interpreters_script_names_the_agent_where_the_kernel_names_the_interpreter() {
+        // macOS: the process is `node`, the script is the second word.
+        let node = |argv: &[&'static str]| {
+            login_shell(200).exec(200, 101, 200, ("node", "/opt/homebrew/bin/node"), argv, &[])
+        };
+        assert_eq!(
+            seen(&node(&["node", "/opt/homebrew/bin/claude"])),
+            kind(agent(Agent::ClaudeCode))
+        );
+        assert_eq!(
+            seen(&node(&[
+                "node",
+                "/Users/me/.nvm/versions/node/v22.0.0/lib/node_modules/@openai/codex/bin/codex.js",
+                "--yolo",
+            ])),
+            kind(agent(Agent::Codex)),
+            "npm's wrapper: the script without its extension"
+        );
+        assert_eq!(
+            seen(&node(&[
+                "node",
+                "--max-old-space-size=4096",
+                "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+            ])),
+            kind(agent(Agent::ClaudeCode)),
+            "a generic entry file: the package names it, node's own options are skipped"
+        );
+        assert_eq!(
+            seen(&node(&[
+                "node",
+                "/usr/local/lib/node_modules/@google/gemini-cli/dist/index.js"
+            ])),
+            kind(agent(Agent::GeminiCli))
+        );
+        // Python agents: a script, and a module.
+        let python = |argv: &[&'static str]| {
+            login_shell(200).exec(200, 101, 200, ("python3", "/usr/bin/python3"), argv, &[])
+        };
+        assert_eq!(
+            seen(&python(&["python3", "/Users/me/.local/bin/kimi", "--yolo"])),
+            kind(agent(Agent::KimiCli))
+        );
+        assert_eq!(
+            seen(&python(&["python3", "-m", "aider", "--model", "x"])),
+            kind(agent(Agent::Other))
+        );
+        assert_eq!(
+            seen(&python(&["python3", "-m", "kimi_cli"])),
+            kind(agent(Agent::KimiCli)),
+            "a module's underscore is the package's dash"
+        );
+        // Linux: the process is named after the script and the argv is the
+        // interpreter's.
+        let linux = login_shell(200).exec(
+            200,
+            101,
+            200,
+            ("claude", "/usr/bin/node"),
+            &["node", "/usr/bin/claude"],
+            &[],
+        );
+        assert_eq!(seen(&linux), kind(agent(Agent::ClaudeCode)));
+    }
+
+    #[test]
+    fn a_program_that_runs_a_script_of_its_own_is_not_an_agent() {
+        let table = login_shell(200).exec(
+            200,
+            101,
+            200,
+            ("node", "/opt/homebrew/bin/node"),
+            &["node", "server.js"],
+            &[],
+        );
+        assert_eq!(seen(&table), Seen::Nothing);
+        let table = login_shell(200).exec(
+            200,
+            101,
+            200,
+            ("python3", "/usr/bin/python3"),
+            &["python3", "manage.py", "runserver"],
+            &[],
+        );
+        assert_eq!(seen(&table), Seen::Nothing, "no REPL either");
+    }
+
+    #[test]
+    fn the_tools_are_known_by_name_and_the_outermost_one_wins() {
+        let named = [
+            ("vim", Kind::Editor),
+            ("nvim", Kind::Editor),
+            ("htop", Kind::Monitor),
+            ("lazygit", Kind::Git),
+            ("make", Kind::Task),
+            ("cargo", Kind::Task),
+            ("man", Kind::Pager),
+            ("yazi", Kind::Files),
+            ("ssh", Kind::Remote),
+            ("mosh-client", Kind::Remote),
+        ];
+        for (name, expected) in named {
+            let table = login_shell(200).run(200, 101, 200, &[name]);
+            assert_eq!(seen(&table), kind(expected), "{name}");
+        }
+        // Python scripts that are tools: macOS names the process `python3`.
+        let ranger = login_shell(200).exec(
+            200,
+            101,
+            200,
+            ("python3", "/usr/bin/python3"),
+            &["python3", "/opt/homebrew/bin/ranger"],
+            &[],
+        );
+        assert_eq!(seen(&ranger), kind(Kind::Files));
+        // The tool that opened another is the one named.
+        let table =
+            login_shell(200)
+                .run(200, 101, 200, &["lazygit"])
+                .run(201, 200, 200, &["nvim", "file"]);
+        assert_eq!(seen(&table), kind(Kind::Git));
+        // Whatever the pid order.
+        let table =
+            login_shell(300)
+                .run(300, 101, 300, &["lazygit"])
+                .run(250, 300, 300, &["nvim", "file"]);
+        assert_eq!(seen(&table), kind(Kind::Git));
+        // A pager under a command nothing names.
+        let table =
+            login_shell(200)
+                .run(200, 101, 200, &["git", "log"])
+                .run(201, 200, 200, &["less"]);
+        assert_eq!(seen(&table), kind(Kind::Pager));
+    }
+
+    #[test]
+    fn an_agent_is_what_the_pane_does_whatever_it_runs() {
+        let table = login_shell(200)
+            .exec(
+                200,
+                101,
+                200,
+                ("node", "/opt/homebrew/bin/node"),
+                &["node", "/opt/homebrew/bin/claude"],
+                &[],
+            )
+            .run(201, 200, 200, &["python3"])
+            .run(202, 200, 200, &["make", "test"])
+            .run(203, 200, 200, &["bash"]);
+        assert_eq!(seen(&table), kind(agent(Agent::ClaudeCode)));
+    }
+
+    #[test]
+    fn the_guide_bars_families_are_read_not_copied() {
+        let repl = |name: &'static str, exec: &'static str, argv: &[&'static str]| {
+            seen(&login_shell(200).exec(200, 101, 200, (name, exec), argv, &[]))
+        };
+        assert_eq!(
+            repl("python3", "/usr/bin/python3", &["python3"]),
+            kind(Kind::Repl)
+        );
+        assert_eq!(repl("node", "/usr/bin/node", &["node"]), kind(Kind::Repl));
+        assert_eq!(
+            repl(
+                "psql",
+                "/usr/bin/psql",
+                &["psql", "-h", "db.prod", "-U", "app", "main"]
+            ),
+            kind(Kind::Database)
+        );
+        assert_eq!(
+            repl(
+                "docker",
+                "/usr/bin/docker",
+                &["docker", "exec", "-it", "web", "sh"]
+            ),
+            kind(Kind::Container)
+        );
+        // A shell started from the prompt.
+        assert_eq!(
+            seen(&login_shell(200).run(200, 101, 200, &["bash"])),
+            kind(Kind::Shell)
+        );
+    }
+
+    #[test]
+    fn sudo_is_looked_through_and_a_root_shell_is_a_kind() {
+        // `sudo htop`: sudo holds the terminal, htop is below it.
+        let table = login_shell(200)
+            .run(200, 101, 200, &["sudo", "htop"])
+            .owned_by(200, 0)
+            .run(201, 200, 201, &["htop"])
+            .owned_by(201, 0);
+        assert_eq!(seen(&table), kind(Kind::Monitor));
+        // `sudo -i`: its root shell.
+        let table = login_shell(200)
+            .run(200, 101, 200, &["sudo", "-i"])
+            .owned_by(200, 0)
+            .with(201, 200, 201, "zsh")
+            .owned_by(201, 0);
+        assert_eq!(seen(&table), kind(Kind::Root));
+        // Still at its password prompt: nothing yet.
+        let table = login_shell(200)
+            .run(200, 101, 200, &["sudo", "htop"])
+            .owned_by(200, 0);
+        assert_eq!(seen(&table), Seen::Waiting);
+    }
+
+    #[test]
+    fn nothing_known_and_not_yet_are_told_apart() {
+        // The shell itself holds the terminal: the command has not executed.
+        assert_eq!(seen(&login_shell(101)), Seen::Waiting);
+        // No shell yet.
+        let table = Table::new(Some(200)).with(100, 1, 100, "login");
+        assert_eq!(seen(&table), Seen::Waiting);
+        let table = login_shell(200).run(200, 101, 200, &["frobnicate", "--now"]);
+        assert_eq!(seen(&table), Seen::Nothing);
+    }
+
+    #[test]
+    fn an_app_name_is_looked_up_without_regard_to_case() {
+        for app in ["claude", "claude-code", "Claude-Code", "CLAUDE"] {
+            assert_eq!(from_app(app), Some(agent(Agent::ClaudeCode)), "{app}");
+        }
+        assert_eq!(from_app("codex"), Some(agent(Agent::Codex)));
+        assert_eq!(from_app("Cursor"), Some(agent(Agent::CursorCli)));
+        assert_eq!(from_app("github-copilot"), Some(agent(Agent::CopilotCli)));
+        assert_eq!(from_app("gemini-cli"), Some(agent(Agent::GeminiCli)));
+        assert_eq!(from_app("kimi_cli"), Some(agent(Agent::KimiCli)));
+        assert_eq!(from_app("cargo"), None, "a tool is no reporting agent");
+        assert_eq!(from_app("vim"), None);
+        assert_eq!(from_app(""), None);
+        assert_eq!(from_app("unheard-of"), None);
+    }
+
+    #[test]
+    fn wrappers_in_front_of_a_command_are_looked_through() {
+        let cases = [
+            ("env FOO=1 npx opencode", Some(agent(Agent::OpenCode))),
+            ("FOO=1 BAR=2 codex --yolo", Some(agent(Agent::Codex))),
+            ("sudo htop", Some(Kind::Monitor)),
+            ("sudo -u bob -E vim notes.txt", Some(Kind::Editor)),
+            ("sudo -i", Some(Kind::Root)),
+            ("sudo -s", Some(Kind::Root)),
+            ("su -", Some(Kind::Root)),
+            ("time nohup exec cargo build --release", Some(Kind::Task)),
+            ("exec -a login zsh", Some(Kind::Shell)),
+            ("env -i -u HOME PATH=/bin make", Some(Kind::Task)),
+            ("sudo -u", None),
+            (
+                "npx -y @anthropic-ai/claude-code@latest",
+                Some(agent(Agent::ClaudeCode)),
+            ),
+            ("bunx opencode-ai@latest", Some(agent(Agent::OpenCode))),
+            ("uvx --from kimi-cli kimi", Some(agent(Agent::KimiCli))),
+            (
+                "npx --package=@openai/codex codex",
+                Some(agent(Agent::Codex)),
+            ),
+            ("sudo", None),
+            ("sudo -u bob", None),
+            ("FOO=1", None),
+            ("env", None),
+            ("", None),
+            ("   ", None),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(from_line(line), expected, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_line_is_read_as_the_first_command_with_its_quotes() {
+        let cases = [
+            ("\"vim\" 'my notes.txt'", Some(Kind::Editor)),
+            ("vim a\\ b.txt | cat", Some(Kind::Editor)),
+            ("/usr/local/bin/nvim", Some(Kind::Editor)),
+            ("./claude", Some(agent(Agent::ClaudeCode))),
+            ("htop; claude", Some(Kind::Monitor)),
+            ("ls -l | claude", None),
+            ("echo 'a | vim'", None),
+            ("cd src && vim", None),
+            ("git log", None),
+            ("ssh -p 22 host", Some(Kind::Remote)),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(from_line(line), expected, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_line_is_decided_as_a_process_is() {
+        let cases = [
+            ("python3", Some(Kind::Repl)),
+            ("python3 -i", Some(Kind::Repl)),
+            ("python3 build.py", None),
+            ("node", Some(Kind::Repl)),
+            ("node server.js", None),
+            (
+                "node /opt/homebrew/bin/claude",
+                Some(agent(Agent::ClaudeCode)),
+            ),
+            (
+                "node ~/.nvm/versions/node/v22/lib/node_modules/@openai/codex/bin/codex.js",
+                Some(agent(Agent::Codex)),
+            ),
+            ("python3 -m aider", Some(agent(Agent::Other))),
+            ("python3 -m pytest -x", Some(Kind::Task)),
+            ("bun run dev", Some(Kind::Task)),
+            ("psql -h db.prod -U app main", Some(Kind::Database)),
+            ("docker exec -it web sh", Some(Kind::Container)),
+            ("docker ps", None),
+            ("kubectl exec -it api-7f9c -- sh", Some(Kind::Container)),
+            ("bash", Some(Kind::Shell)),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(from_line(line), expected, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn the_sources_are_trusted_in_order_and_a_remote_session_skips_the_table() {
+        let (app, group, line) = (
+            Some(agent(Agent::Codex)),
+            Some(Kind::Editor),
+            Some(Kind::Task),
+        );
+        assert_eq!(decide(app, group, line, false), agent(Agent::Codex));
+        assert_eq!(decide(None, group, line, false), Kind::Editor);
+        assert_eq!(decide(None, None, line, false), Kind::Task);
+        assert_eq!(decide(None, None, None, false), Kind::Shell);
+        // Remote: the process table says `ssh` and nothing of the far side.
+        assert_eq!(decide(None, Some(Kind::Remote), line, true), Kind::Task);
+        assert_eq!(decide(None, Some(Kind::Remote), None, true), Kind::Remote);
+        assert_eq!(decide(None, None, None, true), Kind::Remote);
+        assert_eq!(decide(app, None, line, true), agent(Agent::Codex));
+    }
+
+    #[test]
+    fn the_table_is_consistent() {
+        let mut seen_names: Vec<&str> = Vec::new();
+        for row in &ROWS {
+            for name in row.names.iter().chain(row.apps) {
+                assert_eq!(*name, normalized(name), "{name} is spelled as looked up");
+            }
+            for name in row.names {
+                assert!(!shell::is_shell(name), "{name} is a shell, not a row");
+                assert!(!seen_names.contains(name), "{name} is in two rows");
+                seen_names.push(name);
+            }
+            if !matches!(row.kind, Kind::Agent(_)) {
+                assert!(row.apps.is_empty(), "only agents report an app");
+            }
+        }
+        // Every agent has a row and every row is found by each of its names.
+        for (_, which) in AGENTS {
+            assert!(ROWS.iter().any(|row| row.kind == agent(which)));
+        }
+        for row in &ROWS {
+            for name in row.names {
+                assert_eq!(by_name(name), Some(row.kind), "{name}");
+            }
+            for app in row.apps {
+                assert_eq!(from_app(app), Some(row.kind), "{app}");
+            }
+        }
+    }
+}

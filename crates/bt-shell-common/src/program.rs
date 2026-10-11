@@ -49,9 +49,17 @@
 //! python leaves the bar to python), a nested shell last. While sudo holds
 //! the terminal its own raw modes say nothing of the program
 //! ([`Found::Waiting`], [`Found::Elevated`]).
+//!
+//! **A tab's icon asks another question** ([`identity`]): not whether the
+//! program reads the keyboard but which program it is — an agent, an editor, a
+//! build, whatever the bar deliberately does not name. It reads this module's
+//! families rather than copying them ([`classify`] says a REPL, a client, a
+//! container session or a shell), and takes one more thing from an argv: the
+//! name of the script an interpreter runs, to be compared and dropped.
 
 mod container;
 mod database;
+pub mod identity;
 mod options;
 mod shell;
 
@@ -630,6 +638,36 @@ pub fn classify(members: &[Member], home: Option<&Path>) -> Option<Program> {
     in_line(members, nested)
 }
 
+/// `pid`'s ancestors inside the group, nearest first; the walk is bounded by
+/// the group's size and stops at a cycle — a corrupt table (a process its own
+/// parent) must neither loop nor make a process its own ancestor. The one
+/// walk: [`in_line`] and the tab icon's choice among the group's programs
+/// (`identity`) read it.
+fn ancestors_in(members: &[Member], pid: u32) -> Vec<u32> {
+    let parent_of = |pid: u32| {
+        members
+            .iter()
+            .find(|member| member.pid == pid)
+            .and_then(|member| member.parent)
+    };
+    let mut up = Vec::new();
+    let mut at = pid;
+    for _ in 0..members.len() {
+        match parent_of(at) {
+            Some(next)
+                if next != pid
+                    && !up.contains(&next)
+                    && members.iter().any(|member| member.pid == next) =>
+            {
+                up.push(next);
+                at = next;
+            }
+            _ => break,
+        }
+    }
+    up
+}
+
 /// The program of `recognized` the whole group is the line of: the
 /// **topmost** (one with no recognized ancestor in the group — pids wrap,
 /// so the lower pid is not the parent), and every other member must be its
@@ -638,33 +676,7 @@ pub fn classify(members: &[Member], home: Option<&Path>) -> Option<Program> {
 /// pipeline's other side — in `fzf | python3` fzf turned the terminal raw
 /// and python3 reads a pipe — and the bar would name the wrong program.
 fn in_line(members: &[Member], recognized: Vec<Program>) -> Option<Program> {
-    let parent_of = |pid: u32| {
-        members
-            .iter()
-            .find(|member| member.pid == pid)
-            .and_then(|member| member.parent)
-    };
-    // `pid`'s ancestors inside the group, nearest first; the walk is bounded
-    // by the group's size and stops at a cycle — a corrupt table (a process
-    // its own parent) must neither loop nor make a process its own ancestor.
-    let ancestors = |pid: u32| {
-        let mut up = Vec::new();
-        let mut at = pid;
-        for _ in 0..members.len() {
-            match parent_of(at) {
-                Some(next)
-                    if next != pid
-                        && !up.contains(&next)
-                        && members.iter().any(|member| member.pid == next) =>
-                {
-                    up.push(next);
-                    at = next;
-                }
-                _ => break,
-            }
-        }
-        up
-    };
+    let ancestors = |pid: u32| ancestors_in(members, pid);
     let pids: Vec<u32> = recognized.iter().map(|program| program.pid).collect();
     let program = recognized
         .into_iter()

@@ -3,13 +3,24 @@
 //! terminal keeps one record per id.
 //!
 //! **What is kept and what is not.** A record holds its state, when it entered
-//! it, and its `progress` — a number from 0 to 100 a host embedding the pane shows
-//! ([`crate::Session::program_records`]). `kind`, `app`, `title` and `msg` are
-//! **validated** (a report that breaks a limit, fails to decode or carries a
-//! control character is discarded whole, as the protocol says) but not stored:
-//! nothing shows them yet, and a text nobody reads is attack surface for nothing.
-//! When a surface shows `msg` or `title` it stores them then, and neutralizes
-//! bidirectional and invisible formatting characters on the way out.
+//! it, its `progress` — a number from 0 to 100 a host embedding the pane shows
+//! ([`crate::Session::program_records`]) — and its `app`. `kind`, `app`, `title`
+//! and `msg` are **validated** (a report that breaks a limit, fails to decode or
+//! carries a control character is discarded whole, as the protocol says); `kind`,
+//! `title` and `msg` are not stored: nothing shows them yet, and a text nobody
+//! reads is attack surface for nothing. When a surface shows `msg` or `title` it
+//! stores them then, and neutralizes bidirectional and invisible formatting
+//! characters on the way out.
+//!
+//! **`app` is kept to be looked up, never shown** ([`ProgramStatus::app`]): a
+//! restricted name of at most 32 bytes (letters, digits, `_ . + -`), which the
+//! tab's icon matches against a table of known programs — nothing of it is drawn
+//! or printed. A report for an id that already has a record and names no `app`
+//! keeps the name the record had (a progress update does not make the program
+//! anonymous). The answer is the root record's name, else the most recently
+//! updated record's that has one, and it goes with its record: a `clear`, or the
+//! next prompt for a record still alive. A `done` or `error` record survives the
+//! prompt, so its name does too — the program's result is still on show.
 //!
 //! **`OSC 9 ; 4` is the root record's stand-in** until the first `OSC 7501` report
 //! arrives ([`progress`]): ConEmu's progress sequence — what `cargo`, `zig` and
@@ -114,6 +125,9 @@ pub(crate) enum Report {
         state: State,
         /// From 0 to 100; `None` when the report gives none.
         progress: Option<u8>,
+        /// The validated `app` name ([`MAX_APP`] bytes of [`name_byte`]s);
+        /// `None` when the report gives none or an empty one.
+        app: Option<String>,
     },
 }
 
@@ -166,11 +180,14 @@ pub(crate) fn parse(payload: &[u8], decoded: &mut Vec<u8>) -> Option<Report> {
         Some(value) => Some(percent(value)?),
         None => None,
     };
-    if let Some(value) = app
-        && !(value.len() <= MAX_APP && value.iter().copied().all(name_byte))
-    {
-        return None;
-    }
+    let app = match app {
+        Some(value) if !(value.len() <= MAX_APP && value.iter().copied().all(name_byte)) => {
+            return None;
+        }
+        // Every byte is ASCII by the check above.
+        Some(value) if !value.is_empty() => String::from_utf8(value.to_vec()).ok(),
+        _ => None,
+    };
     for (value, limit) in [(title, MAX_TITLE), (msg, MAX_MSG)] {
         if let Some(value) = value {
             text(value, limit, decoded)?;
@@ -183,6 +200,7 @@ pub(crate) fn parse(payload: &[u8], decoded: &mut Vec<u8>) -> Option<Report> {
         id,
         state: State::parse(state)?,
         progress,
+        app,
     })
 }
 
@@ -219,16 +237,19 @@ pub(crate) fn progress(payload: &[u8]) -> Option<Report> {
             id: root(),
             state: State::Working,
             progress: value,
+            app: None,
         },
         b"3" => Report::Set {
             id: root(),
             state: State::Working,
             progress: None,
+            app: None,
         },
         b"2" => Report::Set {
             id: root(),
             state: State::Error,
             progress: value,
+            app: None,
         },
         _ => return None,
     })
@@ -272,11 +293,14 @@ fn text(value: &[u8], limit: usize, decoded: &mut Vec<u8>) -> Option<()> {
 }
 
 /// One record.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Record {
     state: State,
     /// From 0 to 100, as its last report said; `None` when it gave none.
     progress: Option<u8>,
+    /// The program's name as a report gave it, kept to be looked up
+    /// ([`ProgramStatus::app`]); a report that names none keeps the last one.
+    app: Option<String>,
     /// When the record entered its state: a report that repeats the state (a
     /// progress update) keeps it, so a ring's clock and the counter run on.
     since: Instant,
@@ -344,12 +368,14 @@ impl ProgramStatus {
                 id,
                 state,
                 progress,
+                app,
             } => {
                 self.clock += 1;
                 let (entered, since) = match self.records.get(&id) {
                     Some(record) if record.state == state => (false, record.since),
                     _ => (true, now),
                 };
+                let app = app.or_else(|| self.records.get(&id).and_then(|r| r.app.clone()));
                 if entered {
                     match state {
                         State::Done => self.done = self.done.wrapping_add(1),
@@ -362,6 +388,7 @@ impl ProgramStatus {
                     Record {
                         state,
                         progress,
+                        app,
                         since,
                         updated: self.clock,
                     },
@@ -424,6 +451,23 @@ impl ProgramStatus {
             .collect()
     }
 
+    /// The reporting program's name, to be looked up in a table and never
+    /// shown: the root record's, else the most recently updated record's
+    /// that carries one; `None` when no record does. It leaves with its record.
+    pub(crate) fn app(&self) -> Option<&str> {
+        let root = self
+            .records
+            .get("")
+            .and_then(|record| record.app.as_deref());
+        root.or_else(|| {
+            self.records
+                .values()
+                .filter(|record| record.app.is_some())
+                .max_by_key(|record| record.updated)
+                .and_then(|record| record.app.as_deref())
+        })
+    }
+
     /// What the tab reads; `None` while no program reports being there (no record,
     /// or only results waiting to be seen) — the shell's own marks are then the
     /// whole story.
@@ -459,6 +503,16 @@ mod tests {
             id: id.to_owned(),
             state,
             progress: None,
+            app: None,
+        }
+    }
+
+    fn named(id: &str, state: State, app: &str) -> Report {
+        Report::Set {
+            id: id.to_owned(),
+            state,
+            progress: None,
+            app: Some(app.to_owned()),
         }
     }
 
@@ -480,8 +534,9 @@ mod tests {
     fn unknown_keys_and_pairs_without_a_value_are_skipped() {
         assert_eq!(
             read("state=idle:future=1:junk:app=claude-code"),
-            Some(set("", State::Idle))
+            Some(named("", State::Idle, "claude-code"))
         );
+        assert_eq!(read("state=idle:future=1:junk"), Some(set("", State::Idle)));
     }
 
     #[test]
@@ -524,6 +579,7 @@ mod tests {
                 id: "build".to_owned(),
                 state: State::Working,
                 progress: Some(40),
+                app: None,
             })
         );
         let mut status = ProgramStatus::default();
@@ -545,6 +601,75 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn the_app_is_read_whole_and_an_empty_one_is_none() {
+        assert_eq!(
+            read("state=working:app=Claude.Code_2+x"),
+            Some(named("", State::Working, "Claude.Code_2+x"))
+        );
+        assert_eq!(read("state=working:app="), Some(set("", State::Working)));
+        let longest = "a".repeat(MAX_APP);
+        assert_eq!(
+            read(&format!("state=working:app={longest}")),
+            Some(named("", State::Working, &longest))
+        );
+        assert_eq!(read("state=working:app=a b"), None, "outside the charset");
+        assert_eq!(read("state=working:app=a/b"), None, "no path");
+    }
+
+    #[test]
+    fn the_app_is_kept_with_its_record_and_goes_with_it() {
+        let mut status = ProgramStatus::default();
+        let now = Instant::now();
+        assert_eq!(status.app(), None, "nothing reported");
+        status.apply(set("", State::Working), now);
+        assert_eq!(status.app(), None, "a report that names none");
+        status.apply(named("", State::Working, "claude-code"), now);
+        assert_eq!(status.app(), Some("claude-code"));
+        // A progress update that names none keeps the name.
+        status.apply(read("state=working:progress=40").unwrap(), now);
+        assert_eq!(status.app(), Some("claude-code"));
+        // Another name replaces it.
+        status.apply(named("", State::Idle, "codex"), now);
+        assert_eq!(status.app(), Some("codex"));
+        status.apply(Report::Clear { id: String::new() }, now);
+        assert_eq!(status.app(), None, "cleared with its record");
+    }
+
+    #[test]
+    fn the_root_names_the_program_else_the_latest_record_that_has_a_name() {
+        let mut status = ProgramStatus::default();
+        let now = Instant::now();
+        status.apply(named("a", State::Working, "first"), now);
+        status.apply(named("b", State::Working, "second"), now);
+        status.apply(set("c", State::Working), now);
+        assert_eq!(status.app(), Some("second"), "the latest with a name");
+        status.apply(named("", State::Idle, "root"), now);
+        assert_eq!(status.app(), Some("root"), "the root outranks the latest");
+        status.apply(Report::Clear { id: "b".into() }, now);
+        status.apply(Report::Clear { id: String::new() }, now);
+        assert_eq!(status.app(), None);
+    }
+
+    #[test]
+    fn a_prompt_ends_the_name_of_a_live_record_but_not_of_a_result() {
+        let mut status = ProgramStatus::default();
+        let now = Instant::now();
+        status.apply(named("", State::Working, "claude"), now);
+        assert!(status.prompt());
+        assert_eq!(status.app(), None, "the program ended with its record");
+        status.apply(named("", State::Done, "claude"), now);
+        assert!(!status.prompt());
+        assert_eq!(status.app(), Some("claude"), "its result is still on show");
+    }
+
+    #[test]
+    fn the_progress_sequence_names_no_program() {
+        let mut status = ProgramStatus::default();
+        status.apply_progress(progress(b"4;1;50").unwrap(), Instant::now());
+        assert_eq!(status.app(), None);
     }
 
     #[test]
@@ -582,6 +707,7 @@ mod tests {
                 id: String::new(),
                 state,
                 progress,
+                app: None,
             })
         };
         assert_eq!(progress(b"4;1;50"), root(State::Working, Some(50)));

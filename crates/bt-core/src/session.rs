@@ -9143,6 +9143,17 @@ impl Session {
         lock(&self.shell).program.records()
     }
 
+    /// The name the reporting program gave itself (`app=` of `OSC 7501`): the root
+    /// record's, else the latest record's that has one; `None` when no record does. A
+    /// restricted name of at most 32 bytes **to be looked up in a table, never shown** — what
+    /// a tab's icon is chosen by. It goes with its record (a `clear`, the next prompt for a
+    /// record still alive). Its news is [`Wake::program_status_changed`]. One leaf-lock round.
+    ///
+    /// **Journal-neutral:** reads only.
+    pub fn program_app(&self) -> Option<String> {
+        lock(&self.shell).program.app().map(str::to_owned)
+    }
+
     /// The newest command as the shell's ledger knows it ([`CommandState`]) — what a host
     /// that reports commands one by one looks at on every activity edge
     /// ([`crate::command_news`]). Our remote shell's while its session runs, else the local

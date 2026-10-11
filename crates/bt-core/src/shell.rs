@@ -9454,7 +9454,7 @@ mod tests {
         assert_eq!(
             seen,
             [
-                "Set { id: \"build\", state: Working, progress: None }",
+                "Set { id: \"build\", state: Working, progress: None, app: None }",
                 "query",
                 "PromptEnd"
             ]
@@ -9492,6 +9492,20 @@ mod tests {
         assert!(log.program.activity(Instant::now()).is_none());
         let outcome = feed(&mut log, b"\x1b]133;A;bt_block=2\x07");
         assert!(!outcome.status, "nothing was left to end");
+    }
+
+    #[test]
+    fn the_programs_name_is_kept_until_its_record_goes() {
+        let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
+        feed(&mut log, b"\x1b]7501;state=working:app=claude-code\x07");
+        assert_eq!(log.program.app(), Some("claude-code"));
+        feed(&mut log, b"\x1b]7501;state=working:progress=5\x07");
+        assert_eq!(log.program.app(), Some("claude-code"), "a repeat keeps it");
+        // A report the protocol drops whole does not rename the program.
+        feed(&mut log, b"\x1b]7501;state=working:app=bad name\x07");
+        assert_eq!(log.program.app(), Some("claude-code"));
+        feed(&mut log, b"\x1b]133;A;bt_block=1\x07");
+        assert_eq!(log.program.app(), None, "the prompt ended the program");
     }
 
     #[test]
