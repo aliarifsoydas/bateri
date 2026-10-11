@@ -12,6 +12,8 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-12
+
 ### Changed
 
 - **The dock stands a step above the text.** The line over the input row is
