@@ -43,11 +43,15 @@ pub struct Grid {
 /// deliberately `pub`, so a placeholder like `CellMetrics::new(9, 18, 7, 8,
 /// 1, 1.0)` written there would revive and the two tests here would stay green.
 ///
-/// **The left gutter is subtracted from the columns**: so the
-/// stripe does not overlap the text. The gutter is always reserved — the
+/// **The left margin is subtracted from the columns**: so the
+/// stripe does not overlap the text. The margin is always reserved — the
 /// accepted cost is that it stays empty in a session without integration
 /// (bash/fish, `shell.integration = false`, SSH); the alternative was a
 /// SIGWINCH at the first prompt and three consumers being updated at once.
+/// It is the **side margin** ([`CellMetrics::side_left_px`]), not the gutter:
+/// beside a round bottom corner it is wider, and the dock's width follows it
+/// the same way — the vertical arithmetic (the dock's share, the top reserve)
+/// stays on the gutter.
 ///
 /// **The dock share is subtracted from the rows** and, unlike the left
 /// gutter, is **conditional**: the dock exists only in an integrated zsh
@@ -99,13 +103,13 @@ pub fn split_into_grid(
     // source in production is `Renderer::cell_metrics`, and the guarantee of the ratio is `bt-atlas`'s ≥ 1 clamp.
     //
     // The subtraction is **in `f64`** and this is not a preference but a
-    // requirement: in a window narrower than the gutter the difference goes
+    // requirement: in a window narrower than the margin the difference goes
     // negative, the division stays negative and `as u16` saturates it to zero
     // — i.e. the existing behavior (zero columns, `Session::resize` ignores
     // it) is preserved. Had the same subtraction been done in `u16` it would
     // **overflow** and produce a column count near 65535, a `TIOCSWINSZ` of
     // that size. No new lower bound is deliberately introduced: the end of the chain is already right.
-    let usable_width = width_px - f64::from(cell.gutter_px());
+    let usable_width = width_px - f64::from(cell.side_left_px());
     // The scroll bar's reserve is subtracted the same way and for the same
     // reason: in a window narrower than the gutter and the track the
     // difference goes negative and saturates to zero columns. The width here
@@ -220,6 +224,32 @@ mod tests {
         // The gutter travels with the metrics: the value that built the grid gives it back
         // and the draw origin and mouse mapping read the same value.
         assert_eq!(gutter.cell.gutter_px(), 8);
+    }
+
+    #[test]
+    fn a_round_corner_costs_columns_beyond_the_gutter_and_only_sideways() {
+        // A 20.5 pt corner at @2x: the margin is 25 px beside a 16 px gutter.
+        // At 1780 px of 18 px cells the gutter leaves exactly 98 columns
+        // (1764 / 18) and the corner's margin only 97.5 of them.
+        let flat = CellMetrics::new(18, 36, 18, 16, 1, 2.0).expect("non-zero cell");
+        let round = flat.with_corners(20.5, 20.5);
+        assert_eq!(round.side_left_px(), 25);
+        let at = |cell| split_into_grid(1780.0, 1200.0, cell, DOCK_ROWS, NO_RESERVE, NO_TOP);
+        let (flat_grid, round_grid) = (at(flat), at(round));
+        assert_eq!(flat_grid.cols, 98, "(1780 - 16) / 18");
+        assert_eq!(round_grid.cols, 97, "(1780 - 25) / 18");
+        // The dock's width follows the same margin.
+        assert_eq!(flat_grid.dock_cols, 98);
+        assert_eq!(round_grid.dock_cols, 97);
+        // Rows are the gutter's arithmetic: a corner does not change them.
+        assert_eq!(round_grid.rows, flat_grid.rows);
+        assert_eq!(
+            bt_gpu::dock_px(DOCK_ROWS, round),
+            bt_gpu::dock_px(DOCK_ROWS, flat)
+        );
+        // The metrics travel with the grid: the draw origin and the mouse
+        // read the margin the columns were counted with.
+        assert_eq!(round_grid.cell.side_left_px(), 25);
     }
 
     #[test]

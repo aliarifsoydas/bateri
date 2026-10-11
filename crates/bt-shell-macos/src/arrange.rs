@@ -1016,6 +1016,10 @@ impl Raised {
             let frame = pane.frame();
             let at = rect_of(frame);
             if !pane.is_card() {
+                // Only the look: the corners stay what the layout told
+                // (`TerminalPane::set_corners`), since the text would start
+                // elsewhere and the shell would get a `SIGWINCH` for a look
+                // that lasts while a key is held.
                 pane.set_card(true);
                 forced.push(pane.id());
             }

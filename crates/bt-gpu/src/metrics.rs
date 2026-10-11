@@ -42,6 +42,12 @@ pub struct CellMetrics {
     cell_px: (u16, u16),
     context_cell_px: u16,
     gutter_px: u16,
+    /// The left and right margins the grid and the dock start and end
+    /// inside, in pixels — the **horizontal** margin, kept apart from the
+    /// gutter ([`CellMetrics::side_left_px`]). Both equal the gutter until
+    /// [`CellMetrics::with_corners`] says the pane's bottom corners are round.
+    side_left_px: u16,
+    side_right_px: u16,
     rule_px: u16,
     /// Physical pixels per point — the backing scale the atlas was opened at.
     ///
@@ -64,6 +70,15 @@ pub struct CellMetrics {
 /// (NaN, negative) gives zero-sized parts rather than inverted ones.
 fn points_px(pt: f64, scale: f64) -> f64 {
     (pt * scale).round().max(0.0)
+}
+
+/// The side margin for a corner of `corner_pt` points: `max(gutter, corner −
+/// gutter)`, in pixels ([`CellMetrics::with_corners`] is the rule's doc). A
+/// corner that is not a radius (NaN, negative) is zero through
+/// [`points_px`], so it leaves the gutter; `as u16` stops a huge one at 65535.
+fn side_px(gutter_px: u16, corner_pt: f64, scale: f64) -> u16 {
+    let gutter = f64::from(gutter_px);
+    (points_px(corner_pt, scale) - gutter).max(gutter) as u16
 }
 
 // By hand, because the scale is a float: equal bit for bit. The metrics are
@@ -126,6 +141,8 @@ impl CellMetrics {
             cell_px: (width, height),
             context_cell_px: context_width,
             gutter_px: gutter,
+            side_left_px: gutter,
+            side_right_px: gutter,
             rule_px: rule,
             scale,
         })
@@ -152,6 +169,31 @@ impl CellMetrics {
             .expect("bt-atlas clamps the cell size to 1")
     }
 
+    /// These metrics for a pane whose bottom corners have the given radii, in
+    /// **points** (left and right): the horizontal margin follows the corner
+    /// instead of the gutter alone.
+    ///
+    /// The rule is concentric, and this is its **one** owner: the margin is
+    /// `max(gutter, corner − gutter)`. The dock's text sits `gutter` above the
+    /// pane's bottom edge, so a text edge that keeps the same `gutter` clear
+    /// of a concentric curve of radius `corner` stands `corner − gutter` from
+    /// the side. A 20.5 pt window corner gives 12.5 pt: the first letter is
+    /// `gutter` away from the curve, as far as it is from the straight edge.
+    /// A square corner (zero, or a value that is not a radius: NaN, negative)
+    /// and a corner no wider than twice the gutter leave the gutter itself.
+    ///
+    /// The vertical arithmetic is **not** here: the dock's breathing room, the
+    /// row gap and the top fade stay on the gutter ([`CellMetrics::gutter_px`]).
+    /// Pixels come from the gutter's own conversion ([`points_px`]), so at a
+    /// fractional scale the margin and the gutter cannot round apart.
+    pub fn with_corners(self, left_pt: f64, right_pt: f64) -> Self {
+        Self {
+            side_left_px: side_px(self.gutter_px, left_pt, self.scale),
+            side_right_px: side_px(self.gutter_px, right_pt, self.scale),
+            ..self
+        }
+    }
+
     /// (width, height).
     ///
     /// The type is **carried** between `bt-gpu` and `bt-shell`; the tuple is
@@ -176,6 +218,21 @@ impl CellMetrics {
     /// deliberately give zero where the gutter is not the subject.
     pub fn gutter_px(self) -> u16 {
         self.gutter_px
+    }
+
+    /// The margin on the left that the grid and the dock start **after**, in
+    /// pixels: the gutter on a square corner, more where the corner is round
+    /// ([`CellMetrics::with_corners`]). Every horizontal reader — the draw
+    /// origin, the mouse mapping, the column count — reads it from here; the
+    /// vertical ones stay on [`CellMetrics::gutter_px`].
+    pub fn side_left_px(self) -> u16 {
+        self.side_left_px
+    }
+
+    /// The margin on the right, the same rule as [`CellMetrics::side_left_px`]
+    /// with the bottom right corner.
+    pub fn side_right_px(self) -> u16 {
+        self.side_right_px
     }
 
     /// The thickness of the rule line, in pixels — the font's **own**
@@ -216,5 +273,88 @@ impl CellMetrics {
     /// the cell grid (the scroll bar).
     pub(crate) fn pt_px(self, pt: f32) -> f32 {
         points_px(f64::from(pt), self.scale) as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The metrics a pane has at `scale` before the corners are known: the
+    /// production gutter (8 pt) in pixels, both side margins equal to it.
+    fn flat(scale: f64) -> CellMetrics {
+        let gutter = points_px(CellMetrics::GUTTER_PT, scale) as u16;
+        CellMetrics::new(9, 18, 9, gutter, 1, scale).expect("a cell with no zero component")
+    }
+
+    #[test]
+    fn the_side_margin_is_the_gutter_until_a_corner_is_told() {
+        for scale in [1.0, 2.0] {
+            let metrics = flat(scale);
+            assert_eq!(metrics.side_left_px(), metrics.gutter_px());
+            assert_eq!(metrics.side_right_px(), metrics.gutter_px());
+        }
+    }
+
+    #[test]
+    fn a_corner_gives_the_margin_concentric_with_it() {
+        // The macOS 26 window corner: 20.5 − 8 = 12.5 pt, so the first letter
+        // stands as far from the curve as from the straight edge (8 pt).
+        let retina = flat(2.0).with_corners(20.5, 20.5);
+        assert_eq!(retina.gutter_px(), 16);
+        assert_eq!(retina.side_left_px(), 25, "12.5 pt at @2x");
+        assert_eq!(retina.side_right_px(), 25);
+        // At @1x 12.5 pt rounds half up, the way the gutter's own pixels do.
+        let plain = flat(1.0).with_corners(20.5, 20.5);
+        assert_eq!(plain.gutter_px(), 8);
+        assert_eq!(plain.side_left_px(), 13);
+        // A card's corner (window less the gap) is 12.5 pt as well.
+        assert_eq!(flat(2.0).with_corners(12.5, 12.5).side_left_px(), 16);
+    }
+
+    #[test]
+    fn a_corner_no_wider_than_twice_the_gutter_leaves_the_gutter() {
+        // 12.5 pt − 8 = 4.5 pt is under the gutter; so is the 10 pt corner of
+        // the releases before macOS 26 (10 − 8 = 2), and a square one.
+        for corner in [12.5, 10.0, 16.0, 0.0] {
+            for scale in [1.0, 2.0] {
+                let metrics = flat(scale).with_corners(corner, corner);
+                assert_eq!(
+                    metrics.side_left_px(),
+                    metrics.gutter_px(),
+                    "{corner} @{scale}"
+                );
+                assert_eq!(
+                    metrics.side_right_px(),
+                    metrics.gutter_px(),
+                    "{corner} @{scale}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_radius_is_a_square_corner() {
+        for corner in [f64::NAN, -20.5, f64::NEG_INFINITY] {
+            let metrics = flat(2.0).with_corners(corner, corner);
+            assert_eq!(metrics.side_left_px(), 16, "{corner}");
+            assert_eq!(metrics.side_right_px(), 16, "{corner}");
+        }
+        // A huge one stops at the type's end instead of wrapping.
+        assert_eq!(
+            flat(2.0).with_corners(f64::INFINITY, 0.0).side_left_px(),
+            u16::MAX
+        );
+    }
+
+    #[test]
+    fn the_two_sides_follow_their_own_corner_and_the_gutter_stays() {
+        let metrics = flat(2.0).with_corners(20.5, 0.0);
+        assert_eq!(metrics.side_left_px(), 25);
+        assert_eq!(metrics.side_right_px(), 16, "a square corner on the right");
+        // The vertical readers keep the gutter: the dock's breathing room does
+        // not grow with the corner.
+        assert_eq!(metrics.gutter_px(), 16);
+        assert_eq!(metrics.cell_px(), (9, 18));
     }
 }

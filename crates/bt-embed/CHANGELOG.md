@@ -20,6 +20,16 @@ commit. Pushing is a separate step.
 
 ## [Unreleased]
 
+### Added
+
+- `bt_pane_set_corner_radii(pane, left, right)`: the radii, in points, of the
+  pane's bottom left and right corners — the window's or the card's curve the
+  text keeps clear of. The columns, the prompt row and the pointer start
+  further in beside a round corner, with the same distance from the curve as
+  from the straight edge. A host that does not call it leaves both at zero
+  (square), which is the margin the pane always had; call it on layout, since
+  the pane takes its geometry again when a radius moves.
+
 ## [0.1.0] - 2026-10-11
 
 ### Added

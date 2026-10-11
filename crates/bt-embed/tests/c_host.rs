@@ -194,6 +194,10 @@ fn main() {
         host.borrow_mut().pane = pane;
         assert_eq!(bt_pane_id(pane), PANE);
         assert!(bt_pane_start(pane), "the shell starts");
+        assert!(
+            bt_pane_set_corner_radii(pane, 20.5, 20.5),
+            "the host tells the window's corners"
+        );
     }
 
     let deadline = Instant::now() + Duration::from_secs(20);

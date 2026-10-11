@@ -50,6 +50,13 @@ of every installed copy. A version without a section is not released.
 
 ### Changed
 
+- **Text stays clear of the window's rounded corner.** On macOS 26 the bottom
+  corners of a window are generously round, and the folder line and the
+  prompt sat right against the curve. The left margin now follows the corner,
+  so the first letter keeps the same distance from the curve as from the
+  straight edge — in a window, in a card of a split tab and beside a window
+  corner in a lined split. Full screen, whose corners are square, keeps the
+  margin it had.
 - **The dock's two lines are a point thick.** The line above the input row
   and the one above the folder row were a single pixel, which looked faint
   on a Retina display; they now keep the same weight at every scale.

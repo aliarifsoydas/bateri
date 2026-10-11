@@ -1109,7 +1109,9 @@ pub(crate) struct Frame {
     /// geometry and has 32 call sites; the doc of `GUTTER_PT` already says
     /// "a constant, not a setting".
     caret_style: CaretStyle,
-    /// The grid's left margin: every cell's x starts **after** it.
+    /// The gutter: the dock's breathing room, the row gap, the top fade and
+    /// the caret glow are measured in it (the **vertical** margin; the
+    /// horizontal start is `side_left_px`).
     ///
     /// A value [`Frame::clear`] carries rather than a field, for the same
     /// reason as `cell_px` (both arrive with one [`CellMetrics`]): when the
@@ -1117,6 +1119,11 @@ pub(crate) struct Frame {
     /// separate constant it could diverge from the `cols` computation — its
     /// having a single source for all three is the condition for the gutter.
     gutter_px: f32,
+    /// The grid's and the dock's actual left start: the gutter on a square
+    /// corner, more beside a round one ([`CellMetrics::side_left_px`]). The
+    /// horizontal readers (`pos_at`, `dock_pos`, `padding`) start here; the
+    /// vertical ones stay on `gutter_px`.
+    side_left_px: f32,
     /// The grid's columns and rows in this frame (`Cursor::cols`, `rows`):
     /// the padding needs a row's last column.
     grid_cols: u16,
@@ -1531,6 +1538,7 @@ impl Frame {
         self.context_cell_px = f32::from(metrics.context_cell_px());
         self.rule_px = f32::from(metrics.rule_px());
         self.gutter_px = f32::from(metrics.gutter_px());
+        self.side_left_px = f32::from(metrics.side_left_px());
         self.scale = metrics.scale() as f32;
         // At least a pixel: a degenerate scale must not erase the lines.
         self.separator_px = metrics.pt_px(SEPARATOR_PT).max(1.0);
@@ -3636,7 +3644,7 @@ impl Frame {
             return out;
         }
         let top = self.origin_px();
-        let left = self.gutter_px;
+        let left = self.side_left_px;
         let right = left + f32::from(cols) * w;
         let right_w = viewport[0] - right;
         let bottom = top + f32::from(rows) * h;
@@ -3781,7 +3789,7 @@ impl Frame {
         } else {
             0.0
         };
-        [self.gutter_px + f32::from(col) * w, y + pad + gap]
+        [self.side_left_px + f32::from(col) * w, y + pad + gap]
     }
 
     /// The column step in the dock's `row`, in pixels.
@@ -3813,7 +3821,7 @@ impl Frame {
     fn pos_at(&self, at: [f32; 2]) -> [f32; 2] {
         let (w, h) = self.cell_px;
         debug_assert!(w > 0.0 && h > 0.0, "clear(metrics) was not called");
-        [self.gutter_px + at[0] * w, at[1] * h]
+        [self.side_left_px + at[0] * w, at[1] * h]
     }
 }
 
@@ -4579,6 +4587,66 @@ mod tests {
         // the settled state in production go through here.
         frame.set_origin_rows(3.0);
         assert_eq!(frame.origin_px(), 54.0);
+    }
+
+    #[test]
+    fn a_round_corner_starts_the_grid_and_the_dock_further_in_and_only_sideways() {
+        // The horizontal start is the side margin, the vertical arithmetic is
+        // still the gutter's: a round bottom corner moves where the columns
+        // begin, not how tall the dock's breathing room is.
+        let flat = CellMetrics::new(9, 18, 9, GUTTER, 1, 1.0).expect("metrics");
+        let round = flat.with_corners(20.5, 0.0);
+        let side = f32::from(round.side_left_px());
+        assert!(side > f32::from(GUTTER), "the corner must move the margin");
+
+        let drawn = |metrics: CellMetrics| {
+            let mut frame = Frame::default();
+            frame.clear(metrics, CaretStyle::default());
+            frame.push(Cell {
+                col: 3,
+                row: 2,
+                ch: Some('x'),
+                bg: Some(BG),
+                ..Default::default()
+            });
+            for row in 0..2 {
+                frame.push_dock(Cell {
+                    col: 3,
+                    row,
+                    ch: Some('x'),
+                    ..Default::default()
+                });
+            }
+            frame.open_dock(BG, CURSOR, CURSOR);
+            frame
+        };
+        let (flat_frame, round_frame) = (drawn(flat), drawn(round));
+
+        assert_eq!(
+            round_frame.bg_instances()[0].pos,
+            [side + 27.0, 36.0],
+            "grid"
+        );
+        assert_eq!(
+            round_frame.bg_instances()[0].pos[0] - flat_frame.bg_instances()[0].pos[0],
+            side - f32::from(GUTTER),
+        );
+        for (round_glyph, flat_glyph) in round_frame
+            .dock_glyphs()
+            .iter()
+            .zip(flat_frame.dock_glyphs())
+        {
+            assert_eq!(
+                round_glyph.pos[0],
+                flat_glyph.pos[0] + side - f32::from(GUTTER)
+            );
+            assert_eq!(
+                round_glyph.pos[1], flat_glyph.pos[1],
+                "dock rows stay on the gutter"
+            );
+        }
+        assert_eq!(round_frame.dock_layout_px(), flat_frame.dock_layout_px());
+        assert_eq!(dock_px(DOCK_ROWS, round), dock_px(DOCK_ROWS, flat));
     }
 
     #[test]

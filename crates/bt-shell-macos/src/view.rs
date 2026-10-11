@@ -192,7 +192,7 @@ pub(crate) fn point_to_cell(
     // The view is `isFlipped`, so y arrives in the grid's direction (from the
     // top): no flipping back. The grid's size is told by `cols`/`rows`, not
     // the view - a point in the window margin sticks to the last cell.
-    let x = view_px.0 * scale - f64::from(metrics.gutter_px());
+    let x = view_px.0 * scale - f64::from(metrics.side_left_px());
     // The vertical origin is subtracted the same way as the padding and **in
     // `f64`**: with bottom-sticking the blank area is **at the top** and on a
     // click there the difference goes negative. Done in `u16` it would
@@ -254,7 +254,7 @@ pub(crate) fn cover_of(
     let (cell_w, cell_h) = metrics.cell_px();
     let (cell_w, cell_h) = (f64::from(cell_w.max(1)), f64::from(cell_h.max(1)));
     let first_row = ((bottom_px - origin_px) / cell_h).ceil();
-    let from_col = ((left_px - f64::from(metrics.gutter_px())) / cell_w).floor();
+    let from_col = ((left_px - f64::from(metrics.side_left_px())) / cell_w).floor();
     SearchCover {
         // `as` saturates: no overflow in a giant window either.
         first_row: first_row as i32,
@@ -267,7 +267,7 @@ pub(crate) fn cover_of(
 /// The dock band is at the window's bottom and its size is `bt-gpu`'s formula
 /// ([`bt_gpu::dock_px`]; the **single** copy `split_into_grid` and the second
 /// viewport use), the input line is below the band's breathing padding - the
-/// padding's source is the left padding ([`CellMetrics::gutter_px`],
+/// padding's source is the gutter ([`CellMetrics::gutter_px`],
 /// `Frame::dock_pos`). The line is given to [`point_to_cell`] with this value
 /// as **a one-row grid**: the column and half arithmetic comes from the same
 /// body as the grid's, and so does the press's rejection ("the context line
@@ -2790,7 +2790,7 @@ fn context_band_px(metrics: CellMetrics, top: f32, rows: u16) -> (f64, f64) {
 /// hand cursor read these two, so the column and the rectangle cannot diverge.
 fn context_col_at(metrics: CellMetrics, top: f32, rows: u16, (x, y): (f64, f64)) -> Option<u16> {
     let (band_top, band_bottom) = context_band_px(metrics, top, rows);
-    let x = x - f64::from(metrics.gutter_px());
+    let x = x - f64::from(metrics.side_left_px());
     if y < band_top || y >= band_bottom || x < 0.0 {
         return None;
     }
@@ -2810,7 +2810,7 @@ fn context_span_px(
 ) -> (f64, f64, f64, f64) {
     let (band_top, band_bottom) = context_band_px(metrics, top, rows);
     let cell = f64::from(metrics.context_cell_px());
-    let x = f64::from(metrics.gutter_px()) + f64::from(start) * cell;
+    let x = f64::from(metrics.side_left_px()) + f64::from(start) * cell;
     let width = f64::from(end.saturating_sub(start)) * cell;
     (x, band_top, width, band_bottom - band_top)
 }
@@ -2837,7 +2837,7 @@ mod tests {
             crate::grid::split_into_grid(900.0, 600.0, cell, bt_gpu::DOCK_ROWS, reserve, 0.0);
         let top = crate::view::dock_input_top_px(600.0, cell, bt_gpu::DOCK_ROWS);
         let last = grid.dock_cols - 1;
-        let x = f64::from(cell.gutter_px()) + (f64::from(last) + 0.25) * 9.0;
+        let x = f64::from(cell.side_left_px()) + (f64::from(last) + 0.25) * 9.0;
         let hit = crate::view::point_to_cell(
             (x, top + 4.0),
             cell,
@@ -2921,11 +2921,42 @@ mod tests {
             assert_eq!(at(x + 0.01, y - 0.01), None, "above the band is outside");
             assert_eq!(at(x + 0.01, y + height), None, "below the band is outside");
             assert_eq!(
-                at(f64::from(metrics.gutter_px()) - 0.01, mid),
+                at(f64::from(metrics.side_left_px()) - 0.01, mid),
                 None,
                 "left padding is outside"
             );
         }
+    }
+
+    #[test]
+    fn a_round_corner_moves_the_pointer_mapping_with_the_drawing() {
+        // The margin beside a 20.5 pt corner is 13 px, not the 8 px gutter:
+        // the cell drawn at column c starts at 13 + 16·c, so a press, the
+        // dock's context column, its button rectangle and the search panel's
+        // covered columns all start there.
+        let metrics = CellMetrics::new(16, 33, 13, 8, 2, 1.0)
+            .expect("cell")
+            .with_corners(20.5, 0.0);
+        let side = f64::from(metrics.side_left_px());
+        assert_eq!(side, 13.0);
+
+        let press = |x: f64| point_to_cell((x, 5.0), metrics, 0.0, OutOfGrid::Reject, 1.0, 40, 1);
+        assert_eq!(press(10.0), None, "between the gutter and the margin");
+        assert_eq!(
+            press(side + 3.0 * 16.0 + 8.0).map(|point| point.col),
+            Some(3)
+        );
+
+        let (x, y, width, height) = context_span_px(metrics, 500.0, 2, 40, 52);
+        assert_eq!(x, side + 40.0 * 13.0);
+        let mid = y + height / 2.0;
+        let at = |px: f64| context_col_at(metrics, 500.0, 2, (px, mid));
+        assert_eq!(at(x + 0.01), Some(40));
+        assert_eq!(at(x + width - 0.01), Some(51));
+        assert_eq!(at(f64::from(metrics.gutter_px()) + 0.5), None);
+
+        let cover = cover_of(40.0, side + 16.0 * 3.5, 0.0, metrics);
+        assert_eq!(cover.from_col, 3);
     }
 
     #[test]

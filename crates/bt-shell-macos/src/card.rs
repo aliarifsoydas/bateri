@@ -43,7 +43,7 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAnimatablePropertyContainer, NSAnimationContext, NSBezierPath, NSColor, NSGradient,
-    NSGraphicsContext, NSShadow, NSView, NSWindingRule,
+    NSGraphicsContext, NSShadow, NSView, NSWindingRule, NSWindow, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGRect;
 use objc2_foundation::{
@@ -62,12 +62,27 @@ use crate::split::{self, Rect, Slide};
 /// keeps most of the room a divider would have taken.
 pub(crate) const GAP_PT: f64 = 8.0;
 
-/// The window's own corner radius, in points. AppKit has no public reading
-/// of it, so it is measured: macOS 26 draws this app's window (a compact
-/// toolbar over a full-size content view) with a continuous curve of
-/// ~20.5 pt — fitted to the window's picture at 2× —; the releases before it
-/// round windows at 10 pt (the known value, not measured here).
-fn window_corner_pt() -> f64 {
+/// The radius, in points, of the window's bottom corners **now**: the
+/// windowed corner ([`windowed_corner_pt`]), or square in full screen. The one
+/// owner of the window's corner — the card's corner ([`corner_pt`]) and the
+/// text's distance from the curve (`CellMetrics::with_corners`, told through
+/// `TerminalPane::set_corners`) both come from here. `None`, no window yet,
+/// is the windowed corner: the window a tab is about to stand in.
+pub(crate) fn window_corner_pt(window: Option<&NSWindow>) -> f64 {
+    if window.is_some_and(|window| window.styleMask().contains(NSWindowStyleMask::FullScreen)) {
+        0.0
+    } else {
+        windowed_corner_pt()
+    }
+}
+
+/// The window's own corner radius, in points, in its windowed state. AppKit
+/// has no public reading of it, so it is measured: macOS 26 draws this app's
+/// window (a compact toolbar over a full-size content view) with a
+/// continuous curve of ~20.5 pt — fitted to the window's picture at 2× —; the
+/// releases before it round windows at 10 pt (the known value, not measured
+/// here).
+fn windowed_corner_pt() -> f64 {
     static RADIUS: OnceLock<f64> = OnceLock::new();
     *RADIUS.get_or_init(|| {
         let tahoe = NSOperatingSystemVersion {
@@ -86,9 +101,12 @@ fn window_corner_pt() -> f64 {
 /// A card's corner radius, in points: concentric with the window's corner —
 /// the window's radius less the gap around the cards — so the gap is as wide
 /// at the window's corners as along its edges. A fixed 10 pt was a tighter
-/// corner than macOS 26's window: the gap narrowed to ~4 pt there.
+/// corner than macOS 26's window: the gap narrowed to ~4 pt there. The
+/// windowed corner on purpose: full screen has no curve to be concentric
+/// with, and cards that changed their corner would change shape under a
+/// layout that did not.
 pub(crate) fn corner_pt() -> f64 {
-    (window_corner_pt() - GAP_PT).max(0.0)
+    (windowed_corner_pt() - GAP_PT).max(0.0)
 }
 
 /// The slide's length, in seconds. A design constant, the canvas's 220 ms.

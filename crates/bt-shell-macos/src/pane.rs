@@ -49,7 +49,8 @@ use bt_core::{
 };
 use bt_core::{load_shell, smoke_shell};
 use bt_gpu::{
-    DisplayLink, GpuError, Layout, Pacer, Renderer, ScrollbarMode, Stats, Surface, Waker,
+    CellMetrics, DisplayLink, GpuError, Layout, Pacer, Renderer, ScrollbarMode, Stats, Surface,
+    Waker,
 };
 use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::Retained;
@@ -1829,6 +1830,11 @@ pub struct PaneIvars {
     /// so it is the birth settings' from `new`; the link gets it in
     /// `start_session`; its live change is [`TerminalPane::set_content_edge`].
     content_edge: Cell<ContentEdge>,
+    /// The radii, in points, of the pane's bottom left and right corners:
+    /// what the container tells it ([`TerminalPane::set_corners`]) and the
+    /// grid's and the dock's side margin follows ([`CellMetrics::with_corners`]).
+    /// Zero until told: a square corner, the gutter alone.
+    corners: Cell<(f64, f64)>,
     /// `Rc`: the renderer is pinned to the main thread (see `bt_gpu::DisplayLink`)
     /// and the link holds a copy too.
     renderer: Rc<Renderer>,
@@ -2469,6 +2475,7 @@ impl TerminalPane {
             smooth_scroll: Cell::new(smooth_scroll),
             scrollbar: Cell::new(scrollbar),
             content_edge: Cell::new(content_edge),
+            corners: Cell::new((0.0, 0.0)),
             renderer,
             layer,
             surface,
@@ -2903,7 +2910,7 @@ impl TerminalPane {
     fn jump_place(&self, size: NSSize) -> Option<NSPoint> {
         let scale = self.window()?.backingScaleFactor();
         let ivars = self.ivars();
-        let cell = ivars.renderer.cell_metrics(scale);
+        let cell = self.cell_metrics(scale);
         let track = f64::from(ivars.scrollbar.get().reserve_px(cell)) / scale;
         let dock = f64::from(bt_gpu::dock_px(ivars.dock_rows.get(), cell)) / scale;
         Some(jump_origin(self.bounds().size, size, track, dock))
@@ -3733,6 +3740,42 @@ impl TerminalPane {
         }
     }
 
+    /// Tells the pane the radii, in points, of its bottom left and right
+    /// corners — what the window's or the card's curve takes from the text:
+    /// the grid, the dock and the pointer start further in beside a round
+    /// corner (the rule is [`CellMetrics::with_corners`]'s). The container
+    /// calls it on every layout, which the window repeats when full screen
+    /// comes or goes; a value that is not a radius (NaN, negative, infinite)
+    /// is a square corner. The geometry is taken again when the value moves —
+    /// and only then: the temporary look of the arrangement
+    /// ([`crate::arrange`]) does not tell corners, since a column count that
+    /// moved would send the shell a `SIGWINCH` for a look that lasts a moment.
+    pub fn set_corners(&self, left: f64, right: f64) {
+        let radius = |value: f64| {
+            if value.is_finite() {
+                value.max(0.0)
+            } else {
+                0.0
+            }
+        };
+        let corners = (radius(left), radius(right));
+        if self.ivars().corners.replace(corners) != corners {
+            self.refresh_geometry();
+        }
+    }
+
+    /// The renderer's metrics at `scale` with this pane's corners applied:
+    /// the **one** way the pane asks for them, so the grid's columns, the
+    /// minimum size, the keyboard step and the jump button all read the same
+    /// margins the drawing and the mouse do.
+    fn cell_metrics(&self, scale: f64) -> CellMetrics {
+        let (left, right) = self.ivars().corners.get();
+        self.ivars()
+            .renderer
+            .cell_metrics(scale)
+            .with_corners(left, right)
+    }
+
     /// The pane is lifted for arranging ([`crate::arrange`]), or set down:
     /// its frame reads at the focused strength while lifted.
     pub(crate) fn set_raised(&self, raised: bool) {
@@ -3956,7 +3999,7 @@ impl TerminalPane {
     /// [`MIN_PANE_ROWS`].
     pub fn min_size(&self) -> Option<NSSize> {
         let scale = self.window()?.backingScaleFactor();
-        let cell = self.ivars().renderer.cell_metrics(scale);
+        let cell = self.cell_metrics(scale);
         let (cell_w, cell_h) = cell.cell_px();
         let dock_rows = self
             .ivars()
@@ -3964,7 +4007,7 @@ impl TerminalPane {
             .borrow()
             .as_ref()
             .map_or(self.ivars().dock_rows.get(), |birth| birth.integration.1);
-        let width = f64::from(cell.gutter_px()) + f64::from(MIN_PANE_COLS) * f64::from(cell_w);
+        let width = f64::from(cell.side_left_px()) + f64::from(MIN_PANE_COLS) * f64::from(cell_w);
         let height = f64::from(bt_gpu::dock_px(dock_rows, cell))
             + f64::from(MIN_PANE_ROWS) * f64::from(cell_h);
         Some(NSSize::new(width / scale, height / scale))
@@ -3974,7 +4017,7 @@ impl TerminalPane {
     /// (`TerminalTab::resize_split`). `None` if not attached to a window.
     pub(crate) fn cell_size(&self) -> Option<NSSize> {
         let scale = self.window()?.backingScaleFactor();
-        let (cell_w, cell_h) = self.ivars().renderer.cell_metrics(scale).cell_px();
+        let (cell_w, cell_h) = self.cell_metrics(scale).cell_px();
         Some(NSSize::new(
             f64::from(cell_w) / scale,
             f64::from(cell_h) / scale,
@@ -4686,7 +4729,7 @@ impl TerminalPane {
         // purpose. Had two rules sat side by side, which one wins would depend
         // on call order and the symptom, a one-pixel cell shift, would be silent.
         let renderer = &self.ivars().renderer;
-        let cell = renderer.cell_metrics(scale);
+        let cell = self.cell_metrics(scale);
         self.host().post_notices(
             self.ivars().id,
             Source::Font,

@@ -107,6 +107,34 @@ fn spacing(leaves: usize, scale: f64, style: SplitStyle) -> Spacing {
     }
 }
 
+/// How far a pane's edge may stand from the container's and still be on it,
+/// in points: the frames' sub-pixel rounding, not a gap. The smallest pane is
+/// far larger than this, so no pane stands this close to an edge it is not on.
+const EDGE_EPS: f64 = 0.5;
+
+/// The radii, in points, of a pane's bottom left and right corners, given
+/// where it stands in the container (`bounds`, which is the window's content
+/// to its edge): a card has its own round corners on both sides; a pane that
+/// is not a card has the **window's** corner exactly where it touches the
+/// window's bottom edge and that side edge, and a square one everywhere else —
+/// the lone pane, the zoomed pane and the bottom panes of a lined split. The
+/// text beside a corner starts where the curve lets it
+/// (`CellMetrics::with_corners`), and a corner the pane does not own is not
+/// the pane's to keep clear of. Pure.
+fn bottom_corners(rect: Rect, bounds: Rect, carded: bool, window: f64, card: f64) -> (f64, f64) {
+    if carded {
+        return (card, card);
+    }
+    let on = |edge: f64, of: f64| (edge - of).abs() <= EDGE_EPS;
+    let bottom = on(rect.y + rect.height, bounds.y + bounds.height);
+    let left = bottom && on(rect.x, bounds.x);
+    let right = bottom && on(rect.x + rect.width, bounds.x + bounds.width);
+    (
+        if left { window } else { 0.0 },
+        if right { window } else { 0.0 },
+    )
+}
+
 pub(crate) struct HandleIvars {
     /// Its index in [`split::Layout::dividers`] - [`Tree::drag`]'s index.
     index: Cell<usize>,
@@ -1009,6 +1037,8 @@ impl SplitView {
         if let [only] = panes.as_slice() {
             only.setHidden(false);
             only.set_card(false);
+            let (left, right) = self.corners_of(self.bounds_rect(), false);
+            only.set_corners(left, right);
             only.setFrame(self.bounds());
             self.sync_handles(&[]);
             self.ground_follows();
@@ -1025,6 +1055,11 @@ impl SplitView {
                 Some((_, rect)) => {
                     pane.setHidden(false);
                     pane.set_card(carded);
+                    // Before the frame: the pane's last geometry is then the
+                    // one the frame's resize takes, with the corners already
+                    // known.
+                    let (left, right) = self.corners_of(*rect, carded);
+                    pane.set_corners(left, right);
                     pane.setFrame(NSRect::new(
                         NSPoint::new(rect.x, rect.y),
                         NSSize::new(rect.width, rect.height),
@@ -1035,6 +1070,19 @@ impl SplitView {
         }
         self.sync_handles(&layout.dividers);
         self.ground_follows();
+    }
+
+    /// The radii of the bottom corners of a pane at `rect` (points, in this
+    /// container's coordinates): [`bottom_corners`] with the window's corner
+    /// now ([`card::window_corner_pt`], square in full screen) and the card's.
+    fn corners_of(&self, rect: Rect, carded: bool) -> (f64, f64) {
+        bottom_corners(
+            rect,
+            self.bounds_rect(),
+            carded,
+            card::window_corner_pt(self.window().as_deref()),
+            card::corner_pt(),
+        )
     }
 
     /// The window this container stands in, if it is laid out in one.
@@ -1122,5 +1170,96 @@ mod tests {
         for leaves in [1, 2, 5] {
             assert_eq!(spacing(leaves, 2.0, SplitStyle::Lines), Spacing::DIVIDED);
         }
+    }
+
+    /// The corners the container would tell each pane of `tree` laid out in a
+    /// 1000×600 pt area at 2× with `spacing`, by pane id.
+    fn corners(tree: &Tree, spacing: Spacing, carded: bool) -> Vec<(u64, (f64, f64))> {
+        let bounds = Rect::new(0.0, 0.0, 1000.0, 600.0);
+        tree.layout_spaced(bounds, 2.0, spacing)
+            .panes
+            .into_iter()
+            .map(|(id, rect)| (id, bottom_corners(rect, bounds, carded, 20.5, 12.5)))
+            .collect()
+    }
+
+    #[test]
+    fn a_lone_pane_has_the_windows_corners_and_a_zoomed_one_too() {
+        assert_eq!(
+            corners(&Tree::Leaf(1), Spacing::DIVIDED, false),
+            [(1, (20.5, 20.5))]
+        );
+        // A zoomed pane covers the area whatever the spacing.
+        let bounds = Rect::new(0.0, 0.0, 1000.0, 600.0);
+        let mut tree = Tree::Leaf(1);
+        assert!(tree.split(1, Axis::Horizontal, 2));
+        let layout =
+            tree.layout_zoomed_spaced(bounds, 2.0, Some(2), spacing(2, 2.0, SplitStyle::Cards));
+        let (_, rect) = layout.panes[0];
+        assert_eq!(
+            bottom_corners(rect, bounds, false, 20.5, 12.5),
+            (20.5, 20.5)
+        );
+    }
+
+    #[test]
+    fn under_lines_only_the_panes_on_the_windows_bottom_corners_have_them() {
+        let mut tree = Tree::Leaf(1);
+        assert!(tree.split(1, Axis::Horizontal, 2));
+        // Side by side: each pane owns the corner on its own side.
+        assert_eq!(
+            corners(&tree, Spacing::DIVIDED, false),
+            [(1, (20.5, 0.0)), (2, (0.0, 20.5))]
+        );
+        // Stacked: the upper pane is on no bottom corner, the lower on both.
+        let mut tree = Tree::Leaf(1);
+        assert!(tree.split(1, Axis::Vertical, 2));
+        assert_eq!(
+            corners(&tree, Spacing::DIVIDED, false),
+            [(1, (0.0, 0.0)), (2, (20.5, 20.5))]
+        );
+        // Four: the grid's bottom row owns the corners, one each.
+        assert!(tree.split(1, Axis::Horizontal, 3));
+        assert!(tree.split(2, Axis::Horizontal, 4));
+        assert_eq!(
+            corners(&tree, Spacing::DIVIDED, false),
+            [
+                (1, (0.0, 0.0)),
+                (3, (0.0, 0.0)),
+                (2, (20.5, 0.0)),
+                (4, (0.0, 20.5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_card_has_the_cards_corner_on_both_sides_wherever_it_stands() {
+        let mut tree = Tree::Leaf(1);
+        assert!(tree.split(1, Axis::Horizontal, 2));
+        let cards = spacing(2, 2.0, SplitStyle::Cards);
+        assert_eq!(
+            corners(&tree, cards, true),
+            [(1, (12.5, 12.5)), (2, (12.5, 12.5))]
+        );
+        // The same layout not drawn as cards touches no window corner: the
+        // gap around keeps every pane off them.
+        assert_eq!(
+            corners(&tree, cards, false),
+            [(1, (0.0, 0.0)), (2, (0.0, 0.0))]
+        );
+    }
+
+    #[test]
+    fn a_pane_a_pixel_off_an_edge_is_still_on_it_and_a_gap_is_not() {
+        let bounds = Rect::new(0.0, 0.0, 1000.0, 600.0);
+        let near = Rect::new(0.25, 0.0, 400.0, 599.75);
+        assert_eq!(bottom_corners(near, bounds, false, 20.5, 12.5), (20.5, 0.0));
+        let gapped = Rect::new(8.0, 0.0, 400.0, 592.0);
+        assert_eq!(
+            bottom_corners(gapped, bounds, false, 20.5, 12.5),
+            (0.0, 0.0)
+        );
+        // A full screen window has no curve: nothing to keep clear of.
+        assert_eq!(bottom_corners(bounds, bounds, false, 0.0, 12.5), (0.0, 0.0));
     }
 }

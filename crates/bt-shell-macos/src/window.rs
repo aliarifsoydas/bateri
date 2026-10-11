@@ -687,16 +687,20 @@ define_class!(
             self.ivars().toolbar.setVisible(false);
         }
 
-        /// The lights left the row: the strip starts at the edge.
+        /// The lights left the row: the strip starts at the edge. The window's
+        /// corners went with them, and the panes' text no longer keeps clear
+        /// of a curve ([`TerminalWindow::refresh_corners`]).
         #[unsafe(method(windowDidEnterFullScreen:))]
         fn window_did_enter_full_screen(&self, _n: &NSNotification) {
             self.ivars().root.lay_out();
+            self.refresh_corners();
         }
 
         #[unsafe(method(windowDidExitFullScreen:))]
         fn window_did_exit_full_screen(&self, _n: &NSNotification) {
             self.ivars().toolbar.setVisible(true);
             self.ivars().root.lay_out();
+            self.refresh_corners();
         }
 
         /// The red button: whether to ask before closing the whole window.
@@ -2930,6 +2934,16 @@ impl TerminalWindow {
     pub(crate) fn refresh_split_look(&self) {
         for tab in self.tabs() {
             tab.refresh_look();
+        }
+    }
+
+    /// The window's corners changed (full screen came or went): every tab's
+    /// container is laid out again, which tells each pane the corners it now
+    /// stands in ([`SplitView::layout_panes`]). The container's own frame can
+    /// stay what it was across the change, so nothing else would ask.
+    fn refresh_corners(&self) {
+        for tab in self.tabs() {
+            tab.container().layout_panes();
         }
     }
 

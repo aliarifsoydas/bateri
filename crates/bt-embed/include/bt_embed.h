@@ -224,6 +224,11 @@ bool bt_pane_focus(BtPane *pane);
 bool bt_pane_set_hidden(BtPane *pane, bool hidden);
 /* The host hid or showed a view above the pane: the pane looks again. */
 bool bt_pane_visibility_changed(BtPane *pane);
+/* The radii, in points, of the pane's bottom left and right corners: the
+ * curves of the window or card it stands in, which the text keeps clear of.
+ * Not told, both are 0 (square). Not a radius (NaN, negative), 0. The pane
+ * takes its geometry again when one moves: call it on layout, not per frame. */
+bool bt_pane_set_corner_radii(BtPane *pane, double left, double right);
 /* Writes `len` bytes to the shell as if typed. false before it started. */
 bool bt_pane_write(BtPane *pane, const uint8_t *bytes, size_t len);
 /* Pastes text as the user's paste would (bracketed if the program asked).

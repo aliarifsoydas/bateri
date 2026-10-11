@@ -354,7 +354,7 @@ pub(crate) fn link_cell_at(
 ) -> Option<(i32, u16)> {
     let (cell_w, cell_h) = metrics.cell_px();
     let (cell_w, cell_h) = (f64::from(cell_w.max(1)), f64::from(cell_h.max(1)));
-    let x = view_px.0 * scale - f64::from(metrics.gutter_px());
+    let x = view_px.0 * scale - f64::from(metrics.side_left_px());
     let y = view_px.1 * scale - origin_px;
     if x < 0.0 || x >= cell_w * f64::from(cols) || !y.is_finite() {
         return None;
@@ -375,7 +375,7 @@ fn span_rects_px(spans: &[LinkSpan], metrics: CellMetrics, origin_px: f64) -> Ve
         .map(|span| {
             let width = f64::from(span.last.saturating_sub(span.first) + 1) * cell_w;
             [
-                f64::from(metrics.gutter_px()) + f64::from(span.first) * cell_w,
+                f64::from(metrics.side_left_px()) + f64::from(span.first) * cell_w,
                 origin_px + f64::from(span.row) * cell_h,
                 width,
                 cell_h,
@@ -1386,6 +1386,28 @@ mod tests {
         assert!(!spans_contain(&spans, false, LinkCell::Dock(0, 4)));
         assert!(spans_contain(&spans, true, LinkCell::Dock(0, 4)));
         assert!(!spans_contain(&spans, true, LinkCell::Screen(0, 4)));
+    }
+
+    #[test]
+    fn a_round_corner_moves_the_link_cells_with_the_drawing() {
+        // The margin beside a 20.5 pt corner is 13 px, not the 8 px gutter:
+        // the cell drawn at column 0 starts there, and the hand covers it.
+        let m = metrics().with_corners(20.5, 0.0);
+        assert_eq!(m.side_left_px(), 13);
+        let at = |x: f64, y: f64| link_cell_at((x, y), m, 100.0, 1.0, 80, 24);
+        assert_eq!(at(12.9, 110.0), None, "the margin is outside the grid");
+        assert_eq!(at(13.0, 110.0), Some((0, 0)));
+        let span = LinkSpan {
+            row: 0,
+            first: 2,
+            last: 4,
+        };
+        let [rect] = span_rects_px(&[span], m, 100.0)[..] else {
+            panic!("one span, one rectangle");
+        };
+        assert_eq!(rect, [33.0, 100.0, 30.0, 20.0]);
+        assert_eq!(at(rect[0], rect[1]), Some((0, 2)));
+        assert_eq!(at(rect[0] + rect[2] - 0.5, rect[1]), Some((0, 4)));
     }
 
     /// Reads this Mac's Launch Services database (an application declaring an
