@@ -236,13 +236,11 @@ dim_unfocused_splits = false
 # lines lets the panes touch with one thin line between them, for the most
 # room.
 split_style = "cards"
-# "plain" | "ring" | "tile" | "none". What a tab shows before its title about
-# the program it runs: plain draws its mark in the text's color with a ring
-# turning round it while a command runs; ring keeps the mark inside a thin
-# ring whose color tells the state; tile sets it on a tile of its kind's color
-# with a line running round the edge; none shows no icon, only the small
-# indicator a tab had before icons.
-tab_icons = "plain"
+# true | false. Shows the program a tab runs as an icon before its title: the
+# program's mark on a tile, like an application's icon, with a line running
+# round the tile's edge while a command runs; a split tab shows a deck of
+# tiles. Off: no icon, only the small indicator a tab had before icons.
+tab_icons = true
 # "theme" | "brand". Whether the icon takes the theme's colors, or the program's
 # own where it has a colored brand (Claude, Antigravity, Gemini, Qwen); the
 # single-color ones and the kinds bateri draws itself stay as they are.
@@ -828,7 +826,7 @@ content_edge = "fade"
 minimum_contrast = 3.0
 dim_unfocused_splits = false
 split_style = "cards"
-tab_icons = "plain"
+tab_icons = true
 tab_icon_colors = "theme"
 ```
 
@@ -841,7 +839,7 @@ tab_icon_colors = "theme"
 | `minimum_contrast` | decimal, `1.0`–`21.0` | `3.0` | the least contrast ratio a program's text keeps against its background; `1` turns it off |
 | `dim_unfocused_splits` | `true` \| `false` | `false` | dim the panes of a split tab that don't have the focus |
 | `split_style` | `"cards"` \| `"lines"` | `"cards"` | how a split tab sets its panes apart: cards on a ground, or panes divided by a line |
-| `tab_icons` | `"plain"` \| `"ring"` \| `"tile"` \| `"none"` | `"plain"` | how a tab's chip draws the program it runs: a bare mark, a mark in a ring, a mark on a tile, or no icon |
+| `tab_icons` | `true` \| `false` | `true` | show the program a tab runs as an icon on a tile before its title |
 | `tab_icon_colors` | `"theme"` \| `"brand"` | `"theme"` | whether the icon uses the theme's colors only, or keeps the program's own color where it has one |
 
 - `theme = "system"` leaves the theme to the macOS appearance: `light_theme`
@@ -927,19 +925,17 @@ tab_icon_colors = "theme"
   Qwen Code and Kimi CLI by their own marks, and a shell, a remote session, an
   editor, a language shell, a database client, a container tool, a monitor, a
   git tool, a task, a pager, a file manager and a root shell by marks bateri
-  draws. `tab_icons = "plain"` draws the mark in the title's color; while a
-  command runs a ring turns round it, and a question, a tick, a dot or an
-  arrow sits on its corner for a tab that waits, finished, failed or
-  transfers. `"ring"` keeps the mark inside a thin ring whose color tells the
-  state, with no badge. `"tile"` sets it on a tile in its kind's color, with
-  a line running round the tile's edge while a command runs and the same
-  badges. `"none"` shows no icon, only the small indicator a tab had before
-  icons. A tab of several panes shows the focused pane's program on a tile,
-  with one more edge behind it for each other pane. `tab_icon_colors =
-  "brand"` lets Claude Code, Antigravity, Gemini CLI and Qwen Code keep their
-  own colors (on a tile it becomes the tile's ground); the others and the
-  marks bateri draws stay in the theme's. Both apply at once, and the Show All
-  Tabs list wears the same icons.
+  draws. The mark stands on a tile, like an application's icon, in its kind's
+  color; while a command runs a line runs round the tile's edge, and a
+  question, a tick, a dot or an arrow sits on its corner for a tab that waits,
+  finished, failed or transfers. A tab of several panes shows a deck: the
+  focused pane's program on the front tile, and a smaller tile behind it for
+  each other pane, up to two, the front ones turned a little more than the
+  ones behind. `tab_icons = false` shows no icon, only the small indicator a
+  tab had before icons. `tab_icon_colors = "brand"` lets Claude Code,
+  Antigravity, Gemini CLI and Qwen Code keep their own colors as the tile's
+  ground; the others and the marks bateri draws stay in the theme's. Both
+  apply at once, and the Show All Tabs list wears the same icons.
 - `dim_unfocused_splits = true` brings back the veil over the panes that
   don't have the focus: the theme's background at 30% over their text, as
   other terminals do. It applies at once.

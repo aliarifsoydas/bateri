@@ -109,7 +109,7 @@ use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
-use bt_core::{HostMark, IconColors, TabIcons, Theme};
+use bt_core::{HostMark, IconColors, Theme};
 use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
@@ -118,19 +118,20 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAccessibility, NSAccessibilityButtonRole, NSAccessibilityRadioButtonRole,
-    NSAccessibilityTabButtonSubrole, NSAccessibilityTabGroupRole, NSAnimatablePropertyContainer,
-    NSAnimationContext, NSApplication, NSAutoresizingMaskOptions, NSBezierPath, NSBox, NSBoxType,
-    NSColor, NSCompositingOperation, NSControl, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSEvent,
-    NSEventMask, NSEventModifierFlags, NSEventType, NSFocusRingType, NSFont, NSFontWeightMedium,
+    NSAccessibilityTabButtonSubrole, NSAccessibilityTabGroupRole,
+    NSAffineTransformNSAppKitAdditions, NSAnimatablePropertyContainer, NSAnimationContext,
+    NSApplication, NSAutoresizingMaskOptions, NSBezierPath, NSBox, NSBoxType, NSColor,
+    NSCompositingOperation, NSControl, NSControlStateValueOn, NSControlTextEditingDelegate,
+    NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSEvent, NSEventMask,
+    NSEventModifierFlags, NSEventType, NSFocusRingType, NSFont, NSFontWeightMedium,
     NSFontWeightRegular, NSFontWeightSemibold, NSGradient, NSGraphicsContext, NSImage,
     NSLineBreakMode, NSLineCapStyle, NSLineJoinStyle, NSMenu, NSMenuItem, NSShadow,
     NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTitlePosition, NSTrackingArea,
     NSTrackingAreaOptions, NSView, NSWindowButton, NSWindowOrderingMode, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    NSArray, NSData, NSNotification, NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
-    NSUserDefaults, ns_string,
+    NSAffineTransform, NSArray, NSData, NSNotification, NSNumber, NSObjectProtocol, NSPoint,
+    NSRect, NSSize, NSString, NSUserDefaults, ns_string,
 };
 use objc2_quartz_core::{
     CABasicAnimation, CAKeyframeAnimation, CALayer, CAMediaTiming, CAMediaTimingFunction,
@@ -302,7 +303,7 @@ struct Palette {
     /// kinds of programs wear on a tile ([`icon::Tint`]).
     info: u32,
     ansi: [u32; 8],
-    /// A dark theme: a tile takes a little more of its colour on it.
+    /// A dark theme: the tabs' tiles are a raised grey, on a light one white.
     dark: bool,
     selected: Tint,
     selected_line: Tint,
@@ -413,12 +414,38 @@ impl Palette {
         }
     }
 
-    /// How much of its colour a tile's ground takes over the chip.
-    fn tile_share(self) -> f64 {
+    /// A tab's tile, a raised face like an application's icon: the front tile's face, the
+    /// face of the deck's tiles behind it, the line round them and the shadow they cast.
+    fn tile_face(self) -> u32 {
         if self.dark {
-            TILE_SHARE_DARK
+            mix(self.ground, self.title, TILE_FACE_DARK)
         } else {
-            TILE_SHARE_LIGHT
+            0xffffff
+        }
+    }
+
+    fn tile_back(self) -> u32 {
+        if self.dark {
+            mix(self.ground, self.title, TILE_BACK_DARK)
+        } else {
+            mix(0xffffff, self.title, TILE_BACK_LIGHT)
+        }
+    }
+
+    fn tile_line(self) -> Tint {
+        if self.dark {
+            // Light, not dark: a dark theme's ground may be black, and a black line on it is none.
+            Tint::of(self.title, 0.16)
+        } else {
+            Tint::of(self.title, 0.16)
+        }
+    }
+
+    fn tile_shadow(self) -> Tint {
+        if self.dark {
+            Tint::of(0x000000, 0.45)
+        } else {
+            Tint::of(0x000000, 0.16)
         }
     }
 }
@@ -751,48 +778,49 @@ const GLYPH_OVERHANG: f64 = 6.0;
 /// Room it keeps to the left: the line that runs round a tile's edge stands a little outside it.
 const GLYPH_LEFT: f64 = 2.0;
 
-/// The icon's strength over the chip: the text's colour less a little, a second voice beside the
-/// title rather than a louder one.
-const ICON_INK: f64 = 0.82;
+/// The mark's own side on its tile, and on the smaller tile of a menu row.
+const MARK_TILED: f64 = 12.0;
+const MARK_LISTED: f64 = 11.0;
 
-/// The mark's own side within the [`tabs::ICON_SIDE`] square: bare, inside the running ring, on
-/// a deck's tile (the ring takes the same room on a tile as off one).
-const MARK_BARE: f64 = 11.0;
-const MARK_RINGED: f64 = 8.0;
-const MARK_TILED: f64 = 10.0;
-
-/// The running ring in the square: its radius and the width of its stroke.
-const RING_RADIUS: f64 = 6.9;
-const RING_WIDTH: f64 = 1.4;
+/// The width of the line that runs round a tile's edge while a command runs.
+const EDGE_STROKE: f64 = 1.4;
 
 /// The badge on the icon's corner: its diameter (the failure's dot is smaller, a shape apart from
-/// the rest), the ring cut clear round it and how far inside the corner its centre sits.
+/// the rest) and the ring cut clear round it.
 const BADGE_SIDE: f64 = 10.0;
 const BADGE_DOT: f64 = 7.0;
 const BADGE_HALO: f64 = 1.5;
-const BADGE_INSET: f64 = 1.0;
 
-/// A deck tile's corner radius and the hairline round it.
+/// The corner radius of a menu row's tile, and the hairline round every tile.
 const TILE_RADIUS: f64 = 4.8;
 const TILE_LINE: f64 = 0.75;
 
-/// How much of its kind's colour a tile's ground takes over the chip (a tint of the colour its
-/// mark is drawn in): a little less on a light theme, where the same share reads heavier.
-const TILE_SHARE_DARK: f64 = 0.20;
-const TILE_SHARE_LIGHT: f64 = 0.16;
+/// A tab's tile ([`tabs::TILE_WIDTH`] by [`tabs::TILE_HEIGHT`]): its corner radius, the
+/// shadow it casts (how far down and how soft) and how much of the text's colour its face and the
+/// faces behind it in a deck take over the ground on a dark theme (on a light one the face is
+/// white and the ones behind take a little of the text's colour).
+const TILE_ROUND: f64 = 5.0;
+const TILE_DROP: f64 = 0.75;
+const TILE_BLUR: f64 = 1.5;
+const TILE_FACE_DARK: f64 = 0.20;
+const TILE_BACK_DARK: f64 = 0.12;
+const TILE_BACK_LIGHT: f64 = 0.06;
 
-/// The ring round an idle tab's icon in the ring style: the title's colour, faint.
-const RING_IDLE: f64 = 0.18;
+/// How far in from the tile's corner the badge's centre sits: the tile is taller than the icon's
+/// square, and a badge farther out would stand out of the glyph's room above.
+const TILE_BADGE_INSET: f64 = 2.5;
 
-/// The line that runs round a tile's edge while a command runs: a rounded square a little outside
-/// the tile (its side and corner radius), drawn in a picture [`EDGE_ROOM`] on a side so the stroke
-/// is not cut. What shows of it is what a wedge — [`WEDGE_HALF`] degrees to each side of its middle,
-/// a picture [`WEDGE_ROOM`] on a side that reaches past the corners — lets through as it turns
-/// about the tile's centre. The tile does not turn, only what shows of its edge.
-const EDGE_SIDE: f64 = 17.6;
-const EDGE_RADIUS: f64 = 5.6;
-const EDGE_ROOM: f64 = 20.0;
-const WEDGE_ROOM: f64 = 32.0;
+/// The line that runs round a tile's edge while a command runs: a rounded rectangle a little
+/// outside the tile (its width, height and corner radius), drawn in a picture [`EDGE_ROOM`] on a
+/// side so the stroke is not cut, leaning too. What shows of it is what a wedge —
+/// [`WEDGE_HALF`] degrees to each side of its middle, a picture [`WEDGE_ROOM`] on a side that
+/// reaches past the corners — lets through as it turns about the tile's centre. The tile does not
+/// turn, only what shows of its edge.
+const EDGE_WIDTH: f64 = tabs::TILE_WIDTH + 1.6;
+const EDGE_HEIGHT: f64 = tabs::TILE_HEIGHT + 1.6;
+const EDGE_RADIUS: f64 = TILE_ROUND + 0.8;
+const EDGE_ROOM: f64 = 28.0;
+const WEDGE_ROOM: f64 = 40.0;
 const WEDGE_HALF: f64 = 38.0;
 
 /// Into how many straight runs the wedge's turn is cut: between two the window server turns it at
@@ -803,11 +831,22 @@ const EDGE_STEPS: usize = 64;
 const LIST_SIDE: f64 = 16.0;
 const LIST_DOT: f64 = 5.0;
 
-/// How the chips draw their icons (`[appearance] tab_icons` and `tab_icon_colors`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// How the chips draw their icons (`[appearance] tab_icons` and `tab_icon_colors`): whether they
+/// show them at all — without, a chip wears the small indicator alone — and in which colours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IconStyle {
-    icons: TabIcons,
+    icons: bool,
     colors: IconColors,
+}
+
+impl Default for IconStyle {
+    /// The settings' defaults: icons, in the theme's colours.
+    fn default() -> Self {
+        Self {
+            icons: true,
+            colors: IconColors::default(),
+        }
+    }
 }
 
 impl IconStyle {
@@ -823,38 +862,26 @@ impl IconStyle {
     }
 }
 
-/// The colours an icon is drawn in: its tile's ground (the tile style only) and its mark, `None`
-/// for the text's own colour.
+/// The colours an icon is drawn in: its tile's face and its mark.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Inks {
-    tile: Option<Tint>,
-    mark: Option<Tint>,
+    tile: Tint,
+    mark: Tint,
 }
 
-/// What `icon` is drawn in under `style`. A tile takes its kind's colour — the ground a share of
-/// it, the mark all of it — or, in brand colours and where the program has one, the brand colour
-/// as its ground with a white mark; the other styles keep the text's colour, except for a brand
-/// colour on the mark itself.
+/// What `icon` is drawn in under `style`: a raised face ([`Palette::tile_face`]) with the mark in
+/// its kind's colour, or, in brand colours and where the program has one, the brand colour as its
+/// face with a white mark.
 fn inks(icon: &icon::Icon, style: IconStyle, palette: Palette) -> Inks {
-    let brand = icon.brand.filter(|_| style.colors == IconColors::Brand);
-    if style.icons == TabIcons::Tile {
-        return match brand {
-            Some(rgb) => Inks {
-                tile: Some(Tint::of(rgb, 1.0)),
-                mark: Some(Tint::of(0xffffff, 1.0)),
-            },
-            None => {
-                let role = palette.tint(icon.tint);
-                Inks {
-                    tile: Some(Tint::of(role, palette.tile_share())),
-                    mark: Some(Tint::of(role, 1.0)),
-                }
-            }
-        };
-    }
-    Inks {
-        tile: None,
-        mark: brand.map(|rgb| Tint::of(rgb, 1.0)),
+    match icon.brand.filter(|_| style.colors == IconColors::Brand) {
+        Some(rgb) => Inks {
+            tile: Tint::of(rgb, 1.0),
+            mark: Tint::of(0xffffff, 1.0),
+        },
+        None => Inks {
+            tile: Tint::of(palette.tile_face(), 1.0),
+            mark: Tint::of(palette.tint(icon.tint), 1.0),
+        },
     }
 }
 
@@ -885,35 +912,37 @@ pub(crate) struct GlyphIvars {
     /// own backing layer is AppKit's (its anchor is a corner, and AppKit resets what it sets).
     arc: Retained<CALayer>,
     /// A tile's edge while a command runs, a picture that stands still, and the wedge that lets a
-    /// part of it show ([`EDGE_SIDE`]): the wedge is the edge's mask and the turn is played on it.
+    /// part of it show ([`EDGE_WIDTH`]): the wedge is the edge's mask and the turn is played on it.
     edge: Retained<CALayer>,
     wedge: Retained<CALayer>,
     /// The pace of the turn playing and on what (one whole turn takes this long), `None` while
     /// nothing turns. A turn set again at the same pace is left alone: setting it anew at every
     /// layout would make it jump back.
     turning: Cell<Option<(Duration, Spin)>>,
-    /// What the arc's picture was drawn in: its colour, the scale of the screen it is on, and
-    /// whether it is the small indicator's.
-    arc_ink: Cell<Option<(u32, f64, bool)>>,
-    /// What the edge's and the wedge's pictures were drawn in: the colour and the scale.
-    edge_ink: Cell<Option<(u32, f64)>>,
+    /// What the arc's picture was drawn in: its colour and the scale of the screen it is on.
+    arc_ink: Cell<Option<(u32, f64)>>,
+    /// What the edge's and the wedge's pictures were drawn in: the colour, the scale and the deck's
+    /// cards behind (they turn the edge with the front tile).
+    edge_ink: Cell<Option<(u32, f64, usize)>>,
     palette: Cell<Option<Palette>>,
 }
 
 /// What turns on a running glyph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Spin {
-    /// The ring's accent arc: a picture that turns.
+    /// Without icons, the small indicator's accent arc: a picture that turns.
     Ring,
-    /// A tile's edge: a picture that stands still, seen through a wedge that turns.
-    Edge,
+    /// A tile's edge: a picture that stands still, seen through a wedge that turns; with the
+    /// number of cards behind the tile, which turns the front one (`tabs::deck_card`).
+    Edge(usize),
 }
 
-/// What would turn on `look`, if anything: a running command's ring, or a tile's edge.
+/// What would turn on `look`, if anything: a tile's edge, or without icons the small indicator's
+/// ring.
 fn spin_of(look: Option<GlyphLook>) -> Option<Spin> {
     let look = look.filter(|look| look.indicator == Some(Indicator::Running))?;
-    Some(if look.style.icons == TabIcons::Tile {
-        Spin::Edge
+    Some(if look.style.icons {
+        Spin::Edge(look.emblem.edges.min(tabs::DECK_EDGES))
     } else {
         Spin::Ring
     })
@@ -961,22 +990,24 @@ define_class!(
     }
 );
 
-/// The square the icon sits in, in the glyph's own (flipped) space: [`GLYPH_LEFT`] in from its
-/// left edge, with [`GLYPH_OVERHANG`] above.
+/// The tile the icon stands on, in the glyph's own (flipped) space: [`GLYPH_LEFT`] in from its
+/// left edge, at the middle of the [`tabs::ICON_SIDE`] square that has [`GLYPH_OVERHANG`] above.
 fn glyph_slot() -> NSRect {
     NSRect::new(
-        NSPoint::new(GLYPH_LEFT, GLYPH_OVERHANG),
-        NSSize::new(tabs::ICON_SIDE, tabs::ICON_SIDE),
+        NSPoint::new(
+            GLYPH_LEFT,
+            GLYPH_OVERHANG + (tabs::ICON_SIDE - tabs::TILE_HEIGHT) / 2.0,
+        ),
+        NSSize::new(tabs::TILE_WIDTH, tabs::TILE_HEIGHT),
     )
 }
 
-/// The square the small indicator sits in when there is no icon (`tab_icons = "none"`): the icon's
+/// The square the small indicator sits in when there is no icon (`tab_icons = false`): the icon's
 /// square less what [`tabs::INDICATOR_SIDE`] leaves, at the same middle.
 fn indicator_slot() -> NSRect {
-    let slot = glyph_slot();
     let room = (tabs::ICON_SIDE - tabs::INDICATOR_SIDE) / 2.0;
     NSRect::new(
-        NSPoint::new(slot.origin.x, slot.origin.y + room),
+        NSPoint::new(GLYPH_LEFT, GLYPH_OVERHANG + room),
         NSSize::new(tabs::INDICATOR_SIDE, tabs::INDICATOR_SIDE),
     )
 }
@@ -992,10 +1023,11 @@ fn centred_square(rect: NSRect, side: f64) -> NSRect {
     )
 }
 
-/// The glyph: in the tile style the tile of the program's kind, behind the front tile the deck if
-/// the tab holds more panes, the program's mark, and on it what the tab reports — the running ring,
-/// a badge on the corner, or, in the ring style, the colour of the ring round the mark. With no
-/// icons (`tab_icons = "none"`) it is the small indicator alone.
+/// The glyph: the program's tile, behind it the deck if the tab holds more panes (its cards
+/// smaller and less turned the further back, `tabs::deck_card`), the program's mark on the tile,
+/// and a badge on its corner for what the tab reports — a command running is the line round the
+/// tile's edge, a layer of its own. With no icons (`tab_icons = false`) it is the small indicator
+/// alone.
 fn draw_glyph(look: GlyphLook, palette: Palette) {
     let GlyphLook {
         emblem,
@@ -1003,7 +1035,7 @@ fn draw_glyph(look: GlyphLook, palette: Palette) {
         indicator,
         down,
     } = look;
-    if style.icons == TabIcons::Off {
+    if !style.icons {
         if let Some(indicator) = indicator {
             draw_bare(indicator, down, indicator_slot().origin, palette);
         }
@@ -1012,73 +1044,58 @@ fn draw_glyph(look: GlyphLook, palette: Palette) {
     let slot = glyph_slot();
     let Emblem { kind, edges } = emblem;
     let inks = inks(icon::of(kind), style, palette);
-    if edges > 0 {
-        // Opaque, like the deck's other tiles: they overlap.
-        let front = inks
-            .tile
-            .map(|tile| mix(palette.ground, tile.rgb, tile.alpha));
-        draw_deck(edges, slot, palette, front);
-    } else if let Some(tile) = inks.tile {
-        draw_tile_fill(slot, tile);
+    // The cards behind, back to front, each turned about its own middle.
+    for step in (1..=edges.min(tabs::DECK_EDGES)).rev() {
+        let card = tabs::deck_card(slot.size.width, step, edges);
+        let rect = card_rect(slot, card);
+        NSGraphicsContext::saveGraphicsState_class();
+        turn(rect, card.turn);
+        draw_face(rect, TILE_ROUND, palette.tile_back(), palette);
+        NSGraphicsContext::restoreGraphicsState_class();
     }
-    let running = indicator == Some(Indicator::Running);
-    let side = match style.icons {
-        TabIcons::Plain if running => MARK_RINGED,
-        TabIcons::Plain if edges > 0 => MARK_TILED,
-        TabIcons::Plain | TabIcons::Off => MARK_BARE,
-        TabIcons::Ring => MARK_RINGED,
-        TabIcons::Tile => MARK_TILED,
-    };
-    let ink = inks.mark.unwrap_or(Tint::of(palette.title, ICON_INK));
-    draw_mark(kind, centred_square(slot, side), &ink.color());
-    if style.icons == TabIcons::Ring {
-        draw_circle(slot, ring_tint(indicator, palette));
+    NSGraphicsContext::saveGraphicsState_class();
+    turn(slot, tabs::deck_card(slot.size.width, 0, edges).turn);
+    draw_face(slot, TILE_ROUND, inks.tile.rgb, palette);
+    draw_mark(kind, centred_square(slot, MARK_TILED), &inks.mark.color());
+    if let Some(indicator) = indicator.filter(|&indicator| indicator != Indicator::Running) {
+        draw_badge(indicator, down, slot, palette);
+    }
+    NSGraphicsContext::restoreGraphicsState_class();
+}
+
+/// Where a deck's `card` stands, from the front card's `slot`: its size a share of the front
+/// card's, its middle `dx` to the right on the same middle line.
+fn card_rect(slot: NSRect, card: tabs::DeckCard) -> NSRect {
+    let (width, height) = (slot.size.width * card.scale, slot.size.height * card.scale);
+    NSRect::new(
+        NSPoint::new(
+            slot.origin.x + slot.size.width / 2.0 + card.dx - width / 2.0,
+            slot.origin.y + (slot.size.height - height) / 2.0,
+        ),
+        NSSize::new(width, height),
+    )
+}
+
+/// Turns what is drawn next `degrees` counter-clockwise on screen about `rect`'s middle (the
+/// glyph's space is flipped: a positive angle there goes clockwise).
+fn turn(rect: NSRect, degrees: f64) {
+    if degrees == 0.0 {
         return;
     }
-    match indicator {
-        // The tile's edge is a layer of its own, like the ring's arc.
-        Some(Indicator::Running) if style.icons == TabIcons::Tile => {}
-        Some(Indicator::Running) => draw_circle(slot, palette.track),
-        Some(indicator) => draw_badge(indicator, down, slot, palette),
-        None => {}
-    }
+    let (x, y) = (
+        rect.origin.x + rect.size.width / 2.0,
+        rect.origin.y + rect.size.height / 2.0,
+    );
+    let turn = NSAffineTransform::transform();
+    turn.translateXBy_yBy(x, y);
+    turn.rotateByDegrees(-degrees);
+    turn.translateXBy_yBy(-x, -y);
+    turn.concat();
 }
 
-/// The ring round the mark in the ring style, in the colour of what the tab reports: the title's
-/// colour, faint, while it reports nothing; the track the arc turns on while a command runs; the
-/// role of its meaning for the rest.
-fn ring_tint(indicator: Option<Indicator>, palette: Palette) -> Tint {
-    match indicator {
-        None => Tint::of(palette.title, RING_IDLE),
-        Some(Indicator::Running) => palette.track,
-        Some(indicator) => Tint::of(palette.tone(tabs::list_dot(indicator), 0), 1.0),
-    }
-}
-
-/// A deck: the empty edges of the tab's other panes, each one step further right and behind the
-/// tile in front, which stands in the slot (`front` its ground, the neutral one without). Tiles
-/// are opaque, so the ones behind show only the edge that peeks out.
-fn draw_deck(edges: usize, slot: NSRect, palette: Palette, front: Option<u32>) {
-    let fill = |share| mix(palette.ground, palette.title, share);
-    let line = Tint::of(fill(0.30), 1.0);
-    for step in (1..=edges.min(tabs::DECK_EDGES)).rev() {
-        let mut rect = slot;
-        rect.origin.x += step as f64 * tabs::DECK_STEP;
-        draw_tile(rect, fill(0.09), line);
-    }
-    draw_tile(slot, front.unwrap_or_else(|| fill(0.17)), line);
-}
-
-/// A tile with no line round it: the tile style's ground.
-fn draw_tile_fill(rect: NSRect, fill: Tint) {
-    let path =
-        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, TILE_RADIUS, TILE_RADIUS);
-    fill.color().setFill();
-    path.fill();
-}
-
-/// One deck tile: a rounded square with a hairline round it.
-fn draw_tile(rect: NSRect, fill: u32, line: Tint) {
+/// One raised face in `rect`, `radius` round — a tab's tile, like an application's icon:
+/// filled in `fill` over its shadow, with a hairline round it.
+fn draw_face(rect: NSRect, radius: f64, fill: u32, palette: Palette) {
     let inset = TILE_LINE / 2.0;
     let rect = NSRect::new(
         NSPoint::new(rect.origin.x + inset, rect.origin.y + inset),
@@ -1086,13 +1103,20 @@ fn draw_tile(rect: NSRect, fill: u32, line: Tint) {
     );
     let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
         rect,
-        TILE_RADIUS - inset,
-        TILE_RADIUS - inset,
+        radius - inset,
+        radius - inset,
     );
+    NSGraphicsContext::saveGraphicsState_class();
+    let shadow = NSShadow::new();
+    shadow.setShadowOffset(NSSize::new(0.0, -TILE_DROP));
+    shadow.setShadowBlurRadius(TILE_BLUR);
+    shadow.setShadowColor(Some(&palette.tile_shadow().color()));
+    shadow.set();
     Tint::of(fill, 1.0).color().setFill();
     path.fill();
+    NSGraphicsContext::restoreGraphicsState_class();
     path.setLineWidth(TILE_LINE);
-    line.color().setStroke();
+    palette.tile_line().color().setStroke();
     path.stroke();
 }
 
@@ -1157,54 +1181,33 @@ fn draw_mask(png: &'static [u8], rect: NSRect, ink: &NSColor) {
     tinted.drawInRect(rect);
 }
 
-/// "Running": the ring's centre and radius in the icon's square.
-fn ring_circle() -> (NSPoint, f64) {
-    (
-        NSPoint::new(tabs::ICON_SIDE / 2.0, tabs::ICON_SIDE / 2.0),
-        RING_RADIUS,
-    )
-}
-
-/// The ring round the icon's square, in `tint`: the track under the turning arc while a command
-/// runs, in the ring style the state's colour for the rest.
-fn draw_circle(slot: NSRect, tint: Tint) {
-    let (at, radius) = ring_circle();
-    let ring = NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-        NSPoint::new(slot.origin.x + at.x - radius, slot.origin.y + at.y - radius),
-        NSSize::new(2.0 * radius, 2.0 * radius),
-    ));
-    stroke(&ring, RING_WIDTH, tint);
-}
-
-/// "Running": the quarter arc in `accent`, resting at the top and running clockwise from there —
-/// the picture the turning layer carries. Drawn in a flipped square like the glyph's own, where
-/// angles grow clockwise on screen and −90° is the top. `bare` is the small indicator's arc.
-fn draw_arc(color: u32, bare: bool) {
-    let (at, radius, width) = if bare {
-        let (at, radius) = bare_circle(NSPoint::ZERO);
-        (at, radius, BARE_WIDTH)
-    } else {
-        let (at, radius) = ring_circle();
-        (at, radius, RING_WIDTH)
-    };
+/// "Running", without icons: the small indicator's quarter arc in `accent`, resting at the top and
+/// running clockwise from there — the picture the turning layer carries. Drawn in a flipped square
+/// like the glyph's own, where angles grow clockwise on screen and −90° is the top.
+fn draw_arc(color: u32) {
+    let (at, radius) = bare_circle(NSPoint::ZERO);
     let arc = NSBezierPath::bezierPath();
     arc.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise(
         at, radius, -90.0, 0.0, false,
     );
-    stroke(&arc, width, Tint::of(color, 1.0));
+    stroke(&arc, BARE_WIDTH, Tint::of(color, 1.0));
 }
 
-/// A tile's edge: the rounded square a little outside the tile, in `accent`, stroked whole. Only
-/// a part of it shows, through [`draw_wedge`].
-fn draw_edge(color: u32) {
-    let inset = (EDGE_ROOM - EDGE_SIDE) / 2.0;
+/// A tile's edge: the rounded rectangle a little outside the tile, in `accent`, stroked whole and
+/// turned with the front tile of a deck with `edges` cards behind it. Only a part of it shows,
+/// through [`draw_wedge`].
+fn draw_edge(color: u32, edges: usize) {
     let rect = NSRect::new(
-        NSPoint::new(inset, inset),
-        NSSize::new(EDGE_SIDE, EDGE_SIDE),
+        NSPoint::new(
+            (EDGE_ROOM - EDGE_WIDTH) / 2.0,
+            (EDGE_ROOM - EDGE_HEIGHT) / 2.0,
+        ),
+        NSSize::new(EDGE_WIDTH, EDGE_HEIGHT),
     );
+    turn(rect, tabs::deck_card(tabs::TILE_WIDTH, 0, edges).turn);
     let path =
         NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, EDGE_RADIUS, EDGE_RADIUS);
-    stroke(&path, RING_WIDTH, Tint::of(color, 1.0));
+    stroke(&path, EDGE_STROKE, Tint::of(color, 1.0));
 }
 
 /// The wedge the edge is seen through: a slice from the middle of its square, pointing at the top
@@ -1335,13 +1338,11 @@ fn draw_bare_arrow(at: NSPoint, down: bool, color: u32) {
 
 // ─── The icon in a menu row ───────────────────────────────────────────────
 
-/// The icon of tab `label` for a menu row (Show All Tabs): its mark in the style the chip wears,
-/// and what the tab reports as a dot on the corner — or, in the ring style, as the ring's colour.
-/// A running ring stands still. The mark is drawn in the menu's own text colour unless its
-/// style gives it one: the menu follows the system's appearance, not the theme's.
+/// The icon of tab `label` for a menu row (Show All Tabs): its mark on its tile, as the chip wears
+/// it, and what the tab reports as a dot on the corner.
 fn list_image(label: &Label, style: IconStyle, palette: Palette) -> Retained<NSImage> {
     let indicator = label.indicator;
-    if style.icons == TabIcons::Off {
+    if !style.icons {
         let dot = indicator.map(|indicator| palette.tone(tabs::list_dot(indicator), 0));
         return dot_image(dot);
     }
@@ -1362,22 +1363,9 @@ fn draw_listed(
 ) {
     let slot = NSRect::new(NSPoint::ZERO, NSSize::new(LIST_SIDE, LIST_SIDE));
     let inks = inks(icon::of(kind), style, palette);
-    if let Some(tile) = inks.tile {
-        draw_tile_fill(slot, tile);
-    }
-    let side = match style.icons {
-        TabIcons::Tile => MARK_TILED,
-        TabIcons::Ring => MARK_RINGED,
-        TabIcons::Plain | TabIcons::Off => MARK_BARE,
-    };
-    let ink = inks.mark.map_or_else(NSColor::labelColor, Tint::color);
-    draw_mark(kind, centred_square(slot, side), &ink);
-    if style.icons == TabIcons::Ring {
-        draw_circle(slot, ring_tint(indicator, palette));
-        if indicator == Some(Indicator::Running) {
-            draw_arc(palette.accent, false);
-        }
-    } else if let Some(indicator) = indicator {
+    draw_face(slot, TILE_RADIUS, inks.tile.rgb, palette);
+    draw_mark(kind, centred_square(slot, MARK_LISTED), &inks.mark.color());
+    if let Some(indicator) = indicator {
         draw_corner_dot(indicator, slot, palette);
     }
 }
@@ -1412,8 +1400,8 @@ fn draw_corner_dot(indicator: Indicator, slot: NSRect, palette: Palette) {
 fn draw_badge(indicator: Indicator, down: bool, slot: NSRect, palette: Palette) {
     let role = palette.tone(tabs::list_dot(indicator), 0);
     let centre = NSPoint::new(
-        slot.origin.x + slot.size.width - BADGE_INSET,
-        slot.origin.y + BADGE_INSET,
+        slot.origin.x + slot.size.width - TILE_BADGE_INSET,
+        slot.origin.y + TILE_BADGE_INSET,
     );
     let side = if indicator == Indicator::Failed {
         BADGE_DOT
@@ -1514,8 +1502,16 @@ impl Glyph {
             layer.setPosition(at);
             layer
         };
-        let arc = layer(tabs::ICON_SIDE, middle);
-        let edge = layer(EDGE_ROOM, middle);
+        // The arc is the small indicator's, in its square.
+        let arc = layer(
+            tabs::INDICATOR_SIDE,
+            NSPoint::new(GLYPH_LEFT + tabs::INDICATOR_SIDE / 2.0, middle.y),
+        );
+        // The edge goes round the tile, wider than the square: its middle is the tile's.
+        let edge = layer(
+            EDGE_ROOM,
+            NSPoint::new(GLYPH_LEFT + tabs::TILE_WIDTH / 2.0, middle.y),
+        );
         // The wedge is in the edge's own space, at its middle.
         let wedge = layer(WEDGE_ROOM, NSPoint::new(EDGE_ROOM / 2.0, EDGE_ROOM / 2.0));
         // SAFETY: the wedge is a plain layer of its own; the edge holds the one reference a mask
@@ -1573,33 +1569,13 @@ impl Glyph {
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         iv.arc.setHidden(spin != Some(Spin::Ring));
-        iv.edge.setHidden(spin != Some(Spin::Edge));
-        if let Some(look) = look {
-            self.size_arc(look.style.icons == TabIcons::Off);
-        }
+        iv.edge.setHidden(!matches!(spin, Some(Spin::Edge(_))));
         CATransaction::commit();
         if spin.is_some() {
             self.hang();
             self.ink();
         }
         self.turn(turn.zip(spin));
-    }
-
-    /// The arc's layer fits the ring it turns on: the icon's, or the small indicator's.
-    fn size_arc(&self, bare: bool) {
-        let arc = &self.ivars().arc;
-        let side = if bare {
-            tabs::INDICATOR_SIDE
-        } else {
-            tabs::ICON_SIDE
-        };
-        if arc.bounds().size.width != side {
-            arc.setBounds(NSRect::new(NSPoint::ZERO, NSSize::new(side, side)));
-            arc.setPosition(NSPoint::new(
-                GLYPH_LEFT + side / 2.0,
-                GLYPH_OVERHANG + tabs::ICON_SIDE / 2.0,
-            ));
-        }
     }
 
     /// The pictures of what turns, in the colour `accent` has in the bar and at the scale of the
@@ -1616,22 +1592,19 @@ impl Glyph {
             .map_or(2.0, |window| window.backingScaleFactor());
         match spin {
             Spin::Ring => {
-                let bare = look.is_some_and(|look| look.style.icons == TabIcons::Off);
-                if iv.arc_ink.replace(Some((color, scale, bare))) == Some((color, scale, bare)) {
+                if iv.arc_ink.replace(Some((color, scale))) == Some((color, scale)) {
                     return;
                 }
-                let side = if bare {
-                    tabs::INDICATOR_SIDE
-                } else {
-                    tabs::ICON_SIDE
-                };
-                paint(&iv.arc, side, scale, move || draw_arc(color, bare));
+                paint(&iv.arc, tabs::INDICATOR_SIDE, scale, move || {
+                    draw_arc(color);
+                });
             }
-            Spin::Edge => {
-                if iv.edge_ink.replace(Some((color, scale))) == Some((color, scale)) {
+            Spin::Edge(edges) => {
+                let ink = Some((color, scale, edges));
+                if iv.edge_ink.replace(ink) == ink {
                     return;
                 }
-                paint(&iv.edge, EDGE_ROOM, scale, move || draw_edge(color));
+                paint(&iv.edge, EDGE_ROOM, scale, move || draw_edge(color, edges));
                 paint(&iv.wedge, WEDGE_ROOM, scale, draw_wedge);
             }
         }
@@ -1648,7 +1621,7 @@ impl Glyph {
         };
         let layer = match spin {
             Spin::Ring => &iv.arc,
-            Spin::Edge => &iv.wedge,
+            Spin::Edge(_) => &iv.wedge,
         };
         // SAFETY: reading the animation a layer holds, on the main thread.
         let playing = unsafe { layer.animationForKey(turn_key()) }.is_some();
@@ -1677,14 +1650,25 @@ impl Glyph {
                 round.setTimingFunction(Some(&even));
                 layer.addAnimation_forKey(&round, Some(turn_key()));
             }
-            Spin::Edge => {
+            Spin::Edge(edges) => {
                 // Between two angles the wedge turns at an even rate; the angles are where the
-                // edge's pace comes out even (`tabs::edge_angle`). A turn already under way starts
-                // where the command's age puts it, by its time offset.
+                // edge's pace comes out even (`tabs::edge_angle`), turned with the edge when a deck
+                // turns its front tile (counter-clockwise: back against the glyph's flipped space).
+                // A turn already under way starts where the command's age puts it, by its time
+                // offset.
+                let lean = -tabs::deck_card(tabs::TILE_WIDTH, 0, edges)
+                    .turn
+                    .to_radians();
                 let angles: Vec<Retained<AnyObject>> = (0..=EDGE_STEPS)
                     .map(|step| {
                         let share = step as f64 / EDGE_STEPS as f64;
-                        let angle = tabs::edge_angle(EDGE_SIDE / 2.0, EDGE_RADIUS, share);
+                        let angle = lean
+                            + tabs::edge_angle(
+                                EDGE_WIDTH / 2.0,
+                                EDGE_HEIGHT / 2.0,
+                                EDGE_RADIUS,
+                                share,
+                            );
                         // `NSNumber` → `NSValue` → `NSObject` → the root: what `values` takes.
                         Retained::into_super(Retained::into_super(Retained::into_super(
                             NSNumber::numberWithDouble(angle),
@@ -2275,11 +2259,11 @@ impl Chip {
         let inner = (size.width - 2.0 * pad).max(0.0);
         // Without icons the small indicator takes the place, and only while the tab reports
         // something; with them the icon is always there (a deck widens it).
-        let bare = style.icons == TabIcons::Off;
+        let bare = !style.icons;
         let lead = if bare {
             indicator.map(|_| tabs::INDICATOR_SIDE)
         } else {
-            emblem.map(|emblem| tabs::lead_width(emblem.edges))
+            emblem.map(|emblem| tabs::lead_width(tabs::TILE_WIDTH, emblem.edges))
         };
         let (glyph_x, text_x, text_width) = tabs::title_row(inner, natural.width, lead);
         text.setFrame(NSRect::new(
@@ -4752,15 +4736,15 @@ pub(crate) fn watch_command_key() -> Option<Retained<AnyObject>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BADGE_HALO, BADGE_INSET, BADGE_SIDE, CARD_PAD_X, CARD_WIDTH, CHIP_HEIGHT, Emblem,
-        GLYPH_OVERHANG, GlyphLook, IconStyle, Motion, Palette, RING_IDLE, Spin, TAB_RADIUS,
-        TILE_SHARE_DARK, Tint, TitleAction, card_x, command_alone, contains, inks, line_span,
-        ring_tint, single_label, spin_of, title_double_click,
+        BADGE_HALO, BADGE_SIDE, CARD_PAD_X, CARD_WIDTH, CHIP_HEIGHT, Emblem, GLYPH_OVERHANG,
+        GlyphLook, IconStyle, Motion, Palette, Spin, TAB_RADIUS, TILE_BADGE_INSET, Tint,
+        TitleAction, card_x, command_alone, contains, inks, line_span, single_label, spin_of,
+        title_double_click,
     };
     use crate::icon;
     use crate::program::identity::{Agent, Kind as ProgramKind};
     use crate::tabs::{self, Indicator, Tone};
-    use bt_core::{IconColors, TabIcons, Theme};
+    use bt_core::{IconColors, Theme};
     use objc2_app_kit::NSEventModifierFlags;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -4876,8 +4860,14 @@ mod tests {
             CHIP_HEIGHT,
             "a chip's height is the icon's square and the room for its badge on both sides"
         );
-        // The badge and the ring cut round it fit that room above the square.
-        const { assert!(BADGE_SIDE / 2.0 + BADGE_HALO - BADGE_INSET <= GLYPH_OVERHANG) };
+        // The badge and the ring cut round it fit that room above the tile, which stands taller
+        // than the square, with a point to spare: a deck's front tile turns its corner up by less.
+        const {
+            assert!(
+                BADGE_SIDE / 2.0 + BADGE_HALO - TILE_BADGE_INSET + 1.0
+                    <= GLYPH_OVERHANG - (tabs::TILE_HEIGHT - tabs::ICON_SIDE) / 2.0
+            )
+        };
     }
 
     /// The question waits in the theme's `warning`, as its badge and its list dot wear it.
@@ -4890,56 +4880,41 @@ mod tests {
         );
     }
 
-    /// A tile is its kind's colour, a share of it as the ground and all of it as the mark; in brand
-    /// colours a program that has one makes it the ground, with a white mark, and the rest keep the
-    /// theme's. The other styles keep the text's colour, a brand colour only on the mark.
+    /// A tile is a raised face with the mark in its kind's colour; in brand colours a program that
+    /// has one makes it the face, with a white mark, and the rest keep the theme's.
     #[test]
     fn a_tile_takes_its_kinds_colour_or_the_brand() {
         let palette = Palette::of(&Theme::BATERI);
         let task = icon::of(ProgramKind::Task);
         let claude = icon::of(ProgramKind::Agent(Agent::ClaudeCode));
         let codex = icon::of(ProgramKind::Agent(Agent::Codex));
-        let theme = |icons| IconStyle {
-            icons,
+        let theme = IconStyle {
+            icons: true,
             colors: IconColors::Theme,
         };
-        let brand = |icons| IconStyle {
-            icons,
+        let brand = IconStyle {
+            icons: true,
             colors: IconColors::Brand,
         };
-        let task_ink = inks(task, theme(TabIcons::Tile), palette);
-        assert_eq!(task_ink.mark, Some(Tint::of(palette.tint(task.tint), 1.0)));
+        let task_ink = inks(task, theme, palette);
+        assert_eq!(task_ink.mark, Tint::of(palette.tint(task.tint), 1.0));
+        assert_eq!(task_ink.tile, Tint::of(palette.tile_face(), 1.0));
         assert_eq!(
-            task_ink.tile,
-            Some(Tint::of(palette.tint(task.tint), TILE_SHARE_DARK))
-        );
-        assert_eq!(
-            inks(claude, theme(TabIcons::Tile), palette)
-                .tile
-                .map(|t| t.alpha),
-            Some(TILE_SHARE_DARK),
+            inks(claude, theme, palette).tile,
+            Tint::of(palette.tile_face(), 1.0),
             "theme colours: no brand on a tile"
         );
-        let branded = inks(claude, brand(TabIcons::Tile), palette);
-        assert_eq!(branded.tile, Some(Tint::of(claude.brand.unwrap(), 1.0)));
-        assert_eq!(branded.mark, Some(Tint::of(0xffffff, 1.0)));
+        let branded = inks(claude, brand, palette);
+        assert_eq!(branded.tile, Tint::of(claude.brand.unwrap(), 1.0));
+        assert_eq!(branded.mark, Tint::of(0xffffff, 1.0));
         assert_eq!(
-            inks(codex, brand(TabIcons::Tile), palette),
-            inks(codex, theme(TabIcons::Tile), palette),
+            inks(codex, brand, palette),
+            inks(codex, theme, palette),
             "a one-colour mark does not change"
         );
-        for icons in [TabIcons::Plain, TabIcons::Ring] {
-            assert_eq!(inks(claude, theme(icons), palette).mark, None);
-            assert_eq!(inks(claude, theme(icons), palette).tile, None);
-            assert_eq!(
-                inks(claude, brand(icons), palette).mark,
-                Some(Tint::of(claude.brand.unwrap(), 1.0))
-            );
-            assert_eq!(inks(codex, brand(icons), palette).mark, None);
-        }
-        // A light theme's tiles take less of the colour.
-        let light = Palette::of(&Theme::BATERI_LIGHT);
-        assert!(light.tile_share() < palette.tile_share());
+        // A dark theme's tile is raised off its ground; a light theme's is white.
+        assert_ne!(palette.tile_face(), palette.ground);
+        assert_eq!(Palette::of(&Theme::BATERI_LIGHT).tile_face(), 0xffffff);
     }
 
     /// A kind's tint reads the palette: the foreground, a status role or a normal ANSI colour.
@@ -4961,40 +4936,15 @@ mod tests {
         }
     }
 
-    /// In the ring style the state is the ring's colour: faint while nothing is reported, the
-    /// track while a command runs, the role of its meaning for the rest.
-    #[test]
-    fn the_ring_tells_the_state_by_its_colour() {
-        let palette = Palette::of(&Theme::BATERI);
-        assert_eq!(ring_tint(None, palette), Tint::of(palette.title, RING_IDLE));
-        assert_eq!(ring_tint(Some(Indicator::Running), palette), palette.track);
-        for indicator in [
-            Indicator::Question,
-            Indicator::Failed,
-            Indicator::Finished,
-            Indicator::Uploading,
-        ] {
-            assert_eq!(
-                ring_tint(Some(indicator), palette),
-                Tint::of(palette.tone(tabs::list_dot(indicator), 0), 1.0),
-                "{indicator:?}"
-            );
-        }
-        let colours: Vec<_> = [Indicator::Question, Indicator::Failed, Indicator::Finished]
-            .into_iter()
-            .map(|indicator| ring_tint(Some(indicator), palette).rgb)
-            .collect();
-        assert!(colours[0] != colours[1] && colours[1] != colours[2] && colours[0] != colours[2]);
-    }
-
-    /// Only a running glyph turns, and a tile's edge turns where a ring's arc would not.
+    /// Only a running glyph turns: a tile's edge, its deck's cards counted, or without icons the
+    /// small indicator's ring.
     #[test]
     fn a_running_glyph_turns_its_arc_or_its_edge() {
         let look = |icons, indicator| {
             Some(GlyphLook {
                 emblem: Emblem {
                     kind: ProgramKind::Shell,
-                    edges: 0,
+                    edges: 1,
                 },
                 style: IconStyle {
                     icons,
@@ -5005,15 +4955,10 @@ mod tests {
             })
         };
         let running = Some(Indicator::Running);
-        assert_eq!(spin_of(look(TabIcons::Plain, running)), Some(Spin::Ring));
-        assert_eq!(spin_of(look(TabIcons::Ring, running)), Some(Spin::Ring));
-        assert_eq!(spin_of(look(TabIcons::Off, running)), Some(Spin::Ring));
-        assert_eq!(spin_of(look(TabIcons::Tile, running)), Some(Spin::Edge));
-        assert_eq!(
-            spin_of(look(TabIcons::Tile, Some(Indicator::Finished))),
-            None
-        );
-        assert_eq!(spin_of(look(TabIcons::Plain, None)), None);
+        assert_eq!(spin_of(look(true, running)), Some(Spin::Edge(1)));
+        assert_eq!(spin_of(look(false, running)), Some(Spin::Ring));
+        assert_eq!(spin_of(look(true, Some(Indicator::Finished))), None);
+        assert_eq!(spin_of(look(true, None)), None);
         assert_eq!(spin_of(None), None);
     }
 

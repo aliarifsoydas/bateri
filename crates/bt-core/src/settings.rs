@@ -579,51 +579,17 @@ impl SplitStyle {
     }
 }
 
-/// `[appearance] tab_icons`: how a tab's chip draws the program it runs.
-///
-/// Only the platform shell reads it (the tab bar's drawing); the session never
-/// sees it. One field of [`Changes`] covers it and [`IconColors`], for
-/// [`Scrollbar`]'s reason. An ordinary key: a value that isn't accepted is the
-/// default at launch and leaves the value in effect at save time.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TabIcons {
-    /// The mark in the text's color, bare; a ring turns round it while a
-    /// command runs and a badge on its corner tells the rest.
-    #[default]
-    Plain,
-    /// The mark always inside a thin ring; the ring's color tells the state.
-    Ring,
-    /// The mark on a tile in its kind's color; while a command runs a line
-    /// runs round the tile's edge, and badges sit on its corner.
-    Tile,
-    /// No icon: the small indicator before the title that a tab had before
-    /// icons (a question, a ring, a tick, a dot, an arrow).
-    Off,
-}
-
-impl TabIcons {
-    /// The single list of spellings in the settings file (the same rationale as
-    /// [`UnfocusedCaret::NAMES`]).
-    pub const NAMES: &'static [(&'static str, Self)] = &[
-        ("plain", Self::Plain),
-        ("ring", Self::Ring),
-        ("tile", Self::Tile),
-        ("none", Self::Off),
-    ];
-
-    /// The spelling in the settings file.
-    pub fn name(self) -> &'static str {
-        name_in(Self::NAMES, self)
-    }
-}
-
 /// `[appearance] tab_icon_colors`: whether a tab's icon takes the theme's
 /// colors or its program's own brand color where it has one.
 ///
-/// Read with [`TabIcons`], for its reason.
+/// Only the platform shell reads it (the tab bar's drawing), with
+/// [`Settings::tab_icons`]; the session never sees it. One field of
+/// [`Changes`] covers the two, for [`Scrollbar`]'s reason. An ordinary key: a
+/// value that isn't accepted is the default at launch and leaves the value in
+/// effect at save time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IconColors {
-    /// The theme's colors only: the text's color, and a kind's role on a tile.
+    /// The theme's colors only: a raised tile, and a kind's role on the mark.
     #[default]
     Theme,
     /// Programs with a colored brand keep it (a tile takes it as its ground);
@@ -1460,9 +1426,12 @@ pub struct Settings {
     /// `[appearance] split_style`: cards on a ground or panes divided by a
     /// line ([`SplitStyle`]). Doesn't enter `TerminalOptions`.
     pub split_style: SplitStyle,
-    /// `[appearance] tab_icons`: how a tab's chip draws its program
-    /// ([`TabIcons`]). Doesn't enter `TerminalOptions`.
-    pub tab_icons: TabIcons,
+    /// `[appearance] tab_icons`: whether a tab's chip shows the program it
+    /// runs as an icon before its title — the program's mark on a tile, like
+    /// an application's icon, a split tab's as a deck — or, off, only the small
+    /// indicator a tab had before icons (a question, a ring, a tick, a dot, an
+    /// arrow). On by default. Doesn't enter `TerminalOptions`.
+    pub tab_icons: bool,
     /// `[appearance] tab_icon_colors`: theme colors or brand colors for the
     /// icon ([`IconColors`]). Doesn't enter `TerminalOptions`.
     pub tab_icon_colors: IconColors,
@@ -1544,7 +1513,7 @@ impl Default for Settings {
             minimum_contrast: MINIMUM_CONTRAST,
             dim_unfocused_splits: false,
             split_style: SplitStyle::default(),
-            tab_icons: TabIcons::default(),
+            tab_icons: true,
             tab_icon_colors: IconColors::default(),
             font: FontOptions::default(),
             osc52: Osc52::Copy,
@@ -1651,7 +1620,7 @@ pub enum SettingsEdit {
     /// The settings window's "Split style": `[appearance] split_style`.
     SplitStyle(SplitStyle),
     /// The settings window's "Tab icons": `[appearance] tab_icons`.
-    TabIcons(TabIcons),
+    TabIcons(bool),
     /// The settings window's "Icon colors": `[appearance] tab_icon_colors`.
     IconColors(IconColors),
     /// Shell ▸ Mark … as ▸: the `[remote] hosts` edit that makes
@@ -1795,7 +1764,6 @@ impl SettingsEdit {
             Self::Scrollbar(scrollbar) => scrollbar.name().into(),
             Self::ContentEdge(edge) => edge.name().into(),
             Self::SplitStyle(style) => style.name().into(),
-            Self::TabIcons(icons) => icons.name().into(),
             Self::IconColors(colors) => colors.name().into(),
             Self::Osc52(mode) => mode.name().into(),
             Self::CursorMotion(motion) => motion.name().into(),
@@ -1818,7 +1786,8 @@ impl SettingsEdit {
             | Self::DownloadNotify(on)
             | Self::RemoteIntegration(on)
             | Self::ShellPorts(on)
-            | Self::DimUnfocusedSplits(on) => (*on).into(),
+            | Self::DimUnfocusedSplits(on)
+            | Self::TabIcons(on) => (*on).into(),
             Self::CursorRadius(value)
             | Self::CursorGlow(value)
             | Self::BlinkInterval(value)
@@ -1949,13 +1918,11 @@ dim_unfocused_splits = false
 # lines lets the panes touch with one thin line between them, for the most
 # room.
 split_style = "cards"
-# "plain" | "ring" | "tile" | "none". What a tab shows before its title about
-# the program it runs: plain draws its mark in the text's color with a ring
-# turning round it while a command runs; ring keeps the mark inside a thin
-# ring whose color tells the state; tile sets it on a tile of its kind's color
-# with a line running round the edge; none shows no icon, only the small
-# indicator a tab had before icons.
-tab_icons = "plain"
+# true | false. Shows the program a tab runs as an icon before its title: the
+# program's mark on a tile, like an application's icon, with a line running
+# round the tile's edge while a command runs; a split tab shows a deck of
+# tiles. Off: no icon, only the small indicator a tab had before icons.
+tab_icons = true
 # "theme" | "brand". Whether the icon takes the theme's colors, or the program's
 # own where it has a colored brand (Claude, Antigravity, Gemini, Qwen); the
 # single-color ones and the kinds bateri draws itself stay as they are.
@@ -2371,11 +2338,10 @@ stats_interval = 3
                     );
                 }
                 if let Some(item) = appearance.get("tab_icons") {
-                    parsed.settings.tab_icons = named_enum(
+                    parsed.settings.tab_icons = boolean(
                         text,
                         item,
                         "appearance.tab_icons",
-                        TabIcons::NAMES,
                         fallback.tab_icons,
                         &mut parsed.diagnostics,
                     );
@@ -4433,7 +4399,7 @@ mod tests {
             minimum_contrast: 4.5,
             dim_unfocused_splits: true,
             split_style: SplitStyle::Lines,
-            tab_icons: TabIcons::Tile,
+            tab_icons: false,
             tab_icon_colors: IconColors::Brand,
             font: FontOptions::default(),
             osc52: Osc52::Copy,
@@ -5672,17 +5638,11 @@ found 1.5; using 0.1"
 
     #[test]
     fn tab_icons_and_their_colors_are_read() {
-        assert_eq!(clean("").tab_icons, TabIcons::Plain);
+        assert!(clean("").tab_icons, "icons are on by default");
         assert_eq!(clean("").tab_icon_colors, IconColors::Theme);
-        for (value, expected) in [
-            ("plain", TabIcons::Plain),
-            ("ring", TabIcons::Ring),
-            ("tile", TabIcons::Tile),
-            ("none", TabIcons::Off),
-        ] {
-            let text = format!("[appearance]\ntab_icons = \"{value}\"\n");
-            assert_eq!(clean(&text).tab_icons, expected, "{value}");
-            assert_eq!(expected.name(), value);
+        for value in [true, false] {
+            let text = format!("[appearance]\ntab_icons = {value}\n");
+            assert_eq!(clean(&text).tab_icons, value, "{value}");
         }
         for (value, expected) in [("theme", IconColors::Theme), ("brand", IconColors::Brand)] {
             let text = format!("[appearance]\ntab_icon_colors = \"{value}\"\n");
@@ -5690,7 +5650,7 @@ found 1.5; using 0.1"
             assert_eq!(expected.name(), value);
         }
         // A change of either is the one field the shell redraws its bars for.
-        let tile = clean("[appearance]\ntab_icons = \"tile\"\n");
+        let tile = clean("[appearance]\ntab_icons = false\n");
         let brand = clean("[appearance]\ntab_icon_colors = \"brand\"\n");
         assert!(clean("").changes(&tile).tab_icons);
         assert!(clean("").changes(&brand).tab_icons);
@@ -5701,24 +5661,24 @@ found 1.5; using 0.1"
     #[test]
     fn unrecognized_tab_icons_keep_their_own_key() {
         // At launch an ordinary key falls to its default, and only that key is named.
-        let (settings, diagnostic) = rejected("[appearance]\ntab_icons = \"round\"\n");
-        assert_eq!(settings.tab_icons, TabIcons::Plain);
+        let (settings, diagnostic) = rejected("[appearance]\ntab_icons = \"tile\"\n");
+        assert!(settings.tab_icons);
         assert_eq!(diagnostic.key, Some("appearance.tab_icons"));
         let (settings, diagnostic) = rejected("[appearance]\ntab_icon_colors = 1\n");
         assert_eq!(settings.tab_icon_colors, IconColors::Theme);
         assert_eq!(diagnostic.key, Some("appearance.tab_icon_colors"));
         // At save time the value in effect stands in; also when the section has the wrong type.
         let current = Settings {
-            tab_icons: TabIcons::Tile,
+            tab_icons: false,
             tab_icon_colors: IconColors::Brand,
             ..Settings::default()
         };
         for text in [
-            "[appearance]\ntab_icons = \"round\"\ntab_icon_colors = 1\n",
+            "[appearance]\ntab_icons = \"tile\"\ntab_icon_colors = 1\n",
             "appearance = 5\n",
         ] {
             let parsed = Settings::parse_keeping(text, &current).expect("parseable text");
-            assert_eq!(parsed.settings.tab_icons, TabIcons::Tile, "{text}");
+            assert!(!parsed.settings.tab_icons, "{text}");
             assert_eq!(parsed.settings.tab_icon_colors, IconColors::Brand, "{text}");
         }
     }
@@ -6924,7 +6884,7 @@ cursor = \"spring\"
             SettingsEdit::MinimumContrast(ratio) => settings.minimum_contrast = two(ratio),
             SettingsEdit::DimUnfocusedSplits(on) => settings.dim_unfocused_splits = on,
             SettingsEdit::SplitStyle(style) => settings.split_style = style,
-            SettingsEdit::TabIcons(icons) => settings.tab_icons = icons,
+            SettingsEdit::TabIcons(on) => settings.tab_icons = on,
             SettingsEdit::IconColors(colors) => settings.tab_icon_colors = colors,
             SettingsEdit::FontFamily(name) => {
                 settings.font.family = (!name.is_empty()).then_some(name);
@@ -7005,7 +6965,7 @@ cursor = \"spring\"
             SettingsEdit::MinimumContrast(4.5),
             SettingsEdit::DimUnfocusedSplits(true),
             SettingsEdit::SplitStyle(SplitStyle::Lines),
-            SettingsEdit::TabIcons(TabIcons::Tile),
+            SettingsEdit::TabIcons(false),
             SettingsEdit::IconColors(IconColors::Brand),
             SettingsEdit::FontFamily("Menlo".to_owned()),
             SettingsEdit::FontFamily(String::new()),

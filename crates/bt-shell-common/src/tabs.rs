@@ -398,9 +398,16 @@ pub const TAB_RADIUS: f64 = 7.0;
 /// Space between two neighbouring buttons on the right.
 pub const BUTTON_GAP: f64 = 4.0;
 
-/// Side of the square a tab's program icon sits in, left of its title: the icon, the ring that
-/// turns round it while the tab works and the tile it stands on in a deck all fit this square.
+/// Side of the square a tab's icon is centred in, left of its title: the shell keeps the badge's
+/// room above and below it, a chip high. The tile stands at its middle ([`TILE_HEIGHT`]), and
+/// without icons the small indicator ([`INDICATOR_SIDE`]).
 pub const ICON_SIDE: f64 = 16.0;
+
+/// The tile a tab sets its program's mark on, like an application's icon: wider than high, and
+/// taller than [`ICON_SIDE`] — a tile of that square reads as a small grey patch, and the mark on
+/// it smaller still. It stands at the square's middle.
+pub const TILE_WIDTH: f64 = 22.0;
+pub const TILE_HEIGHT: f64 = 18.0;
 
 /// How far each further edge of a deck peeks out beyond the one in front of it: the tile of the
 /// focused pane stands at the left and the empty edges of the tab's other panes follow to its
@@ -409,6 +416,46 @@ pub const DECK_STEP: f64 = 4.0;
 
 /// The most edges a deck shows behind its front tile; a tab of more panes shows no more.
 pub const DECK_EDGES: usize = 2;
+
+/// How much smaller each card of a deck is than the one in front of it: the front card is the
+/// icon's own size and the ones behind fall back.
+pub const DECK_SHRINK: f64 = 0.88;
+
+/// How far, in degrees counter-clockwise, each card of a deck turns over the one under it: the
+/// card at the back stands straight and each one laid on it leans a little further left, like
+/// cards laid down by hand.
+pub const DECK_TURN: f64 = 2.5;
+
+/// Where one card of a deck sits ([`deck_card`]): its centre's distance right of the front card's
+/// centre, its size as a share of the front card's and how far it turns, in degrees
+/// counter-clockwise about its own centre. Every card shares the front card's middle line.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeckCard {
+    pub dx: f64,
+    pub scale: f64,
+    pub turn: f64,
+}
+
+/// The card `step` places behind the front one (0 is the front card) of a deck with `edges` cards
+/// behind its front one, the front card `front` wide: each card behind is [`DECK_SHRINK`] of the
+/// one in front of it and peeks out [`DECK_STEP`] beyond it on the right, so the deck takes
+/// [`lead_width`]; the card at the back stands straight and each card over it turns
+/// [`DECK_TURN`] further.
+pub fn deck_card(front: f64, step: usize, edges: usize) -> DeckCard {
+    let edges = edges.min(DECK_EDGES);
+    let step = step.min(edges);
+    let (mut dx, mut scale) = (0.0, 1.0);
+    for _ in 0..step {
+        let behind = scale * DECK_SHRINK;
+        dx += DECK_STEP + front * (scale - behind) / 2.0;
+        scale = behind;
+    }
+    DeckCard {
+        dx,
+        scale,
+        turn: DECK_TURN * (edges - step) as f64,
+    }
+}
 
 /// The label's inset from a chip's sides: room for `×` on the left, the same on the right so the
 /// title stays centred (and the ⌘ hint sits there). The shell draws the chip's content inside it
@@ -419,7 +466,7 @@ pub const CHIP_PAD: f64 = 26.0;
 pub const ICON_GAP: f64 = 6.0;
 
 /// Side of the small indicator a tab wears before its title when it has no icon (`tab_icons =
-/// "none"`): a question, a ring, a tick, a dot or an arrow, and nothing while the tab reports
+/// false`): a question, a ring, a tick, a dot or an arrow, and nothing while the tab reports
 /// nothing. It takes the place of [`lead_width`] then.
 pub const INDICATOR_SIDE: f64 = 12.0;
 
@@ -429,10 +476,10 @@ pub fn deck_edges(panes: usize) -> usize {
     panes.saturating_sub(1).min(DECK_EDGES)
 }
 
-/// The width the icon of a tab with `edges` deck edges takes before its title: the front tile
-/// and the edges' steps.
-pub fn lead_width(edges: usize) -> f64 {
-    ICON_SIDE + edges.min(DECK_EDGES) as f64 * DECK_STEP
+/// The width the icon of a tab with `edges` deck edges takes before its title: the front tile,
+/// `front` wide ([`TILE_WIDTH`]), and the edges' steps.
+pub fn lead_width(front: f64, edges: usize) -> f64 {
+    front + edges.min(DECK_EDGES) as f64 * DECK_STEP
 }
 
 /// Where a chip's leading element (its icon with the deck, `lead` wide) and its title sit across
@@ -1264,14 +1311,14 @@ pub fn ring_turn(elapsed: Duration, reduce_motion: bool) -> Option<Turn> {
 
 /// The angle, in radians clockwise from the top, of the ray from a tile's centre to the point
 /// `fraction` (a share of a turn, any real number) of the way along its edge: the edge is a
-/// square of `half` the side with corners rounded to `radius`, and the way starts at the middle
-/// of the top side and runs clockwise.
+/// rectangle `half_width` and `half_height` out from its centre with corners rounded to `radius`,
+/// and the way starts at the middle of the top side and runs clockwise.
 ///
 /// The line running round a tile's edge while a command runs is the edge seen through a wedge
 /// that turns about the tile's centre. A wedge turned at an even rate would race through the
 /// corners (the edge is farther off there) at twice the pace it keeps along the sides; turned by
 /// this angle at an even rate in `fraction`, its middle keeps an even pace along the edge.
-pub fn edge_angle(half: f64, radius: f64, fraction: f64) -> f64 {
+pub fn edge_angle(half_width: f64, half_height: f64, radius: f64, fraction: f64) -> f64 {
     use std::f64::consts::{FRAC_PI_2, PI, TAU};
     enum Piece {
         /// From one point to another.
@@ -1280,18 +1327,20 @@ pub fn edge_angle(half: f64, radius: f64, fraction: f64) -> f64 {
         /// down).
         Arc((f64, f64), f64),
     }
-    let flat = (half - radius).max(0.0);
-    let round = radius.min(half);
+    let (hw, hh) = (half_width, half_height);
+    let round = radius.min(hw).min(hh);
+    // The corners' centres: how far the straight runs reach from the middle across and down.
+    let (fw, fh) = (hw - round, hh - round);
     let pieces = [
-        Piece::Line((0.0, -half), (flat, -half)),
-        Piece::Arc((flat, -flat), -FRAC_PI_2),
-        Piece::Line((half, -flat), (half, flat)),
-        Piece::Arc((flat, flat), 0.0),
-        Piece::Line((flat, half), (-flat, half)),
-        Piece::Arc((-flat, flat), FRAC_PI_2),
-        Piece::Line((-half, flat), (-half, -flat)),
-        Piece::Arc((-flat, -flat), PI),
-        Piece::Line((-flat, -half), (0.0, -half)),
+        Piece::Line((0.0, -hh), (fw, -hh)),
+        Piece::Arc((fw, -fh), -FRAC_PI_2),
+        Piece::Line((hw, -fh), (hw, fh)),
+        Piece::Arc((fw, fh), 0.0),
+        Piece::Line((fw, hh), (-fw, hh)),
+        Piece::Arc((-fw, fh), FRAC_PI_2),
+        Piece::Line((-hw, fh), (-hw, -fh)),
+        Piece::Arc((-fw, -fh), PI),
+        Piece::Line((-fw, -hh), (0.0, -hh)),
     ];
     let length = |piece: &Piece| match *piece {
         Piece::Line((x0, y0), (x1, y1)) => (x1 - x0).hypot(y1 - y0),
@@ -1299,7 +1348,7 @@ pub fn edge_angle(half: f64, radius: f64, fraction: f64) -> f64 {
     };
     let total: f64 = pieces.iter().map(length).sum();
     let mut left = fraction.rem_euclid(1.0) * total;
-    let mut at = (0.0, -half);
+    let mut at = (0.0, -hh);
     for piece in &pieces {
         let run = length(piece);
         if left <= run {
@@ -2669,7 +2718,7 @@ mod tests {
     fn the_edge_angle_follows_the_edge_at_an_even_pace() {
         use std::f64::consts::{FRAC_PI_2, PI, TAU};
         for (half, radius) in [(8.8, 5.6), (8.0, 0.0), (8.0, 8.0)] {
-            let at = |fraction| edge_angle(half, radius, fraction);
+            let at = |fraction| edge_angle(half, half, radius, fraction);
             assert!(at(0.0).abs() < 1e-9, "{half} {radius}");
             for (quarter, angle) in [(0.25, FRAC_PI_2), (0.5, PI), (0.75, PI + FRAC_PI_2)] {
                 assert!(
@@ -2688,8 +2737,28 @@ mod tests {
         }
         // At an even pace along the edge the ray swings faster across a side's middle (the edge
         // is near) than through a corner (it is far, and slants away).
-        let swing = |from: f64, to: f64| edge_angle(8.8, 5.6, to) - edge_angle(8.8, 5.6, from);
+        let swing =
+            |from: f64, to: f64| edge_angle(8.8, 8.8, 5.6, to) - edge_angle(8.8, 8.8, 5.6, from);
         assert!(swing(0.23, 0.27) > swing(0.105, 0.145));
+    }
+
+    /// A wide tile's edge is walked the same way, its width and its height each where they
+    /// belong: the top's straight run ends `half_width - radius` across and `half_height` up.
+    #[test]
+    fn a_wide_tiles_edge_angle_keeps_its_width_and_height() {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let (hw, hh, r) = (11.8, 9.8, 5.8);
+        let total = 4.0 * (hw - r) + 4.0 * (hh - r) + 4.0 * r * FRAC_PI_2;
+        let run = (hw - r) / total;
+        assert!((edge_angle(hw, hh, r, run) - (hw - r).atan2(hh)).abs() < 1e-9);
+        assert!(
+            (edge_angle(hw, hh, r, 0.25) - FRAC_PI_2).abs() < 1e-9,
+            "the right's middle"
+        );
+        assert!(
+            (edge_angle(hw, hh, r, 0.5) - PI).abs() < 1e-9,
+            "the bottom's middle"
+        );
     }
 
     /// A deck has an edge for every pane but the one in front, two at the most; a tab of one
@@ -2701,12 +2770,51 @@ mod tests {
         assert_eq!(deck_edges(2), 1);
         assert_eq!(deck_edges(3), 2);
         assert_eq!(deck_edges(9), DECK_EDGES);
-        assert_eq!(lead_width(0), ICON_SIDE);
-        assert_eq!(lead_width(2), ICON_SIDE + 2.0 * DECK_STEP);
+        assert_eq!(lead_width(ICON_SIDE, 0), ICON_SIDE);
+        assert_eq!(lead_width(ICON_SIDE, 2), ICON_SIDE + 2.0 * DECK_STEP);
+        assert_eq!(lead_width(TILE_WIDTH, 1), TILE_WIDTH + DECK_STEP);
         assert_eq!(
-            lead_width(7),
-            lead_width(DECK_EDGES),
+            lead_width(ICON_SIDE, 7),
+            lead_width(ICON_SIDE, DECK_EDGES),
             "no more than the deck shows"
+        );
+    }
+
+    /// A deck's cards fall back smaller, each peeking out the same step beyond the one in front of
+    /// it, so the deck is as wide as its lead; the card at the back stands straight, the ones over
+    /// it lean further left a step at a time, and a lone card does not lean.
+    #[test]
+    fn a_decks_cards_fall_back_smaller_and_lean_from_the_back() {
+        let right = |card: DeckCard| card.dx + TILE_WIDTH * card.scale / 2.0;
+        for edges in 0..=DECK_EDGES {
+            let back = deck_card(TILE_WIDTH, edges, edges);
+            assert_eq!(back.turn, 0.0, "the back card stands straight ({edges})");
+            assert!(
+                (right(back) + TILE_WIDTH / 2.0 - lead_width(TILE_WIDTH, edges)).abs() < 1e-9,
+                "the deck is as wide as its lead ({edges})"
+            );
+            for step in 1..=edges {
+                let (card, over) = (
+                    deck_card(TILE_WIDTH, step, edges),
+                    deck_card(TILE_WIDTH, step - 1, edges),
+                );
+                assert!(card.scale < over.scale);
+                assert!((right(card) - right(over) - DECK_STEP).abs() < 1e-9);
+                assert!((over.turn - card.turn - DECK_TURN).abs() < 1e-9);
+            }
+        }
+        assert_eq!(
+            deck_card(TILE_WIDTH, 0, 0),
+            DeckCard {
+                dx: 0.0,
+                scale: 1.0,
+                turn: 0.0
+            },
+            "a tab of one pane"
+        );
+        assert_eq!(
+            deck_card(TILE_WIDTH, 0, 7),
+            deck_card(TILE_WIDTH, 0, DECK_EDGES)
         );
     }
 
@@ -2724,7 +2832,7 @@ mod tests {
         assert_eq!(lead, Some(0.0));
         assert_eq!(text, step);
         assert_eq!(width, 132.0 - step, "the title is cut, not the icon");
-        let deck = lead_width(2);
+        let deck = lead_width(ICON_SIDE, 2);
         let (lead, text, width) = title_row(132.0, 300.0, Some(deck));
         assert_eq!(lead, Some(0.0));
         assert_eq!(text, deck + ICON_GAP);
@@ -2743,7 +2851,7 @@ mod tests {
     #[test]
     fn the_narrowest_chip_still_reads_beside_the_widest_deck() {
         let inner = MIN_WIDTH - 2.0 * CHIP_PAD;
-        let (_, _, width) = title_row(inner, 200.0, Some(lead_width(DECK_EDGES)));
+        let (_, _, width) = title_row(inner, 200.0, Some(lead_width(ICON_SIDE, DECK_EDGES)));
         assert!(width >= 36.0, "{width} pt for the title");
     }
 

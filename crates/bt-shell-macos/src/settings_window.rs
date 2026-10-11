@@ -32,7 +32,7 @@ use bt_core::{
     KeepRunning, Keypress, LETTER_SPACING_RANGE, LINE_HEIGHT_RANGE, Osc52, PreviewKeep,
     ReduceMotion, RemoteStatsMode, RestoreWindows, SCROLLBACK_MAX, STATS_INTERVAL_RANGE,
     SYSTEM_THEME, Scrollbar, Settings, SettingsEdit, ShellIntegration, SmoothScroll, SplitStyle,
-    TabIcons, UnfocusedCaret,
+    UnfocusedCaret,
 };
 use bt_gpu::{FontNotice, ScrollbarMode};
 use objc2::rc::Retained;
@@ -468,20 +468,6 @@ impl Choice for SplitStyle {
         match self {
             SplitStyle::Cards => "Cards",
             SplitStyle::Lines => "Lines",
-        }
-    }
-}
-
-impl Choice for TabIcons {
-    fn names() -> &'static [(&'static str, Self)] {
-        Self::NAMES
-    }
-    fn title(self) -> &'static str {
-        match self {
-            TabIcons::Plain => "Plain",
-            TabIcons::Ring => "Ring",
-            TabIcons::Tile => "Tile",
-            TabIcons::Off => "None",
         }
     }
 }
@@ -1129,7 +1115,7 @@ struct Controls {
     scrollbar: Retained<NSPopUpButton>,
     content_edge: Retained<NSPopUpButton>,
     split_style: Retained<NSPopUpButton>,
-    tab_icons: Retained<NSPopUpButton>,
+    tab_icons: Retained<NSSwitch>,
     tab_icon_colors: Retained<NSPopUpButton>,
     minimum_contrast: Retained<NSPopUpButton>,
     shape: Retained<NSPopUpButton>,
@@ -1318,7 +1304,6 @@ define_class!(
                 Key::Scrollbar => choice_at(index).map(SettingsEdit::Scrollbar),
                 Key::ContentEdge => choice_at(index).map(SettingsEdit::ContentEdge),
                 Key::SplitStyle => choice_at(index).map(SettingsEdit::SplitStyle),
-                Key::TabIcons => choice_at(index).map(SettingsEdit::TabIcons),
                 Key::TabIconColors => choice_at(index).map(SettingsEdit::IconColors),
                 Key::ShellIntegration => choice_at(index).map(SettingsEdit::ShellIntegration),
                 Key::Shape => choice_at(index).map(SettingsEdit::Cursor),
@@ -1373,6 +1358,7 @@ define_class!(
                 Some(Key::RemoteIntegration) => Some(SettingsEdit::RemoteIntegration(on)),
                 Some(Key::Ports) => Some(SettingsEdit::ShellPorts(on)),
                 Some(Key::DimSplits) => Some(SettingsEdit::DimUnfocusedSplits(on)),
+                Some(Key::TabIcons) => Some(SettingsEdit::TabIcons(on)),
                 _ => None,
             };
             self.save(edit);
@@ -1709,7 +1695,7 @@ impl SettingsWindow {
         select_choice(&c.scrollbar, settings.scrollbar);
         select_choice(&c.content_edge, settings.content_edge);
         select_choice(&c.split_style, settings.split_style);
-        select_choice(&c.tab_icons, settings.tab_icons);
+        set_switch(&c.tab_icons, settings.tab_icons);
         select_choice(&c.tab_icon_colors, settings.tab_icon_colors);
 
         select_choice(&c.shape, settings.cursor);
@@ -2377,7 +2363,7 @@ impl SettingsWindow {
         let content_edge = self.popup::<ContentEdge>(Key::ContentEdge);
         let dim_splits = self.switch(Key::DimSplits);
         let split_style = self.popup::<SplitStyle>(Key::SplitStyle);
-        let tab_icons = self.popup::<TabIcons>(Key::TabIcons);
+        let tab_icons = self.switch(Key::TabIcons);
         let tab_icon_colors = self.popup::<IconColors>(Key::TabIconColors);
         let mut appearance = Form::new(mtm);
         appearance.row(Key::Theme, "Theme:", &theme, &[&theme], None);
@@ -2459,7 +2445,7 @@ impl SettingsWindow {
             "Tab icons:",
             &tab_icons,
             &[&tab_icons],
-            Some("What a tab shows before its title about the program it runs: a bare mark, a mark in a ring, a mark on a tile, or no icon."),
+            Some("Show the program a tab runs as an icon on a tile before its title. Off: only a small indicator while the tab works, waits or has finished."),
         );
         appearance.row(
             Key::TabIconColors,
@@ -3287,7 +3273,7 @@ mod tests {
                 Key::Ports => SettingsEdit::ShellPorts(false),
                 Key::DimSplits => SettingsEdit::DimUnfocusedSplits(true),
                 Key::SplitStyle => SettingsEdit::SplitStyle(SplitStyle::Lines),
-                Key::TabIcons => SettingsEdit::TabIcons(TabIcons::Tile),
+                Key::TabIcons => SettingsEdit::TabIcons(false),
                 Key::TabIconColors => SettingsEdit::IconColors(IconColors::Brand),
             };
             assert_eq!(edit.path(), key.path(), "{key:?}");
@@ -3353,7 +3339,6 @@ mod tests {
         check::<Scrollbar>();
         check::<ContentEdge>();
         check::<SplitStyle>();
-        check::<TabIcons>();
         check::<IconColors>();
         check::<ShellIntegration>();
         check::<CaretShape>();

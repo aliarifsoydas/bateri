@@ -33,21 +33,20 @@ of every installed copy. A version without a section is not released.
   Code, Kimi CLI), or a drawing for what else a pane spends its time in — the
   shell, an ssh session's server, an editor, a language prompt, a database, a
   container, a system monitor, git, a build or test run, a pager, a file
-  manager, a root shell. The ring that turns while a command runs now goes
-  round the icon, and a question, a finished command, a failure or a transfer
-  sits on its corner. A tab split into panes shows the focused pane's program
-  on a tile with one or two empty tile edges behind it. A command that ends
-  while you look at another tab leaves its icon with the tick or the dot until
-  you come back, so you can read what finished.
-- **Choose how a tab draws its icon, and in which colors.** The new Tab icons
-  setting (Settings ▸ Appearance, `tab_icons`) picks between the bare mark
-  (the default), the mark inside a thin ring that tells the state by its
-  color, the mark on a tile of its kind's color with a line running round
-  the tile's edge while a command runs, and no icon at all — the small
+  manager, a root shell. The mark stands on a tile, like an application's
+  icon; while a command runs a line runs round the tile's edge, and a
+  question, a finished command, a failure or a transfer sits on its corner. A
+  tab split into panes shows a deck: the focused pane's program on the front
+  tile and a smaller tile behind it for each other pane, the front ones
+  turned a little, like cards laid down by hand. A command that ends while you
+  look at another tab leaves its icon with the tick or the dot until you come
+  back, so you can read what finished.
+- **Turn tab icons off, or give them brand colors.** Settings ▸ Appearance ▸
+  Tab icons (`tab_icons`) turns the icons off and brings back the small
   indicator tabs had before. Icon colors (`tab_icon_colors`) lets Claude
-  Code, Antigravity, Gemini CLI and Qwen Code keep their own brand colors
-  instead of the theme's. Show All Tabs lists each tab with its icon too. A
-  change applies at once.
+  Code, Antigravity, Gemini CLI and Qwen Code keep their own brand colors on
+  their tiles instead of the theme's. Show All Tabs lists each tab with its
+  icon too. A change applies at once.
 
 ### Changed
 

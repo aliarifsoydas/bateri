@@ -1736,9 +1736,12 @@ fn keep_looking(wait: bool, looks: u16) -> bool {
 /// What a look at the process table leaves the identity probe to keep and to do: the program it
 /// named, if it did, and whether to look again at the next output — only while neither it nor the
 /// command's line has named one. A line that names a program is enough to rest on: the table
-/// would only second it.
+/// would only second it. A shell in the foreground is no answer and looks again: it is most often
+/// a program's launcher in the moment before it replaces itself with the program (Pi's `sh`,
+/// Cursor CLI's `bash`), and kept as one it would stand over the line that named the program.
 fn after_table(seen: Seen, line: Option<Kind>) -> (Option<Kind>, bool) {
     match seen {
+        Seen::Kind(Kind::Shell) => (None, true),
         Seen::Kind(kind) => (Some(kind), false),
         Seen::Waiting | Seen::Nothing => (None, line.is_none()),
     }
@@ -3305,6 +3308,15 @@ impl TerminalPane {
         // thread, so where the last reference drops is clear (see `shutdown`).
         let _ = self.ivars().session.set(Arc::clone(&session));
         let _ = self.ivars().shell_parent.set(shell_parent);
+        // A pane carried over mid-command (an update, a crash) saw that command start in the
+        // process it came from, and no start comes here to look its program up: it is looked up
+        // now, or the tab would show the shell until the next command.
+        if adopting
+            && session.running_command().is_some()
+            && self.ivars().wake.identity_probe.command_started()
+        {
+            self.ivars().wake.dispatch_identity_probe(None);
+        }
         // The host marks' list at birth; its live change comes
         // from `AppDelegate::reload_settings` ([`Self::set_host_marks`]).
         session.set_host_marks(&settings.remote_hosts);
@@ -5582,6 +5594,11 @@ mod tests {
         assert_eq!(
             after_table(Seen::Waiting, Some(Kind::Editor)),
             (None, false)
+        );
+        assert_eq!(
+            after_table(Seen::Kind(Kind::Shell), Some(Kind::Agent(Agent::Pi))),
+            (None, true),
+            "a launcher script before it execs is no answer, and does not hide the line"
         );
     }
 

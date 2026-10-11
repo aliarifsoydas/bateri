@@ -122,8 +122,9 @@ const ROWS: [Row; 19] = [
     },
     Row {
         kind: Kind::Agent(Agent::Antigravity),
-        names: &["antigravity"],
-        apps: &["antigravity"],
+        // `agy` is the command its installer puts on the path.
+        names: &["antigravity", "agy"],
+        apps: &["antigravity", "agy"],
     },
     Row {
         kind: Kind::Agent(Agent::GeminiCli),
@@ -132,7 +133,8 @@ const ROWS: [Row; 19] = [
     },
     Row {
         kind: Kind::Agent(Agent::Pi),
-        names: &["pi"],
+        // Its npm package, the script's when the process keeps node's argv.
+        names: &["pi", "pi-coding-agent"],
         apps: &["pi"],
     },
     Row {
@@ -261,8 +263,33 @@ fn package_of(path: &str) -> Option<&str> {
     }
 }
 
+/// The stems a bundled program's entry point has, which name nothing: the program is the folder
+/// it sits in (Cursor CLI runs `…/cursor-agent/versions/2025.09.18-7ae6800/index.js`).
+const ENTRY_STEMS: [&str; 3] = ["index", "cli", "main"];
+
+/// The folder an entry point belongs to: the nearest above it that is not a version (it starts
+/// with a digit) or a build's output.
+fn folder_of(script: &str) -> Option<&str> {
+    script.rsplit('/').skip(1).find(|folder| {
+        !folder.starts_with(|c: char| c.is_ascii_digit())
+            && !matches!(
+                *folder,
+                "versions"
+                    | "releases"
+                    | "current"
+                    | "dist"
+                    | "bundle"
+                    | "build"
+                    | "out"
+                    | "lib"
+                    | "bin"
+                    | "src"
+            )
+    })
+}
+
 /// The kind an interpreter's script is: its file name without the extension,
-/// else its package.
+/// else its package, else — for an entry point that names nothing — its folder.
 fn of_script(script: &str) -> Option<Kind> {
     let file = base(script);
     let stem = match file.rsplit_once('.') {
@@ -271,7 +298,15 @@ fn of_script(script: &str) -> Option<Kind> {
         }
         _ => file,
     };
-    by_name(stem).or_else(|| package_of(script).and_then(by_name))
+    by_name(stem)
+        .or_else(|| package_of(script).and_then(by_name))
+        .or_else(|| {
+            ENTRY_STEMS
+                .contains(&stem)
+                .then(|| folder_of(script))
+                .flatten()
+                .and_then(by_name)
+        })
 }
 
 /// One process of the foreground group, as the decision reads it.
@@ -342,6 +377,11 @@ fn of_process(process: &Process) -> Option<Kind> {
         return Some(kind);
     }
     let record = process.member.candidate.as_ref()?.record.as_ref()?;
+    // A program that renames itself (Node's `process.title`: Pi does) writes its name over the
+    // interpreter's argv, so the script is gone and argv's first word is all that names it.
+    if let Some(kind) = record.args.first().and_then(|first| by_name(base(first))) {
+        return Some(kind);
+    }
     let args = record.args.get(1..).unwrap_or_default();
     match Family::of_name(&process.name)? {
         Family::Node => node_script(args).and_then(|(script, _)| of_script(script)),
@@ -670,11 +710,12 @@ mod tests {
     use super::*;
     use crate::jobs::tests::{Table, login_shell};
 
-    const AGENTS: [(&str, Agent); 12] = [
+    const AGENTS: [(&str, Agent); 13] = [
         ("claude", Agent::ClaudeCode),
         ("codex", Agent::Codex),
         ("opencode", Agent::OpenCode),
         ("antigravity", Agent::Antigravity),
+        ("agy", Agent::Antigravity),
         ("gemini", Agent::GeminiCli),
         ("pi", Agent::Pi),
         ("herdr", Agent::Herdr),
@@ -774,6 +815,53 @@ mod tests {
             &[],
         );
         assert_eq!(seen(&linux), kind(agent(Agent::ClaudeCode)));
+        // A program that renamed itself: the interpreter's argv is its name alone.
+        let retitled = login_shell(200).exec(
+            200,
+            101,
+            200,
+            ("node", "/opt/homebrew/bin/node"),
+            &["pi", ""],
+            &[],
+        );
+        assert_eq!(seen(&retitled), kind(agent(Agent::Pi)));
+        // A bundled entry point names nothing; the folder it is installed in does.
+        let bundled = login_shell(200).exec(
+            200,
+            101,
+            200,
+            (
+                "node",
+                "/Users/u/.local/share/cursor-agent/versions/2025.09.18-7ae6800/node",
+            ),
+            &[
+                "node",
+                "--use-system-ca",
+                "/Users/u/.local/share/cursor-agent/versions/2025.09.18-7ae6800/index.js",
+            ],
+            &[],
+        );
+        assert_eq!(seen(&bundled), kind(agent(Agent::CursorCli)));
+        let pi = "/Users/u/.pi/agent/install/releases/1.0.4/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js";
+        let packaged = login_shell(200).exec(
+            200,
+            101,
+            200,
+            ("node", "/usr/local/bin/node"),
+            &["node", pi],
+            &[],
+        );
+        assert_eq!(seen(&packaged), kind(agent(Agent::Pi)));
+        // A project's own entry point is not taken for a program by its folder's name.
+        let project = login_shell(200).exec(
+            200,
+            101,
+            200,
+            ("node", "/usr/local/bin/node"),
+            &["node", "/Users/u/Projects/shop/dist/index.js"],
+            &[],
+        );
+        assert_eq!(seen(&project), Seen::Nothing);
     }
 
     #[test]

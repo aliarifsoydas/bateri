@@ -153,6 +153,9 @@ objc2-foundation = { workspace = true, features = [
 # (`window::listed_title`): `NSStringDrawing` measures it in the menu font
 # (`sizeWithAttributes:`). Only a header flag over headers already in the set;
 # `Cargo.lock` did not move.
+# A split tab's deck of icons leans a little (`tab_bar`): `NSAffineTransform`
+# brings AppKit's `concat`, which turns what is drawn next. Only a header flag
+# over `objc2-foundation` headers already in its set; `Cargo.lock` did not move.
 objc2-app-kit = { workspace = true, features = [
     "NSAccessibility", "NSAlert", "NSAppearance", "NSBox", "NSButton", "NSCell", "NSClipView",
     "NSColor", "NSControl", "NSDragging", "NSFont", "NSFontDescriptor", "NSGridView", "NSImage",
@@ -169,7 +172,7 @@ objc2-app-kit = { workspace = true, features = [
     "NSScreen", "NSWindowRestoration", "NSScroller", "NSTrackingArea", "NSAttributedString",
     "NSToolbar", "NSBezierPath", "NSAccessibilityConstants", "NSAccessibilityProtocols",
     "NSGradient", "NSPasteboardItem", "NSStringDrawing", "NSVisualEffectView",
-    "NSGraphicsContext",
+    "NSGraphicsContext", "NSAffineTransform",
 ] }
 # Only for the CALayer type: NSView::setLayer(Option<&CALayer>) wants it.
 # The layer rules record this as "only attaching a CALayer".

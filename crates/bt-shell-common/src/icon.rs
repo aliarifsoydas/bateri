@@ -422,7 +422,7 @@ static SHELL: Icon = Icon {
 static REMOTE: Icon = Icon {
     name: "Remote session",
     art: Art::Path(Shape {
-        d: "M2 2.2h8v3.3H2ZM2 6.5h8v3.3H2ZM3.9 3.85h.01M3.9 8.15h.01",
+        d: "M1.5 1.25h9V5h-9ZM1.5 7h9v3.75h-9ZM3.75 3.125h.01M3.75 8.875h.01",
         view_box: ViewBox::square(12.0),
         paint: Paint::Stroke {
             width: STROKE_WIDTH,
