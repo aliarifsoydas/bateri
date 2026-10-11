@@ -12,6 +12,8 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-12
+
 ### Added
 
 - **24 well-known themes, built in.** View ▸ Theme ▸ and the settings window
