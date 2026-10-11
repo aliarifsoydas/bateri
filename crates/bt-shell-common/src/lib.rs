@@ -20,8 +20,8 @@
 //! shared memory and `bateri compact` (`journal`), the saved
 //! session layout and its file (`restore`), the
 //! process table (`jobs`), which program reads the keyboard and its guide
-//! bar (`program`), the shell's birth (`child`) and file watching
-//! (`watch`).
+//! bar (`program`), the drawing that stands for a program in a tab (`icon`),
+//! the shell's birth (`child`) and file watching (`watch`).
 //!
 //! **The boundary:** no AppKit, Foundation, Quartz or notification centre —
 //! whatever needs the toolkit stays in the platform shell (`bt-shell-macos` on
@@ -40,6 +40,7 @@ pub mod focus;
 pub mod gesture;
 pub mod grid;
 pub mod handover;
+pub mod icon;
 pub mod jobs;
 pub mod journal;
 pub mod keys;
