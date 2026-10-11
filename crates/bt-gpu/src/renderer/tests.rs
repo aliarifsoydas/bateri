@@ -987,7 +987,7 @@ fn a_negative_viewport_origin_draws_and_clips_from_the_top() {
     // out alive.
     frame.set_origin_rows(-FILL_PX / f32::from(CELL));
     frame.set_dock_rows(1);
-    frame.open_dock(blue, WHITE, WHITE);
+    frame.open_dock(blue, WHITE, WHITE, blue);
     let pixels = render_offscreen(&r, EDGE, ACCENT, &frame);
     assert!(
         near(pixel_at(&pixels, EDGE, 14, 12), (0, 0, 255)),
@@ -1223,6 +1223,48 @@ fn command_marks_paint_the_gutter_on_the_gpu() {
 }
 
 #[test]
+fn the_context_row_stands_on_its_own_tone_with_no_line_between_the_rows() {
+    // **The two rows are told apart by tone, not by a line.** Only pixels can say that the
+    // tone lands on the context row and nowhere else, and that nothing white (the line's
+    // colour here) is left between the rows: the only line in the dock is the top one.
+    let r = renderer();
+    const EDGE: usize = 32;
+    const CELL: u16 = 8;
+    let green = LinearRgba::from_srgb(0x00, 0xff, 0x00);
+    let blue = LinearRgba::from_srgb(0x00, 0x00, 0xff);
+    // Saturated colours (fixed points of the sRGB transfer function), as in the neighbouring
+    // dock tests, so they can be asked with byte equality.
+
+    // A two-row dock: 16 pixels, input row at 16..24 and context row at 24..32, no margin.
+    let mut frame = Frame::default();
+    frame.clear(grid(CELL, CELL), CaretStyle::default());
+    frame.set_dock_rows(2);
+    frame.open_dock(green, WHITE, WHITE, blue);
+
+    let pixels = render_offscreen(&r, EDGE, ACCENT, &frame);
+    let pixel = |x: usize, y: usize| pixel_at(&pixels, EDGE, x, y);
+
+    assert_eq!(pixel(14, 16), (255, 255, 255), "the top line is gone");
+    assert_eq!(pixel(14, 20), (0, 255, 0), "the input row's ground");
+    assert_eq!(
+        pixel(14, 23),
+        (0, 255, 0),
+        "the input row's ground, to its end"
+    );
+    assert_eq!(
+        pixel(14, 24),
+        (0, 0, 255),
+        "the tone starts at the row boundary"
+    );
+    assert_eq!(pixel(14, 31), (0, 0, 255), "the tone runs to the bottom");
+    for x in [0, 14, 31] {
+        for y in 17..EDGE {
+            assert_ne!(pixel(x, y), (255, 255, 255), "a line is left at ({x}, {y})");
+        }
+    }
+}
+
+#[test]
 fn the_dock_paints_the_bottom_band_and_the_sliding_grid_cannot_reach_it() {
     // **Phase-3's CPU-to-GPU seam.** The second `setViewport` claims two things at once and
     // both can only be read from pixels: the dock sticks to the **bottom** of the texture, and
@@ -1253,7 +1295,7 @@ fn the_dock_paints_the_bottom_band_and_the_sliding_grid_cannot_reach_it() {
     frame.push(bg_cell(0, 0, red));
     frame.push_dock(bg_cell(0, 0, blue));
     frame.set_dock_rows(1);
-    frame.open_dock(green, WHITE, WHITE);
+    frame.open_dock(green, WHITE, WHITE, green);
 
     let pixels = render_offscreen(&r, EDGE, ACCENT, &frame);
     let pixel = |x: usize, y: usize| pixel_at(&pixels, EDGE, x, y);
@@ -1310,7 +1352,7 @@ fn the_dock_paints_the_bottom_band_and_the_sliding_grid_cannot_reach_it() {
 #[test]
 fn no_band_paints_no_dock_pixel_and_the_grid_reaches_the_bottom() {
     // **No band** (a program reading the keyboard itself): the surface is open but the
-    // band's height is zero — the ground and both hairlines must not reach a single pixel,
+    // band's height is zero — the ground, the hairline and the tone must not reach a single pixel,
     // and the grid, the whole share lower, owns the window's bottom. Asked of pixels, not of
     // the zero-size instances: a viewport set at the texture's bottom edge is the renderer's
     // to clip.
@@ -1326,7 +1368,7 @@ fn no_band_paints_no_dock_pixel_and_the_grid_reaches_the_bottom() {
     // A one-row share, settled at no band: the excess is the whole share.
     frame.set_dock_share(1);
     frame.set_dock_band(EDGE as f32, -1.0);
-    frame.open_dock(green, WHITE, WHITE);
+    frame.open_dock(green, WHITE, WHITE, green);
     assert_eq!(frame.dock_band_px(), 0.0);
 
     let pixels = render_offscreen(&r, EDGE, ACCENT, &frame);
@@ -1374,7 +1416,7 @@ fn a_growing_band_reveals_its_rows_from_the_bottom() {
         frame.push_dock(bg_cell(0, 2, blue));
         frame.push_dock(bg_cell(0, 3, red));
         frame.set_dock_band(EDGE as f32, extra);
-        frame.open_dock(green, WHITE, WHITE);
+        frame.open_dock(green, WHITE, WHITE, green);
         render_offscreen(&r, EDGE, ACCENT, &frame)
     };
 
@@ -1468,7 +1510,7 @@ fn the_dock_draws_glyphs_and_its_own_caret() {
         true,
     );
     frame.set_dock_rows(1);
-    frame.open_dock(red, WHITE, WHITE);
+    frame.open_dock(red, WHITE, WHITE, red);
 
     let pixels = render_offscreen(&r, EDGE, ACCENT, &frame);
     // The dock is anchored to the **bottom** of the texture, not counted in cells from the top:
@@ -1522,7 +1564,7 @@ fn an_upload_button_paints_a_fill_and_a_brighter_edge_in_the_dock() {
         let mut frame = Frame::default();
         frame.clear(grid(cw, ch), CaretStyle::default());
         frame.set_dock_rows(1);
-        frame.open_dock(black, black, black);
+        frame.open_dock(black, black, black, black);
         frame.set_dock_buttons([
             None,
             Some(DockButton {
@@ -1612,7 +1654,7 @@ fn scroll_bar_with_blocks(
     frame.clear(cell, CaretStyle::default());
     frame.set_dock_rows(1);
     let ground = LinearRgba::from_srgb(0xff, 0x00, 0x00);
-    frame.open_dock(ground, ground, ground);
+    frame.open_dock(ground, ground, ground, ground);
     frame.set_dock_band(edge as f32, 0.0);
     let floor = frame.band_top_px(edge as f32);
     let position = bt_core::ScrollPosition {
@@ -3383,7 +3425,7 @@ fn dock_fx_frame(cell_px: (u16, u16), cells: &[Cell], fx: &[Fx]) -> Frame {
     }
     frame.set_dock_fx(fx.iter().copied(), &Clusters::default(), HEAT);
     frame.set_dock_rows(1);
-    frame.open_dock(BACKGROUND, BACKGROUND, BACKGROUND);
+    frame.open_dock(BACKGROUND, BACKGROUND, BACKGROUND, BACKGROUND);
     frame
 }
 
@@ -3864,7 +3906,7 @@ fn dock_glyph_stays_inside_its_band() {
             ..glyph_cell(1, 'É', None)
         });
         frame.set_dock_rows(1);
-        frame.open_dock(BACKGROUND, BACKGROUND, BACKGROUND);
+        frame.open_dock(BACKGROUND, BACKGROUND, BACKGROUND, BACKGROUND);
         let band_top = EDGE - frame.dock_layout_px() as usize;
         assert_eq!(band_top, EDGE - ch, "the band is one row @{scale}x");
         let pixels = render_offscreen(&r, EDGE, ACCENT, &frame);
@@ -3905,7 +3947,7 @@ fn arrival_effect_matches_static_glyph_below_one() {
         frame.push_dock(cell);
         frame.set_dock_fx(fx.iter().copied(), &Clusters::default(), HEAT);
         frame.set_dock_rows(1);
-        frame.open_dock(BACKGROUND, BACKGROUND, BACKGROUND);
+        frame.open_dock(BACKGROUND, BACKGROUND, BACKGROUND, BACKGROUND);
         frame
     };
     let cell = Cell {
@@ -4217,7 +4259,7 @@ fn the_scroll_bar_and_the_dock_do_not_fade() {
     frame.push(bg_cell(0, 0, WHITE));
     frame.set_dock_rows(1);
     frame.push_dock(glyph_cell(0, 'M', None));
-    frame.open_dock(red, red, red);
+    frame.open_dock(red, red, red, red);
     frame.set_dock_band(EDGE as f32, 0.0);
     let floor = frame.band_top_px(EDGE as f32);
     let position = bt_core::ScrollPosition {
@@ -4274,7 +4316,7 @@ fn a_dock_climbing_to_the_top_does_not_fade_without_a_bar() {
     frame.clear(grid(cw, ch), CaretStyle::default());
     frame.set_dock_rows(2);
     frame.push_dock(glyph_cell(0, 'M', None));
-    frame.open_dock(red, red, red);
+    frame.open_dock(red, red, red, red);
     assert!(
         frame.dock_layout_px() >= EDGE as f32,
         "the dock does not reach the window's top"

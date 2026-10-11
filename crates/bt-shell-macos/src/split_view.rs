@@ -1038,8 +1038,7 @@ impl SplitView {
             only.setHidden(false);
             only.set_card(false);
             let (left, right) = self.corners_of(self.bounds_rect(), false);
-            only.set_corners(left, right);
-            only.setFrame(self.bounds());
+            only.place(self.bounds(), left, right);
             self.sync_handles(&[]);
             self.ground_follows();
             return;
@@ -1055,15 +1054,17 @@ impl SplitView {
                 Some((_, rect)) => {
                     pane.setHidden(false);
                     pane.set_card(carded);
-                    // Before the frame: the pane's last geometry is then the
-                    // one the frame's resize takes, with the corners already
-                    // known.
+                    // Together with the frame: the frame's resize takes the
+                    // geometry once, with the corners already known.
                     let (left, right) = self.corners_of(*rect, carded);
-                    pane.set_corners(left, right);
-                    pane.setFrame(NSRect::new(
-                        NSPoint::new(rect.x, rect.y),
-                        NSSize::new(rect.width, rect.height),
-                    ));
+                    pane.place(
+                        NSRect::new(
+                            NSPoint::new(rect.x, rect.y),
+                            NSSize::new(rect.width, rect.height),
+                        ),
+                        left,
+                        right,
+                    );
                 }
                 None => pane.setHidden(true),
             }

@@ -3747,11 +3747,35 @@ impl TerminalPane {
     /// corner (the rule is [`CellMetrics::with_corners`]'s). The container
     /// calls it on every layout, which the window repeats when full screen
     /// comes or goes; a value that is not a radius (NaN, negative, infinite)
-    /// is a square corner. The geometry is taken again when the value moves —
-    /// and only then: the temporary look of the arrangement
+    /// is a square corner and an absurdly large one is capped
+    /// ([`CellMetrics::with_corners`]). The geometry is taken again when the
+    /// value moves — and only then: the temporary look of the arrangement
     /// ([`crate::arrange`]) does not tell corners, since a column count that
     /// moved would send the shell a `SIGWINCH` for a look that lasts a moment.
     pub fn set_corners(&self, left: f64, right: f64) {
+        if self.take_corners(left, right) {
+            self.refresh_geometry();
+        }
+    }
+
+    /// Sets the corners and the frame together, for a container that moves a
+    /// pane and rounds it in one layout: the frame's own notification takes
+    /// the geometry once, with the new corners already in it, so the shell
+    /// never gets the size of a pane that was never drawn (the old frame with
+    /// the new corners). When the frame does not move there is no
+    /// notification and the corners alone take the geometry again.
+    pub(crate) fn place(&self, frame: NSRect, left: f64, right: f64) {
+        let moved = self.take_corners(left, right);
+        let same_frame = self.frame() == frame;
+        self.setFrame(frame);
+        if moved && same_frame {
+            self.refresh_geometry();
+        }
+    }
+
+    /// Stores the corners (a value that is not a radius is square) and says
+    /// whether they moved; the geometry is the caller's to take.
+    fn take_corners(&self, left: f64, right: f64) -> bool {
         let radius = |value: f64| {
             if value.is_finite() {
                 value.max(0.0)
@@ -3760,9 +3784,7 @@ impl TerminalPane {
             }
         };
         let corners = (radius(left), radius(right));
-        if self.ivars().corners.replace(corners) != corners {
-            self.refresh_geometry();
-        }
+        self.ivars().corners.replace(corners) != corners
     }
 
     /// The renderer's metrics at `scale` with this pane's corners applied:

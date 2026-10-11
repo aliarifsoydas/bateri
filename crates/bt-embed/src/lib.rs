@@ -731,8 +731,9 @@ pub unsafe extern "C" fn bt_pane_set_hidden(pane: *mut BtPane, hidden: bool) -> 
 /// Tells the pane the radii, in points, of its bottom left and right corners — the curves of the
 /// window or card it stands in, which the text keeps clear of: the columns, the prompt row and
 /// the pointer start further in beside a round corner. A host that does not say leaves both at
-/// zero, a square corner. A value that is not a radius (NaN, negative) is a square corner. The
-/// pane takes its geometry again when a radius moves, so call it on layout, not per frame.
+/// zero, a square corner. A value that is not a radius (NaN, negative, infinite) is a square
+/// corner, and one past 64 points is taken as 64. The pane takes its geometry again when a radius
+/// moves, so call it on layout, not per frame.
 ///
 /// # Safety
 /// As [`bt_pane_start`].

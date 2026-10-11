@@ -129,7 +129,7 @@ impl Entrance {
     }
 }
 
-/// How one of the dock's two lines comes in.
+/// How the top line or the context row's tone comes in.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Line {
     /// There from the start.
@@ -164,10 +164,9 @@ struct Calendar {
     letters_entrance: Entrance,
     /// Whether the dock climbs from [`RISE_PT`] below its place.
     rise: bool,
-    /// The dock's fade-in (ground and lines).
+    /// The dock's fade-in (ground, line and tone).
     band: f32,
-    /// How the top line and the one between the input and the context row
-    /// come in.
+    /// How the top line and the context row's tone come in.
     lines: [Line; 2],
     /// Whether the top line ripples: it waves while the shell starts and a
     /// ring spreads from the › when it speaks.
@@ -185,7 +184,7 @@ struct Calendar {
 }
 
 /// What the dock does at the first prompt: it climbs a little as it fades in,
-/// its two lines are drawn from the left, the › pops in, the path and the
+/// its top line and the context row's tone are drawn from the left, the › pops in, the path and the
 /// branch type themselves out column by column and the cursor comes last.
 const TYPED: Calendar = Calendar {
     entrance: Entrance::Pop,
@@ -202,7 +201,7 @@ const TYPED: Calendar = Calendar {
 
 /// What the dock does at the first prompt when its top line has been rippling:
 /// the › pops in and a ring spreads from it along the line, which settles
-/// flat; the second line is drawn from the left and the context row fades in
+/// flat; the context row's tone is drawn from the left and the row fades in
 /// all at once, the cursor right behind it.
 const RIPPLED: Calendar = Calendar {
     entrance: Entrance::Pop,
@@ -220,8 +219,8 @@ const RIPPLED: Calendar = Calendar {
 /// What the dock does at the first prompt when dust has been drifting around
 /// it: the ground is there at once (the dust is pulled across it), the dust
 /// lands on the top line from left to right and the line is woven behind it,
-/// the › pops in as the first motes land, the second line is drawn from the
-/// left and the context row fades in all at once, the cursor just before it.
+/// the › pops in as the first motes land, the context row's tone is drawn from
+/// the left and the row fades in all at once, the cursor just before it.
 const DUSTED: Calendar = Calendar {
     entrance: Entrance::Pop,
     letters_entrance: Entrance::Fade,
@@ -293,9 +292,11 @@ impl Default for Arrival {
 pub(crate) struct Scene {
     /// The share of [`RISE_PT`] the dock still has to climb, `1 → 0`.
     pub(crate) rise: f32,
-    /// The ground's and the lines' opacity.
+    /// The ground's, the line's and the tone's opacity.
     pub(crate) band: f32,
-    /// How much of its width each line has drawn.
+    /// How much of its width each of the two has drawn: `[0]` the top line,
+    /// `[1]` the context row's tone, which opens from the left the way the
+    /// line between the rows used to.
     pub(crate) lines: [f32; 2],
     /// The › entrance's progress, `0 →1`; the curve is the shader's.
     pub(crate) mark: f32,
@@ -1252,7 +1253,7 @@ mod tests {
         arrival.advance(BORN + 1.2 + 0.1, true);
         let middle = arrival.scene().expect("armed");
         assert!(middle.mark > 0.0, "{middle:?}");
-        assert_eq!(middle.lines[1], 0.0, "the second line starts at 120 ms");
+        assert_eq!(middle.lines[1], 0.0, "the tone starts at 120 ms");
         assert_eq!(middle.caret, 0.0);
         arrival.advance(BORN + 1.2 + 0.15, true);
         assert!(arrival.scene().expect("armed").lines[1] > 0.0);
@@ -1397,7 +1398,7 @@ mod tests {
         arrival.advance(BORN + 1.2 + 0.31, true);
         let middle = arrival.scene().expect("armed");
         assert!(middle.mark > 0.0, "{middle:?}");
-        assert!(middle.lines[1] > 0.0, "the second line starts at 300 ms");
+        assert!(middle.lines[1] > 0.0, "the tone starts at 300 ms");
         assert_eq!(middle.letter(0), 0.0, "the context row starts at 330 ms");
         assert!(
             middle.caret > 0.0,

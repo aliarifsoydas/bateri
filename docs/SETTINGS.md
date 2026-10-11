@@ -1302,8 +1302,8 @@ files take, the longer that is):
   prompt mark and the cursor stand while the shell starts and the folder and
   branch fill in with the first prompt.
 - **`"type"`** — nothing shows while the shell starts. At the first prompt the
-  dock rises a little (about 10 points) as it fades in, its two lines are drawn
-  from the left, the prompt mark pops in, the folder and branch type
+  dock rises a little (about 10 points) as it fades in, its line and the folder
+  row's tone are drawn from the left, the prompt mark pops in, the folder and branch type
   themselves out letter by letter and the cursor comes last.
 - **`"dust"`** — specks of dust drift around the dock while the shell starts.
   At the first prompt they are drawn left to right onto the top line, which is

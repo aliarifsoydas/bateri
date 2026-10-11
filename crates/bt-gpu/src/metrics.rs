@@ -72,13 +72,27 @@ fn points_px(pt: f64, scale: f64) -> f64 {
     (pt * scale).round().max(0.0)
 }
 
+/// The largest corner radius the margin follows, in points: a window's
+/// corner is a few tens of points at most, and a host that passes something
+/// absurd must not eat the width (it would leave no columns). A cap, not a
+/// measurement.
+const MAX_CORNER_PT: f64 = 64.0;
+
 /// The side margin for a corner of `corner_pt` points: `max(gutter, corner −
 /// gutter)`, in pixels ([`CellMetrics::with_corners`] is the rule's doc). A
-/// corner that is not a radius (NaN, negative) is zero through
-/// [`points_px`], so it leaves the gutter; `as u16` stops a huge one at 65535.
+/// corner that is not a radius (NaN, infinite, negative) is square and leaves
+/// the gutter; one past [`MAX_CORNER_PT`] is capped there. The **one** place
+/// that decides either, so the pane and the C host can pass what they have.
 fn side_px(gutter_px: u16, corner_pt: f64, scale: f64) -> u16 {
     let gutter = f64::from(gutter_px);
-    (points_px(corner_pt, scale) - gutter).max(gutter) as u16
+    let corner = if corner_pt.is_finite() {
+        corner_pt.clamp(0.0, MAX_CORNER_PT)
+    } else {
+        0.0
+    };
+    // audit: at most 64 pt · scale, far inside `u16` at any real scale; the
+    // cast saturates at 65535 for a degenerate one.
+    (points_px(corner, scale) - gutter).max(gutter) as u16
 }
 
 // By hand, because the scale is a float: equal bit for bit. The metrics are
@@ -90,6 +104,8 @@ impl PartialEq for CellMetrics {
         self.cell_px == other.cell_px
             && self.context_cell_px == other.context_cell_px
             && self.gutter_px == other.gutter_px
+            && self.side_left_px == other.side_left_px
+            && self.side_right_px == other.side_right_px
             && self.rule_px == other.rule_px
             && self.scale.to_bits() == other.scale.to_bits()
     }
@@ -179,8 +195,9 @@ impl CellMetrics {
     /// of a concentric curve of radius `corner` stands `corner − gutter` from
     /// the side. A 20.5 pt window corner gives 12.5 pt: the first letter is
     /// `gutter` away from the curve, as far as it is from the straight edge.
-    /// A square corner (zero, or a value that is not a radius: NaN, negative)
-    /// and a corner no wider than twice the gutter leave the gutter itself.
+    /// A square corner (zero, or a value that is not a radius: NaN, infinite,
+    /// negative) and a corner no wider than twice the gutter leave the gutter
+    /// itself; a radius past [`MAX_CORNER_PT`] is taken as that.
     ///
     /// The vertical arithmetic is **not** here: the dock's breathing room, the
     /// row gap and the top fade stay on the gutter ([`CellMetrics::gutter_px`]).
@@ -340,10 +357,30 @@ mod tests {
             assert_eq!(metrics.side_left_px(), 16, "{corner}");
             assert_eq!(metrics.side_right_px(), 16, "{corner}");
         }
-        // A huge one stops at the type's end instead of wrapping.
+        // Infinity is not a radius either.
         assert_eq!(
             flat(2.0).with_corners(f64::INFINITY, 0.0).side_left_px(),
-            u16::MAX
+            16
+        );
+        // A huge finite one is capped (64 pt − 8 pt = 56 pt = 112 px at @2x)
+        // instead of eating the width.
+        let huge = flat(2.0).with_corners(1.0e6, 1.0e6);
+        assert_eq!(huge.side_left_px(), 112);
+        assert_eq!(huge.side_right_px(), 112);
+        assert_eq!(flat(2.0).with_corners(64.0, 0.0).side_left_px(), 112);
+    }
+
+    #[test]
+    fn metrics_with_other_margins_are_not_the_same_geometry() {
+        // The equality tells "the geometry moved" from "the same again": the
+        // margins are geometry.
+        let square = flat(2.0);
+        assert_ne!(square, square.with_corners(20.5, 0.0));
+        assert_ne!(square, square.with_corners(0.0, 20.5));
+        assert_eq!(square, square.with_corners(0.0, 0.0));
+        assert_eq!(
+            square.with_corners(20.5, 20.5),
+            flat(2.0).with_corners(20.5, 20.5)
         );
     }
 

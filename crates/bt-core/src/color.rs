@@ -728,15 +728,40 @@ impl Theme {
     /// theme gets its own ground from its own colours; the steps are larger
     /// on a dark theme, where a small difference from black does not show.
     pub const fn ground_srgb(&self) -> [[u8; 3]; 2] {
-        let (lift, start, end) = if self.is_dark() {
-            (8, 38, 28)
-        } else {
-            (4, 28, 22)
-        };
-        let base = toward(self.background_rgb(), rgb(self.foreground), lift);
+        let (start, end) = if self.is_dark() { (38, 28) } else { (28, 22) };
+        let base = self.band_rgb();
         let start = toward(base, rgb(self.accent), start);
         let end = toward(base, rgb(self.cursor), end);
         [[start.r, start.g, start.b], [end.r, end.g, end.b]]
+    }
+
+    /// The tone the dock's folder row stands on, **linear** RGBA: the
+    /// background lifted a step toward the foreground — a dark theme's row is
+    /// lighter than the input row above it, a light theme's darker — so the
+    /// two rows read as two surfaces without a line between them.
+    ///
+    /// **Not a role but a value derived from two** (a role that isn't drawn
+    /// isn't added), and the very step the split tab's ground starts from
+    /// ([`Theme::ground_srgb`]): one rule for "a surface a step above the
+    /// panes", so the two can't drift apart. The step is larger on a dark
+    /// theme, where a small difference from black does not show; another
+    /// theme gets its own tone from its own colours.
+    pub const fn band_linear(&self) -> LinearRgba {
+        linear_rgba(self.band_rgb())
+    }
+
+    /// The folder row's tone, as **sRGB** bytes (`[r, g, b]`), for the tests
+    /// to read the colour as a person writes it; the path to the GPU is
+    /// [`Theme::band_linear`], both from the same value.
+    #[cfg(test)]
+    pub(crate) const fn band_srgb(&self) -> [u8; 3] {
+        let Rgb { r, g, b } = self.band_rgb();
+        [r, g, b]
+    }
+
+    const fn band_rgb(&self) -> Rgb {
+        let lift = if self.is_dark() { 8 } else { 4 };
+        toward(self.background_rgb(), rgb(self.foreground), lift)
     }
 
     /// The hairlines' color, **linear** RGBA.
@@ -1351,6 +1376,38 @@ mod tests {
             Theme::BATERI_LIGHT.ground_srgb(),
             [[0xbc, 0xc9, 0xdc], [0xd7, 0xd0, 0xbf]]
         );
+    }
+
+    #[test]
+    fn the_band_is_one_step_toward_the_foreground() {
+        // Black lifted 8 % toward the foreground; Linen (light) 4 %.
+        assert_eq!(Theme::BATERI.band_srgb(), [0x11, 0x11, 0x12]);
+        assert_eq!(Theme::LINEN.band_srgb(), [0xeb, 0xe7, 0xdf]);
+        // The GPU's value is the same colour, not a second computation.
+        for theme in [Theme::BATERI, Theme::BATERI_LIGHT, Theme::LINEN] {
+            let [r, g, b] = theme.band_srgb();
+            assert_eq!(theme.band_linear(), LinearRgba::from_srgb(r, g, b));
+            assert_ne!(
+                theme.band_linear(),
+                theme.background_linear(),
+                "the band must be told apart from the background"
+            );
+        }
+    }
+
+    #[test]
+    fn the_band_is_the_base_the_ground_leans_from() {
+        // One copy of "a step above the panes": with nothing to lean toward
+        // (accent and cursor are the band itself) the ground is the band.
+        for theme in [Theme::BATERI, Theme::LINEN] {
+            let [r, g, b] = theme.band_srgb();
+            let flat = Theme {
+                accent: u32::from_be_bytes([0, r, g, b]),
+                cursor: u32::from_be_bytes([0, r, g, b]),
+                ..theme
+            };
+            assert_eq!(flat.ground_srgb(), [[r, g, b]; 2]);
+        }
     }
 
     #[test]

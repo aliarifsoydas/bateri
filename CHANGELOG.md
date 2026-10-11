@@ -64,9 +64,16 @@ of every installed copy. A version without a section is not released.
   the path did on the left. They now end the same distance from the right edge
   as the text starts from the left one, at every width; the path keeps its
   place beside the prompt's ›, and a click or hover lands on what is drawn.
-- **The dock's two lines are a point thick.** The line above the input row
-  and the one above the folder row were a single pixel, which looked faint
-  on a Retina display; they now keep the same weight at every scale.
+- **The folder row has a tone of its own.** The line between the input row and
+  the row with the folder, branch, ports and buttons is gone; the folder row
+  now stands on a slightly lighter (on a light theme, darker) ground than the
+  input above it, running to the window's bottom edge, and the two rows read
+  as two surfaces without a rule. On a remote session, where the dock is only
+  that row, the whole dock takes the tone. A new tab brings the tone in from
+  the left, the way the line used to be drawn.
+- **The dock's line is a point thick.** The line above the input row was a
+  single pixel, which looked faint on a Retina display; it now keeps the same
+  weight at every scale.
 - **The running ring in a tab now turns smoothly.** It used to jump a twelfth
   of a turn every second, which read as stuttering; it now goes round at an
   even pace (twelve seconds a turn, twelve minutes once a command has run for

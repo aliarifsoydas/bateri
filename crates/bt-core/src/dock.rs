@@ -55,12 +55,20 @@ pub struct Dock {
     /// unmarked), under a program's guide bar the bar's tone, otherwise
     /// [`Self::separator`].
     ///
-    /// A separate field, because the second hairline (between the input block
-    /// and the context row) does not convey distance — that is a division,
-    /// this is the surface's edge.
+    /// A separate field, because this line says the distance (the host, the
+    /// program) while [`Self::separator`] is only the theme's quiet hairline.
     pub edge: LinearRgba,
-    /// The hairline separating the input block from the context row.
+    /// The theme's hairline color: the top hairline's when nothing else
+    /// colors it ([`Self::edge`]) and the upload track's on an unmarked host.
+    /// There is no line between the input block and the context row any more,
+    /// the tone ([`Self::band`]) is what tells them apart.
     pub separator: LinearRgba,
+    /// The context row's tone: the ground a step toward the foreground
+    /// ([`Theme::band_linear`]). It covers the row from the middle of the gap
+    /// above it to the surface's bottom edge — the whole surface when the
+    /// dock is only a context row (a remote session, a program's guide bar).
+    /// Must be **opaque**, like [`Self::ground`].
+    pub band: LinearRgba,
     /// The caret's place in the input block — row **and** column: a long
     /// line wraps, so the caret can stand on the second visual row too. The
     /// row is inside the vertical window, dock-local (`0` = the first drawn
@@ -103,7 +111,7 @@ pub struct Dock {
     /// marked host, the separator's on an unmarked one. The filled part is
     /// always the theme's `info` ([`Self::edge`]) — a red filling bar on prod
     /// read like an error (the user, visual check). A separate field, because
-    /// [`Self::separator`] is also the second hairline's color.
+    /// [`Self::separator`] is also the top hairline's default color.
     pub track: LinearRgba,
     /// The buttons of the upload row, left to right; at most
     /// two. The cells (label) flow from the sink, the fill and border from
@@ -1485,6 +1493,7 @@ pub(crate) fn render_with(
             (None, None, None) => theme.separator_linear(),
         },
         separator: theme.separator_linear(),
+        band: theme.band_linear(),
         caret: None,
         caret_text: theme.background_linear(),
         // With no input row (remote session) there is no mark either:
@@ -4634,7 +4643,7 @@ mod tests {
     #[test]
     fn a_marked_host_takes_its_mark_color() {
         // `⇄ host` and the top line in the mark's color; the path
-        // tiers and the second line do not change.
+        // tiers and the context row's tone do not change.
         let state = live("", "", "", 0);
         for (mark, expected) in [
             (HostMark::Production, THEME.error_linear()),
@@ -4692,7 +4701,7 @@ mod tests {
 
     #[test]
     fn a_local_session_keeps_the_separator_on_the_edge() {
-        // Locally the top line is today's separator color: both lines the same color.
+        // Locally the top line is today's separator color, the same as the theme's quiet one.
         let state = live("", "", "", 0);
         let (_, dock) = draw_with(&state, &context("/tmp", "main"), COLS);
         assert_eq!(dock.edge, THEME.separator_linear());
@@ -4806,6 +4815,14 @@ mod tests {
         assert_ne!(
             dock.separator, dock.ground,
             "separator is the same color as the ground"
+        );
+        // The context row's tone is the theme's derived step, opaque like the
+        // ground, and it must tell the rows apart (no line does it any more).
+        assert_eq!(dock.band, THEME.band_linear());
+        assert_eq!(dock.band.to_array()[3], 1.0, "band is translucent");
+        assert_ne!(
+            dock.band, dock.ground,
+            "band is the same color as the ground"
         );
         // The text under the caret is by the same rule as in the grid: the ground color.
         assert_eq!(dock.caret_text, THEME.background_linear());

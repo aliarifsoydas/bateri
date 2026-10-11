@@ -1554,7 +1554,7 @@ impl Core {
             frame.push_dock_selection(&self.dock_selection.borrow());
             // The surface opens **after** the cells: the call bringing the
             // colours is the very call printing the cells (`Frame::open_dock`).
-            frame.open_dock(dock.ground, dock.edge, dock.separator);
+            frame.open_dock(dock.ground, dock.edge, dock.separator, dock.band);
             frame.set_dock_progress(dock.progress, dock.track);
             frame.set_dock_buttons(dock.buttons);
         } else {
@@ -3526,6 +3526,7 @@ mod tests {
                 Theme::BATERI.background_linear(),
                 Theme::BATERI.accent_linear(),
                 Theme::BATERI.accent_linear(),
+                Theme::BATERI.background_linear(),
             );
             compose(&mut frame, motion, BOTTOM, DOCK_ROWS);
 
@@ -3560,6 +3561,7 @@ mod tests {
             Theme::BATERI.background_linear(),
             Theme::BATERI.accent_linear(),
             Theme::BATERI.accent_linear(),
+            Theme::BATERI.background_linear(),
         );
         compose(&mut frame, motion, BOTTOM, DOCK_ROWS);
         assert_eq!(frame.dock_band_px(), frame.dock_layout_px());
@@ -3611,6 +3613,7 @@ mod tests {
                 Theme::BATERI.background_linear(),
                 Theme::BATERI.separator_linear(),
                 Theme::BATERI.separator_linear(),
+                Theme::BATERI.background_linear(),
             );
             compose(&mut frame, motion, BOTTOM, DOCK_ROWS);
             frame
@@ -3696,6 +3699,7 @@ mod tests {
                 Theme::BATERI.background_linear(),
                 Theme::BATERI.info_linear(),
                 Theme::BATERI.accent_linear(),
+                Theme::BATERI.background_linear(),
             );
             compose(&mut frame, motion, BOTTOM, DOCK_ROWS);
             frame
@@ -3777,6 +3781,7 @@ mod tests {
             Theme::BATERI.background_linear(),
             Theme::BATERI.accent_linear(),
             Theme::BATERI.accent_linear(),
+            Theme::BATERI.background_linear(),
         );
         compose(&mut frame, motion, 600.0, 1);
         assert_eq!(frame.dock_band_px(), crate::frame::dock_px(1, cell));
@@ -3801,6 +3806,7 @@ mod tests {
             Theme::BATERI.background_linear(),
             Theme::BATERI.accent_linear(),
             Theme::BATERI.accent_linear(),
+            Theme::BATERI.background_linear(),
         );
         compose(&mut frame, motion, 600.0, DOCK_ROWS);
         assert_eq!(frame.origin_px(), -36.0);
@@ -3880,6 +3886,7 @@ mod tests {
             Theme::BATERI.background_linear(),
             Theme::BATERI.separator_linear(),
             Theme::BATERI.separator_linear(),
+            Theme::BATERI.background_linear(),
         );
         place_edge(&mut frame, edge, FADE_BOTTOM, dock_rows, FADE_ROWS, cell);
         compose(&mut frame, motion, FADE_BOTTOM, dock_rows);

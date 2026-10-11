@@ -622,7 +622,7 @@ fn rule_kind(underline: UnderlineStyle) -> Option<RuleKind> {
     }
 }
 
-/// The dock's two colours, one per frame.
+/// The dock's colours, one per frame.
 ///
 /// The row count is **not** here: the cells' layout depends on it and
 /// the cells are pushed **before** the surface ([`Frame::open_dock`]), so the
@@ -635,10 +635,15 @@ pub(crate) struct DockSurface {
     ground: [f32; 4],
     /// The **top** hairline that separates the dock from the grid
     /// (`bt_core::Dock::edge`): on a remote session it is a separate colour
-    /// so it cannot be the same field as the second line.
+    /// so it cannot be the same field as the theme's quiet one.
     edge: [f32; 4],
-    /// The hairline that separates the input block from the context row.
+    /// The theme's quiet hairline: only the progress bar's empty track starts
+    /// from it (`bt_core::Dock::separator`).
     separator: [f32; 4],
+    /// The context row's tone (`bt_core::Dock::band`), **opaque**: it covers
+    /// the row from the middle of the gap above it down to the surface's
+    /// bottom edge ([`Frame::dock_ground`]).
+    band: [f32; 4],
     /// The filled share of the top line, `0..=1`
     /// ([`Frame::set_dock_progress`]); `None` → the line is entirely `edge`.
     progress: Option<f32>,
@@ -774,7 +779,7 @@ pub fn dock_px(dock_rows: u16, cell: CellMetrics) -> f32 {
 /// `input_rows == 1` the two are the **same** pixels.
 ///
 /// There is no gap between input rows — a single editor surface; the gap and
-/// the second hairline are only between the input block and the context row
+/// the tone's edge are only between the input block and the context row.
 /// The formula's body is still [`dock_height`]:
 /// the band is a dock of `input_rows + 1` rows.
 ///
@@ -1046,7 +1051,7 @@ fn dock_row_gap(pad: f32) -> f32 {
     (pad * 2.0).round()
 }
 
-/// The thickness of the dock's two lines, in **points** — two pixels at @2x.
+/// The thickness of the dock's line, in **points** — two pixels at @2x.
 ///
 /// It used to be one **pixel** at every scale, on the reasoning that a
 /// hairline should get finer on a Retina display. On one it read as faint
@@ -1165,7 +1170,7 @@ pub(crate) struct Frame {
     /// ([`caret_rect`]). A field for the same reason as `cell_px`: a motion
     /// frame does not call `clear` and **keeps** the value.
     rule_px: f32,
-    /// The dock's two lines' thickness in pixels ([`SEPARATOR_PT`] at this
+    /// The dock's line's thickness in pixels ([`SEPARATOR_PT`] at this
     /// scale). A field for the same reason as `rule_px`.
     separator_px: f32,
     /// The caret's shape; [`Frame::push_caret`] writes it, [`Frame::move_caret`]
@@ -2937,8 +2942,8 @@ impl Frame {
         self.dock_top_px = bottom_px - self.band_height();
     }
 
-    /// Opens the dock surface for this frame: its ground and the colours of the
-    /// two hairlines.
+    /// Opens the dock surface for this frame: its ground, the colours of the
+    /// top hairline and the theme's hairline, and the context row's tone.
     ///
     /// It is called **after** the cells and this is not an order preference but
     /// a necessity: the colours come back from `bt-core`'s dock call and that
@@ -2951,11 +2956,13 @@ impl Frame {
         ground: LinearRgba,
         edge: LinearRgba,
         separator: LinearRgba,
+        band: LinearRgba,
     ) {
         self.dock = Some(DockSurface {
             ground: ground.to_array(),
             edge: edge.to_array(),
             separator: separator.to_array(),
+            band: band.to_array(),
             progress: None,
             track: separator.to_array(),
             buttons: [None; 2],
@@ -3306,7 +3313,8 @@ impl Frame {
         self.gutter_px
     }
 
-    /// The dock's ground and separator, **at the given width**.
+    /// The dock's ground, its top hairline (with the upload's fill on it) and
+    /// the context row's tone, **at the given width**.
     ///
     /// The width is an argument, because `Frame` does not know the width of
     /// the touch and must not: the lists are born from the cell grid, whereas
@@ -3319,25 +3327,26 @@ impl Frame {
     /// `LinkDelegate::set_origin`) and this rectangle is the only thing that
     /// covers it.
     ///
-    /// **In the band's space**: all three are drawn from the drawn
+    /// **In the band's space**: all of them are drawn from the drawn
     /// band's viewport (`Renderer::encode_dock`, `height − band`), so the
     /// ground and the top hairline rise and fall with the animation; the
-    /// second hairline is **bottom-anchored** — it stays in the gap above the
-    /// context row and its place comes from the difference between the band's
-    /// height and the layout's.
+    /// tone is **bottom-anchored** — it starts in the middle of the gap above
+    /// the context row and its place comes from the difference between the
+    /// band's height and the layout's.
     pub(crate) fn dock_ground(&self, width_px: f32) -> [Instance; 4] {
         let dock = self.dock.unwrap_or(DockSurface {
             ground: [0.0; 4],
             edge: [0.0; 4],
             separator: [0.0; 4],
+            band: [0.0; 4],
             progress: None,
             track: [0.0; 4],
             buttons: [None; 2],
         });
         // **The arrival scene shapes the surface here and nowhere else**: the
-        // ground and the lines fade in together and the two lines are drawn
-        // from the left. Without a scene both factors are the identity, bit
-        // for bit (`drawn`, `faded`).
+        // ground, the line and the tone fade in together and the line and the
+        // tone are drawn from the left. Without a scene both factors are the
+        // identity, bit for bit (`drawn`, `faded`).
         let (band_alpha, lines) = self
             .dock_scene
             .map_or((1.0, [1.0; 2]), |scene| (scene.band, scene.lines));
@@ -3353,6 +3362,17 @@ impl Frame {
             self.dock_rows
         } else {
             0
+        };
+        // Where the tone starts: the middle of the gap between the rows
+        // ([`Frame::dock_band_top_y`], bottom-anchored like the layout), or
+        // just under the top hairline when the dock is only the context row.
+        // Never above the top hairline: the tone is drawn last and is opaque,
+        // and during the slide the drawn band is shorter than the layout, so
+        // the edge would otherwise climb over the line.
+        let band_top = if rows < 2 {
+            self.separator_px
+        } else {
+            (band - self.dock_layout_px() + self.dock_band_top_y(rows)).max(self.separator_px)
         };
         [
             Instance {
@@ -3381,53 +3401,46 @@ impl Frame {
                 size: [width(lines[0], fill.round()), self.separator_px],
                 rgba: faded(dock.edge, band_alpha),
             },
-            // **The second separator: between the input row and the context
-            // row.** Locally the same colour and the same thickness as the top
-            // one, because it says the same thing — "these are two separate
-            // surfaces"; it does not take the remote session's colour. An earlier
-            // design had put a gap between; a gap *suggests* a separation, a line
-            // **says** it (the user asked).
+            // **The context row's tone**, in place of the line that used to
+            // part the rows: the ground a step toward the foreground, from
+            // the middle of the gap above the row down to the surface's
+            // bottom edge, so the rows read as two surfaces without a line.
+            // The middle of the gap, not the row's own top: placed at an edge
+            // it would stick to one row and look as if it belonged to it; in
+            // the middle both rows are equidistant from it.
             //
-            // Its place is the **middle** of the gap, not its top or bottom
-            // edge: placed at an edge it would stick to one row and look as if
-            // it belonged to it. In the middle both rows are equidistant from
-            // it.
-            //
-            // While `rows < 2` its height is **zero**: there are not two rows
-            // to separate. The array's length stays fixed so the caller does
-            // not branch; a zero-height rectangle produces no fragments.
+            // It is the **last** instance and drawn over the ground only: the
+            // top hairline stays clear of it because, with no input row to
+            // part from (`rows < 2`: a remote session, a program's guide
+            // bar), the tone takes the whole surface *below* that hairline.
+            // Its width opens with the scene's second share, the way the line
+            // it replaces did.
             Instance {
-                pos: [
-                    0.0,
-                    band - self.dock_layout_px() + self.dock_row_divider_y(rows),
-                ],
-                size: [
-                    width(lines[1], width_px),
-                    if rows < 2 { 0.0 } else { self.separator_px },
-                ],
-                rgba: faded(dock.separator, band_alpha),
+                pos: [0.0, band_top],
+                size: [width(lines[1], width_px), (band - band_top).max(0.0)],
+                rgba: faded(dock.band, band_alpha),
             },
         ]
     }
 
-    /// The **top** edge of the line separating the input block from the
-    /// context row, in pixels in the layout's space.
+    /// The **top** edge of the context row's tone, in pixels in the layout's
+    /// space.
     ///
     /// The rows' layout is in [`Frame::dock_pos`]: the input rows are adjacent
     /// at `pad + r·cell_h`, the context row is below the gap — i.e. the gap is
-    /// between `pad + (rows − 1)·cell_h` and its `gap` excess. The line sits
-    /// in the middle of that interval.
-    fn dock_row_divider_y(&self, rows: u16) -> f32 {
+    /// between `pad + (rows − 1)·cell_h` and its `gap` excess. The edge sits
+    /// in the middle of that interval, so both rows are equally far from it.
+    fn dock_band_top_y(&self, rows: u16) -> f32 {
         if rows < 2 {
             return 0.0;
         }
         let pad = self.dock_pad();
         let gap = dock_row_gap(pad);
-        // Rounded: a hairline that does not land on the device grid would
-        // spread over two pixels and fade. At @2x the gap and the line are
-        // both even and the middle is already whole; at @1x the line is odd
-        // and the rounding picks a side.
-        (pad + f32::from(rows - 1) * self.cell_px.1 + (gap - self.separator_px) * 0.5).round()
+        // Rounded: an edge that does not land on the device grid would
+        // spread over two pixels and fade. The gap is `2·pad` rounded, an
+        // even whole number of pixels, so its middle is whole at every scale;
+        // the rounding only guards a fractional cell.
+        (pad + f32::from(rows - 1) * self.cell_px.1 + gap * 0.5).round()
     }
 
     pub(crate) fn dock_bg(&self) -> &[Instance] {
@@ -4016,6 +4029,7 @@ mod tests {
     // offscreen tests use that because they need three distinct tones.
     const BG: LinearRgba = bt_core::Theme::BATERI.background_linear();
     const CURSOR: LinearRgba = bt_core::Theme::BATERI.accent_linear();
+    const BAND: LinearRgba = bt_core::Theme::BATERI.band_linear();
     /// The colour of the text under the block; in production the theme's ground
     /// (`bt-core` → `Cursor::text`). Here it is enough for it to be **distinct**
     /// from the block's colour.
@@ -4790,7 +4804,7 @@ mod tests {
                     ..Default::default()
                 });
             }
-            frame.open_dock(BG, CURSOR, CURSOR);
+            frame.open_dock(BG, CURSOR, CURSOR, BAND);
             frame
         };
         let (flat_frame, round_frame) = (drawn(flat), drawn(round));
@@ -5004,7 +5018,7 @@ mod tests {
                 });
             }
             frame.set_context_trailing(Some(14), 3);
-            frame.open_dock(BG, CURSOR, CURSOR);
+            frame.open_dock(BG, CURSOR, CURSOR, BAND);
             frame.set_dock_buttons([
                 None,
                 Some(DockButton {
@@ -5105,7 +5119,7 @@ mod tests {
             g[2].pos[1] - g[0].pos[1],
             20.0 + dock_row_gap(GUTTER as f32)
         );
-        frame.open_dock(BG, CURSOR, CURSOR);
+        frame.open_dock(BG, CURSOR, CURSOR, BAND);
         assert_eq!(
             frame.dock_layout_px(),
             dock_px(
@@ -5134,7 +5148,7 @@ mod tests {
             ch: Some('C'),
             ..Cell::default()
         });
-        frame.open_dock(BG, CURSOR, CURSOR);
+        frame.open_dock(BG, CURSOR, CURSOR, BAND);
         assert_eq!(frame.dock_button_draws(0.0).count(), 0, "no button told");
         let button = DockButton {
             start: 2,
@@ -5188,7 +5202,7 @@ mod tests {
             "darkens under the pointer"
         );
         // Opening clears them every frame.
-        frame.open_dock(BG, CURSOR, CURSOR);
+        frame.open_dock(BG, CURSOR, CURSOR, BAND);
         assert_eq!(frame.dock_button_draws(0.0).count(), 0);
     }
 
@@ -5259,7 +5273,7 @@ mod tests {
             underline: UnderlineStyle::Single,
             ..dock_cell(1)
         });
-        frame.open_dock(BG, CURSOR, CURSOR);
+        frame.open_dock(BG, CURSOR, CURSOR, BAND);
 
         assert_eq!(frame.bg_count(), 1, "dock cell was counted");
         assert_eq!(frame.glyph_count(), 0, "dock glyph was counted");
@@ -5803,13 +5817,13 @@ mod tests {
         // during the slide the grid's overflowing bottom row stays under it.
         let mut frame = Frame::default();
         frame.clear(grid(9, 18), CaretStyle::default());
-        // The top line's colour is a separate field: the two lines are
-        // opened with two separate colours so that if one took the other's
+        // The top line's colour is a separate field: the line and the tone
+        // are opened with separate colours so that if one took the other's
         // colour it would show.
-        frame.open_dock(BG, SUCCESS, CURSOR);
+        frame.open_dock(BG, SUCCESS, CURSOR, BAND);
         assert_eq!(frame.dock_layout_px(), 36.0, "rows not converted");
 
-        let [ground, separator, _, divider] = frame.dock_ground(500.0);
+        let [ground, separator, _, tone] = frame.dock_ground(500.0);
         assert_eq!(ground.pos, [0.0, 0.0], "ground not from margin");
         assert_eq!(ground.size, [500.0, 36.0]);
         assert_eq!(ground.rgba, BG.to_array());
@@ -5822,27 +5836,29 @@ mod tests {
             SUCCESS.to_array(),
             "top line is the edge's colour"
         );
-        // The second separator is **between** the two rows and in the
-        // separator's colour — it does not take the remote session's edge
-        // colour. Without a margin at this measure the row gap is zero, so the
-        // line is exactly on the row boundary.
-        assert_eq!(divider.pos, [0.0, 18.0]);
-        assert_eq!(divider.size, [500.0, 1.0]);
-        assert_eq!(divider.rgba, CURSOR.to_array());
+        // The context row's tone starts **between** the two rows and runs to
+        // the surface's bottom, in its own colour — not the ground's, not the
+        // edge's. Without a margin at this measure the row gap is zero, so it
+        // starts exactly on the row boundary (where the line between the rows
+        // used to be) and covers the context row, nothing above it.
+        assert_eq!(tone.pos, [0.0, 18.0]);
+        assert_eq!(tone.size, [500.0, 18.0]);
+        assert_eq!(tone.rgba, BAND.to_array());
+        assert_ne!(tone.rgba, ground.rgba, "the rows are not told apart");
 
         // While an upload runs the top line is a bar: its ground
         // in the empty track's colour, the part filling from the left
-        // in the edge's colour; the second separator keeps its own colour.
+        // in the edge's colour; the tone keeps its own colour.
         frame.set_dock_progress(Some(2_500), BG);
-        let [_, base, fill, divider] = frame.dock_ground(500.0);
+        let [_, base, fill, tone] = frame.dock_ground(500.0);
         assert_eq!(base.size, [500.0, 1.0]);
         assert_eq!(base.rgba, BG.to_array(), "bar's ground is the empty track");
-        assert_eq!(divider.rgba, CURSOR.to_array(), "separator has no track");
+        assert_eq!(tone.rgba, BAND.to_array(), "the tone has no track");
         assert_eq!(fill.pos, [0.0, 0.0]);
         assert_eq!(fill.size, [125.0, 1.0]);
         assert_eq!(fill.rgba, SUCCESS.to_array(), "fill is the edge colour");
         // Opening resets every frame: the bar exists only in the frame it is told.
-        frame.open_dock(BG, SUCCESS, CURSOR);
+        frame.open_dock(BG, SUCCESS, CURSOR, BAND);
         let [_, base, fill, _] = frame.dock_ground(500.0);
         assert_eq!(base.rgba, SUCCESS.to_array());
         assert_eq!(fill.size[0], 0.0);
@@ -5863,7 +5879,7 @@ mod tests {
             CellMetrics::new(9, 18, 9, GUTTER, 1, 1.0).expect("metrics"),
             CaretStyle::default(),
         );
-        frame.open_dock(BG, CURSOR, CURSOR);
+        frame.open_dock(BG, CURSOR, CURSOR, BAND);
         // 2×18 + 2×GUTTER + 1×(2×GUTTER) = 36 + 14 + 14 = 64. The row gap is
         // **twice** the outer margin, because a line passes through its middle:
         // with one margin on each side of the line all four gaps come out equal.
@@ -5872,28 +5888,26 @@ mod tests {
         // **The ground covers the margins too**: a rectangle short by the
         // margin would, during the slide, show the overflowing grid row exactly
         // in the breathing room.
-        let [ground, separator, _, divider] = frame.dock_ground(500.0);
+        let [ground, separator, _, tone] = frame.dock_ground(500.0);
         assert_eq!(ground.size, [500.0, 64.0]);
-        // The line between rows is in the **middle** of the gap: margin 7,
-        // cell 18, gap 14 → 7 + 18 + (14 − 1)/2 = 31.5 → 32. Placed at an edge
-        // it would stick to a row and look as if it belonged to it.
-        assert_eq!(divider.pos, [0.0, 32.0]);
+        // The context row's tone starts in the **middle** of the gap: margin 7,
+        // cell 18, gap 14 → 7 + 18 + 14/2 = 32. Placed at a row's edge it
+        // would stick to that row and look as if it belonged to it.
+        assert_eq!(tone.pos, [0.0, 32.0]);
         // **The rhythm is equal — written pixel by pixel.** `pad` 7, cell 18,
-        // gap 14, line 1 px (a point at @1x). The boxes: top line [0,1], input [7,25], middle
-        // line [32,33], context [39,57], bottom 64. The four gaps in between
-        // are 6, 7, 6, 7 in order — the difference comes from the lines'
-        // **own** pixels and from rounding 31.5, not from the formula. One
-        // pixel cannot be equalized: the gap is even (14), the line odd (1), so
-        // the centre always falls on a half pixel (at @2x both are even —
-        // `the_dock_lines_are_a_point_thick`). In the old state these gaps
-        // were 6, 1, 1, 7.
+        // gap 14. The boxes: top line [0,1], input [7,25], the tone's edge at
+        // 32, context [39,57], bottom 64. The gaps around the rows are 7 (the
+        // margin above the input), 7 (input to the edge), 7 (the edge to the
+        // context row) and 7 (context row to the bottom). The old line
+        // between the rows made the two middle ones 6 and 7 by its own pixel.
         assert_eq!(GUTTER, 7, "the pixel table above depends on this margin");
         let row1_top = f32::from(GUTTER) + 18.0 + dock_row_gap(f32::from(GUTTER));
         assert_eq!(row1_top, 39.0);
-        assert_eq!(divider.pos[1] - (f32::from(GUTTER) + 18.0), 7.0);
-        assert_eq!(row1_top - (divider.pos[1] + 1.0), 6.0);
+        assert_eq!(tone.pos[1] - (f32::from(GUTTER) + 18.0), 7.0);
+        assert_eq!(row1_top - tone.pos[1], 7.0);
         assert_eq!(frame.dock_layout_px() - (row1_top + 18.0), 7.0);
-        assert_eq!(divider.size, [500.0, 1.0]);
+        // …and the tone runs from there to the bottom edge, nothing more.
+        assert_eq!(tone.size, [500.0, 64.0 - 32.0]);
         // The hairline is **above** the margin, at the top of the viewport:
         // that is the boundary with the grid, and putting the margin above it
         // would push the line into the grid.
@@ -5910,7 +5924,7 @@ mod tests {
             ch: Some('x'),
             ..Cell::default()
         });
-        frame.open_dock(BG, CURSOR, CURSOR);
+        frame.open_dock(BG, CURSOR, CURSOR, BAND);
         assert_eq!(
             frame.dock_glyphs()[0].pos[1],
             f32::from(GUTTER),
@@ -5937,8 +5951,8 @@ mod tests {
     }
 
     #[test]
-    fn the_dock_lines_are_a_point_thick() {
-        // A point, not a pixel: at @2x both lines are two pixels tall — one
+    fn the_dock_line_is_a_point_thick() {
+        // A point, not a pixel: at @2x the line is two pixels tall — one
         // pixel read as faint on a Retina display. The wave and the woven
         // line's lit tip take the same thickness, or the swap to the resting
         // line would show.
@@ -5947,16 +5961,18 @@ mod tests {
             CellMetrics::new(18, 36, 18, 14, 2, 2.0).expect("metrics"),
             CaretStyle::default(),
         );
-        frame.open_dock(BG, SUCCESS, CURSOR);
-        let [_, separator, _, divider] = frame.dock_ground(500.0);
+        frame.open_dock(BG, SUCCESS, CURSOR, BAND);
+        let [_, separator, _, tone] = frame.dock_ground(500.0);
         assert_eq!(separator.pos, [0.0, 0.0], "the top line left the edge");
         assert_eq!(separator.size, [500.0, 2.0]);
-        assert_eq!(divider.size, [500.0, 2.0]);
-        // `pad` 14, cell 36, gap 28: the line's middle is whole at @2x, so
-        // the two rows are equally far from it — 13 pixels each side.
-        assert_eq!(divider.pos, [0.0, 63.0]);
-        assert_eq!(divider.pos[1] - (14.0 + 36.0), 13.0);
-        assert_eq!((14.0 + 36.0 + 28.0) - (divider.pos[1] + 2.0), 13.0);
+        // `pad` 14, cell 36, gap 28: the tone's edge is in the middle of the
+        // gap, whole at @2x, so the two rows are equally far from it — 14
+        // pixels each side.
+        assert_eq!(tone.pos, [0.0, 64.0]);
+        assert_eq!(tone.pos[1] - (14.0 + 36.0), 14.0);
+        assert_eq!((14.0 + 36.0 + 28.0) - tone.pos[1], 14.0);
+        // …and it runs to the bottom of the 14 + 36 + 28 + 36 + 14 layout.
+        assert_eq!(tone.size[1], (14.0 + 36.0 + 28.0 + 36.0 + 14.0) - 64.0);
 
         frame.set_dock_progress(Some(2_500), BG);
         let [_, base, fill, _] = frame.dock_ground(500.0);
@@ -5970,7 +5986,7 @@ mod tests {
         // row — small face, small step, no row gap above it (there is no input
         // row to separate) and the band is one row plus two outer margins. The
         // top line is at the top of the band and in the edge's colour; the
-        // second separator has zero height.
+        // tone has the whole surface under that line.
         let metrics = CellMetrics::new(9, 18, 9, GUTTER, 1, 1.0).expect("metrics");
         let mut frame = Frame::default();
         frame.clear(metrics, CaretStyle::default());
@@ -5984,7 +6000,7 @@ mod tests {
             });
         }
         let edge = bt_core::Theme::BATERI.info_linear();
-        frame.open_dock(BG, edge, CURSOR);
+        frame.open_dock(BG, edge, CURSOR, BAND);
         let band = 18.0 + 2.0 * f32::from(GUTTER);
         assert_eq!(frame.dock_layout_px(), band);
         assert_eq!(band_px(Some(0), metrics), band);
@@ -6000,11 +6016,15 @@ mod tests {
             f32::from(metrics.context_cell_px()),
             "context row's step is the small face's advance"
         );
-        let [ground, separator, _, divider] = frame.dock_ground(500.0);
+        let [ground, separator, _, tone] = frame.dock_ground(500.0);
         assert_eq!(ground.size, [500.0, band]);
         assert_eq!(separator.pos, [0.0, 0.0]);
         assert_eq!(separator.rgba, edge.to_array());
-        assert_eq!(divider.size[1], 0.0, "there are not two rows to separate");
+        // No input row to part from: the tone is the whole dock, under the
+        // top line (which keeps its pixel and its colour).
+        assert_eq!(tone.pos, [0.0, separator.size[1]]);
+        assert_eq!(tone.size, [500.0, band - separator.size[1]]);
+        assert_eq!(tone.rgba, BAND.to_array());
         // The tests' one-row dock without context stays under its old rule.
         frame.clear(metrics, CaretStyle::default());
         frame.set_dock_rows(1);
@@ -6021,9 +6041,9 @@ mod tests {
     fn no_band_opens_a_surface_of_zero_rows() {
         // **No band** (a program reading the keyboard itself): the layout has
         // no row, the settled band has no height, so neither the ground nor
-        // either hairline covers a pixel of the window; the surface is still
-        // open and the mouse reads a zero-row input block, so a click on the
-        // grid's bottom row is the grid's.
+        // the hairline nor the tone covers a pixel of the window; the surface
+        // is still open and the mouse reads a zero-row input block, so a click
+        // on the grid's bottom row is the grid's.
         let metrics = CellMetrics::new(9, 18, 9, GUTTER, 1, 1.0).expect("metrics");
         assert_eq!(band_px(None, metrics), 0.0);
         let mut frame = Frame::default();
@@ -6032,16 +6052,16 @@ mod tests {
         let share = dock_px(DOCK_ROWS, metrics);
         // Settled: the excess is the whole share, negative.
         frame.set_dock_band(600.0, -share / 18.0);
-        frame.open_dock(BG, CURSOR, CURSOR);
+        frame.open_dock(BG, CURSOR, CURSOR, BAND);
         assert_eq!(frame.dock_layout_px(), 0.0);
         assert_eq!(frame.dock_band_px(), 0.0);
-        let [ground, separator, fill, divider] = frame.dock_ground(500.0);
+        let [ground, separator, fill, tone] = frame.dock_ground(500.0);
         assert_eq!(ground.size, [500.0, 0.0]);
         // The top hairline sits on the band's top, i.e. at the window's bottom:
         // the band's viewport starts there, so it is below every pixel.
         assert_eq!(separator.pos, [0.0, 0.0]);
         assert_eq!(fill.size[0], 0.0, "no progress");
-        assert_eq!(divider.size[1], 0.0);
+        assert_eq!(tone.size[1], 0.0, "the tone covers no pixel either");
         assert_eq!(frame.dock_hit(), Some((600.0 + f32::from(GUTTER), 0)));
         // The grid's origin is lower by the whole share.
         frame.set_origin_rows(5.0);
@@ -6068,7 +6088,7 @@ mod tests {
     fn a_three_row_band_stacks_its_input_above_the_context_row() {
         // **The multi-row test hook** (`n = 3`): the band is `n` input rows
         // plus the context row; the input rows are adjacent, the gap and the
-        // second hairline only between the input block and the context row.
+        // tone's edge only between the input block and the context row.
         // At @1x, 9×18 cells, margin 7: `4·18 + 2·7 + 14 = 100` px.
         let metrics = CellMetrics::new(9, 18, 9, GUTTER, 1, 1.0).expect("metrics");
         assert_eq!(band_px(Some(3), metrics), 100.0);
@@ -6082,7 +6102,7 @@ mod tests {
             frame.push_dock(dock_row(row));
         }
         frame.set_dock_band(600.0, 2.0);
-        frame.open_dock(BG, CURSOR, CURSOR);
+        frame.open_dock(BG, CURSOR, CURSOR, BAND);
         assert_eq!(frame.dock_layout_px(), 100.0);
         assert_eq!(
             frame.dock_band_px(),
@@ -6103,13 +6123,14 @@ mod tests {
         // The context row is at the **bottom** of the band: only the outer margin below it.
         assert_eq!(frame.dock_layout_px() - (ys[3] + 18.0), 7.0);
 
-        // A single hairline below the input block, in the middle of the gap:
-        // 7 + 3·18 + (14 − 1)/2 = 67.5 → 68. No line between the input rows.
-        let [ground, separator, _, divider] = frame.dock_ground(500.0);
+        // The tone's edge below the input block, in the middle of the gap:
+        // 7 + 3·18 + 14/2 = 68. Nothing between the input rows.
+        let [ground, separator, _, tone] = frame.dock_ground(500.0);
         assert_eq!(ground.size, [500.0, 100.0]);
         assert_eq!(separator.pos, [0.0, 0.0]);
-        assert_eq!(divider.pos, [0.0, 68.0]);
-        assert!(divider.pos[1] > ys[2] + 18.0 && divider.pos[1] < ys[3]);
+        assert_eq!(tone.pos, [0.0, 68.0]);
+        assert_eq!(tone.size, [500.0, 100.0 - 68.0]);
+        assert!(tone.pos[1] > ys[2] + 18.0 && tone.pos[1] < ys[3]);
 
         // The geometry that goes to the mouse: the input block's top
         // (600 − 100 + 7) and three rows.
@@ -6117,10 +6138,10 @@ mod tests {
     }
 
     #[test]
-    fn a_growing_band_keeps_its_rows_and_divider_on_the_bottom() {
+    fn a_growing_band_keeps_its_rows_and_tone_on_the_bottom() {
         // **Bottom-anchored**: while the band is halfway (excess
         // targeting 2, now 0.5) the ground and the top hairline are at the
-        // animation's height, the cells and the second hairline at the
+        // animation's height, the cells and the tone's edge at the
         // layout's — the text stays in place, only the band's top rises. The
         // grid's origin is higher by the band's excess.
         let metrics = CellMetrics::new(9, 18, 9, GUTTER, 1, 1.0).expect("metrics");
@@ -6129,15 +6150,23 @@ mod tests {
         frame.set_dock_rows(4);
         frame.set_origin_rows(5.0);
         frame.set_dock_band(600.0, 0.5);
-        frame.open_dock(BG, CURSOR, CURSOR);
+        frame.open_dock(BG, CURSOR, CURSOR, BAND);
         // The PTY share 64 + the rounded pixels of half a row, 9.
         assert_eq!(frame.dock_band_px(), 73.0);
         assert_eq!(frame.origin_px(), 5.0 * 18.0 - 9.0);
-        let [ground, _, _, divider] = frame.dock_ground(500.0);
+        let [ground, _, _, tone] = frame.dock_ground(500.0);
         assert_eq!(ground.size, [500.0, 73.0]);
-        // In window space the line is at the same pixel as in the layout: the
+        // In window space the edge is at the same pixel as in the layout: the
         // band's viewport is at `600 − 73`, the layout's at `600 − 100`.
-        assert_eq!(600.0 - 73.0 + divider.pos[1], 600.0 - 100.0 + 68.0);
+        assert_eq!(600.0 - 73.0 + tone.pos[1], 600.0 - 100.0 + 68.0);
+        // …and the tone still ends on the band's bottom, whatever the height.
+        assert_eq!(tone.pos[1] + tone.size[1], 73.0);
+        // A band still shorter than the gap's middle keeps the tone under the
+        // top hairline instead of over it: the tone is drawn last and opaque.
+        frame.set_dock_band(600.0, -3.0);
+        let [ground, line, _, tone] = frame.dock_ground(500.0);
+        assert_eq!(tone.pos[1], line.size[1]);
+        assert_eq!(tone.size[1], ground.size[1] - line.size[1]);
     }
 
     #[test]
@@ -6614,7 +6643,7 @@ mod tests {
             frame.push_dock(context_cell(col, ch));
         }
         frame.push_dock_sigil(CURSOR);
-        frame.open_dock(BG, SUCCESS, CURSOR);
+        frame.open_dock(BG, SUCCESS, CURSOR, BAND);
         frame
     }
 
@@ -6789,17 +6818,17 @@ mod tests {
         let waiting = frame.dock_ground(500.0);
         assert_eq!(waiting[0].rgba[3], 0.0, "the ground is transparent");
         assert_eq!(waiting[1].size[0], 0.0, "no top line yet");
-        assert_eq!(waiting[3].size[0], 0.0, "no second line yet");
+        assert_eq!(waiting[3].size[0], 0.0, "no tone yet");
         assert_eq!(waiting[0].size, plain[0].size, "its place does not change");
-        // Part-way the lines have drawn part of their width, the second later
-        // than the first, and the ground has faded in part.
+        // Part-way the line and the tone have drawn part of their width, the
+        // tone later than the line, and the ground has faded in part.
         arrive(&mut frame, Some(scene_at(0.1, 10, false)));
         let partway = frame.dock_ground(500.0);
         assert!(partway[0].rgba[3] > 0.0 && partway[0].rgba[3] < 1.0);
         assert!(partway[1].size[0] > 0.0 && partway[1].size[0] < 500.0);
         assert!(
             partway[3].size[0] <= partway[1].size[0],
-            "the first line leads"
+            "the line leads the tone"
         );
         assert_eq!(
             partway[1].size[0].fract(),
@@ -6840,7 +6869,7 @@ mod tests {
             frame.push_dock(context_cell(col, ch));
         }
         frame.push_dock_sigil(CURSOR);
-        frame.open_dock(BG, SUCCESS, CURSOR);
+        frame.open_dock(BG, SUCCESS, CURSOR, BAND);
         frame.set_dock_quiet(QUIET);
         arrive(&mut frame, scene);
         frame

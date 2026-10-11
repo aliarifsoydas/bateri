@@ -259,7 +259,7 @@ fn the_climbing_dock_is_drawn_lower_by_its_rise() {
         let mut frame = glyph_frame(m);
         frame.set_dock_input_rows(Some(1));
         frame.set_dock_band(EDGE as f32, 0.0);
-        frame.open_dock(ground, top_line, ground);
+        frame.open_dock(ground, top_line, ground, ground);
         frame.set_dock_scene(scene, rise);
         frame.set_dock_fx(std::iter::empty(), &Clusters::default(), WHITE);
         frame
@@ -490,7 +490,7 @@ fn scene_midtone() -> Scene {
     ("midtone ground", 16, frame)
 }
 
-/// Dock ground and both hairlines (two input rows + the context row, with
+/// Dock ground, hairline and the context row's tone (two input rows + the context row, with
 /// a gutter), the caret's dock slot and an offset grid above it — the dock
 /// must be exempt from the offset.
 fn scene_dock_ground() -> Scene {
@@ -504,6 +504,7 @@ fn scene_dock_ground() -> Scene {
         LinearRgba::from_srgb(0x20, 0x22, 0x28),
         WHITE,
         LinearRgba::from_srgb(0x60, 0x60, 0x60),
+        LinearRgba::from_srgb(0x20, 0x22, 0x28),
     );
     frame.set_dock_band(128.0, 0.0);
     frame.set_origin_rows(0.5);
@@ -526,7 +527,12 @@ fn scene_growing_band() -> Scene {
     frame.push_dock(bg_cell(0, 2, MIDTONE));
     frame.push_dock(bg_cell(0, 3, ACCENT));
     frame.set_dock_band(48.0, 0.0);
-    frame.open_dock(LinearRgba::from_srgb(0x00, 0x40, 0x00), WHITE, WHITE);
+    frame.open_dock(
+        LinearRgba::from_srgb(0x00, 0x40, 0x00),
+        WHITE,
+        WHITE,
+        LinearRgba::from_srgb(0x00, 0x40, 0x00),
+    );
     ("growing dock band (scissor)", 48, frame)
 }
 
@@ -557,7 +563,7 @@ fn scene_dock_button() -> Scene {
     let mut frame = Frame::default();
     frame.clear(grid(CELL.0, CELL.1), CaretStyle::default());
     frame.set_dock_rows(1);
-    frame.open_dock(BACKGROUND, BACKGROUND, BACKGROUND);
+    frame.open_dock(BACKGROUND, BACKGROUND, BACKGROUND, BACKGROUND);
     frame.set_dock_buttons([
         None,
         Some(DockButton {
@@ -815,6 +821,7 @@ fn scene_dock_glyphs(m: CellMetrics) -> Scene {
         LinearRgba::from_srgb(0x20, 0x22, 0x28),
         WHITE,
         LinearRgba::from_srgb(0x60, 0x60, 0x60),
+        LinearRgba::from_srgb(0x20, 0x22, 0x28),
     );
     // The caret on the input row's `l` (column 2), in window rows.
     let row = (EDGE as f32 - frame.dock_layout_px()) / frame.cell_px()[1];
@@ -844,7 +851,12 @@ fn scene_growing_band_glyphs(m: CellMetrics) -> Scene {
         });
     }
     frame.set_dock_band(EDGE as f32, 0.0);
-    frame.open_dock(LinearRgba::from_srgb(0x00, 0x40, 0x00), WHITE, WHITE);
+    frame.open_dock(
+        LinearRgba::from_srgb(0x00, 0x40, 0x00),
+        WHITE,
+        WHITE,
+        LinearRgba::from_srgb(0x00, 0x40, 0x00),
+    );
     let band_y = EDGE as f32 - frame.dock_band_px();
     let origin_y = EDGE as f32 - frame.dock_layout_px();
     assert!(band_y > origin_y, "the band does not clip the layout");
@@ -940,7 +952,7 @@ fn fx_frame(m: CellMetrics, statics: &[Cell], fx: &[Fx]) -> Frame {
         LinearRgba::from_srgb(0xff, 0x80, 0x20),
     );
     frame.set_dock_rows(1);
-    frame.open_dock(BACKGROUND, BACKGROUND, BACKGROUND);
+    frame.open_dock(BACKGROUND, BACKGROUND, BACKGROUND, BACKGROUND);
     frame
 }
 
@@ -1043,6 +1055,7 @@ fn scene_three_viewports(m: CellMetrics) -> Scene {
         LinearRgba::from_srgb(0x20, 0x22, 0x28),
         WHITE,
         LinearRgba::from_srgb(0x60, 0x60, 0x60),
+        LinearRgba::from_srgb(0x20, 0x22, 0x28),
     );
     let row = (EDGE as f32 - frame.dock_layout_px()) / frame.cell_px()[1];
     frame.push_caret([4.0, row], BACKGROUND, ACCENT, 1.0, CaretShape::Beam, true);
@@ -1070,6 +1083,7 @@ fn scene_scroll_bar() -> Scene {
         LinearRgba::from_srgb(0x20, 0x22, 0x28),
         WHITE,
         LinearRgba::from_srgb(0x60, 0x60, 0x60),
+        LinearRgba::from_srgb(0x20, 0x22, 0x28),
     );
     frame.set_origin_rows(1.5);
     let position = bt_core::ScrollPosition {
@@ -1195,7 +1209,7 @@ fn arriving_dock_frame(
     // The lines share the ground's colour: what the pixels can then show is
     // ink, not hairlines.
     let ground = LinearRgba::from_srgb(0x20, 0x22, 0x28);
-    frame.open_dock(ground, ground, ground);
+    frame.open_dock(ground, ground, ground, ground);
     frame.set_dock_scene(scene, rise);
     frame.set_dock_fx(std::iter::empty(), &Clusters::default(), WHITE);
     frame
@@ -1230,7 +1244,7 @@ fn waving_dock_frame(m: CellMetrics, edge: u32, scene: Option<crate::arrival::Sc
     frame.set_dock_input_rows(Some(1));
     frame.set_dock_band(edge as f32, 0.0);
     let ground = LinearRgba::from_srgb(0x00, 0x80, 0x00);
-    frame.open_dock(ground, WHITE, ground);
+    frame.open_dock(ground, WHITE, ground, ground);
     frame.set_dock_quiet(LinearRgba::from_srgb(0xff, 0x00, 0x00));
     frame.set_dock_scene(scene, 0.0);
     frame.set_dock_fx(std::iter::empty(), &Clusters::default(), WHITE);
@@ -1690,7 +1704,7 @@ fn loaded_frame(frame: &mut Frame, edge: u16) {
     }
     frame.set_dock_input_rows(Some(1));
     frame.push_dock(bg_cell(2, 0, MIDTONE));
-    frame.open_dock(BACKGROUND, WHITE, WHITE);
+    frame.open_dock(BACKGROUND, WHITE, WHITE, BACKGROUND);
     frame.push_caret([3.0, 2.0], BACKGROUND, ACCENT, 1.0, CaretShape::Block, true);
 }
 

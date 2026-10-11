@@ -27,8 +27,9 @@ commit. Pushing is a separate step.
   text keeps clear of. The columns, the prompt row and the pointer start
   further in beside a round corner, with the same distance from the curve as
   from the straight edge. A host that does not call it leaves both at zero
-  (square), which is the margin the pane always had; call it on layout, since
-  the pane takes its geometry again when a radius moves.
+  (square), which is the margin the pane always had; a value that is not a
+  radius is square too and one past 64 points is taken as 64. Call it on
+  layout, since the pane takes its geometry again when a radius moves.
 
 ## [0.1.0] - 2026-10-11
 
