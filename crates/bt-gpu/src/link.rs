@@ -1608,6 +1608,7 @@ impl Core {
                         cursor.row,
                         origin_target(cursor),
                         band_target,
+                        dock_rows,
                         frame.edge_px(),
                         self.cell.get(),
                     );
@@ -2391,18 +2392,32 @@ pub(crate) fn place_edge(
 /// rectangle gives the whole origin back (`Frame::grid_caret`), so a target
 /// without it would stand the fade's height above its letter. In rows it is
 /// fractional, and that is right — the dock's target is too.
+///
+/// **The breath is the origin's fifth term and the target's too**
+/// ([`crate::frame::grid_breath_px`] of the band's target excess against the
+/// `dock_rows` share): above a band shorter than its share the grid stops
+/// short of the band's top, and a target without it would stand the caret
+/// that much below its letter.
 fn grid_caret_at(
     col: u16,
     row: u16,
     origin_rows: u16,
     band_target: f32,
+    dock_rows: u16,
     edge_px: f32,
     cell: CellMetrics,
 ) -> [f32; 2] {
-    let edge_rows = edge_px / f32::from(cell.cell_px().1);
+    let cell_h = f32::from(cell.cell_px().1);
+    let edge_rows = edge_px / cell_h;
+    let breath_rows = crate::frame::grid_breath_px(
+        band_target * cell_h,
+        dock_rows,
+        cell_h,
+        f32::from(cell.gutter_px()),
+    ) / cell_h;
     [
         f32::from(col),
-        f32::from(row) + f32::from(origin_rows) - band_target + edge_rows,
+        f32::from(row) + f32::from(origin_rows) - band_target - breath_rows + edge_rows,
     ]
 }
 
@@ -3638,7 +3653,7 @@ mod tests {
                     let band_top = BOTTOM - frame.dock_band_px();
                     assert_eq!(
                         band_top - grid_bottom,
-                        strip,
+                        strip + frame.grid_breath(),
                         "{style:?} {band:?}/{frames}: grid and band diverged ({})",
                         motion.band()
                     );
@@ -3725,7 +3740,7 @@ mod tests {
                 let band_top = BOTTOM - frame.dock_band_px();
                 assert_eq!(
                     band_top - grid_bottom,
-                    strip,
+                    strip + frame.grid_breath(),
                     "{input_rows}/{frames}: grid and band diverged ({})",
                     motion.band()
                 );
@@ -3754,8 +3769,15 @@ mod tests {
         assert_eq!(band, 18.0 + 2.0 * 8.0, "context row only");
         assert_eq!(frame.dock_band_px(), band);
         assert_eq!(frame.dock_band_px(), frame.dock_layout_px());
-        // The grid is lower by one cell plus the row gap.
-        assert_eq!(frame.origin_px(), local_origin + 18.0 + 16.0);
+        // The grid is lower by one cell plus the row gap, less the breath it
+        // keeps above the band's top line: the dock's own margin.
+        assert_eq!(frame.grid_breath(), 8.0);
+        assert_eq!(frame.origin_px(), local_origin + 18.0 + 16.0 - 8.0);
+        assert_eq!(
+            BOTTOM - frame.dock_band_px() - (frame.origin_px() + (ROWS - 5.0) * 18.0),
+            strip + 8.0,
+            "the remote prompt's row stands a margin above the line"
+        );
         // The separators are in `frame::tests` (`Instance`'s fields belong to that module).
         // Mouse: there is no input block, the row count is zero (not `None`).
         assert_eq!(frame.dock_hit().map(|(_, rows)| rows), Some(0));
@@ -3919,8 +3941,8 @@ mod tests {
         let band_top = FADE_BOTTOM - frame.dock_band_px();
         assert_eq!(
             band_top - grid_bottom,
-            0.0,
-            "{scene}: a strip opened between the grid and the band"
+            frame.grid_breath(),
+            "{scene}: a strip other than the breath opened between the grid and the band"
         );
         assert_eq!(
             frame.fill_origin_px() + f32::from(fill) * 18.0,
@@ -3948,6 +3970,7 @@ mod tests {
             FADE_CARET_ROW,
             FADE_OFFSET,
             band_target,
+            DOCK_ROWS,
             FADE_EDGE,
             fade_cell(),
         )
@@ -4183,7 +4206,7 @@ mod tests {
             FILL,
             0.0,
         );
-        assert_eq!(frame.origin_px(), local.origin_px() + 18.0 + 16.0);
+        assert_eq!(frame.origin_px(), local.origin_px() + 18.0 + 16.0 - 8.0);
         assert_caret_on_its_letter(&frame, "remote, settled");
     }
 
@@ -4202,7 +4225,7 @@ mod tests {
         }
         // The caret's target without an edge is today's expression.
         assert_eq!(
-            grid_caret_at(3, 7, 5, 2.0, 0.0, cell),
+            grid_caret_at(3, 7, 5, 2.0, DOCK_ROWS, 0.0, cell),
             [3.0, 7.0 + 5.0 - 2.0]
         );
     }
@@ -4244,7 +4267,7 @@ mod tests {
         };
         assert_eq!((rows(Cut), rows(Fade)), (FADE_ROWS, FADE_ROWS));
         let layout = |frame: &mut Frame| frame.set_dock_input_rows(Some(1));
-        let cut_caret = grid_caret_at(0, FADE_CARET_ROW, FADE_OFFSET, 0.0, 0.0, cell);
+        let cut_caret = grid_caret_at(0, FADE_CARET_ROW, FADE_OFFSET, 0.0, DOCK_ROWS, 0.0, cell);
         let mut motion = Motion::default();
         motion.sync(Some(cut_caret), FADE_OFFSET, 0.0, 0, false, false);
         let cut = edge_frame(Cut, motion, DOCK_ROWS, layout, 0, 0.0);

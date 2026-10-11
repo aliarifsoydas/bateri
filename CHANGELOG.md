@@ -88,6 +88,12 @@ of every installed copy. A version without a section is not released.
   for. Text inside a match is now held to the minimum contrast against the
   highlight, the way selected text already is against the selection.
 
+- **An ssh prompt no longer sits on the dock's line.** On a remote session the
+  dock is only the folder row, and the screen came down to fill the room the
+  input row left — all the way, so the remote prompt and its cursor touched the
+  line above the dock. The screen now stops the dock's own margin short of
+  that line, the same space that lies below it, and gives up no row for it.
+
 - **Letters no longer turn into boxes after a long session.** A tab that had
   shown many different characters — hours of Chinese, Japanese or Korean
   text, say — could start drawing every character it met for the first time as

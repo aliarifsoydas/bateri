@@ -1018,6 +1018,44 @@ fn dock_height(rows: u16, cell_h: f32, pad: f32) -> f32 {
     f32::from(rows) * cell_h + 2.0 * pad + gap
 }
 
+/// The **breath** between the grid's bottom row and the top of a dock band
+/// that is shorter than its share, in pixels: how much higher than the band's
+/// top the grid stops.
+///
+/// A remote session's band is the context row alone and the grid is drawn
+/// lower by the input row it gave up; lowered all the way, the remote
+/// prompt's row — and the block caret on it — stood glued to the band's top
+/// line (the user: "zero contact"). Keeping one `pad` of that drop above the
+/// line mirrors the `pad` below it, the dock's own breathing room, and costs
+/// no row: the share already holds it.
+///
+/// **A function of the band's current excess, not of its shape**, so it rides
+/// the band's animation with no state of its own: zero at rest with one input
+/// row or more (`excess ≥ 0`, nothing to spare), rising to `pad` at the
+/// remote shape's drop (one cell plus the row gap) and falling back to zero
+/// at the whole share (no band: a program reading the keyboard itself keeps
+/// its grid on the window's bottom). Both legs keep the grid's drop
+/// (`−excess − breath`) rising with the excess, so a slide never turns back.
+/// A one-row share (a remote alternate screen) has no input row to give up:
+/// zero. Rounded to whole pixels, like the excess itself, so the grid stays
+/// on the device grid.
+///
+/// The formula's single copy; its two readers are the grid's origin
+/// ([`Frame::grid_breath`]) and the grid caret's target (`link.rs`'s
+/// `grid_caret_at`) — the caret target gives the origin back, so a copy that
+/// diverged would stand the caret off its letter.
+pub(crate) fn grid_breath_px(excess_px: f32, share_rows: u16, cell_h: f32, pad: f32) -> f32 {
+    let share = dock_height(share_rows, cell_h, pad);
+    let remote = dock_height(2, cell_h, pad) - dock_height(1, cell_h, pad);
+    let drop = -excess_px;
+    if drop <= 0.0 || share <= remote {
+        return 0.0;
+    }
+    let rise = drop / remote;
+    let fall = (share - drop) / (share - remote);
+    (pad * rise.min(fall).clamp(0.0, 1.0)).round()
+}
+
 /// The gap **between** the dock's rows, in pixels.
 ///
 /// **Twice** the outer margin, and this number is not a taste but the result
@@ -1748,8 +1786,29 @@ impl Frame {
     /// term here is what makes the fill band ([`Frame::fill_origin_px`]), the
     /// mouse's publication and the caret follow it with no second reader.
     /// Zero (`Cut`, `Line`) is today's frame.
+    ///
+    /// **The breath lifts it back** ([`Frame::grid_breath`]): above a band
+    /// shorter than its share the grid stops that much short of the band's
+    /// top, and the same subtraction carries the fill band, the mouse and the
+    /// caret's slot with it.
     pub(crate) fn origin_px(&self) -> f32 {
-        self.origin_px + self.frac_px + self.edge_px - self.band_excess().unwrap_or(0.0)
+        self.origin_px + self.frac_px + self.edge_px
+            - self.band_excess().unwrap_or(0.0)
+            - self.grid_breath()
+    }
+
+    /// The gap kept between the grid's bottom row and the band's top in this
+    /// frame, pixels ([`grid_breath_px`] of the band's current, clamped
+    /// excess); zero in a frame whose band was not told.
+    pub(crate) fn grid_breath(&self) -> f32 {
+        self.band_excess().map_or(0.0, |excess| {
+            grid_breath_px(
+                excess,
+                self.dock_share.unwrap_or(DOCK_ROWS),
+                self.cell_px.1,
+                self.gutter_px,
+            )
+        })
     }
 
     /// The height of the content's top fade, pixels from the window's top;
@@ -6072,6 +6131,49 @@ mod tests {
         assert_eq!(frame.dock_band_px(), 0.0);
         assert_eq!(frame.dock_top_px, 600.0);
         assert_eq!(frame.origin_px(), 5.0 * 18.0 + share);
+    }
+
+    #[test]
+    fn the_grid_breathes_above_a_remote_band_only() {
+        // @1x, 18 px cell: the share is two cells and four margins, the remote
+        // band's drop one cell plus the row gap (two margins).
+        let pad = f32::from(GUTTER);
+        let share = dock_height(DOCK_ROWS, 18.0, pad);
+        let remote = dock_height(2, 18.0, pad) - dock_height(1, 18.0, pad);
+        assert_eq!((share, remote), (36.0 + 4.0 * pad, 18.0 + 2.0 * pad));
+        let breath = |excess: f32| grid_breath_px(excess, DOCK_ROWS, 18.0, pad);
+        // At rest: nothing with an input row (or more), the dock's margin over
+        // the remote band, nothing with no band at all.
+        assert_eq!(breath(0.0), 0.0, "local");
+        assert_eq!(breath(36.0), 0.0, "three input rows");
+        assert_eq!(breath(-remote), pad, "remote");
+        assert_eq!(breath(-share), 0.0, "no band");
+        // A one-row share (a remote alternate screen) has nothing to give up.
+        assert_eq!(grid_breath_px(0.0, 1, 18.0, pad), 0.0);
+        assert_eq!(grid_breath_px(-34.0, 1, 18.0, pad), 0.0);
+        // Every slide between the shapes moves the grid one way: its drop
+        // never shrinks while the band's excess falls, pixel by pixel.
+        let mut last = f32::NEG_INFINITY;
+        for px in 0..=share as u16 {
+            let excess = -f32::from(px);
+            let drop = -excess - breath(excess);
+            assert!(
+                drop >= last,
+                "the grid turned back at {excess}: {drop} < {last}"
+            );
+            assert!((0.0..=pad).contains(&breath(excess)), "{excess}");
+            last = drop;
+        }
+        // The frame reads the same function: a settled remote band.
+        let metrics = CellMetrics::new(9, 18, 9, GUTTER, 1, 1.0).expect("metrics");
+        let mut frame = Frame::default();
+        frame.clear(metrics, CaretStyle::default());
+        frame.set_dock_input_rows(Some(0));
+        frame.set_dock_band(600.0, -remote / 18.0);
+        frame.open_dock(BG, CURSOR, CURSOR, BAND);
+        frame.set_origin_rows(5.0);
+        assert_eq!(frame.grid_breath(), pad);
+        assert_eq!(frame.origin_px(), 5.0 * 18.0 + remote - pad);
     }
 
     /// A cell of a dock with three input rows: `row` 0..3 input, 3 context.
