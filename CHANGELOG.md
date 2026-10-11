@@ -14,6 +14,12 @@ of every installed copy. A version without a section is not released.
 
 ### Fixed
 
+- **Text inside a search match stays readable.** The highlight of a match
+  (⌘F) used to leave the text on it in its own color, so a theme whose
+  highlight was close to a text color could hide the very word you searched
+  for. Text inside a match is now held to the minimum contrast against the
+  highlight, the way selected text already is against the selection.
+
 - **Letters no longer turn into boxes after a long session.** A tab that had
   shown many different characters — hours of Chinese, Japanese or Korean
   text, say — could start drawing every character it met for the first time as

@@ -3416,10 +3416,11 @@ fn cell_cluster(
 /// is the colour the inverse-video swap leaves behind the text — the same
 /// pair, resolved the same way — so white text a dark-theme program paints on
 /// a light theme darkens until it reads, while the ground it was painted on
-/// stays. A `selected` cell's ground is not drawn (the selection's shape is
-/// beneath it), so it measures against the theme's selection instead — the
-/// focused one; the unfocused fade sits closer to the background, which the
-/// theme's selection is held to anyway. Picture characters ([`color::is_drawing`])
+/// stays. Under a highlight — the selection, or a search match — the cell's
+/// ground is not what shows (the highlight's shape is beneath the glyph), so
+/// it measures against the `highlight` instead: the focused colour, since the
+/// unfocused fade sits closer to the background the text was already measured
+/// against. Picture characters ([`color::is_drawing`])
 /// keep their ink. The rule lives here because this is the one place the
 /// grid and the fill band resolve ink — the band's row must read the way it
 /// will when it reaches the screen; the dock's mirror text has its own call
@@ -3450,7 +3451,7 @@ fn cell_style(
     inverse: bool,
     dim: bool,
     ruled: bool,
-    selected: bool,
+    highlight: Option<LinearRgba>,
     colors: &Colors,
     theme: &Theme,
     contrast: f64,
@@ -3478,11 +3479,7 @@ fn cell_style(
             color::resolve(cell.bg, colors, theme),
         )
     };
-    let ground = if selected {
-        theme.selection_linear()
-    } else {
-        color::linear_rgba(ground)
-    };
+    let ground = highlight.unwrap_or_else(|| color::linear_rgba(ground));
     let fg = if color::is_drawing(cell.c) {
         color::linear_rgba(fg)
     } else {
@@ -3536,29 +3533,46 @@ fn suppressed_rows(
     }
 }
 
-/// The window of the search scan: the grid's offset and height, the fill
-/// channel's height (`top_row + fill`) and the suppressed rows.
+/// One search scan's rows: the scrollback lines it covers, the list they land
+/// in and the suppressed rows when the scan can know them.
+///
+/// The grid and the fill channel are scanned **separately**, each right before
+/// its own loop, because the loop draws the text under a match against the
+/// match's highlight ([`search_ground`]) and so has to know the matches first.
+/// The grid's scan cannot know the suppressed rows (their upper end is born in
+/// the grid loop): it runs with `hidden: None` and its list is filtered after
+/// the loop ([`drop_hidden_matches`]). The channel's height is known only after
+/// the grid loop too, so one scan over both cannot come first.
 struct SearchWindow {
+    /// The scanned lines, `top..=bottom`; a match reaching past them gives runs
+    /// only on these.
+    lines: RangeInclusive<i32>,
+    /// What a line adds to become a row of the list: `offset` in the grid,
+    /// `offset + channel` in the channel (its fill-local rows).
+    shift: i32,
+    /// The grid's offset: a suppressed row is a grid row, `line + offset`.
     offset: i32,
-    rows: i32,
-    channel: i32,
     hidden: Option<RangeInclusive<u16>>,
 }
 
-/// Turns the drawn rows' matches into runs.
+/// Turns the matches of one window's rows into runs, appended to `out`.
 ///
-/// **While the `Term` lock is held** ([`Session::frame`]). Row `L` is at
-/// `L + offset` (`0..rows`) in the grid, at `L + offset + channel`
-/// (`0..channel`) in the channel; outside the two nothing is drawn and no run
-/// is given. A match is split into one run per row, those after the first are
-/// `continues`.
+/// **While the `Term` lock is held** ([`Session::frame`]). Line `L` is row
+/// `L + shift` of the list ([`SearchWindow`]); outside the window's lines nothing
+/// is drawn and no run is given. A match is split into one run per row, those
+/// after the first are `continues` — and every line of a match inside the
+/// window has its run, so a match's runs in one list are consecutive and
+/// [`drop_hidden_matches`] can tell them apart by `continues` alone. The runs
+/// come in row order, left to right within a row ([`search::scan`]'s order),
+/// the order [`search_ground`] walks them in.
 ///
 /// **Two excluded matches**, both entirely — a half-highlighted match would
 /// be one match in the count but something else on screen:
 ///
 /// - One touching the suppressed input row: that row is not drawn in
 ///   the grid and the dock is a separate surface; no highlight, count or
-///   navigation target is given to an invisible row.
+///   navigation target is given to an invisible row. Tested here when the
+///   window knows the rows, by [`drop_hidden_matches`] when it does not.
 /// - Ink-less ([`search::has_ink`]): a match consisting only of blanks would
 ///   paint empty rows — a highlight does not create content.
 ///
@@ -3569,69 +3583,126 @@ fn search_visible<T>(
     term: &Term<T>,
     regex: &mut search_engine::RegexSearch,
     current: Option<&search_engine::Match>,
-    out: &mut SearchRuns,
+    out: &mut Vec<SearchRun>,
     window: SearchWindow,
 ) {
     let SearchWindow {
+        lines: window,
+        shift,
         offset,
-        rows,
-        channel,
         hidden,
     } = window;
-    let top = Line(-offset - channel);
-    let bottom = Line(rows - 1 - offset);
     let last_col = term.columns().saturating_sub(1);
-    search::scan(term, regex, top, bottom, |found| {
-        let (start, end) = (*found.start(), *found.end());
-        let lines = start.line.0..=end.line.0;
-        if let Some(hidden) = &hidden
-            && lines
-                .clone()
-                .any(|line| u16::try_from(line + offset).is_ok_and(|row| hidden.contains(&row)))
-        {
-            return;
-        }
-        if !search::has_ink(term, found) {
-            return;
-        }
-        let is_current = current.is_some_and(|current| search::same_place(found, current));
-        for line in lines {
-            if line < top.0 || line > bottom.0 {
-                continue;
+    search::scan(
+        term,
+        regex,
+        Line(*window.start()),
+        Line(*window.end()),
+        |found| {
+            let (start, end) = (*found.start(), *found.end());
+            let lines = start.line.0..=end.line.0;
+            if let Some(hidden) = &hidden
+                && lines
+                    .clone()
+                    .any(|line| u16::try_from(line + offset).is_ok_and(|row| hidden.contains(&row)))
+            {
+                return;
             }
-            let first = if line == start.line.0 {
-                start.column.0
-            } else {
-                0
-            };
-            let last = if line == end.line.0 {
-                // A wide character is two columns: the run goes up to the spacer
-                // (the selection's arithmetic).
-                let wide = term.grid()[end].flags.contains(Flags::WIDE_CHAR);
-                (end.column.0 + usize::from(wide)).min(last_col)
-            } else {
-                last_col
-            };
-            let (Ok(first), Ok(last)) = (u16::try_from(first), u16::try_from(last)) else {
-                continue;
-            };
-            let run = |row: i32| {
-                u16::try_from(row).ok().map(|row| SearchRun {
+            if !search::has_ink(term, found) {
+                return;
+            }
+            let is_current = current.is_some_and(|current| search::same_place(found, current));
+            for line in lines {
+                if !window.contains(&line) {
+                    continue;
+                }
+                let first = if line == start.line.0 {
+                    start.column.0
+                } else {
+                    0
+                };
+                let last = if line == end.line.0 {
+                    // A wide character is two columns: the run goes up to the spacer
+                    // (the selection's arithmetic).
+                    let wide = term.grid()[end].flags.contains(Flags::WIDE_CHAR);
+                    (end.column.0 + usize::from(wide)).min(last_col)
+                } else {
+                    last_col
+                };
+                let (Ok(first), Ok(last), Ok(row)) = (
+                    u16::try_from(first),
+                    u16::try_from(last),
+                    u16::try_from(line + shift),
+                ) else {
+                    continue;
+                };
+                out.push(SearchRun {
                     row,
                     first,
                     last,
                     current: is_current,
                     continues: line != start.line.0,
-                })
-            };
-            let grid_row = line + offset;
-            if grid_row >= 0 {
-                out.runs.extend(run(grid_row));
-            } else {
-                out.fill_runs.extend(run(grid_row + channel));
+                });
             }
+        },
+    );
+}
+
+/// Drops every match of the grid's list that stands on a suppressed row —
+/// its runs on the other rows too, the rule [`search_visible`] applies when it
+/// knows the rows. A match's runs in the list are consecutive and every one
+/// after its first `continues` (the list may open with the tail of a match
+/// that starts in the channel above), and every grid row of the match has its
+/// run, so "a run of the match is on a suppressed row" is the same question as
+/// "a line of the match is".
+///
+/// In place, no allocation: the list is the caller's buffer
+/// ([`SearchRuns`]).
+fn drop_hidden_matches(runs: &mut Vec<SearchRun>, hidden: &RangeInclusive<u16>) {
+    if !runs.iter().any(|run| hidden.contains(&run.row)) {
+        return;
+    }
+    let (mut read, mut write) = (0, 0);
+    while let Some(rest) = runs.get(read..)
+        && !rest.is_empty()
+    {
+        let len = 1 + rest.iter().skip(1).take_while(|run| run.continues).count();
+        let touches = rest.iter().take(len).any(|run| hidden.contains(&run.row));
+        if !touches {
+            // audit: `read + len <= runs.len()` (`len` counts runs of `rest`)
+            // and `write <= read`, so both ranges are inside the list.
+            runs.copy_within(read..read + len, write);
+            write += len;
         }
-    });
+        read += len;
+    }
+    runs.truncate(write);
+}
+
+/// The search highlight drawn under the cell at `(row, col)`, if any — the
+/// ground its text is measured against ([`cell_style`]).
+///
+/// `at` walks `runs` forward only: the cells come in row order, left to right,
+/// and so do the runs ([`search_visible`]). While search is off the list is
+/// empty and this is one comparison.
+fn search_ground(
+    runs: &[SearchRun],
+    at: &mut usize,
+    row: u16,
+    col: u16,
+    colors: &search::SearchColors,
+) -> Option<LinearRgba> {
+    while let Some(run) = runs.get(*at)
+        && (run.row < row || (run.row == row && run.last < col))
+    {
+        *at += 1;
+    }
+    let run = runs.get(*at)?;
+    (run.row == row && run.first <= col).then_some(if run.current {
+        colors.current
+    } else {
+        colors.matched
+    })
 }
 /// The state given to [`Session::with_search`]'s `work`: the current match
 /// taken from the slot and the origin (mutable, put back) and the last
@@ -5535,6 +5606,56 @@ impl Session {
         } = term.renderable_content();
         let offset = display_offset as i32;
 
+        // **Search highlight, the grid's half — before the grid loop**: the loop
+        // draws a match's text against the match's highlight ([`search_ground`]),
+        // the way it draws selected text against the selection, so the matches
+        // must be known first. The suppressed rows are not known yet (their upper
+        // end is born in the loop's anchor scan): the scan runs without them and
+        // the list is filtered after the loop ([`drop_hidden_matches`]); the
+        // channel's half is scanned before the fill loop, once its height is
+        // known ([`SearchWindow`]). A match wrapping from the channel's bottom to
+        // the grid's top is split into the two lists but stays a single match.
+        // **The scroll bar's marks take only scalars from this round**: the
+        // scrollback's observation and the current match's row. Their
+        // bucketing reads the last pass, which lives in the search slot — a
+        // leaf lock, taken after `Term` is released ([`TrackMarks`]).
+        // The scrollback's observation, once: search's tracking and the block
+        // lane read the same one; nothing below in this round moves the history.
+        let ledger = self.ledger_now(&term);
+        let mut search_seen = None;
+        if let Some(regex) = search_pattern.as_mut() {
+            // The current match is first pinned to its content: if output
+            // scrolled the scrollback its highlight is at its scrolled place.
+            let now = ledger;
+            search::track(
+                &term,
+                &mut search_tracking,
+                now,
+                self.scrollback.load(Ordering::Relaxed),
+            );
+            search_seen = Some((
+                now,
+                search_tracking
+                    .current
+                    .as_ref()
+                    .map(|found| found.start().line.0),
+            ));
+            search_visible(
+                &term,
+                regex,
+                search_tracking.current.as_ref(),
+                &mut search.runs,
+                SearchWindow {
+                    lines: -offset..=rows - 1 - offset,
+                    shift: offset,
+                    offset,
+                    hidden: None,
+                },
+            );
+        }
+        // The walk's place in the grid's list ([`search_ground`]).
+        let mut search_at = 0;
+
         // The cursor is resolved **before** the loop, but no longer for the cells'
         // colour: the text under the block became a pixel job (see [`Cursor`]) and
         // the decision is given once per frame, not per cell. The only thing the
@@ -6081,8 +6202,14 @@ impl Session {
             // while the `Term` lock is held (colour resolution, descent to the side
             // table) and on an empty grid nearly all the cells are not drawn. The
             // shared piece ([`cell_style`]): the fill loop passes through the same place.
+            // The selection is drawn above a search match, so it is the ground.
+            let highlight = if selected {
+                Some(theme.selection_linear())
+            } else {
+                search_ground(&search.runs, &mut search_at, row, col, &search.colors)
+            };
             let style = cell_style(
-                cell, inverse, dim, ruled, selected, colors, &theme, contrast,
+                cell, inverse, dim, ruled, highlight, colors, &theme, contrast,
             );
 
             // **The duration counter's collision criterion**, collected in phase 1:
@@ -6162,12 +6289,14 @@ impl Session {
         //
         // **The range is from a single predicate** ([`suppressed_rows`]) and has
         // three consumers: the skipped cells (inside the loop), the selection runs
-        // and the search matches (below). Had they been written separately one
+        // and the search matches (the grid's, here; the channel's scan, below).
+        // Had they been written separately one
         // would diverge from another and an invisible row would be highlighted
         // (a lesson learned).
         let hidden = suppressed_rows(caret_in_dock, suppress_from, suppress_to, suppress_floor);
         if let Some(hidden) = &hidden {
             selection.runs.retain(|run| !hidden.contains(&run.row));
+            drop_hidden_matches(&mut search.runs, hidden);
         }
         let search_hidden = hidden
             .as_ref()
@@ -6341,6 +6470,26 @@ impl Session {
         let has_row_above = i64::from(offset) + i64::from(fill) < history;
         let top_row = u16::from(scroll_frac > 0.0 && has_row_above);
         let channel = top_row + fill;
+        // **Search highlight, the channel's half**: before the fill loop, for the
+        // grid's reason; the suppressed rows are known by now.
+        if channel > 0
+            && let Some(regex) = search_pattern.as_mut()
+        {
+            let channel = i32::from(channel);
+            search_visible(
+                &term,
+                regex,
+                search_tracking.current.as_ref(),
+                &mut search.fill_runs,
+                SearchWindow {
+                    lines: -offset - channel..=-offset - 1,
+                    shift: offset + channel,
+                    offset,
+                    hidden: hidden.clone(),
+                },
+            );
+        }
+        let mut fill_search_at = 0;
         // **Reading from the history is a separate loop and this is necessity, not
         // style.** The guard of the loop above, `debug_assert!((0..rows).contains(&row))`,
         // would blow up on a negative row, and the filled rows must **not** enter
@@ -6426,8 +6575,18 @@ impl Session {
                 if bg.is_none() && ch.is_none() && !ruled && hovered.is_none() {
                     continue;
                 }
-                // Fill rows are never selected (the loop's head says why).
-                let style = cell_style(cell, inverse, dim, ruled, false, colors, &theme, contrast);
+                // Fill rows are never selected (the loop's head says why); a
+                // search match is the only highlight here.
+                let highlight = search_ground(
+                    &search.fill_runs,
+                    &mut fill_search_at,
+                    fill_row,
+                    col,
+                    &search.colors,
+                );
+                let style = cell_style(
+                    cell, inverse, dim, ruled, highlight, colors, &theme, contrast,
+                );
                 let mut drawn = Cell {
                     col,
                     row: fill_row,
@@ -6448,51 +6607,6 @@ impl Session {
                 underline_link(&mut drawn, hovered);
                 fill_sink(drawn);
             }
-        }
-
-        // **Search highlight**: the matches of the drawn rows, the grid and
-        // the fill channel together — the two are consecutive rows
-        // (`-offset - channel ..= rows - 1 - offset`), i.e. a match wrapping from the
-        // channel's bottom to the grid's top is split into two lists but stays a
-        // single match. **After** the loops, because the suppression's upper end is
-        // born in the grid loop (the selection filter's rationale).
-        // **The scroll bar's marks take only scalars from this round**: the
-        // scrollback's observation and the current match's row. Their
-        // bucketing reads the last pass, which lives in the search slot — a
-        // leaf lock, taken after `Term` is released ([`TrackMarks`]).
-        // The scrollback's observation, once: search's tracking and the block
-        // lane read the same one.
-        let ledger = self.ledger_now(&term);
-        let mut search_seen = None;
-        if let Some(regex) = search_pattern.as_mut() {
-            // The current match is first pinned to its content: if output
-            // scrolled the scrollback its highlight is at its scrolled place.
-            let now = ledger;
-            search::track(
-                &term,
-                &mut search_tracking,
-                now,
-                self.scrollback.load(Ordering::Relaxed),
-            );
-            search_seen = Some((
-                now,
-                search_tracking
-                    .current
-                    .as_ref()
-                    .map(|found| found.start().line.0),
-            ));
-            search_visible(
-                &term,
-                regex,
-                search_tracking.current.as_ref(),
-                search,
-                SearchWindow {
-                    offset,
-                    rows,
-                    channel: i32::from(channel),
-                    hidden: hidden.clone(),
-                },
-            );
         }
 
         // **The cursor is built after the loops** and the reason is two fields:
@@ -24038,6 +24152,136 @@ e\\314\\201.'; sleep 5";
         let (_, runs) = search_now(&session);
         assert_eq!(spans(runs.as_slice()), [(0, 2, 4)], "{runs:?}");
         session.shutdown();
+    }
+
+    /// This moment's frame with search: the grid's and the band's cells and the runs.
+    fn search_frame(session: &Session) -> (Vec<Cell>, Vec<Cell>, SearchRuns) {
+        let (mut grid, mut band) = (Vec::new(), Vec::new());
+        let mut runs = SearchRuns::default();
+        session.frame(
+            |cell| grid.push(cell),
+            |cell| band.push(cell),
+            &mut Blocks::default(),
+            &mut SelectionRuns::default(),
+            &mut runs,
+            &mut TrackMarks::default(),
+            &mut Clusters::default(),
+            ScrollGlide::default(),
+            BUDGET,
+        );
+        (grid, band, runs)
+    }
+
+    /// WCAG 2's ratio between two drawn colours.
+    fn apart(a: LinearRgba, b: LinearRgba) -> f64 {
+        let (x, y) = (f64::from(a.luminance()), f64::from(b.luminance()));
+        let (light, dark) = if x > y { (x, y) } else { (y, x) };
+        (light + 0.05) / (dark + 0.05)
+    }
+
+    /// A theme whose two search highlights sit right on the foreground's
+    /// luminance — text kept in its own colour would vanish on them.
+    fn glaring_search() -> Theme {
+        Theme {
+            search_match: 0xb8b9bc,
+            search_current: 0xc8c9cc,
+            ..THEME
+        }
+    }
+
+    /// Every cell of `cells` under a run of `runs` reads on that run's
+    /// highlight; returns how many were checked.
+    fn reads_on_its_match(cells: &[Cell], runs: &[SearchRun], theme: &Theme) -> usize {
+        let mut checked = 0;
+        for cell in cells.iter().filter(|cell| cell.ch.is_some()) {
+            let Some(run) = runs
+                .iter()
+                .find(|run| run.row == cell.row && (run.first..=run.last).contains(&cell.col))
+            else {
+                continue;
+            };
+            let ground = if run.current {
+                theme.search_current_linear()
+            } else {
+                theme.search_match_linear()
+            };
+            assert!(apart(cell.fg, ground) >= 3.0 - 1e-3, "{cell:?} on {run:?}");
+            checked += 1;
+        }
+        checked
+    }
+
+    #[test]
+    fn text_under_a_search_match_reads_on_its_highlight() {
+        // The selection's rule, for search: the highlight is the text's
+        // ground, so the ink is held to the floor against it. Two matches, so
+        // both highlights are met — the current one and the other.
+        let session = text_session("ab xy ab");
+        let theme = glaring_search();
+        session.set_theme(theme);
+        session.set_search(&plain("ab"));
+        let (cells, _, runs) = search_frame(&session);
+        let run = runs.as_slice();
+        assert_eq!(spans(run), [(0, 0, 1), (0, 6, 7)], "{runs:?}");
+        assert!(run.iter().any(|run| run.current) && run.iter().any(|run| !run.current));
+        assert_eq!(reads_on_its_match(&cells, run, &theme), 4, "{cells:?}");
+        // Text outside a match keeps its own colour.
+        for cell in cells
+            .iter()
+            .filter(|cell| matches!(cell.ch, Some('x' | 'y')))
+        {
+            assert_eq!(cell.fg, theme.foreground_linear(), "{cell:?}");
+        }
+        // Search closed: the same text is drawn in its own colour again.
+        session.clear_search();
+        let (cells, _, _) = search_frame(&session);
+        for cell in cells.iter().filter(|cell| cell.ch.is_some()) {
+            assert_eq!(cell.fg, theme.foreground_linear(), "{cell:?}");
+        }
+        session.shutdown();
+    }
+
+    #[test]
+    fn text_under_a_search_match_in_the_band_reads_on_its_highlight() {
+        // The band's rows are the grid's rows on their way: the same rule.
+        // `2` starts `20` and `21` in the band ([`gapped_session`]).
+        let (session, _wake) = gapped_session(true);
+        let theme = glaring_search();
+        session.set_theme(theme);
+        session.set_search(&plain("2"));
+        let (cells, band, runs) = search_frame(&session);
+        assert_eq!(spans(runs.fill_slice()), [(3, 0, 0), (4, 0, 0)], "{runs:?}");
+        assert_eq!(reads_on_its_match(&band, runs.fill_slice(), &theme), 2);
+        assert!(reads_on_its_match(&cells, runs.as_slice(), &theme) > 0);
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_match_on_a_suppressed_row_is_dropped_whole() {
+        let run = |row, continues| SearchRun {
+            row,
+            first: 0,
+            last: 3,
+            current: false,
+            continues,
+        };
+        // The tail of a match from the band, a match over rows 1–3, one on 5.
+        let mut runs = vec![
+            run(0, true),
+            run(1, false),
+            run(2, true),
+            run(3, true),
+            run(5, false),
+        ];
+        // Row 3 is suppressed: the whole middle match goes, its rows 1–2 too.
+        drop_hidden_matches(&mut runs, &(3..=4));
+        assert_eq!(runs, [run(0, true), run(5, false)]);
+        // Nothing on a suppressed row: nothing moves.
+        drop_hidden_matches(&mut runs, &(7..=7));
+        assert_eq!(runs, [run(0, true), run(5, false)]);
+        // The list's opening tail is a match of its own.
+        drop_hidden_matches(&mut runs, &(0..=0));
+        assert_eq!(runs, [run(5, false)]);
     }
 
     #[test]

@@ -869,7 +869,8 @@ split_style = "cards"
   gets darker and light text lighter; text crosses to the other side only when
   its own side cannot reach the ratio — white on a light theme has nothing
   lighter to go to, so it becomes the gray that reads. Selected text is
-  measured against the selection's color.
+  measured against the selection's color, and text inside a search match
+  (⌘F) against the match's highlight.
 - Box drawing, block, Braille and Powerline characters are left as they are:
   programs draw pictures and borders with them, and a half-block image or a
   faint indent guide would get seams or turn loud.
