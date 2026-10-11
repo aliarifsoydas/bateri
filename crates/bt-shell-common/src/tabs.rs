@@ -34,6 +34,8 @@ use std::time::Duration;
 
 use bt_core::{HostMark, ProgramActivity};
 
+use crate::program::identity::Kind;
+
 /// A window's tabs in strip order, and the selected one.
 ///
 /// Invariant: a selection exists exactly when there is at least one tab. A bateri window is born
@@ -354,12 +356,13 @@ pub fn tab_of_menu_tag(tag: isize) -> Option<u64> {
     u64::try_from(tag).ok()?.checked_sub(1)
 }
 
-/// The role of a Show All Tabs row's status dot for what its tab reports: a running command, a
-/// question and a transfer in `accent`, a failure in `error`, a success in `success` — the
-/// colours the chip's own indicators wear.
+/// The role of a Show All Tabs row's status dot for what its tab reports: a running command and
+/// a transfer in `accent`, a question in `warning`, a failure in `error`, a success in `success`
+/// — the colours the chip's own indicators wear.
 pub fn list_dot(indicator: Indicator) -> Tone {
     match indicator {
-        Indicator::Question | Indicator::Running | Indicator::Uploading => Tone::Accent,
+        Indicator::Running | Indicator::Uploading => Tone::Accent,
+        Indicator::Question => Tone::Warning,
         Indicator::Failed => Tone::Error,
         Indicator::Finished => Tone::Success,
     }
@@ -394,6 +397,48 @@ pub const TAB_RADIUS: f64 = 7.0;
 
 /// Space between two neighbouring buttons on the right.
 pub const BUTTON_GAP: f64 = 4.0;
+
+/// Side of the square a tab's program icon sits in, left of its title: the icon, the ring that
+/// turns round it while the tab works and the tile it stands on in a deck all fit this square.
+pub const ICON_SIDE: f64 = 16.0;
+
+/// How far each further edge of a deck peeks out beyond the one in front of it: the tile of the
+/// focused pane stands at the left and the empty edges of the tab's other panes follow to its
+/// right, each [`DECK_STEP`] further.
+pub const DECK_STEP: f64 = 4.0;
+
+/// The most edges a deck shows behind its front tile; a tab of more panes shows no more.
+pub const DECK_EDGES: usize = 2;
+
+/// Space between a tab's icon (or its deck) and its title.
+pub const ICON_GAP: f64 = 6.0;
+
+/// How many edges peek out behind the front tile of a tab with `panes` panes: one for every pane
+/// but the focused one, up to [`DECK_EDGES`]. None for a tab of one pane — it has no deck.
+pub fn deck_edges(panes: usize) -> usize {
+    panes.saturating_sub(1).min(DECK_EDGES)
+}
+
+/// The width the icon of a tab with `edges` deck edges takes before its title: the front tile
+/// and the edges' steps.
+pub fn lead_width(edges: usize) -> f64 {
+    ICON_SIDE + edges.min(DECK_EDGES) as f64 * DECK_STEP
+}
+
+/// Where a chip's leading element (its icon with the deck, `lead` wide) and its title sit across
+/// the `inner` width (the chip less its padding on both sides), from the title's own width:
+/// `(the element's x, the title's x, the title's width)`, relative to the padding's edge. With an
+/// element the two are centred together and the title gives way first — the icon is never cut;
+/// without one the title takes the whole width (it is centred in its frame).
+pub fn title_row(inner: f64, text: f64, lead: Option<f64>) -> (Option<f64>, f64, f64) {
+    let Some(lead) = lead else {
+        return (None, 0.0, inner);
+    };
+    let room = (inner - lead - ICON_GAP).max(0.0);
+    let width = text.ceil().min(room);
+    let start = ((inner - (lead + ICON_GAP + width)) / 2.0).max(0.0).round();
+    (Some(start), start + lead + ICON_GAP, width)
+}
 
 /// Width of the fade at a scrolled strip's edge, where tabs run under the edge.
 pub const FADE: f64 = 28.0;
@@ -1024,6 +1069,8 @@ pub enum Tone {
     Title,
     Dim,
     Accent,
+    /// The theme's `warning` role — a program waiting for the user.
+    Warning,
     Success,
     Error,
     /// The host mark's own colour.
@@ -1099,24 +1146,51 @@ pub struct Tally {
 }
 
 /// A tab's commands that ended while the user was not looking at it: the "finished" tick and the
-/// "failed" dot, until the tab is selected ([`Unseen::looked`]).
+/// "failed" dot, until the tab is selected ([`Unseen::looked`]) — and the program each of them
+/// ran, so the chip keeps showing what ended rather than the shell it fell back to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Unseen {
     pub finished: bool,
     pub failed: bool,
+    /// What the latest unseen failure ran.
+    failed_kind: Option<Kind>,
+    /// What the latest unseen success ran.
+    finished_kind: Option<Kind>,
 }
 
 impl Unseen {
-    /// A pane of the tab moved from `seen` to `now`. What ended while the tab was **not selected**
-    /// marks it — a failure as failed, a success as finished, both kept until the tab is looked
-    /// at, so a later success does not hide an earlier failure. While the tab is selected nothing
-    /// is marked, even with its window behind another: the tab is the one the user left on screen.
-    pub fn observe(&mut self, seen: Tally, now: Tally, selected: bool) {
+    /// A pane of the tab moved from `seen` to `now`; `ended` is what its command ran. What ended
+    /// while the tab was **not selected** marks it — a failure as failed, a success as finished,
+    /// both kept until the tab is looked at, so a later success does not hide an earlier
+    /// failure. While the tab is selected nothing is marked, even with its window behind another:
+    /// the tab is the one the user left on screen.
+    ///
+    /// `ended` is read **when the end is noticed**, not later: by then the pane is back at its
+    /// prompt and what it runs is the shell again.
+    pub fn observe(&mut self, seen: Tally, now: Tally, selected: bool, ended: Kind) {
         if selected {
             return;
         }
-        self.failed |= now.failed != seen.failed;
-        self.finished |= now.finished != seen.finished;
+        if now.failed != seen.failed {
+            self.failed = true;
+            self.failed_kind = Some(ended);
+        }
+        if now.finished != seen.finished {
+            self.finished = true;
+            self.finished_kind = Some(ended);
+        }
+    }
+
+    /// What the mark on the chip is of: the failure's program while one is marked (the dot is
+    /// what the chip shows then), else the success's. `None` when nothing is marked.
+    pub fn kind(&self) -> Option<Kind> {
+        if self.failed {
+            self.failed_kind
+        } else if self.finished {
+            self.finished_kind
+        } else {
+            None
+        }
     }
 
     /// The tab came on screen: what it showed is seen.
@@ -1219,6 +1293,7 @@ impl Clock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program::identity::Agent;
 
     fn tabs(ids: &[u32], selected: u32) -> Tabs<u32> {
         let mut tabs = Tabs::new(ids[0]);
@@ -1511,7 +1586,7 @@ mod tests {
     #[test]
     fn the_list_dot_wears_the_role_of_what_the_tab_reports() {
         assert_eq!(list_dot(Indicator::Running), Tone::Accent);
-        assert_eq!(list_dot(Indicator::Question), Tone::Accent);
+        assert_eq!(list_dot(Indicator::Question), Tone::Warning);
         assert_eq!(list_dot(Indicator::Uploading), Tone::Accent);
         assert_eq!(list_dot(Indicator::Failed), Tone::Error);
         assert_eq!(list_dot(Indicator::Finished), Tone::Success);
@@ -2436,56 +2511,43 @@ mod tests {
     #[test]
     fn an_end_the_user_did_not_see_marks_the_tab_until_it_is_selected() {
         let seen = Tally::default();
-        let mut unseen = Unseen::default();
-        unseen.observe(
-            seen,
-            Tally {
-                finished: 1,
-                failed: 0,
-            },
-            true,
-        );
-        assert_eq!(unseen, Unseen::default(), "the selected tab");
-        unseen.observe(
-            seen,
-            Tally {
-                finished: 1,
-                failed: 0,
-            },
-            false,
-        );
-        assert_eq!(
-            unseen,
-            Unseen {
-                finished: true,
-                failed: false
-            }
-        );
-        let after = Tally {
+        let one = Tally {
             finished: 1,
             failed: 0,
         };
-        unseen.observe(
-            after,
-            Tally {
-                finished: 1,
-                failed: 1,
-            },
-            false,
-        );
+        let mut unseen = Unseen::default();
+        unseen.observe(seen, one, true, Kind::Task);
+        assert_eq!(unseen, Unseen::default(), "the selected tab");
+        assert_eq!(unseen.kind(), None);
+        unseen.observe(seen, one, false, Kind::Task);
+        assert!(unseen.finished && !unseen.failed);
+        assert_eq!(unseen.kind(), Some(Kind::Task), "what ended stays");
+        let both = Tally {
+            finished: 1,
+            failed: 1,
+        };
+        unseen.observe(one, both, false, Kind::Agent(Agent::Codex));
         assert!(unseen.failed && unseen.finished, "a failure joins");
+        assert_eq!(
+            unseen.kind(),
+            Some(Kind::Agent(Agent::Codex)),
+            "the failure's program, which the dot is of"
+        );
         unseen.observe(
-            Tally {
-                finished: 1,
-                failed: 1,
-            },
+            both,
             Tally {
                 finished: 2,
                 failed: 1,
             },
             false,
+            Kind::Shell,
         );
         assert!(unseen.failed, "a later success does not hide the failure");
+        assert_eq!(
+            unseen.kind(),
+            Some(Kind::Agent(Agent::Codex)),
+            "nor the program it was of"
+        );
         assert_eq!(
             indicator(Signals {
                 failed: unseen.failed,
@@ -2495,9 +2557,23 @@ mod tests {
             Some(Indicator::Failed)
         );
         unseen.looked();
-        assert_eq!(unseen, Unseen::default());
-        unseen.observe(after, after, false);
+        assert_eq!(unseen, Unseen::default(), "looking forgets the program too");
+        assert_eq!(unseen.kind(), None);
+        unseen.observe(both, both, false, Kind::Task);
         assert_eq!(unseen, Unseen::default(), "nothing ended");
+    }
+
+    /// With only successes marked, the chip is of the latest one's program.
+    #[test]
+    fn the_tick_is_of_the_program_that_finished_last() {
+        let mut unseen = Unseen::default();
+        let at = |finished| Tally {
+            finished,
+            failed: 0,
+        };
+        unseen.observe(at(0), at(1), false, Kind::Task);
+        unseen.observe(at(1), at(2), false, Kind::Editor);
+        assert_eq!(unseen.kind(), Some(Kind::Editor));
     }
 
     /// Several ends between two looks are one mark, the counts' wrap included.
@@ -2514,14 +2590,66 @@ mod tests {
                 failed: 3,
             },
             false,
+            Kind::Task,
         );
+        assert!(unseen.finished && !unseen.failed);
+        assert_eq!(unseen.kind(), Some(Kind::Task));
+    }
+
+    /// A deck has an edge for every pane but the one in front, two at the most; a tab of one
+    /// pane has none.
+    #[test]
+    fn a_deck_shows_an_edge_for_each_other_pane_up_to_two() {
+        assert_eq!(deck_edges(0), 0);
+        assert_eq!(deck_edges(1), 0);
+        assert_eq!(deck_edges(2), 1);
+        assert_eq!(deck_edges(3), 2);
+        assert_eq!(deck_edges(9), DECK_EDGES);
+        assert_eq!(lead_width(0), ICON_SIDE);
+        assert_eq!(lead_width(2), ICON_SIDE + 2.0 * DECK_STEP);
         assert_eq!(
-            unseen,
-            Unseen {
-                finished: true,
-                failed: false
-            }
+            lead_width(7),
+            lead_width(DECK_EDGES),
+            "no more than the deck shows"
         );
+    }
+
+    /// The icon and a short title are centred together; a long title gives way to the icon and
+    /// is cut, never the icon, and a deck takes its steps from the title; without an icon the
+    /// title has the whole width.
+    #[test]
+    fn the_title_gives_way_to_the_icon_and_its_deck() {
+        let step = ICON_SIDE + ICON_GAP;
+        let (lead, text, width) = title_row(132.0, 40.0, Some(ICON_SIDE));
+        assert_eq!(lead, Some(((132.0 - step - 40.0) / 2.0_f64).round()));
+        assert_eq!(text, lead.unwrap() + step);
+        assert_eq!(width, 40.0);
+        let (lead, text, width) = title_row(132.0, 300.0, Some(ICON_SIDE));
+        assert_eq!(lead, Some(0.0));
+        assert_eq!(text, step);
+        assert_eq!(width, 132.0 - step, "the title is cut, not the icon");
+        let deck = lead_width(2);
+        let (lead, text, width) = title_row(132.0, 300.0, Some(deck));
+        assert_eq!(lead, Some(0.0));
+        assert_eq!(text, deck + ICON_GAP);
+        assert_eq!(
+            width,
+            132.0 - deck - ICON_GAP,
+            "the deck's edges take from the title"
+        );
+        let (lead, _, width) = title_row(10.0, 40.0, Some(ICON_SIDE));
+        assert_eq!(lead, Some(0.0));
+        assert_eq!(width, 0.0, "a chip too narrow keeps the icon alone");
+        assert_eq!(title_row(132.0, 40.0, None), (None, 0.0, 132.0));
+    }
+
+    /// At the narrowest a chip gets, the title keeps room to be read beside the widest deck.
+    #[test]
+    fn the_narrowest_chip_still_reads_beside_the_widest_deck() {
+        // The chip's side padding (the close button's room) is the shell's; 26 pt a side.
+        let inner = MIN_WIDTH - 2.0 * 26.0;
+        let (_, _, width) = title_row(inner, 200.0, Some(lead_width(DECK_EDGES)));
+        assert!(width >= 36.0, "{width} pt for the title");
     }
 
     /// One turn per twelve counter periods: twelve seconds, and twelve minutes from the hour on,

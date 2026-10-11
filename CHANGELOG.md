@@ -27,6 +27,18 @@ of every installed copy. A version without a section is not released.
 - **Ultraviolet, a new theme of bateri's own.** Vivid colors on a deep violet
   ground, with an amber cursor; every color reads clearly on it, comments
   included.
+- **A tab tells which program runs in it.** Before its title a tab now
+  draws a small icon: the mark of the coding agent in it (Claude Code, Codex,
+  OpenCode, Antigravity, Gemini CLI, Pi, Herdr, Cursor CLI, Copilot CLI, Qwen
+  Code, Kimi CLI), or a drawing for what else a pane spends its time in — the
+  shell, an ssh session's server, an editor, a language prompt, a database, a
+  container, a system monitor, git, a build or test run, a pager, a file
+  manager, a root shell. The ring that turns while a command runs now goes
+  round the icon, and a question, a finished command, a failure or a transfer
+  sits on its corner. A tab split into panes shows the focused pane's program
+  on a tile with one or two empty tile edges behind it. A command that ends
+  while you look at another tab leaves its icon with the tick or the dot until
+  you come back, so you can read what finished.
 
 ### Changed
 

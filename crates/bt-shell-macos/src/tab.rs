@@ -58,11 +58,12 @@ use crate::embed;
 use crate::launch::Closing;
 use crate::notices::Source;
 use crate::pane::{PaneHost, TerminalPane};
+use crate::program::identity::Kind;
 use crate::restore::{SavedTab, Shape};
 use crate::sheets;
 use crate::split::{Axis, Direction, Placement, Removal, Tree};
 use crate::split_view::SplitView;
-use crate::tab_bar::Upload;
+use crate::tab_bar::{Emblem, Upload};
 use crate::tabs::{self, Card, CardCommand, Indicator, Signals, Tally, Unseen};
 use crate::upload;
 use crate::uploader;
@@ -1012,7 +1013,9 @@ impl TerminalTab {
     /// while the tab was away ([`TabIvars::unseen`]) and a transfer flowing
     /// ([`Self::upload`]).
     pub(crate) fn indicator(&self) -> Option<Indicator> {
-        let Unseen { finished, failed } = self.ivars().unseen.get();
+        let Unseen {
+            finished, failed, ..
+        } = self.ivars().unseen.get();
         tabs::indicator(Signals {
             question: sheets::question_waiting(self.container()) || self.program_blocked(),
             running: self.running_for().is_some(),
@@ -1020,6 +1023,21 @@ impl TerminalTab {
             finished,
             uploading: self.upload().is_some(),
         })
+    }
+
+    /// What the tab's chip draws before its title: the program the focused pane runs and, when
+    /// the tab holds more panes, the deck behind it (`tabs::deck_edges`). While the chip shows a
+    /// command that ended unseen (`indicator` is its tick or its dot) the program is the one that
+    /// ended — the pane has fallen back to its prompt by now, and "what finished" is what the
+    /// tick is of ([`Unseen::kind`]).
+    pub(crate) fn emblem(&self, indicator: Option<Indicator>) -> Emblem {
+        let ended = matches!(indicator, Some(Indicator::Finished | Indicator::Failed))
+            .then(|| self.ivars().unseen.get().kind())
+            .flatten();
+        Emblem {
+            kind: ended.unwrap_or_else(|| self.focused_pane().program_kind()),
+            edges: tabs::deck_edges(self.panes().len()),
+        }
     }
 
     /// A program in one of the tab's panes reported itself blocked on the user
@@ -1139,7 +1157,13 @@ impl TerminalTab {
                 .iter()
                 .find(|(id, _)| *id == pane.id())
                 .map_or(Tally::default(), |(_, tally)| *tally);
-            unseen.observe(seen, now, selected);
+            // What it ran is read when the end is noticed: the pane is at its prompt by now.
+            let ended = if now == seen {
+                Kind::Shell
+            } else {
+                pane.ended_kind()
+            };
+            unseen.observe(seen, now, selected, ended);
             next.push((pane.id(), now));
         }
         *tallies = next;

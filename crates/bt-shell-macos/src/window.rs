@@ -2851,10 +2851,12 @@ impl TerminalWindow {
                 } else {
                     tab.session_title()
                 };
+                let indicator = tab.indicator();
                 Label {
                     tab: tab.id(),
                     title: title.unwrap_or_else(|| "bateri".to_owned()),
-                    indicator: tab.indicator(),
+                    indicator,
+                    emblem: tab.emblem(indicator),
                     running: tab.running_for(),
                     upload: tab.upload(),
                     mark: tab.host_mark(),

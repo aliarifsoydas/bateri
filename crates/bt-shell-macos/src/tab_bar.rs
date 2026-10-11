@@ -120,15 +120,16 @@ use objc2_app_kit::{
     NSAccessibility, NSAccessibilityButtonRole, NSAccessibilityRadioButtonRole,
     NSAccessibilityTabButtonSubrole, NSAccessibilityTabGroupRole, NSAnimatablePropertyContainer,
     NSAnimationContext, NSApplication, NSAutoresizingMaskOptions, NSBezierPath, NSBox, NSBoxType,
-    NSColor, NSControl, NSControlStateValueOn, NSControlTextEditingDelegate, NSDragOperation,
-    NSDraggingDestination, NSDraggingInfo, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType,
-    NSFocusRingType, NSFont, NSFontWeightMedium, NSFontWeightRegular, NSFontWeightSemibold,
-    NSGradient, NSImage, NSLineBreakMode, NSLineCapStyle, NSLineJoinStyle, NSMenu, NSMenuItem,
-    NSShadow, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTitlePosition, NSTrackingArea,
+    NSColor, NSCompositingOperation, NSControl, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSEvent,
+    NSEventMask, NSEventModifierFlags, NSEventType, NSFocusRingType, NSFont, NSFontWeightMedium,
+    NSFontWeightRegular, NSFontWeightSemibold, NSGradient, NSGraphicsContext, NSImage,
+    NSLineBreakMode, NSLineCapStyle, NSLineJoinStyle, NSMenu, NSMenuItem, NSShadow,
+    NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTitlePosition, NSTrackingArea,
     NSTrackingAreaOptions, NSView, NSWindowButton, NSWindowOrderingMode, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    NSArray, NSNotification, NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    NSArray, NSData, NSNotification, NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
     NSUserDefaults, ns_string,
 };
 use objc2_quartz_core::{
@@ -137,6 +138,8 @@ use objc2_quartz_core::{
 
 use crate::app;
 use crate::arrange;
+use crate::icon;
+use crate::program::identity::Kind as ProgramKind;
 use crate::tab_drag;
 use crate::tabs::{
     self, BUTTON, Bar, Card, CardCommand, Clock, Drag, FADE, Grip, Indicator, Over, Strip,
@@ -170,11 +173,6 @@ const CHIP_PAD: f64 = 26.0;
 
 /// The single tab's title box inset — it has no `×` to make room for.
 const SINGLE_PAD: f64 = 8.0;
-
-/// The indicator's side and the space between it and the title (the
-/// design's 12 pt glyph, 6 pt gap).
-const GLYPH_SIDE: f64 = 12.0;
-const GLYPH_GAP: f64 = 6.0;
 
 /// The `×` button: its side, its inset from the chip's corner and its
 /// corner radius.
@@ -385,6 +383,7 @@ impl Palette {
             Tone::Title => self.title,
             Tone::Dim => self.dim,
             Tone::Accent => self.accent,
+            Tone::Warning => self.warning,
             Tone::Success => self.success,
             Tone::Error => self.error,
             Tone::Mark => mark,
@@ -710,10 +709,60 @@ impl CloseButton {
     }
 }
 
-// ─── A chip's indicator ───────────────────────────────────────────────────
+// ─── A chip's icon ────────────────────────────────────────────────────────
+
+/// Room the glyph's view keeps round the icon's square, above, below and to the right, for what
+/// overhangs it: the badge on its corner, which a view cannot draw outside its own frame. The
+/// view is as high as a chip.
+const GLYPH_OVERHANG: f64 = 6.0;
+
+/// The icon's strength over the chip: the text's colour less a little, a second voice beside the
+/// title rather than a louder one.
+const ICON_INK: f64 = 0.82;
+
+/// The mark's own side within the [`tabs::ICON_SIDE`] square: bare, inside the running ring, on
+/// a deck's tile (the ring takes the same room on a tile as off one).
+const MARK_BARE: f64 = 11.0;
+const MARK_RINGED: f64 = 8.0;
+const MARK_TILED: f64 = 10.0;
+
+/// The running ring in the square: its radius and the width of its stroke.
+const RING_RADIUS: f64 = 6.9;
+const RING_WIDTH: f64 = 1.4;
+
+/// The badge on the icon's corner: its diameter (the failure's dot is smaller, a shape apart from
+/// the rest), the ring cut clear round it and how far inside the corner its centre sits.
+const BADGE_SIDE: f64 = 10.0;
+const BADGE_DOT: f64 = 7.0;
+const BADGE_HALO: f64 = 1.5;
+const BADGE_INSET: f64 = 1.0;
+
+/// A deck tile's corner radius and the hairline round it.
+const TILE_RADIUS: f64 = 4.8;
+const TILE_LINE: f64 = 0.75;
+
+/// What a chip's icon is of ([`TerminalTab::emblem`](crate::tab::TerminalTab::emblem)): the
+/// program its focused pane runs, and how many panes' edges peek out behind it (a deck,
+/// `tabs::deck_edges`; none for a tab of one pane).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Emblem {
+    pub(crate) kind: ProgramKind,
+    pub(crate) edges: usize,
+}
+
+/// What the glyph draws.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GlyphLook {
+    emblem: Emblem,
+    /// What the tab reports, on the icon: the ring round it while a command runs, a badge on its
+    /// corner for the rest.
+    indicator: Option<Indicator>,
+    /// A transfer is a download: the badge's arrow points down.
+    down: bool,
+}
 
 pub(crate) struct GlyphIvars {
-    shown: Cell<Option<Indicator>>,
+    look: Cell<Option<GlyphLook>>,
     /// The running ring's arc, a layer of its own that the turn is played on: the glyph's
     /// own backing layer is AppKit's (its anchor is a corner, and AppKit resets what it sets).
     arc: Retained<CALayer>,
@@ -723,8 +772,6 @@ pub(crate) struct GlyphIvars {
     turning: Cell<Option<Duration>>,
     /// What the arc's picture was drawn in: its colour and the scale of the screen it is on.
     arc_ink: Cell<Option<(u32, f64)>>,
-    /// The transfer is a download: the arrow points down.
-    down: Cell<bool>,
     palette: Cell<Option<Palette>>,
 }
 
@@ -758,73 +805,182 @@ define_class!(
             self.ink_arc();
         }
 
-        /// The glyph in a [`GLYPH_SIDE`] square, in its role.
+        /// The icon in its square, with its deck, its ring or its badge.
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
             let iv = self.ivars();
-            let (Some(indicator), Some(palette)) = (iv.shown.get(), iv.palette.get()) else {
+            let (Some(look), Some(palette)) = (iv.look.get(), iv.palette.get()) else {
                 return;
             };
-            // The role is `tabs`' one table, the Show All Tabs dots' too.
-            let role = palette.tone(tabs::list_dot(indicator), 0);
-            match indicator {
-                Indicator::Question => draw_question(role),
-                Indicator::Running => draw_track(palette),
-                Indicator::Finished => draw_tick(role),
-                Indicator::Failed => draw_dot(role),
-                Indicator::Uploading => draw_arrow(iv.down.get(), role),
-            }
+            draw_glyph(look, palette);
         }
     }
 );
 
-/// "Waiting for an answer": a ring with a question mark in it, in `accent`
-/// — a mark of its own, not a role of its own.
-fn draw_question(color: u32) {
-    let ink = Tint::of(color, 1.0);
-    let ring = NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-        NSPoint::new(0.75, 0.75),
-        NSSize::new(GLYPH_SIDE - 1.5, GLYPH_SIDE - 1.5),
-    ));
-    stroke(&ring, 1.3, ink);
-    let mark = NSBezierPath::bezierPath();
-    mark.moveToPoint(NSPoint::new(4.3, 4.6));
-    mark.curveToPoint_controlPoint1_controlPoint2(
-        NSPoint::new(7.7, 4.6),
-        NSPoint::new(4.3, 2.5),
-        NSPoint::new(7.7, 2.5),
-    );
-    mark.curveToPoint_controlPoint1_controlPoint2(
-        NSPoint::new(6.0, 7.0),
-        NSPoint::new(7.7, 5.8),
-        NSPoint::new(6.0, 5.8),
-    );
-    stroke(&mark, 1.3, ink);
-    let dot = NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-        NSPoint::new(5.2, 8.05),
-        NSSize::new(1.6, 1.6),
-    ));
-    ink.color().setFill();
-    dot.fill();
-}
-
-/// "Running": the ring's centre and radius in the glyph's square.
-fn ring_circle() -> (NSPoint, f64) {
-    (
-        NSPoint::new(GLYPH_SIDE / 2.0, GLYPH_SIDE / 2.0),
-        GLYPH_SIDE / 2.0 - 1.4,
+/// The square the icon sits in, in the glyph's own (flipped) space: at its left edge, with
+/// [`GLYPH_OVERHANG`] above.
+fn glyph_slot() -> NSRect {
+    NSRect::new(
+        NSPoint::new(0.0, GLYPH_OVERHANG),
+        NSSize::new(tabs::ICON_SIDE, tabs::ICON_SIDE),
     )
 }
 
-/// "Running": the faint ring under the turning arc, in the bar's track colour. The arc itself is
-/// not drawn here — it turns, so it is a layer of its own ([`draw_arc`]).
-fn draw_track(palette: Palette) {
+/// `rect`'s middle, as a square of the given `side`.
+fn centred_square(rect: NSRect, side: f64) -> NSRect {
+    NSRect::new(
+        NSPoint::new(
+            rect.origin.x + (rect.size.width - side) / 2.0,
+            rect.origin.y + (rect.size.height - side) / 2.0,
+        ),
+        NSSize::new(side, side),
+    )
+}
+
+/// `under` with `over` laid on it at `share`: an opaque colour, for what has to hide what is behind
+/// it (a deck's tiles overlap) without knowing what the chip below is lit as.
+fn blend(under: u32, over: u32, share: f64) -> u32 {
+    let channel = |shift: u32| {
+        let (a, b) = (
+            f64::from((under >> shift) & 0xff),
+            f64::from((over >> shift) & 0xff),
+        );
+        ((a + (b - a) * share).round().clamp(0.0, 255.0) as u32) << shift
+    };
+    channel(16) | channel(8) | channel(0)
+}
+
+/// The glyph: the deck behind the front tile if the tab holds more panes, the program's mark, and
+/// on it the running ring or the badge of what the tab reports.
+fn draw_glyph(look: GlyphLook, palette: Palette) {
+    let slot = glyph_slot();
+    let Emblem { kind, edges } = look.emblem;
+    let ringed = look.indicator == Some(Indicator::Running);
+    if edges > 0 {
+        draw_deck(edges, slot, palette);
+    }
+    let side = match (edges > 0, ringed) {
+        (_, true) => MARK_RINGED,
+        (false, false) => MARK_BARE,
+        (true, false) => MARK_TILED,
+    };
+    draw_mark(
+        kind,
+        centred_square(slot, side),
+        Tint::of(palette.title, ICON_INK),
+    );
+    match look.indicator {
+        Some(Indicator::Running) => draw_track(slot, palette),
+        Some(indicator) => draw_badge(indicator, look.down, slot, palette),
+        None => {}
+    }
+}
+
+/// A deck: the empty edges of the tab's other panes, each one step further right and behind the
+/// tile in front, which stands in the slot. Tiles are opaque, so the ones behind show only the
+/// edge that peeks out.
+fn draw_deck(edges: usize, slot: NSRect, palette: Palette) {
+    let fill = |share| blend(palette.ground, palette.title, share);
+    let line = Tint::of(fill(0.30), 1.0);
+    for step in (1..=edges.min(tabs::DECK_EDGES)).rev() {
+        let mut rect = slot;
+        rect.origin.x += step as f64 * tabs::DECK_STEP;
+        draw_tile(rect, fill(0.09), line);
+    }
+    draw_tile(slot, fill(0.17), line);
+}
+
+/// One deck tile: a rounded square with a hairline round it.
+fn draw_tile(rect: NSRect, fill: u32, line: Tint) {
+    let inset = TILE_LINE / 2.0;
+    let rect = NSRect::new(
+        NSPoint::new(rect.origin.x + inset, rect.origin.y + inset),
+        NSSize::new(rect.size.width - TILE_LINE, rect.size.height - TILE_LINE),
+    );
+    let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+        rect,
+        TILE_RADIUS - inset,
+        TILE_RADIUS - inset,
+    );
+    Tint::of(fill, 1.0).color().setFill();
+    path.fill();
+    path.setLineWidth(TILE_LINE);
+    line.color().setStroke();
+    path.stroke();
+}
+
+/// The program's mark in `rect` (a square): its path data scaled into it and filled or stroked as
+/// its source has it, or the one mark that exists only as a picture, tinted.
+fn draw_mark(kind: ProgramKind, rect: NSRect, ink: Tint) {
+    match icon::of(kind).art {
+        icon::Art::Path(shape) => {
+            let Ok(segments) = shape.segments() else {
+                return;
+            };
+            let fit = shape.view_box.fit(rect.size.width);
+            let place = |p: icon::Point| NSPoint::new(rect.origin.x + p.x, rect.origin.y + p.y);
+            let path = NSBezierPath::bezierPath();
+            for segment in segments {
+                match fit.segment(segment) {
+                    icon::Segment::Move(to) => path.moveToPoint(place(to)),
+                    icon::Segment::Line(to) => path.lineToPoint(place(to)),
+                    icon::Segment::Cubic { c1, c2, to } => path
+                        .curveToPoint_controlPoint1_controlPoint2(place(to), place(c1), place(c2)),
+                    icon::Segment::Close => path.closePath(),
+                }
+            }
+            match shape.paint {
+                icon::Paint::Fill => {
+                    ink.color().setFill();
+                    path.fill();
+                }
+                icon::Paint::Stroke { width } => stroke(&path, fit.length(width), ink),
+            }
+        }
+        icon::Art::Mask(png) => draw_mask(png, rect, ink),
+    }
+}
+
+/// A picture whose alpha is the shape, in `rect` and in `ink`: the picture is laid on a clear
+/// image of its own and the colour poured over what it covers.
+fn draw_mask(png: &'static [u8], rect: NSRect, ink: Tint) {
+    let data = NSData::with_bytes(png);
+    let Some(mask) = NSImage::initWithData(NSImage::alloc(), &data) else {
+        return;
+    };
+    let color = ink.color();
+    let draw = RcBlock::new(move |bounds: NSRect| -> Bool {
+        mask.drawInRect(bounds);
+        NSGraphicsContext::saveGraphicsState_class();
+        if let Some(context) = NSGraphicsContext::currentContext() {
+            context.setCompositingOperation(NSCompositingOperation::SourceIn);
+        }
+        color.setFill();
+        NSBezierPath::fillRect(bounds);
+        NSGraphicsContext::restoreGraphicsState_class();
+        Bool::YES
+    });
+    let tinted = NSImage::imageWithSize_flipped_drawingHandler(rect.size, true, &draw);
+    tinted.drawInRect(rect);
+}
+
+/// "Running": the ring's centre and radius in the icon's square.
+fn ring_circle() -> (NSPoint, f64) {
+    (
+        NSPoint::new(tabs::ICON_SIDE / 2.0, tabs::ICON_SIDE / 2.0),
+        RING_RADIUS,
+    )
+}
+
+/// "Running": the faint ring under the turning arc, in the bar's track colour, round the icon.
+/// The arc itself is not drawn here — it turns, so it is a layer of its own ([`draw_arc`]).
+fn draw_track(slot: NSRect, palette: Palette) {
     let (at, radius) = ring_circle();
     let track = NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-        NSPoint::new(at.x - radius, at.y - radius),
+        NSPoint::new(slot.origin.x + at.x - radius, slot.origin.y + at.y - radius),
         NSSize::new(2.0 * radius, 2.0 * radius),
     ));
-    stroke(&track, 1.6, palette.track);
+    stroke(&track, RING_WIDTH, palette.track);
 }
 
 /// "Running": the quarter arc in `accent`, resting at the top and running clockwise from there —
@@ -836,44 +992,95 @@ fn draw_arc(color: u32) {
     arc.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise(
         at, radius, -90.0, 0.0, false,
     );
-    stroke(&arc, 1.6, Tint::of(color, 1.0));
+    stroke(&arc, RING_WIDTH, Tint::of(color, 1.0));
 }
 
-/// "Finished while you were away": a tick in `success`.
-fn draw_tick(color: u32) {
-    let path = NSBezierPath::bezierPath();
-    path.moveToPoint(NSPoint::new(2.6, 6.4));
-    path.lineToPoint(NSPoint::new(5.0, 8.8));
-    path.lineToPoint(NSPoint::new(9.4, 3.6));
-    stroke(&path, 1.8, Tint::of(color, 1.0));
+/// What the tab reports, other than a command running, as a badge on the icon's corner: a
+/// question, a tick, a dot or an arrow in the role of its meaning, with a ring cut clear round it
+/// so the icon does not run into it.
+fn draw_badge(indicator: Indicator, down: bool, slot: NSRect, palette: Palette) {
+    let role = palette.tone(tabs::list_dot(indicator), 0);
+    let centre = NSPoint::new(
+        slot.origin.x + slot.size.width - BADGE_INSET,
+        slot.origin.y + BADGE_INSET,
+    );
+    let side = if indicator == Indicator::Failed {
+        BADGE_DOT
+    } else {
+        BADGE_SIDE
+    };
+    let circle = |side: f64| {
+        NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+            NSPoint::new(centre.x - side / 2.0, centre.y - side / 2.0),
+            NSSize::new(side, side),
+        ))
+    };
+    // Transparent, not the chip's colour: the chip is lit differently selected, hovered and not.
+    NSGraphicsContext::saveGraphicsState_class();
+    if let Some(context) = NSGraphicsContext::currentContext() {
+        context.setCompositingOperation(NSCompositingOperation::Clear);
+    }
+    circle(side + 2.0 * BADGE_HALO).fill();
+    NSGraphicsContext::restoreGraphicsState_class();
+    Tint::of(role, 1.0).color().setFill();
+    circle(side).fill();
+    let ink = Tint::of(palette.ground, 1.0);
+    match indicator {
+        Indicator::Question => draw_query(centre, ink),
+        Indicator::Finished => draw_check(centre, ink),
+        Indicator::Uploading => draw_arrow(centre, down, ink),
+        Indicator::Running | Indicator::Failed => {}
+    }
 }
 
-/// "Failed while you were away": a full dot in `error` — a shape apart from
-/// the tick, so the two part without their colours too.
-fn draw_dot(color: u32) {
+/// A point of the 12-unit grid the marks below are drawn in, placed at `scale` about `centre`.
+fn on_grid(centre: NSPoint, scale: f64, x: f64, y: f64) -> NSPoint {
+    NSPoint::new(centre.x + (x - 6.0) * scale, centre.y + (y - 6.0) * scale)
+}
+
+/// "Waiting for an answer": a question mark in the badge.
+fn draw_query(centre: NSPoint, ink: Tint) {
+    let at = |x, y| on_grid(centre, 0.7, x, y);
+    let mark = NSBezierPath::bezierPath();
+    mark.moveToPoint(at(4.3, 4.6));
+    mark.curveToPoint_controlPoint1_controlPoint2(at(7.7, 4.6), at(4.3, 2.5), at(7.7, 2.5));
+    mark.curveToPoint_controlPoint1_controlPoint2(at(6.0, 7.0), at(7.7, 5.8), at(6.0, 5.8));
+    stroke(&mark, 1.2, ink);
+    let dot = at(6.0, 8.85);
     let dot = NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-        NSPoint::new(2.5, 2.5),
-        NSSize::new(GLYPH_SIDE - 5.0, GLYPH_SIDE - 5.0),
+        NSPoint::new(dot.x - 0.7, dot.y - 0.7),
+        NSSize::new(1.4, 1.4),
     ));
-    Tint::of(color, 1.0).color().setFill();
+    ink.color().setFill();
     dot.fill();
 }
 
-/// "A transfer flows": an arrow in `accent`, up for an upload and down for
-/// a download (the title prefix's `↑`/`↓`).
-fn draw_arrow(down: bool, color: u32) {
+/// "Finished while you were away": a tick in the badge.
+fn draw_check(centre: NSPoint, ink: Tint) {
+    let at = |x, y| on_grid(centre, 0.6, x, y);
+    let path = NSBezierPath::bezierPath();
+    path.moveToPoint(at(2.5, 6.4));
+    path.lineToPoint(at(5.0, 8.8));
+    path.lineToPoint(at(9.8, 3.4));
+    stroke(&path, 1.4, ink);
+}
+
+/// "A transfer flows": an arrow in the badge, up for an upload and down for a download (the
+/// title prefix's `↑`/`↓`).
+fn draw_arrow(centre: NSPoint, down: bool, ink: Tint) {
+    let at = |x, y| on_grid(centre, 0.55, x, y);
     let (tip, tail, head) = if down {
         (9.8, 2.2, 7.0)
     } else {
         (2.2, 9.8, 5.0)
     };
     let path = NSBezierPath::bezierPath();
-    path.moveToPoint(NSPoint::new(6.0, tail));
-    path.lineToPoint(NSPoint::new(6.0, tip));
-    path.moveToPoint(NSPoint::new(2.8, head));
-    path.lineToPoint(NSPoint::new(6.0, tip));
-    path.lineToPoint(NSPoint::new(9.2, head));
-    stroke(&path, 1.6, Tint::of(color, 1.0));
+    path.moveToPoint(at(6.0, tail));
+    path.lineToPoint(at(6.0, tip));
+    path.moveToPoint(at(2.8, head));
+    path.lineToPoint(at(6.0, tip));
+    path.lineToPoint(at(9.2, head));
+    stroke(&path, 1.2, ink);
 }
 
 /// The key the turn is played under on the arc's layer.
@@ -885,19 +1092,22 @@ impl Glyph {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let arc = CALayer::new();
         // The arc's own layer: its anchor is the middle (a view's backing layer's is a corner), so
-        // a turn about z is a turn about the ring's centre. Hidden until the ring runs.
+        // a turn about z is a turn about the ring's centre. Hidden until the ring runs. The icon's
+        // square is mid-way down the glyph, so the centre is the glyph's.
         arc.setBounds(NSRect::new(
             NSPoint::ZERO,
-            NSSize::new(GLYPH_SIDE, GLYPH_SIDE),
+            NSSize::new(tabs::ICON_SIDE, tabs::ICON_SIDE),
         ));
-        arc.setPosition(NSPoint::new(GLYPH_SIDE / 2.0, GLYPH_SIDE / 2.0));
+        arc.setPosition(NSPoint::new(
+            tabs::ICON_SIDE / 2.0,
+            GLYPH_OVERHANG + tabs::ICON_SIDE / 2.0,
+        ));
         arc.setHidden(true);
         let this = Self::alloc(mtm).set_ivars(GlyphIvars {
-            shown: Cell::new(None),
+            look: Cell::new(None),
             arc: arc.clone(),
             turning: Cell::new(None),
             arc_ink: Cell::new(None),
-            down: Cell::new(false),
             palette: Cell::new(None),
         });
         // SAFETY: `initWithFrame:` is NSView's designated initializer and the
@@ -921,19 +1131,18 @@ impl Glyph {
         }
     }
 
-    /// Shows `shown` in the glyph's square. `turn` is how the running ring goes round
+    /// Shows `look` (nothing, for `None`). `turn` is how the running ring goes round
     /// (`tabs::ring_turn`) and is read only for a running ring: `None` for a ring that stands still
     /// — Reduce Motion, a window nobody sees.
-    fn set(&self, shown: Option<Indicator>, turn: Option<Turn>, down: bool, palette: Palette) {
+    fn set(&self, look: Option<GlyphLook>, turn: Option<Turn>, palette: Palette) {
         let iv = self.ivars();
-        let indicator = iv.shown.replace(shown) != shown;
-        let flipped = iv.down.replace(down) != down;
+        let looked = iv.look.replace(look) != look;
         let repainted = iv.palette.replace(Some(palette)) != Some(palette);
-        if indicator || flipped || repainted {
+        if looked || repainted {
             self.setNeedsDisplay(true);
         }
-        self.setHidden(shown.is_none());
-        let running = shown == Some(Indicator::Running);
+        self.setHidden(look.is_none());
+        let running = look.is_some_and(|look| look.indicator == Some(Indicator::Running));
         // The layer's own properties move without Core Animation's 0.25 s of implicit fading.
         CATransaction::begin();
         CATransaction::setDisableActions(true);
@@ -950,8 +1159,12 @@ impl Glyph {
     /// glyph is on; drawn again only when one of the two changed.
     fn ink_arc(&self) {
         let iv = self.ivars();
-        let (Some(palette), true) = (iv.palette.get(), iv.shown.get() == Some(Indicator::Running))
-        else {
+        let (Some(palette), true) = (
+            iv.palette.get(),
+            iv.look
+                .get()
+                .is_some_and(|look| look.indicator == Some(Indicator::Running)),
+        ) else {
             return;
         };
         let color = palette.tone(tabs::list_dot(Indicator::Running), 0);
@@ -966,7 +1179,7 @@ impl Glyph {
             Bool::YES
         });
         let image = NSImage::imageWithSize_flipped_drawingHandler(
-            NSSize::new(GLYPH_SIDE, GLYPH_SIDE),
+            NSSize::new(tabs::ICON_SIDE, tabs::ICON_SIDE),
             true,
             &draw,
         );
@@ -1013,24 +1226,6 @@ impl Glyph {
         iv.arc.addAnimation_forKey(&round, Some(turn_key()));
         iv.turning.set(Some(turn.period));
     }
-}
-
-/// Where a chip's indicator and title sit across its `inner` width (the
-/// chip less its padding on both sides), from the title's own width:
-/// `(indicator's x, title's x, title's width)`, relative to the padding's
-/// edge. With an indicator the two are centred together and the title
-/// gives way to the glyph first; without one the title takes the whole
-/// width (it is centred in its frame).
-fn title_row(inner: f64, text: f64, glyph: bool) -> (Option<f64>, f64, f64) {
-    if !glyph {
-        return (None, 0.0, inner);
-    }
-    let room = (inner - GLYPH_SIDE - GLYPH_GAP).max(0.0);
-    let width = text.ceil().min(room);
-    let start = ((inner - (GLYPH_SIDE + GLYPH_GAP + width)) / 2.0)
-        .max(0.0)
-        .round();
-    (Some(start), start + GLYPH_SIDE + GLYPH_GAP, width)
 }
 
 // ─── A chip's top and bottom lines ───────────────────────────────────────
@@ -1458,6 +1653,7 @@ impl Chip {
     ) {
         let Look {
             title,
+            emblem,
             indicator,
             turn,
             down,
@@ -1473,7 +1669,7 @@ impl Chip {
         let (selected, hovered, single) = (*selected, *hovered, *single);
         let (lifted, ghost) = (*lifted && !single, *ghost && !single);
         // The one-tab form is today's title bar: no indicator, no lines, no
-        // hint.
+        // hint — the icon stays, it says what the window runs.
         let indicator = indicator.filter(|_| !single);
         let lines = if single { Lines::default() } else { *lines };
         let hint = hint.as_deref().filter(|_| !single);
@@ -1569,7 +1765,8 @@ impl Chip {
         // that narrow truncates the text it was measured for to "…".
         let natural = text.fittingSize();
         let inner = (size.width - 2.0 * pad).max(0.0);
-        let (glyph_x, text_x, text_width) = title_row(inner, natural.width, indicator.is_some());
+        let lead = emblem.map(|emblem| tabs::lead_width(emblem.edges));
+        let (glyph_x, text_x, text_width) = tabs::title_row(inner, natural.width, lead);
         text.setFrame(NSRect::new(
             NSPoint::new(
                 pad + text_x,
@@ -1577,13 +1774,19 @@ impl Chip {
             ),
             NSSize::new(text_width, natural.height),
         ));
-        if let Some(x) = glyph_x {
+        if let (Some(x), Some(lead)) = (glyph_x, lead) {
+            let high = tabs::ICON_SIDE + 2.0 * GLYPH_OVERHANG;
             iv.glyph.setFrame(NSRect::new(
-                NSPoint::new(pad + x, ((size.height - GLYPH_SIDE) / 2.0).round()),
-                NSSize::new(GLYPH_SIDE, GLYPH_SIDE),
+                NSPoint::new(pad + x, ((size.height - high) / 2.0).round()),
+                NSSize::new(lead + GLYPH_OVERHANG, high),
             ));
         }
-        iv.glyph.set(indicator, *turn, *down, palette);
+        let look = emblem.map(|emblem| GlyphLook {
+            emblem,
+            indicator,
+            down: *down,
+        });
+        iv.glyph.set(look, *turn, palette);
         self.set_hint(hint, size, palette);
         iv.close.set(!single && hovered, palette, motion.close);
         iv.close.setHidden(single);
@@ -1628,6 +1831,8 @@ impl Chip {
 #[derive(Clone, Debug)]
 struct Look<'a> {
     title: &'a str,
+    /// What the icon before the title is of; `None` while the tab is being named.
+    emblem: Option<Emblem>,
     indicator: Option<Indicator>,
     /// How the running ring goes round; `None` stands it still (`tabs::ring_turn`).
     turn: Option<Turn>,
@@ -2332,6 +2537,8 @@ pub(crate) struct Label {
     pub(crate) title: String,
     /// What its chip shows left of the title (`TerminalTab::indicator`).
     pub(crate) indicator: Option<Indicator>,
+    /// What the icon before the title is of (`TerminalTab::emblem`).
+    pub(crate) emblem: Emblem,
     /// How long its running command has run (`TerminalTab::running_for`), when it was read:
     /// the angle a ring is set turning from and the bar's clock.
     pub(crate) running: Option<Duration>,
@@ -2982,6 +3189,7 @@ impl TabBar {
             let mark = (label.mark != HostMark::None).then(|| theme.mark_rgb(label.mark));
             let look = Look {
                 title: &title,
+                emblem: Some(label.emblem).filter(|_| !naming),
                 indicator: label.indicator.filter(|_| !naming),
                 turn: label
                     .running
@@ -4024,8 +4232,9 @@ pub(crate) fn watch_command_key() -> Option<Retained<AnyObject>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CARD_PAD_X, CARD_WIDTH, GLYPH_GAP, GLYPH_SIDE, Motion, Palette, TAB_RADIUS, TitleAction,
-        card_x, command_alone, contains, line_span, single_label, title_double_click, title_row,
+        BADGE_HALO, BADGE_INSET, BADGE_SIDE, CARD_PAD_X, CARD_WIDTH, CHIP_HEIGHT, GLYPH_OVERHANG,
+        Motion, Palette, TAB_RADIUS, TitleAction, blend, card_x, command_alone, contains,
+        line_span, single_label, title_double_click,
     };
     use crate::tabs::{self, Indicator, Tone};
     use bt_core::Theme;
@@ -4135,23 +4344,36 @@ mod tests {
         assert_eq!(palette.tone(Tone::Mark, mark), Theme::BATERI.error);
     }
 
-    /// The indicator and a short title are centred together; a long title
-    /// gives way to the glyph and is cut, never the glyph; without an
-    /// indicator the title has the whole width, as before.
+    /// The glyph's view is as high as a chip, so the icon's square sits in the middle of it with
+    /// the badge's room above — the layout puts the view at the chip's top.
     #[test]
-    fn the_indicator_sits_left_of_the_title_and_both_are_centred() {
-        let step = GLYPH_SIDE + GLYPH_GAP;
-        assert_eq!(title_row(132.0, 40.0, false), (None, 0.0, 132.0));
-        let (glyph, text, width) = title_row(132.0, 40.0, true);
-        assert_eq!(glyph, Some(((132.0 - step - 40.0) / 2.0_f64).round()));
-        assert_eq!(text, glyph.unwrap() + step);
-        assert_eq!(width, 40.0);
-        let (glyph, text, width) = title_row(132.0, 300.0, true);
-        assert_eq!(glyph, Some(0.0));
-        assert_eq!(text, step);
-        assert_eq!(width, 132.0 - step, "the title is cut, not the glyph");
-        let (_, _, width) = title_row(10.0, 300.0, true);
-        assert_eq!(width, 0.0, "a chip too narrow keeps the glyph alone");
+    fn the_glyph_is_as_high_as_a_chip() {
+        assert_eq!(
+            tabs::ICON_SIDE + 2.0 * GLYPH_OVERHANG,
+            CHIP_HEIGHT,
+            "a chip's height is the icon's square and the room for its badge on both sides"
+        );
+        // The badge and the ring cut round it fit that room above the square.
+        const { assert!(BADGE_SIDE / 2.0 + BADGE_HALO - BADGE_INSET <= GLYPH_OVERHANG) };
+    }
+
+    /// A blend is its two colours at the ends and a channel-wise mix between.
+    #[test]
+    fn a_blend_mixes_each_channel() {
+        assert_eq!(blend(0x102030, 0xf0e0d0, 0.0), 0x102030);
+        assert_eq!(blend(0x102030, 0xf0e0d0, 1.0), 0xf0e0d0);
+        assert_eq!(blend(0x000000, 0xffffff, 0.5), 0x808080);
+        assert_eq!(blend(0x000000, 0xff8000, 0.5), 0x804000);
+    }
+
+    /// The question waits in the theme's `warning`, as its badge and its list dot wear it.
+    #[test]
+    fn a_question_wears_the_warning_role() {
+        let palette = Palette::of(&Theme::BATERI);
+        assert_eq!(
+            palette.tone(tabs::list_dot(Indicator::Question), 0),
+            palette.warning
+        );
     }
 
     /// The lines run inside a chip's rounded corners and never go negative.

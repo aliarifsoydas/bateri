@@ -43,9 +43,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use bt_core::{
-    BlockHandle, BlockInfo, ContentEdge, FontOptions, PaneUuid, ProgramBar, RemoteFiles,
-    RemoteTarget, SearchCover, SearchDirection, SearchReport, SearchStatus, Session,
-    SessionOptions, Settings, Theme, TtyModes, Wake,
+    BlockHandle, BlockInfo, CommandId, CommandPhase, ContentEdge, FontOptions, PaneUuid,
+    ProgramBar, RemoteFiles, RemoteTarget, SearchCover, SearchDirection, SearchReport,
+    SearchStatus, Session, SessionOptions, Settings, Theme, TtyModes, Wake,
 };
 use bt_core::{load_shell, smoke_shell};
 use bt_gpu::{
@@ -86,6 +86,7 @@ use crate::password_sheet::PasswordSheet;
 use crate::ports::Listener;
 use crate::preview::PreviewTicket;
 use crate::program;
+use crate::program::identity::{self, Kind, Seen};
 use crate::promise::FinderDrops;
 use crate::quote;
 use crate::remote_helper::RemoteHelper;
@@ -931,6 +932,11 @@ struct ShellWake {
     /// ([`PROBE_DELAY`]) and reads the moment it runs, so a burst of output
     /// is one probe and an idle pane runs none.
     program_probe: Arc<RemoteProbe>,
+    /// Which program the pane runs, for its tab's icon: the same two bits again — armed on the
+    /// `C` edge of a local command and on the edges of the remote shell's, a first look at once
+    /// (the command's line is on the screen), then one look per [`IDENTITY_DELAY`] of output
+    /// until the process table names the program ([`TerminalPane::probe_identity`]).
+    identity_probe: Arc<RemoteProbe>,
     /// The listening ports' probe ([`PortProbe`]): on with `[shell] ports`,
     /// every edge (output, `C`, a prompt) schedules one delayed scan.
     pub(crate) port_probe: Arc<PortProbe>,
@@ -1106,6 +1112,12 @@ const BLOCK_PACE: std::time::Duration = std::time::Duration::from_millis(16);
 /// stays unseen — the dock stays, today's behaviour, the safe direction.
 const PROBE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How long the identity probe lets a burst of output gather before it looks at the process
+/// table again. Slower than [`PROBE_DELAY`]: a command whose program the table does not know (a
+/// build tool's helper, a script of its own) is asked once per delay for as long as it prints,
+/// and the icon is not a decision the next keystroke waits for.
+const IDENTITY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
 impl ShellWake {
     /// Throws the remote-session probe to the main queue ([`RemoteProbe`]).
     fn dispatch_remote_probe(&self) {
@@ -1201,6 +1213,41 @@ impl ShellWake {
                 probe.rearm();
             }
         });
+    }
+
+    /// Throws the identity probe to the main queue ([`ShellWake::identity_probe`]): at once for a
+    /// command's start (`delay` is `None`), after [`IDENTITY_DELAY`] for output. A look that
+    /// changed what the pane is says so to the tab; one that could not tell arms the next.
+    fn dispatch_identity_probe(&self, delay: Option<std::time::Duration>) {
+        let probe = Arc::clone(&self.identity_probe);
+        let (id, lookup) = (self.id, self.lookup);
+        let job = move || {
+            if !probe.begin() {
+                return;
+            }
+            // audit: a block running on the main queue is on the main thread by definition.
+            let mtm = MainThreadMarker::new().expect("the main queue is the main thread");
+            let Some(pane) = lookup(mtm, id) else {
+                return;
+            };
+            let outcome = pane.probe_identity();
+            if outcome.changed {
+                pane.host().activity_changed(id);
+            }
+            if outcome.undecided {
+                probe.rearm();
+            }
+        };
+        match delay {
+            None => DispatchQueue::main().exec_async(job),
+            Some(delay) => {
+                let Ok(when) = DispatchTime::try_from(delay) else {
+                    self.identity_probe.release();
+                    return;
+                };
+                let _ = DispatchQueue::main().after(when, job);
+            }
+        }
     }
 
     /// Takes the leaf lock; if poisoned it continues with what is inside — the
@@ -1311,6 +1358,10 @@ impl Wake for ShellWake {
         // armed, an edge with no look pending schedules one.
         if self.program_probe.output() {
             self.dispatch_program_probe();
+        }
+        // The program the process table has not named yet: one look per burst of output.
+        if self.identity_probe.output() {
+            self.dispatch_identity_probe(Some(IDENTITY_DELAY));
         }
         // A server prints its address once it listens; a burst is one scan.
         self.poke_ports();
@@ -1440,6 +1491,9 @@ impl Wake for ShellWake {
         if self.program_probe.command_started() {
             self.dispatch_program_probe();
         }
+        if self.identity_probe.command_started() {
+            self.dispatch_identity_probe(None);
+        }
         self.poke_ports();
     }
 
@@ -1456,8 +1510,12 @@ impl Wake for ShellWake {
 
     fn remote_command_edge(&self) {
         // Reader thread, lock-free: a command on the far end of ssh started
-        // or ended — the tab's indicator alone hears it.
+        // or ended — the tab's indicator alone hears it, and its icon: the command's line is
+        // all there is to know the program by on this side.
         self.announce_activity();
+        if !self.timed && self.identity_probe.command_started() {
+            self.dispatch_identity_probe(None);
+        }
     }
 
     fn mirror_changed(&self) {
@@ -1657,6 +1715,50 @@ fn marks_notifier(id: u64, lookup: PaneLookup) -> Box<dyn Fn()> {
             }
         });
     })
+}
+
+/// How many commands have ended in the session — what [`Unseen`](crate::tabs::Unseen) counts
+/// against: the same two counters, so a program seen "before the end" is one the tab's reading
+/// of that end can be matched with. Wraps like they do.
+fn ended_count(session: &Session) -> u64 {
+    let activity = session.activity();
+    activity.finished.wrapping_add(activity.failed)
+}
+
+/// What a look at the process table leaves the identity probe to keep and to do: the program it
+/// named, if it did, and whether to look again at the next output — only while neither it nor the
+/// command's line has named one. A line that names a program is enough to rest on: the table
+/// would only second it.
+fn after_table(seen: Seen, line: Option<Kind>) -> (Option<Kind>, bool) {
+    match seen {
+        Seen::Kind(kind) => (Some(kind), false),
+        Seen::Waiting | Seen::Nothing => (None, line.is_none()),
+    }
+}
+
+/// The program of the command that just ended, from what [`TerminalPane::program_kind`] last saw
+/// (`ran`: the count of ended commands then, and the kind) and the count of ended commands now:
+/// what it saw counts only if it was during the command that ended — exactly one end since;
+/// anything older is a command that came and went unseen, and the pane was at its prompt.
+fn kind_of_end(ran: Option<(u64, Kind)>, ends: u64) -> Kind {
+    ran.filter(|(before, _)| before.wrapping_add(1) == ends)
+        .map_or(Kind::Shell, |(_, kind)| kind)
+}
+
+/// What the pane has read of the program it runs, kept for the tab's icon
+/// ([`TerminalPane::program_kind`]). Main thread only.
+#[derive(Clone, Copy, Debug, Default)]
+struct ProgramMemo {
+    /// What the line of the newest command (ours or the remote shell's) said, by its id: read
+    /// once, from the screen, when the command was first looked at — the row scrolls away.
+    line: Option<(CommandId, Option<Kind>)>,
+    /// What the process table named, by the local command's generation. Only a program it named
+    /// is kept: "nothing known" is asked again.
+    group: Option<(u64, Kind)>,
+    /// What the pane was last seen to run, with the count of commands that had ended by then:
+    /// the program of the command that ends next, which is what the tab keeps showing for it
+    /// ([`TerminalPane::ended_kind`]).
+    ran: Option<(u64, Kind)>,
 }
 
 /// Result of the remote-session probe ([`TerminalPane::probe_remote`]): two
@@ -1866,6 +1968,8 @@ pub struct PaneIvars {
     /// The wrapped `ssh` the probe found and whether its server was recorded
     /// ([`TerminalPane::check_remote_up`]).
     wrap_proof: RefCell<WrapProof>,
+    /// What was read of the program the pane runs ([`ProgramMemo`]).
+    program_memo: Cell<ProgramMemo>,
     /// The open "Show files (N)" popover.
     upload_list: RefCell<Option<UploadPopover>>,
     /// Time of the event that closed the popover (`popoverWillClose:`): so that
@@ -2371,6 +2475,7 @@ impl TerminalPane {
                 remote_probe: Arc::default(),
                 login_probe: Arc::default(),
                 program_probe: Arc::default(),
+                identity_probe: Arc::default(),
                 port_probe: Arc::new(PortProbe::new(ports_on)),
                 link_pending: Arc::default(),
                 blocks_pending: Arc::default(),
@@ -2415,6 +2520,7 @@ impl TerminalPane {
             journal: RefCell::new(None),
             ssh_session: Cell::new(None),
             wrap_proof: RefCell::new(WrapProof::default()),
+            program_memo: Cell::new(ProgramMemo::default()),
             upload_list: RefCell::new(None),
             list_closed_at: Cell::new(None),
             stats_popover: RefCell::new(None),
@@ -3933,6 +4039,109 @@ impl TerminalPane {
         }
     }
 
+    /// Which program the pane runs now, as its tab's icon draws it: what the program said of
+    /// itself (`app=` of `OSC 7501`), else what the process table named, else what the command's
+    /// line said — the shell when no command runs, the server in a remote session none of them
+    /// knows ([`identity::decide`]). Read live from the three, so a program that speaks up later
+    /// is heard on the tab's next refresh; the readings that cost a screen walk or a syscall are
+    /// the probe's ([`Self::probe_identity`]) and kept. Remembers what it saw while a command
+    /// runs, for [`Self::ended_kind`]. A leaf lock or two; no `Term`.
+    pub(crate) fn program_kind(&self) -> Kind {
+        let Some(session) = self.session() else {
+            return Kind::Shell;
+        };
+        let Some(running) = session.running_command() else {
+            return Kind::Shell;
+        };
+        let memo = self.ivars().program_memo.get();
+        let app = session
+            .program_app()
+            .as_deref()
+            .and_then(identity::from_app);
+        let line = session
+            .last_command()
+            .filter(|command| command.phase == CommandPhase::Running)
+            .and_then(|command| memo.line.filter(|(id, _)| *id == command.id))
+            .and_then(|(_, kind)| kind);
+        let group = memo
+            .group
+            .filter(|(generation, _)| *generation == running)
+            .map(|(_, kind)| kind);
+        let remote = session.remote_line().is_some();
+        let kind = identity::decide(app, group, line, remote);
+        let ends = ended_count(session);
+        if memo.ran != Some((ends, kind)) {
+            self.ivars().program_memo.set(ProgramMemo {
+                ran: Some((ends, kind)),
+                ..memo
+            });
+        }
+        kind
+    }
+
+    /// The program of the command that just ended, for the tab to keep showing: by the time the
+    /// end is noticed the pane is at its prompt and [`Self::program_kind`] says shell. What
+    /// [`Self::program_kind`] last saw while a command ran, if that was during the command that
+    /// ended (exactly one end since); the shell for one that came and went before anyone looked.
+    pub(crate) fn ended_kind(&self) -> Kind {
+        let Some(session) = self.session() else {
+            return Kind::Shell;
+        };
+        kind_of_end(self.ivars().program_memo.get().ran, ended_count(session))
+    }
+
+    /// The identity probe: reads what [`Self::program_kind`] cannot cheaply — the newest command's
+    /// line, off the screen, once per command, and the foreground group's processes — and keeps
+    /// it. `undecided` while nothing names the program (the shell itself still holds the
+    /// terminal, the command has not executed, the group is a helper nobody knows) and the line
+    /// has not either: the next burst of output looks again; `changed` when the kind is another.
+    /// A remote session has no table to read (the process table shows only the local `ssh`) and
+    /// is settled by the line alone. Main thread, syscalls only.
+    pub(crate) fn probe_identity(&self) -> RemoteProbeOutcome {
+        let settled = RemoteProbeOutcome::default();
+        let (Some(session), Some(&parent)) =
+            (self.ivars().session.get(), self.ivars().shell_parent.get())
+        else {
+            return settled;
+        };
+        if !session.reader_alive() {
+            return settled;
+        }
+        let Some(running) = session.running_command() else {
+            return settled;
+        };
+        let before = self.program_kind();
+        let mut memo = self.ivars().program_memo.get();
+        if let Some(command) = session
+            .last_command()
+            .filter(|command| command.phase == CommandPhase::Running)
+            && memo.line.map(|(id, _)| id) != Some(command.id)
+        {
+            let kind = session
+                .command_line(command.id)
+                .as_deref()
+                .and_then(identity::from_line);
+            memo.line = Some((command.id, kind));
+        }
+        let mut undecided = false;
+        if session.remote_line().is_none()
+            && memo.group.map(|(generation, _)| generation) != Some(running)
+        {
+            let line = memo.line.and_then(|(_, kind)| kind);
+            let (group, wait) = after_table(
+                identity::find(parent, session.child_pid(), &SystemTable),
+                line,
+            );
+            memo.group = group.map(|kind| (running, kind)).or(memo.group);
+            undecided = wait;
+        }
+        self.ivars().program_memo.set(memo);
+        RemoteProbeOutcome {
+            undecided,
+            changed: self.program_kind() != before,
+        }
+    }
+
     /// The program probe: whether the running command's program reads the
     /// keyboard itself — `true` while there is no answer yet (the arm stays
     /// set, the next output edge looks again). Asked only while a job outside
@@ -5326,6 +5535,52 @@ mod tests {
         assert!(probe.command_started());
         probe.release();
         assert!(probe.output(), "the slot was given back");
+    }
+
+    /// The process table's answer settles the identity probe, an unknown one does not — unless the
+    /// command's own line already named the program, which the table would only second.
+    #[test]
+    fn the_identity_probe_rests_on_a_name_and_looks_again_without_one() {
+        use super::{Kind, Seen, after_table};
+        use bt_shell_common::program::identity::Agent;
+        let claude = Kind::Agent(Agent::ClaudeCode);
+        assert_eq!(after_table(Seen::Kind(claude), None), (Some(claude), false));
+        assert_eq!(
+            after_table(Seen::Kind(Kind::Task), Some(Kind::Shell)),
+            (Some(Kind::Task), false),
+            "the table says what the program is, whatever the line guessed"
+        );
+        assert_eq!(after_table(Seen::Waiting, None), (None, true));
+        assert_eq!(after_table(Seen::Nothing, None), (None, true));
+        assert_eq!(
+            after_table(Seen::Nothing, Some(Kind::Editor)),
+            (None, false),
+            "a line that named the program is enough"
+        );
+        assert_eq!(
+            after_table(Seen::Waiting, Some(Kind::Editor)),
+            (None, false)
+        );
+    }
+
+    /// What a pane ran is handed over for the command that ended only if it was seen during that
+    /// one — exactly one end since — and the counts' wrap does not matter.
+    #[test]
+    fn an_ended_command_keeps_the_program_seen_while_it_ran() {
+        use super::{Kind, kind_of_end};
+        assert_eq!(kind_of_end(Some((4, Kind::Task)), 5), Kind::Task);
+        assert_eq!(
+            kind_of_end(Some((3, Kind::Task)), 5),
+            Kind::Shell,
+            "a command came and went since: the pane is at its prompt"
+        );
+        assert_eq!(
+            kind_of_end(Some((5, Kind::Task)), 5),
+            Kind::Shell,
+            "nothing ended since it was seen"
+        );
+        assert_eq!(kind_of_end(None, 5), Kind::Shell);
+        assert_eq!(kind_of_end(Some((u64::MAX, Kind::Editor)), 0), Kind::Editor);
     }
 
     #[test]
