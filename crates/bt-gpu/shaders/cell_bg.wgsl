@@ -301,24 +301,46 @@ fn wave_height(x: f32, scale: f32) -> f32 {
         + select(0.0, spread, behind <= 0.0);
 }
 
-// The dust scene's gradient rides in the same fragment, picked by `core.z`
-// (zero is the wave above):
+// The dust scene's gradient and the dock's plate ride in the same fragment,
+// picked by `core.z` (zero is the wave above):
 //
 //   1 = the lit tip of the woven line: the instance's alpha ramps from nothing
 //       at `core.x` to whole at `core.w` (a row of pixels, left to right).
+//   2 = the shadow the plate casts above its top edge: `core.x` is the
+//       plate's top (not a line's centre), `core.w` how far the shadow
+//       reaches in pixels. The instance's alpha at the edge, falling off as
+//       the square of the distance to nothing at the reach — a soft shadow
+//       that is darkest where the plate meets the content.
+//   3 = the plate itself under its top edge: the instance's colour below the
+//       curve at `core.x`, with a one-pixel soft edge.
 //
-// It does not carry the content's top fade: it is drawn in window space like
-// the wave.
+// Modes 2 and 3 follow the same curve as the line (`shape`); with both peaks
+// at zero it is the flat edge, so one draw serves the dock at rest and while
+// it ripples. None of them carries the content's top fade: they are drawn in
+// window space like the wave.
 const MODE_RAMP: f32 = 1.0;
+const MODE_SHADOW: f32 = 2.0;
+const MODE_FILL: f32 = 3.0;
 
 @fragment
 fn wave_fragment(in: Out) -> @location(0) vec4<f32> {
     let mode = imm.core.z;
+    let scale = imm.core.y;
+    if (mode > MODE_SHADOW - 0.5) {
+        let top = imm.core.x + wave_height(in.position.x, scale);
+        // How much of the pixel lies below the curve: `position` is the
+        // pixel's centre, so a flat edge on a pixel boundary covers whole rows.
+        let under = clamp(in.position.y + 0.5 - top, 0.0, 1.0);
+        if (mode > MODE_FILL - 0.5) {
+            return vec4<f32>(in.rgba.rgb, in.rgba.a * under);
+        }
+        let fall = 1.0 - clamp((top - in.position.y) / max(imm.core.w, 1.0), 0.0, 1.0);
+        return vec4<f32>(in.rgba.rgb, in.rgba.a * fall * fall * (1.0 - under));
+    }
     if (mode > MODE_RAMP - 0.5) {
         let across = clamp((in.position.x - imm.core.x) / max(imm.core.w - imm.core.x, 1.0), 0.0, 1.0);
         return vec4<f32>(in.rgba.rgb, in.rgba.a * across);
     }
-    let scale = imm.core.y;
     let half = max(imm.core.w, 1.0) * 0.5;
     let x = in.position.x;
     // The distance to the curve measured across it, not straight down: a

@@ -12,6 +12,19 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+### Changed
+
+- **The dock stands a step above the text.** The line over the input row is
+  gone: the dock is now a raised plate, a shade lighter than the terminal,
+  with a soft shadow falling on the last lines of output and a lit edge. The
+  shadow lies under the text, so nothing you read gets darker. On a pure
+  black theme, where a shadow cannot show, the lit edge carries it. When the
+  edge has something to say it still says it: over ssh and under a program's
+  guide bar it is a line in the host's or the bar's color, with no shadow on
+  the line you are typing just above it, and an upload's progress fills
+  along it and glows. While a new tab's shell starts, the rippling line now
+  has the input row's color under it.
+
 ## [0.12.0] - 2026-10-12
 
 ### Added

@@ -2182,6 +2182,20 @@ impl Renderer {
             plan.search(frame, true);
             plan.ops.push(Op::Viewport(origin));
         }
+        // **The dock's shadow over the grounds, under the text**: it lies on
+        // the content the dock's plate stands above, and the last line of
+        // output stays as crisp as the rest. Window space: it reaches above
+        // the band's top, which the band's viewport would clip.
+        if let Some(band_y) = dock_top {
+            let shadows = frame.dock_shadows(band_y, viewport_px[0]);
+            if shadows.iter().any(Option::is_some) {
+                plan.ops.push(Op::Viewport(0.0));
+                for draw in shadows.iter().flatten() {
+                    plan.wave(draw);
+                }
+                plan.ops.push(Op::Viewport(origin));
+            }
+        }
         // **The dust above the dock's band: over the grid's ground, under its
         // text** — a restored pane's old lines stay in front of the motes.
         // Its other half, inside the band, waits for the dock's ground. The
@@ -2258,10 +2272,15 @@ impl Renderer {
             // **The wave over the ground, in window space**: it leaves its row
             // above the band's top, which the band's viewport would clip. The
             // dock's own top line is held back meanwhile (the scene gives it
-            // no width) and comes back when the scene ends.
-            if let Some(wave) = frame.dock_wave(band_y, viewport_px[0]) {
+            // no width) and comes back when the scene ends. The plate under
+            // the curve first, the line on it.
+            let fill = frame.dock_wave_fill(band_y, viewport_px[0]);
+            let wave = frame.dock_wave(band_y, viewport_px[0]);
+            if fill.is_some() || wave.is_some() {
                 plan.ops.push(Op::Viewport(0.0));
-                plan.wave(&wave);
+                for draw in [fill, wave].iter().flatten() {
+                    plan.wave(draw);
+                }
             }
             // **The dust inside the band, over the dock's ground** (its ground
             // is opaque from the arrival on, and the motes still on their way

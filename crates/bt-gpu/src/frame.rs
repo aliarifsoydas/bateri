@@ -652,6 +652,13 @@ pub(crate) struct DockSurface {
     /// The upload row's buttons ([`Frame::set_dock_buttons`]); opening clears
     /// them every frame, so a button exists only in the frame it is told.
     buttons: [Option<DockButton>; 2],
+    /// The shadow the surface casts on the content above it, its strength at
+    /// the edge in the alpha ([`Frame::set_dock_depth`]); transparent until
+    /// told, so a frame that is not told casts none.
+    shadow: [f32; 4],
+    /// The glow the top edge's meaning casts into the shadow, its strength in
+    /// the alpha; `None` while the edge is the plain rim.
+    glow: Option<[f32; 4]>,
 }
 
 impl DockSurface {
@@ -709,6 +716,17 @@ struct DustTones {
 
 /// What is too faint to be worth a quad: under half an 8-bit step.
 const INVISIBLE: f32 = 1.0 / 512.0;
+
+/// How far above the dock its shadow reaches before it is gone, points —
+/// **chosen by eye, from the design**: deep enough to read as a plate standing
+/// off the content, short enough to have faded out within the last line of
+/// output above it.
+pub(crate) const SHADOW_PT: f32 = 12.0;
+
+/// `wave_fragment`'s modes for the plate, in `core.z` (`cell_bg.wgsl`): the
+/// shadow above the curve and the fill under it.
+const WAVE_SHADOW: f32 = 2.0;
+const WAVE_FILL: f32 = 3.0;
 
 /// The diameters and blurs, points, of the woven line's spark: a soft halo
 /// and a small brighter core.
@@ -2718,10 +2736,7 @@ impl Frame {
         if alpha <= 0.0 || width_px <= 0.0 {
             return None;
         }
-        let reach = (WAVE_REACH_PT * scale).ceil() + 2.0;
-        // The middle of the › cell, where the dock's one column-and-margin sum
-        // puts it.
-        let origin = self.dock_pos(0, 0)[0] + self.cell_px.0 * 0.5;
+        let reach = self.wave_reach_px();
         Some(WaveDraw {
             instance: Instance {
                 pos: [0.0, band_y - reach],
@@ -2734,12 +2749,131 @@ impl Frame {
                 0.0,
                 self.separator_px,
             ],
-            shape: [
-                wave.amp * scale,
-                wave.phase,
-                origin + wave.travel * scale,
-                wave.kick * scale,
-            ],
+            shape: self.dock_curve(),
+        })
+    }
+
+    /// While the top line is a wave, the plate under it: `wave_fragment`'s
+    /// fill mode from the curve down to where the ground's own quad starts
+    /// ([`Frame::dock_ground`] lowers it by the wave's reach meanwhile), in
+    /// the ground's colour at the plate's opacity
+    /// ([`Frame::dock_plate_alpha`]). So the plate's top edge is the wave, and
+    /// while the shell starts the rippling line has the input row's colour
+    /// under it and nothing else of the dock yet. Window space, like the line
+    /// it is drawn under.
+    pub(crate) fn dock_wave_fill(&self, band_y: f32, width_px: f32) -> Option<WaveDraw> {
+        let dock = self.dock?;
+        if !self.dock_waves() || width_px <= 0.0 {
+            return None;
+        }
+        let rgba = faded(dock.ground, self.dock_plate_alpha());
+        if rgba[3] <= 0.0 {
+            return None;
+        }
+        let reach = self.wave_reach_px();
+        Some(WaveDraw {
+            instance: Instance {
+                pos: [0.0, band_y - reach],
+                size: [width_px, reach * 2.0],
+                rgba,
+            },
+            core: [band_y, self.scale.max(1.0), WAVE_FILL, 0.0],
+            shape: self.dock_curve(),
+        })
+    }
+
+    /// The shadow the dock casts on the content above its top edge, and the
+    /// glow the edge's meaning casts into it: `wave_fragment`'s shadow mode in
+    /// window space, along the curve the top line follows
+    /// ([`Frame::dock_curve`]) — flat at rest, the wave while the scene
+    /// ripples — falling off to nothing [`SHADOW_PT`] above it.
+    ///
+    /// **Drawn under the grid's text**: the plan puts them after the grid's
+    /// grounds and before its glyphs, so the shadow lies on the content the
+    /// plate stands above and the last line of output stays as crisp as the
+    /// rest. Faded with the plate ([`Frame::dock_plate_alpha`]). The glow is
+    /// as wide as an upload's filled share, the whole width otherwise.
+    ///
+    /// **None at all when the dock has no input row** (a remote session, a
+    /// program's guide bar): the line being typed is then the grid's own, the
+    /// last one, right above the edge — a shadow or a glow there lies on the
+    /// cursor's line and pulls the eye to the edge instead of the text. The
+    /// plate and its edge in the meaning's colour still tell the dock apart.
+    pub(crate) fn dock_shadows(&self, band_y: f32, width_px: f32) -> [Option<WaveDraw>; 2] {
+        let Some(dock) = self.dock.filter(|_| self.dock_rows >= 2) else {
+            return [None, None];
+        };
+        let scale = self.scale.max(1.0);
+        let reach = (SHADOW_PT * scale).round();
+        // Room for the curve below the edge too, while it waves.
+        let below = if self.dock_waves() {
+            self.wave_reach_px()
+        } else {
+            0.0
+        };
+        let alpha = self.dock_plate_alpha();
+        let curve = self.dock_curve();
+        let draw = |rgba: [f32; 4], width: f32| {
+            let rgba = faded(rgba, alpha);
+            (rgba[3] > INVISIBLE && width > 0.0 && reach > 0.0).then_some(WaveDraw {
+                instance: Instance {
+                    pos: [0.0, band_y - reach - below],
+                    size: [width, reach + below * 2.0],
+                    rgba,
+                },
+                core: [band_y, scale, WAVE_SHADOW, reach],
+                shape: curve,
+            })
+        };
+        let glow_width = dock
+            .progress
+            .map_or(width_px, |p| (width_px * p.clamp(0.0, 1.0)).round());
+        [
+            draw(dock.shadow, width_px),
+            dock.glow.and_then(|glow| draw(glow, glow_width)),
+        ]
+    }
+
+    /// Whether the scene gives the top line a wave this frame.
+    fn dock_waves(&self) -> bool {
+        self.dock_scene.and_then(|scene| scene.wave).is_some()
+    }
+
+    /// The top edge's curve as `wave_fragment` reads it — `(resting peak,
+    /// phase, the ring's front x, the ring's peak)`, pixels but the phase:
+    /// the scene's wave while it has one, flat (all zero) otherwise. One curve
+    /// for the line, the plate's fill under it and the shadow above it. The
+    /// ring's front starts at the middle of the ›'s cell, where the dock's one
+    /// column-and-margin sum puts it.
+    fn dock_curve(&self) -> [f32; 4] {
+        let Some(wave) = self.dock_scene.and_then(|scene| scene.wave) else {
+            return [0.0; 4];
+        };
+        let scale = self.scale.max(1.0);
+        let origin = self.dock_pos(0, 0)[0] + self.cell_px.0 * 0.5;
+        [
+            wave.amp * scale,
+            wave.phase,
+            origin + wave.travel * scale,
+            wave.kick * scale,
+        ]
+    }
+
+    /// How far the wave may leave its row, pixels: [`WAVE_REACH_PT`] and a
+    /// pixel or two more for the edge's softness.
+    fn wave_reach_px(&self) -> f32 {
+        (WAVE_REACH_PT * self.scale.max(1.0)).ceil() + 2.0
+    }
+
+    /// The plate's opacity this frame: the scene's fade-in, or — while its top
+    /// line is a wave — the wave's own when that is further along, so the
+    /// plate fills in under the rippling line while the shell starts. Without
+    /// a scene it is whole.
+    fn dock_plate_alpha(&self) -> f32 {
+        self.dock_scene.map_or(1.0, |scene| {
+            scene
+                .wave
+                .map_or(scene.band, |wave| scene.band.max(wave.alpha))
         })
     }
 
@@ -3025,7 +3159,27 @@ impl Frame {
             progress: None,
             track: separator.to_array(),
             buttons: [None; 2],
+            shadow: [0.0; 4],
+            glow: None,
         });
+    }
+
+    /// The shadow the dock casts on the content above it and, while its top
+    /// edge says something (a host, a program, an upload), the glow of that
+    /// colour (`bt_core::Dock::{shadow, glow}`), each at its strength at the
+    /// edge. After [`Frame::open_dock`], which clears both every frame; a
+    /// no-op if the dock is not open.
+    pub(crate) fn set_dock_depth(
+        &mut self,
+        shadow: LinearRgba,
+        shadow_strength: f32,
+        glow: Option<LinearRgba>,
+        glow_strength: f32,
+    ) {
+        if let Some(dock) = &mut self.dock {
+            dock.shadow = with_alpha(shadow, shadow_strength);
+            dock.glow = glow.map(|glow| with_alpha(glow, glow_strength));
+        }
     }
 
     /// The upload row's buttons (`bt_core::Dock::buttons`): after
@@ -3401,6 +3555,8 @@ impl Frame {
             progress: None,
             track: [0.0; 4],
             buttons: [None; 2],
+            shadow: [0.0; 4],
+            glow: None,
         });
         // **The arrival scene shapes the surface here and nowhere else**: the
         // ground, the line and the tone fade in together and the line and the
@@ -3409,6 +3565,16 @@ impl Frame {
         let (band_alpha, lines) = self
             .dock_scene
             .map_or((1.0, [1.0; 2]), |scene| (scene.band, scene.lines));
+        // **While the top line is a wave the plate's top is the wave**: the
+        // ground starts the wave's reach lower and the wave's fill
+        // ([`Frame::dock_wave_fill`]) covers the rest up to the curve, at the
+        // plate's opacity — which is there while the shell starts, before
+        // the rest of the dock.
+        let (plate_top, plate_alpha) = if self.dock_waves() {
+            (self.wave_reach_px(), self.dock_plate_alpha())
+        } else {
+            (0.0, band_alpha)
+        };
         let width = |share: f32, px: f32| drawn(px, share);
         // While progress is present the line's ground is the empty track and
         // the filled part on top is in the edge's colour; when absent the
@@ -3423,13 +3589,14 @@ impl Frame {
             0
         };
         // Where the tone starts: the middle of the gap between the rows
-        // ([`Frame::dock_band_top_y`], bottom-anchored like the layout), or
-        // just under the top hairline when the dock is only the context row.
-        // Never above the top hairline: the tone is drawn last and is opaque,
-        // and during the slide the drawn band is shorter than the layout, so
-        // the edge would otherwise climb over the line.
+        // ([`Frame::dock_band_top_y`], bottom-anchored like the layout); with
+        // no input row to part from (a remote session, a program's guide bar)
+        // nowhere — the plate itself is the row's ground. Never above the top
+        // hairline: the tone is drawn last and is opaque, and during the slide
+        // the drawn band is shorter than the layout, so the edge would
+        // otherwise climb over the line.
         let band_top = if rows < 2 {
-            self.separator_px
+            band
         } else {
             (band - self.dock_layout_px() + self.dock_band_top_y(rows)).max(self.separator_px)
         };
@@ -3438,9 +3605,9 @@ impl Frame {
                 // The ground covers the whole surface **margins included**: a
                 // rectangle short by the margin would, during the slide, show
                 // the overflowing grid row exactly where the breathing room is.
-                pos: [0.0, 0.0],
-                size: [width_px, band],
-                rgba: faded(dock.ground, band_alpha),
+                pos: [0.0, plate_top],
+                size: [width_px, (band - plate_top).max(0.0)],
+                rgba: faded(dock.ground, plate_alpha),
             },
             // The separator is **above** the ground and in the dock's topmost
             // pixel: that is the boundary between the grid and the dock. Its
@@ -3469,11 +3636,9 @@ impl Frame {
             // the middle both rows are equidistant from it.
             //
             // It is the **last** instance and drawn over the ground only: the
-            // top hairline stays clear of it because, with no input row to
-            // part from (`rows < 2`: a remote session, a program's guide
-            // bar), the tone takes the whole surface *below* that hairline.
-            // Its width opens with the scene's second share, the way the line
-            // it replaces did.
+            // top hairline stays clear of it, and with no input row to part
+            // from (`rows < 2`) it has no height. Its width opens with the
+            // scene's second share, the way the line it replaces did.
             Instance {
                 pos: [0.0, band_top],
                 size: [width(lines[1], width_px), (band - band_top).max(0.0)],
@@ -6045,7 +6210,8 @@ mod tests {
         // row — small face, small step, no row gap above it (there is no input
         // row to separate) and the band is one row plus two outer margins. The
         // top line is at the top of the band and in the edge's colour; the
-        // tone has the whole surface under that line.
+        // plate is the row's ground, and it casts nothing on the line being
+        // typed right above it.
         let metrics = CellMetrics::new(9, 18, 9, GUTTER, 1, 1.0).expect("metrics");
         let mut frame = Frame::default();
         frame.clear(metrics, CaretStyle::default());
@@ -6079,11 +6245,17 @@ mod tests {
         assert_eq!(ground.size, [500.0, band]);
         assert_eq!(separator.pos, [0.0, 0.0]);
         assert_eq!(separator.rgba, edge.to_array());
-        // No input row to part from: the tone is the whole dock, under the
-        // top line (which keeps its pixel and its colour).
-        assert_eq!(tone.pos, [0.0, separator.size[1]]);
-        assert_eq!(tone.size, [500.0, band - separator.size[1]]);
-        assert_eq!(tone.rgba, BAND.to_array());
+        // No input row to part from: the plate itself is the row's ground —
+        // the tone has no height — under the top line, which keeps its pixel
+        // and its colour.
+        assert_eq!(tone.size, [500.0, 0.0]);
+        assert_eq!(ground.rgba, BG.to_array());
+        frame.set_dock_depth(CURSOR, 0.5, Some(edge), 0.3);
+        assert_eq!(
+            frame.dock_shadows(100.0, 500.0),
+            [None, None],
+            "no shadow or glow on the grid's own input line"
+        );
         // The tests' one-row dock without context stays under its old rule.
         frame.clear(metrics, CaretStyle::default());
         frame.set_dock_rows(1);
@@ -7034,6 +7206,98 @@ mod tests {
         // The resting peak reached its height by 1 s, in pixels.
         assert_eq!(wave.shape[0], 1.8 * 2.0);
         assert_eq!(wave.shape[3], 0.0, "no ring before the prompt");
+    }
+
+    #[test]
+    fn while_the_shell_starts_the_plate_fills_in_under_the_wave_and_nothing_else() {
+        // The ripple waits with the line's own pixel and the folder row's
+        // tone held back; the plate under the rippling line is what it shows
+        // — in the input row's colour, at the wave's opacity, its top the
+        // curve the line follows.
+        let frame = rippling_dock(Some(ripple_at(1.0, true)));
+        let wave = frame.dock_wave(100.0, 500.0).expect("waving");
+        let fill = frame
+            .dock_wave_fill(100.0, 500.0)
+            .expect("the plate under the wave");
+        assert_eq!(fill.core[2], WAVE_FILL);
+        assert_eq!(
+            fill.core[0], 100.0,
+            "the plate's top, not the line's centre"
+        );
+        assert_eq!(fill.shape, wave.shape, "one curve");
+        assert_eq!(fill.instance.rgba, BG.to_array());
+        let [ground, line, _, tone] = frame.dock_ground(500.0);
+        assert_eq!(
+            ground.rgba,
+            BG.to_array(),
+            "the plate is there while waiting"
+        );
+        assert_eq!(
+            fill.instance.pos[1] + fill.instance.size[1],
+            100.0 + ground.pos[1],
+            "the fill meets the ground's own quad"
+        );
+        assert_eq!(line.size[0], 0.0, "the wave is the line");
+        assert_eq!(tone.rgba[3], 0.0, "the folder row comes with the prompt");
+        // Nothing yet while the hold lasts; at rest the plate's top is flat
+        // again and the ground's own.
+        let held = rippling_dock(Some(ripple_at(0.1, true)));
+        assert!(held.dock_wave_fill(100.0, 500.0).is_none());
+        assert_eq!(held.dock_ground(500.0)[0].rgba[3], 0.0);
+        let plain = rippling_dock(None);
+        assert!(plain.dock_wave_fill(100.0, 500.0).is_none());
+        assert_eq!(plain.dock_ground(500.0)[0].pos, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn the_dock_casts_its_shadow_above_its_edge_once_told() {
+        let mut frame = rippling_dock(None);
+        assert_eq!(
+            frame.dock_shadows(100.0, 500.0),
+            [None, None],
+            "not told, no shadow"
+        );
+        frame.set_dock_depth(QUIET, 0.5, None, 0.3);
+        let [shadow, glow] = frame.dock_shadows(100.0, 500.0);
+        assert!(glow.is_none(), "a plain rim casts no glow");
+        let shadow = shadow.expect("told");
+        let reach = SHADOW_PT * 2.0;
+        assert_eq!(shadow.core, [100.0, 2.0, WAVE_SHADOW, reach]);
+        assert_eq!(shadow.shape, [0.0; 4], "flat at rest");
+        assert_eq!(shadow.instance.pos, [0.0, 100.0 - reach]);
+        assert_eq!(
+            shadow.instance.size,
+            [500.0, reach],
+            "above the edge, never on the plate"
+        );
+        assert_eq!(shadow.instance.rgba, with_alpha(QUIET, 0.5));
+        // An upload's glow is as wide as its fill, in the edge's colour.
+        frame.set_dock_depth(QUIET, 0.5, Some(CURSOR), 0.3);
+        frame.set_dock_progress(Some(5_000), BG);
+        let [_, glow] = frame.dock_shadows(100.0, 500.0);
+        let glow = glow.expect("a meaning glows");
+        assert_eq!(glow.instance.size[0], 250.0);
+        assert_eq!(glow.instance.rgba, with_alpha(CURSOR, 0.3));
+        // The shadow comes with the plate: none before it, and while the
+        // line ripples it follows the wave, below the edge too.
+        let told = |scene| {
+            let mut frame = rippling_dock(Some(scene));
+            frame.set_dock_depth(QUIET, 0.5, None, 0.3);
+            frame
+        };
+        assert_eq!(
+            told(ripple_at(0.1, true)).dock_shadows(100.0, 500.0),
+            [None, None],
+            "no plate yet, no shadow"
+        );
+        let waving = told(ripple_at(1.0, true));
+        let [shadow, _] = waving.dock_shadows(100.0, 500.0);
+        let shadow = shadow.expect("the plate is there");
+        assert_eq!(
+            shadow.shape,
+            waving.dock_wave(100.0, 500.0).expect("waving").shape
+        );
+        assert!(shadow.instance.pos[1] + shadow.instance.size[1] > 100.0);
     }
 
     #[test]

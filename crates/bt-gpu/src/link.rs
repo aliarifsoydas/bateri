@@ -1555,6 +1555,12 @@ impl Core {
             // The surface opens **after** the cells: the call bringing the
             // colours is the very call printing the cells (`Frame::open_dock`).
             frame.open_dock(dock.ground, dock.edge, dock.separator, dock.band);
+            frame.set_dock_depth(
+                dock.shadow,
+                dock.shadow_strength,
+                dock.glow,
+                dock.glow_strength,
+            );
             frame.set_dock_progress(dock.progress, dock.track);
             frame.set_dock_buttons(dock.buttons);
         } else {

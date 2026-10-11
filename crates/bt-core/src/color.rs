@@ -729,23 +729,99 @@ impl Theme {
     /// on a dark theme, where a small difference from black does not show.
     pub const fn ground_srgb(&self) -> [[u8; 3]; 2] {
         let (start, end) = if self.is_dark() { (38, 28) } else { (28, 22) };
-        let base = self.band_rgb();
+        let base = self.step(self.background_rgb());
         let start = toward(base, rgb(self.accent), start);
         let end = toward(base, rgb(self.cursor), end);
         [[start.r, start.g, start.b], [end.r, end.g, end.b]]
     }
 
-    /// The tone the dock's folder row stands on, **linear** RGBA: the
-    /// background lifted a step toward the foreground — a dark theme's row is
-    /// lighter than the input row above it, a light theme's darker — so the
-    /// two rows read as two surfaces without a line between them.
+    /// The dock's ground, the surface its input row stands on, **linear**
+    /// RGBA: the background lifted toward the light, so the dock reads as a
+    /// plate one level above the content — it catches more light than what
+    /// it casts its shadow on ([`Theme::dock_shadow_linear`]).
     ///
-    /// **Not a role but a value derived from two** (a role that isn't drawn
-    /// isn't added), and the very step the split tab's ground starts from
-    /// ([`Theme::ground_srgb`]): one rule for "a surface a step above the
-    /// panes", so the two can't drift apart. The step is larger on a dark
-    /// theme, where a small difference from black does not show; another
-    /// theme gets its own tone from its own colours.
+    /// **Not a role but a value derived from the theme's two ends**: "toward
+    /// the light" is white on a light theme and the foreground on a dark one
+    /// (black has no lighter neighbour but the ink, and white would turn a
+    /// tinted dark theme grey). A dark theme takes the step every surface
+    /// above the panes takes ([`Theme::band_linear`]'s rule); a light one goes
+    /// most of the way to white, where a step of a few percent would not
+    /// show against a pale background. **Chosen by eye, from the design.**
+    /// On a pure white background there is no lighter to go to and the plate
+    /// is the background — its shadow carries the edge there, as the rim
+    /// ([`Theme::dock_rim_linear`]) does on pure black, where a shadow
+    /// cannot show.
+    pub const fn dock_ground_linear(&self) -> LinearRgba {
+        linear_rgba(self.dock_ground_rgb())
+    }
+
+    const fn dock_ground_rgb(&self) -> Rgb {
+        if self.is_dark() {
+            self.step(self.background_rgb())
+        } else {
+            toward(self.background_rgb(), WHITE, 60)
+        }
+    }
+
+    /// The dock's top edge, **linear** RGBA: the plate's rim where it catches
+    /// the light — its ground most of the way toward the light end on a light
+    /// theme (an edge brighter than both sides of it), a little of the way on
+    /// a dark one (a faint lit line; on pure black it is what tells the plate
+    /// from the content, since a shadow cannot show there). It is the top
+    /// line's colour whenever nothing else colours it (a host, a program, an
+    /// upload). **Chosen by eye, from the design.**
+    pub const fn dock_rim_linear(&self) -> LinearRgba {
+        let (end, share) = if self.is_dark() {
+            (rgb(self.foreground), 14)
+        } else {
+            (WHITE, 90)
+        };
+        linear_rgba(toward(self.dock_ground_rgb(), end, share))
+    }
+
+    /// The colour of the shadow the dock casts on the content above it,
+    /// **linear** and opaque: the theme's dark end — black on a dark theme,
+    /// the foreground on a light one, so a warm theme's shadow is warm. How
+    /// strongly it is drawn is [`Theme::dock_depth`].
+    pub const fn dock_shadow_linear(&self) -> LinearRgba {
+        linear_rgba(if self.is_dark() {
+            BLACK
+        } else {
+            rgb(self.foreground)
+        })
+    }
+
+    /// How strongly the dock's shadow and its glow are drawn where they meet
+    /// the dock, `(shadow, glow)`, `0..=1`; both fade to nothing a fixed
+    /// height above it (`bt-gpu`).
+    ///
+    /// **A number per kind of theme, not a colour with an alpha** (opacity is
+    /// the drawing's, `LinearRgba` carries none): the same opacity reads very
+    /// differently on the two, so the light/dark answer that decides
+    /// everything else that differs between them ([`Theme::is_dark`]) decides
+    /// this too. On a light theme the shadow is a faint darkening and the
+    /// glow — the shadow taking on the colour of what the top edge says, a
+    /// host or a program — a tint; on a dark one the shadow must be deep to
+    /// show at all and the glow is light given off. **Chosen by eye, from the
+    /// design.**
+    pub const fn dock_depth(&self) -> (f32, f32) {
+        if self.is_dark() {
+            (0.55, 0.30)
+        } else {
+            (0.14, 0.18)
+        }
+    }
+
+    /// The tone the dock's folder row stands on, **linear** RGBA: the dock's
+    /// ground ([`Theme::dock_ground_linear`]) a step toward the foreground —
+    /// a dark theme's row is lighter than the input row above it, a light
+    /// theme's darker — so the two rows read as two surfaces without a line
+    /// between them.
+    ///
+    /// **Not a role but a value derived from the rule for "a surface a step
+    /// above"** ([`Theme::step`]), the same rule the split tab's ground
+    /// starts from ([`Theme::ground_srgb`], a step above the panes), so the
+    /// two can't drift apart.
     pub const fn band_linear(&self) -> LinearRgba {
         linear_rgba(self.band_rgb())
     }
@@ -759,9 +835,26 @@ impl Theme {
         [r, g, b]
     }
 
+    /// The dock's ground as **sRGB** bytes, the tests' reading of
+    /// [`Theme::dock_ground_linear`].
+    #[cfg(test)]
+    pub(crate) const fn dock_ground_srgb(&self) -> [u8; 3] {
+        let Rgb { r, g, b } = self.dock_ground_rgb();
+        [r, g, b]
+    }
+
     const fn band_rgb(&self) -> Rgb {
+        self.step(self.dock_ground_rgb())
+    }
+
+    /// `base` a step toward the foreground: **the one rule for "a surface a
+    /// step above"** — the folder row above the dock's ground, the split
+    /// tab's ground above the panes. The step is larger on a dark theme,
+    /// where a small difference from black does not show; another theme gets
+    /// its own tone from its own colours.
+    const fn step(&self, base: Rgb) -> Rgb {
         let lift = if self.is_dark() { 8 } else { 4 };
-        toward(self.background_rgb(), rgb(self.foreground), lift)
+        toward(base, rgb(self.foreground), lift)
     }
 
     /// The hairlines' color, **linear** RGBA.
@@ -1239,6 +1332,11 @@ const fn rgb(hex: u32) -> Rgb {
     }
 }
 
+/// The two ends of the light, for the derived values that lean toward one
+/// rather than toward a role (the dock's ground, rim and shadow).
+const WHITE: Rgb = rgb(0xffffff);
+const BLACK: Rgb = rgb(0x000000);
+
 /// sRGB-encoded 8-bit channel → linear f32. Its source is the transfer
 /// function of IEC 61966-2-1 (`c/12.92`, after the knee `((c+0.055)/1.055)^2.4`).
 ///
@@ -1379,28 +1477,99 @@ mod tests {
     }
 
     #[test]
-    fn the_band_is_one_step_toward_the_foreground() {
-        // Black lifted 8 % toward the foreground; Linen (light) 4 %.
-        assert_eq!(Theme::BATERI.band_srgb(), [0x11, 0x11, 0x12]);
-        assert_eq!(Theme::LINEN.band_srgb(), [0xeb, 0xe7, 0xdf]);
+    fn the_band_is_one_step_toward_the_foreground_from_the_docks_ground() {
+        // The dock's ground lifted 8 % toward the foreground on a dark theme,
+        // 4 % on a light one.
+        assert_eq!(Theme::BATERI.band_srgb(), [0x21, 0x21, 0x22]);
+        assert_eq!(Theme::LINEN.band_srgb(), [0xf2, 0xf1, 0xec]);
         // The GPU's value is the same colour, not a second computation.
         for theme in [Theme::BATERI, Theme::BATERI_LIGHT, Theme::LINEN] {
             let [r, g, b] = theme.band_srgb();
             assert_eq!(theme.band_linear(), LinearRgba::from_srgb(r, g, b));
+            assert_eq!(
+                theme.band_srgb(),
+                {
+                    let Rgb { r, g, b } = theme.step(theme.dock_ground_rgb());
+                    [r, g, b]
+                },
+                "one rule for a step above"
+            );
             assert_ne!(
                 theme.band_linear(),
-                theme.background_linear(),
-                "the band must be told apart from the background"
+                theme.dock_ground_linear(),
+                "the folder row must be told apart from the input row"
             );
         }
     }
 
     #[test]
-    fn the_band_is_the_base_the_ground_leans_from() {
-        // One copy of "a step above the panes": with nothing to lean toward
-        // (accent and cursor are the band itself) the ground is the band.
+    fn the_docks_ground_is_the_background_lifted_toward_the_light() {
+        // Black lifted 8 % toward the foreground (the step every surface
+        // above the panes takes); Linen 60 % toward white.
+        assert_eq!(Theme::BATERI.dock_ground_srgb(), [0x11, 0x11, 0x12]);
+        assert_eq!(Theme::LINEN.dock_ground_srgb(), [0xfa, 0xf9, 0xf5]);
+        for (_, _, theme) in EMBEDDED {
+            let [r, g, b] = theme.dock_ground_srgb();
+            assert_eq!(theme.dock_ground_linear(), LinearRgba::from_srgb(r, g, b));
+            // Never darker than the content: the plate catches more light
+            // than what it casts its shadow on. Where it is lifted its rim is
+            // lighter still; where it cannot be (a pure white background)
+            // the shadow carries the edge; on pure black the shadow is the
+            // content's own colour and the rim carries it.
+            let (ground, content) = (
+                theme.dock_ground_linear().luminance(),
+                theme.background_linear().luminance(),
+            );
+            assert!(ground >= content, "{theme:?}");
+            if ground > content {
+                assert!(theme.dock_rim_linear().luminance() > ground, "{theme:?}");
+            } else {
+                assert!(
+                    theme.dock_shadow_linear().luminance() < content,
+                    "{theme:?}"
+                );
+            }
+            assert!(
+                theme.dock_shadow_linear().luminance() <= content,
+                "{theme:?}"
+            );
+        }
+        // Pure white has no lighter to go to: the plate is the background and
+        // its shadow carries the edge.
+        let white = Theme {
+            background: 0xffffff,
+            ..Theme::LINEN
+        };
+        assert_eq!(white.dock_ground_srgb(), [0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn the_docks_depth_follows_the_kind_of_theme() {
+        // The shadow is the theme's dark end; how strongly it is drawn is the
+        // light/dark answer, not a colour with an alpha.
+        assert_eq!(
+            Theme::BATERI.dock_shadow_linear(),
+            LinearRgba::from_srgb(0, 0, 0)
+        );
+        assert_eq!(
+            Theme::LINEN.dock_shadow_linear(),
+            linear_hex(Theme::LINEN.foreground)
+        );
+        let (dark_shadow, dark_glow) = Theme::BATERI.dock_depth();
+        let (light_shadow, light_glow) = Theme::LINEN.dock_depth();
+        assert!(dark_shadow > light_shadow && dark_glow > light_glow);
+        for strength in [dark_shadow, dark_glow, light_shadow, light_glow] {
+            assert!(strength > 0.0 && strength <= 1.0);
+        }
+    }
+
+    #[test]
+    fn the_split_grounds_base_is_one_step_above_the_panes() {
+        // One copy of "a step above": with nothing to lean toward (accent and
+        // cursor are the step itself) the ground is the background a step
+        // toward the foreground.
         for theme in [Theme::BATERI, Theme::LINEN] {
-            let [r, g, b] = theme.band_srgb();
+            let Rgb { r, g, b } = theme.step(theme.background_rgb());
             let flat = Theme {
                 accent: u32::from_be_bytes([0, r, g, b]),
                 cursor: u32::from_be_bytes([0, r, g, b]),
@@ -1408,6 +1577,13 @@ mod tests {
             };
             assert_eq!(flat.ground_srgb(), [[r, g, b]; 2]);
         }
+        assert_eq!(
+            {
+                let Rgb { r, g, b } = Theme::LINEN.step(Theme::LINEN.background_rgb());
+                [r, g, b]
+            },
+            [0xeb, 0xe7, 0xdf]
+        );
     }
 
     #[test]

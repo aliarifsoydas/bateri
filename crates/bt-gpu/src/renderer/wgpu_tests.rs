@@ -1344,10 +1344,10 @@ fn a_wave_with_height_paints_beyond_its_row_and_the_ring_only_behind_its_front()
 }
 
 #[test]
-fn a_waiting_ripple_draws_its_line_and_nothing_else() {
-    // The waiting scene holds the ground and the lines back: what is on the
-    // pixels is the wave, in its quiet tone, within its reach of the dock's
-    // top row.
+fn a_waiting_ripple_draws_its_line_over_the_plate_and_nothing_else() {
+    // The waiting scene holds the folder row and the dock's own line back:
+    // what is on the pixels is the wave, in its quiet tone, within its reach
+    // of the dock's top row, and under it the plate in the ground's colour.
     const EDGE: u32 = 128;
     let w = Renderer::new();
     let m = flush_left(w.cell_metrics(SCALE));
@@ -1365,11 +1365,15 @@ fn a_waiting_ripple_draws_its_line_and_nothing_else() {
         0,
         "ink above the wave's reach"
     );
-    assert_eq!(
-        inked_in(&pixels, EDGE, top + reach + 1..EDGE as usize, all),
-        0,
-        "the held-back ground was drawn"
-    );
+    for y in top + reach + 1..EDGE as usize {
+        for x in all.clone() {
+            assert_eq!(
+                pixel_at(&pixels, EDGE as usize, x, y),
+                (0x00, 0x80, 0x00),
+                "not the plate at {x},{y}"
+            );
+        }
+    }
     let (r, g, b) = (0..EDGE as usize)
         .flat_map(|x| (top - reach..top + reach + 1).map(move |y| (x, y)))
         .map(|(x, y)| pixel_at(&pixels, EDGE as usize, x, y))
@@ -1378,6 +1382,63 @@ fn a_waiting_ripple_draws_its_line_and_nothing_else() {
     assert!(
         r > 0x40 && g == 0 && b == 0,
         "not the quiet tone: {r} {g} {b}"
+    );
+}
+
+#[test]
+fn the_docks_shadow_lies_under_the_text_and_fades_out_above_the_edge() {
+    // A red shadow on the black clear colour, a white letter in the grid row
+    // above the dock: the shadow tints the ground near the edge and is gone
+    // by its reach, and the letter's pixels stay pure white — the shadow is
+    // drawn under the text, not over it.
+    const EDGE: u32 = 128;
+    let w = Renderer::new();
+    let m = flush_left(w.cell_metrics(SCALE));
+    let (_, cell_h) = m.cell_px();
+    let lettered = |shadow: bool| {
+        let mut frame = waving_dock_frame(m, EDGE, None);
+        let top = frame.band_top_px(EDGE as f32);
+        let row = (top / f32::from(cell_h)).floor() as u16 - 1;
+        frame.push(glyph_cell(0, row, 'M'));
+        if shadow {
+            frame.set_dock_depth(LinearRgba::from_srgb(0xff, 0x00, 0x00), 1.0, None, 0.0);
+        }
+        (top as usize, w.render_offscreen(EDGE, BACKGROUND, &frame))
+    };
+    let (top, plain) = lettered(false);
+    let (_, shaded) = lettered(true);
+    let reach = (crate::frame::SHADOW_PT * m.scale() as f32).round() as usize;
+    let white_in = |pixels: &[u8]| {
+        (top - reach..top)
+            .flat_map(|y| (0..EDGE as usize).map(move |x| (x, y)))
+            .filter(|&(x, y)| pixel_at(pixels, EDGE as usize, x, y) == (0xff, 0xff, 0xff))
+            .count()
+    };
+    assert!(
+        white_in(&plain) > 0,
+        "the letter is not in the shadow's reach"
+    );
+    assert_eq!(
+        white_in(&shaded),
+        white_in(&plain),
+        "the shadow covered the text"
+    );
+    // Right above the edge, away from the letter, the ground is tinted; past
+    // the reach it is untouched.
+    let far = EDGE as usize - 1;
+    let (r, g, b) = pixel_at(&shaded, EDGE as usize, far, top - 1);
+    assert!(
+        r > 0x80 && g == 0 && b == 0,
+        "no shadow at the edge: {r} {g} {b}"
+    );
+    assert_eq!(
+        pixel_at(&shaded, EDGE as usize, far, top - reach - 1),
+        (0, 0, 0)
+    );
+    assert!(
+        pixel_at(&shaded, EDGE as usize, far, top - reach / 2).0
+            < pixel_at(&shaded, EDGE as usize, far, top - 1).0,
+        "the shadow does not fade"
     );
 }
 

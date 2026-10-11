@@ -48,27 +48,46 @@ use footer::{program_color, render_context};
 /// as an ordinary glyph.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Dock {
-    /// The surface's ground; it must be **opaque** (see [`render`]).
+    /// The surface's ground, a plate a level above the content
+    /// ([`Theme::dock_ground_linear`]); it must be **opaque** (see [`render`]).
     pub ground: LinearRgba,
-    /// Color of the **top** hairline separating the dock from the grid: in a
-    /// remote session the color of the host's mark (the theme's `info` when
-    /// unmarked), under a program's guide bar the bar's tone, otherwise
-    /// [`Self::separator`].
+    /// Color of the **top** edge between the dock and the grid: in a remote
+    /// session the color of the host's mark (the theme's `info` when
+    /// unmarked), under a program's guide bar the bar's tone, otherwise the
+    /// plate's lit rim ([`Theme::dock_rim_linear`]).
     ///
-    /// A separate field, because this line says the distance (the host, the
-    /// program) while [`Self::separator`] is only the theme's quiet hairline.
+    /// A separate field from the rim's own, because this line says the
+    /// distance (the host, the program) — and while it does, [`Self::glow`]
+    /// carries the same colour into the shadow.
     pub edge: LinearRgba,
-    /// The theme's hairline color: the top hairline's when nothing else
-    /// colors it ([`Self::edge`]) and the upload track's on an unmarked host.
-    /// There is no line between the input block and the context row any more,
-    /// the tone ([`Self::band`]) is what tells them apart.
+    /// The theme's quiet hairline color: the progress bar's empty track
+    /// before [`Self::track`] is told. The top edge is no hairline any more
+    /// (the plate's rim, [`Self::edge`]) and there is no line between the
+    /// input block and the context row, the tone ([`Self::band`]) is what
+    /// tells them apart.
     pub separator: LinearRgba,
     /// The context row's tone: the ground a step toward the foreground
     /// ([`Theme::band_linear`]). It covers the row from the middle of the gap
-    /// above it to the surface's bottom edge — the whole surface when the
-    /// dock is only a context row (a remote session, a program's guide bar).
-    /// Must be **opaque**, like [`Self::ground`].
+    /// above it to the surface's bottom edge; when the dock is only a context
+    /// row (a remote session, a program's guide bar) there is no input row to
+    /// part from and the plate itself is the row's ground. Must be
+    /// **opaque**, like [`Self::ground`].
     pub band: LinearRgba,
+    /// The shadow the plate casts on the content above it
+    /// ([`Theme::dock_shadow_linear`], opaque) and how strongly it is drawn
+    /// at the plate's edge ([`Theme::dock_depth`]); it fades to nothing a
+    /// fixed height above it.
+    pub shadow: LinearRgba,
+    pub shadow_strength: f32,
+    /// While the top edge carries a meaning — a host, a program, an upload —
+    /// its colour, cast into the shadow as a glow, at its own strength
+    /// ([`Theme::dock_depth`]); `None` when the edge is the plain rim. An
+    /// upload's glow is as wide as its filled share ([`Self::progress`]).
+    /// A dock with no input row (a remote session, a program's guide bar)
+    /// casts neither: the line being typed is then the grid's, right above
+    /// the edge (`bt-gpu` decides that from the row count).
+    pub glow: Option<LinearRgba>,
+    pub glow_strength: f32,
     /// The caret's place in the input block — row **and** column: a long
     /// line wraps, so the caret can stand on the second visual row too. The
     /// row is inside the vertical window, dock-local (`0` = the first drawn
@@ -1479,21 +1498,27 @@ pub(crate) fn render_with(
 ) -> (Dock, usize, usize) {
     runs.clear();
     let input_rows = band.unwrap_or(0);
+    // While an upload runs the line is in the color of the queue's host
+    // (also after ssh closes, as long as the result row is shown).
+    // While progress runs the filled part is `info` (the mark's meaning is in the empty track).
+    let meaning = match (&context.transfer, &context.remote, &context.program) {
+        (Some(transfer), _, _) if transfer.progress.is_some() => Some(theme.info_linear()),
+        (Some(transfer), _, _) => Some(theme.mark_linear(transfer.mark)),
+        (None, Some(_), _) => Some(theme.mark_linear(context.remote_mark)),
+        // A program's guide bar, in its tone: the band is the program's.
+        (None, None, Some(bar)) => Some(program_color(bar.tone, context.program_mark, theme)),
+        (None, None, None) => None,
+    };
+    let (shadow_strength, glow_strength) = theme.dock_depth();
     let mut surface = Dock {
-        ground: theme.background_linear(),
-        // While an upload runs the line is in the color of the queue's host
-        // (also after ssh closes, as long as the result row is shown).
-        // While progress runs the filled part is `info` (the mark's meaning is in the empty track).
-        edge: match (&context.transfer, &context.remote, &context.program) {
-            (Some(transfer), _, _) if transfer.progress.is_some() => theme.info_linear(),
-            (Some(transfer), _, _) => theme.mark_linear(transfer.mark),
-            (None, Some(_), _) => theme.mark_linear(context.remote_mark),
-            // A program's guide bar, in its tone: the band is the program's.
-            (None, None, Some(bar)) => program_color(bar.tone, context.program_mark, theme),
-            (None, None, None) => theme.separator_linear(),
-        },
+        ground: theme.dock_ground_linear(),
+        edge: meaning.unwrap_or_else(|| theme.dock_rim_linear()),
         separator: theme.separator_linear(),
         band: theme.band_linear(),
+        shadow: theme.dock_shadow_linear(),
+        shadow_strength,
+        glow: meaning,
+        glow_strength,
         caret: None,
         caret_text: theme.background_linear(),
         // With no input row (remote session) there is no mark either:
@@ -1506,7 +1531,7 @@ pub(crate) fn render_with(
             .and_then(|transfer| transfer.progress),
         track: match &context.transfer {
             Some(transfer) if transfer.mark != HostMark::None => theme.mark_linear(transfer.mark),
-            _ => theme.separator_linear(),
+            _ => theme.dock_rim_linear(),
         },
         buttons: [None; 2],
         trailing: None,
@@ -2414,12 +2439,12 @@ fn cell(
         // Reverse video: the two colors swap. If the range has no ground of
         // its own the surface's ground takes its place — `frame()`'s `INVERSE`
         // arm also concretizes the cell's default background the same way.
-        let behind = bg.unwrap_or_else(|| theme.background_linear());
+        let behind = bg.unwrap_or_else(|| theme.dock_ground_linear());
         bg = Some(fg);
         fg = behind;
     }
     if !color::is_drawing(ch) {
-        fg = fg.legible_on(bg.unwrap_or_else(|| theme.background_linear()), contrast);
+        fg = fg.legible_on(bg.unwrap_or_else(|| theme.dock_ground_linear()), contrast);
     }
     Cell {
         col,
@@ -2813,7 +2838,7 @@ mod tests {
         });
         let (cells, _) = draw(&state, COLS);
         let x = cells.iter().find(|cell| cell.ch == Some('x')).expect("x");
-        assert_eq!(x.fg, THEME.background_linear());
+        assert_eq!(x.fg, THEME.dock_ground_linear());
         assert_eq!(x.bg, Some(THEME.foreground_linear()));
     }
 
@@ -4220,7 +4245,10 @@ mod tests {
         }
         let (_, dock) = draw_with(&state, &running, COLS);
         assert_eq!(dock.edge, THEME.info_linear());
-        assert_eq!(dock.track, THEME.separator_linear());
+        assert_eq!(dock.track, THEME.dock_rim_linear());
+        // The fill's colour glows in the shadow (as wide as the fill: the
+        // drawing's side).
+        assert_eq!(dock.glow, Some(THEME.info_linear()));
     }
 
     #[test]
@@ -4635,8 +4663,10 @@ mod tests {
         assert_eq!(color(2), Some(THEME.info_linear()), "host");
         assert_eq!(color(9), Some(THEME.quiet_linear()), "parent directory");
         assert_eq!(color(17), Some(THEME.dim_linear()), "last component");
-        // The top hairline is `info`, the second stays in the separator's color.
+        // The top edge is `info` and so is the glow it casts into the
+        // shadow; the quiet hairline stays the separator's color.
         assert_eq!(dock.edge, THEME.info_linear());
+        assert_eq!(dock.glow, Some(THEME.info_linear()));
         assert_eq!(dock.separator, THEME.separator_linear());
     }
 
@@ -4670,6 +4700,7 @@ mod tests {
             assert_eq!(color(2), Some(expected), "{mark:?}: host");
             assert_eq!(color(17), Some(THEME.dim_linear()), "{mark:?}: path");
             assert_eq!(dock.edge, expected, "{mark:?}: top line");
+            assert_eq!(dock.glow, Some(expected), "{mark:?}: glow");
             assert_eq!(dock.separator, THEME.separator_linear());
         }
     }
@@ -4700,11 +4731,13 @@ mod tests {
     }
 
     #[test]
-    fn a_local_session_keeps_the_separator_on_the_edge() {
-        // Locally the top line is today's separator color, the same as the theme's quiet one.
+    fn a_local_session_puts_the_plates_rim_on_the_edge() {
+        // Locally the top edge says nothing: it is the plate's lit rim and
+        // the shadow takes no colour.
         let state = live("", "", "", 0);
         let (_, dock) = draw_with(&state, &context("/tmp", "main"), COLS);
-        assert_eq!(dock.edge, THEME.separator_linear());
+        assert_eq!(dock.edge, THEME.dock_rim_linear());
+        assert_eq!(dock.glow, None);
         assert_eq!(dock.separator, THEME.separator_linear());
     }
 
@@ -4806,11 +4839,23 @@ mod tests {
     #[test]
     fn the_surface_colors_come_from_the_theme() {
         // The ground is **opaque** and the theme's own: the grid row that
-        // overflows during a slide must stay under it. The separator is a
-        // derived value, not a new role.
+        // overflows during a slide must stay under it. It is the plate's,
+        // lifted off the content, and like the separator a derived value,
+        // not a new role.
         let (_, dock) = draw(&live("", "", "", 0), COLS);
-        assert_eq!(dock.ground, THEME.background_linear());
+        assert_eq!(dock.ground, THEME.dock_ground_linear());
+        assert_ne!(
+            dock.ground,
+            THEME.background_linear(),
+            "the plate is not lifted"
+        );
         assert_eq!(dock.ground.to_array()[3], 1.0, "ground is translucent");
+        // The shadow it casts is the theme's, at the theme's strength.
+        assert_eq!(dock.shadow, THEME.dock_shadow_linear());
+        assert_eq!(
+            (dock.shadow_strength, dock.glow_strength),
+            THEME.dock_depth()
+        );
         assert_eq!(dock.separator, THEME.separator_linear());
         assert_ne!(
             dock.separator, dock.ground,
