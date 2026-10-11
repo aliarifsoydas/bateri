@@ -962,13 +962,15 @@ fn dock_row_gap(pad: f32) -> f32 {
     (pad * 2.0).round()
 }
 
-/// The separator's thickness, in **pixels**.
+/// The thickness of the dock's two lines, in **points** — two pixels at @2x.
 ///
-/// It is not multiplied by the scale and this is deliberate: a hairline is a
-/// line, and being two pixels at @2x would thicken it — the fineness the
-/// retina display brings is exactly this. Not a measured number, a design
-/// constant (the precedent of `CellMetrics::GUTTER_PT`).
-const SEPARATOR_PX: f32 = 1.0;
+/// It used to be one **pixel** at every scale, on the reasoning that a
+/// hairline should get finer on a Retina display. On one it read as faint
+/// (the user: "too feeble"), so the line now keeps its size in points like
+/// the scroll bar's hairline (`scrollbar::HAIRLINE_PT`). Converted once per
+/// geometry ([`Frame::clear`], the gutter's road); not a measured number, a
+/// design constant (the precedent of `CellMetrics::GUTTER_PT`).
+const SEPARATOR_PT: f32 = 1.0;
 
 /// What is to be drawn in a single frame.
 ///
@@ -1079,6 +1081,9 @@ pub(crate) struct Frame {
     /// ([`caret_rect`]). A field for the same reason as `cell_px`: a motion
     /// frame does not call `clear` and **keeps** the value.
     rule_px: f32,
+    /// The dock's two lines' thickness in pixels ([`SEPARATOR_PT`] at this
+    /// scale). A field for the same reason as `rule_px`.
+    separator_px: f32,
     /// The caret's shape; [`Frame::push_caret`] writes it, [`Frame::move_caret`]
     /// keeps it — that path never goes to `bt-core`.
     caret_shape: CaretShape,
@@ -1527,6 +1532,8 @@ impl Frame {
         self.rule_px = f32::from(metrics.rule_px());
         self.gutter_px = f32::from(metrics.gutter_px());
         self.scale = metrics.scale() as f32;
+        // At least a pixel: a degenerate scale must not erase the lines.
+        self.separator_px = metrics.pt_px(SEPARATOR_PT).max(1.0);
         // **Infinity**, not zero: zero would mean "the dock band is at the
         // top of the window" and every caret would fall into the dock slot.
         // The caller overwrites it in every dock frame
@@ -2523,10 +2530,15 @@ impl Frame {
         Some(WaveDraw {
             instance: Instance {
                 pos: [0.0, band_y - reach],
-                size: [width_px, reach * 2.0 + SEPARATOR_PX],
+                size: [width_px, reach * 2.0 + self.separator_px],
                 rgba: [mix(qr, er), mix(qg, eg), mix(qb, eb), alpha],
             },
-            core: [band_y + SEPARATOR_PX * 0.5, scale, 0.0, 0.0],
+            core: [
+                band_y + self.separator_px * 0.5,
+                scale,
+                0.0,
+                self.separator_px,
+            ],
             shape: [
                 wave.amp * scale,
                 wave.phase,
@@ -2613,7 +2625,7 @@ impl Frame {
         let [tr, tg, tb, _] = self.dock_dust_tones.text;
         let front = (dust.front() * width_px).min(width_px);
         let length = (HOT_LENGTH_PT * scale).min(front);
-        let row = band_y + SEPARATOR_PX * 0.5;
+        let row = band_y + self.separator_px * 0.5;
         // The core is the accent a little toward the text: a spark, not a
         // second halo.
         let core = |accent: f32, text: f32| accent * 0.65 + text * 0.35;
@@ -2630,7 +2642,7 @@ impl Frame {
         (length > 0.0).then_some(WaveDraw {
             instance: Instance {
                 pos: [front - length, band_y],
-                size: [length, SEPARATOR_PX],
+                size: [length, self.separator_px],
                 rgba: [ar, ag, ab, hot],
             },
             core: [front - length, 0.0, 1.0, front],
@@ -3186,7 +3198,7 @@ impl Frame {
             // edge says the distance, it is not a divider.
             Instance {
                 pos: [0.0, 0.0],
-                size: [width(lines[0], width_px), SEPARATOR_PX],
+                size: [width(lines[0], width_px), self.separator_px],
                 rgba: faded(edge_base, band_alpha),
             },
             // While an upload runs, the part of the line that
@@ -3195,7 +3207,7 @@ impl Frame {
             // that does not land on the device grid would fade).
             Instance {
                 pos: [0.0, 0.0],
-                size: [width(lines[0], fill.round()), SEPARATOR_PX],
+                size: [width(lines[0], fill.round()), self.separator_px],
                 rgba: faded(dock.edge, band_alpha),
             },
             // **The second separator: between the input row and the context
@@ -3220,7 +3232,7 @@ impl Frame {
                 ],
                 size: [
                     width(lines[1], width_px),
-                    if rows < 2 { 0.0 } else { SEPARATOR_PX },
+                    if rows < 2 { 0.0 } else { self.separator_px },
                 ],
                 rgba: faded(dock.separator, band_alpha),
             },
@@ -3241,9 +3253,10 @@ impl Frame {
         let pad = self.dock_pad();
         let gap = dock_row_gap(pad);
         // Rounded: a hairline that does not land on the device grid would
-        // spread over two pixels and fade — the same source as the rationale
-        // for `SEPARATOR_PX` not being multiplied by the scale.
-        (pad + f32::from(rows - 1) * self.cell_px.1 + (gap - SEPARATOR_PX) * 0.5).round()
+        // spread over two pixels and fade. At @2x the gap and the line are
+        // both even and the middle is already whole; at @1x the line is odd
+        // and the rounding picks a side.
+        (pad + f32::from(rows - 1) * self.cell_px.1 + (gap - self.separator_px) * 0.5).round()
     }
 
     pub(crate) fn dock_bg(&self) -> &[Instance] {
@@ -5430,7 +5443,7 @@ mod tests {
         assert_eq!(ground.rgba[3], 1.0, "translucent ground shows overflow");
         // The separator is at the dock's **topmost** pixel: that is the boundary with the grid.
         assert_eq!(separator.pos, [0.0, 0.0]);
-        assert_eq!(separator.size, [500.0, SEPARATOR_PX]);
+        assert_eq!(separator.size, [500.0, 1.0], "a point at @1x");
         assert_eq!(
             separator.rgba,
             SUCCESS.to_array(),
@@ -5441,7 +5454,7 @@ mod tests {
         // colour. Without a margin at this measure the row gap is zero, so the
         // line is exactly on the row boundary.
         assert_eq!(divider.pos, [0.0, 18.0]);
-        assert_eq!(divider.size, [500.0, SEPARATOR_PX]);
+        assert_eq!(divider.size, [500.0, 1.0]);
         assert_eq!(divider.rgba, CURSOR.to_array());
 
         // While an upload runs the top line is a bar: its ground
@@ -5449,11 +5462,11 @@ mod tests {
         // in the edge's colour; the second separator keeps its own colour.
         frame.set_dock_progress(Some(2_500), BG);
         let [_, base, fill, divider] = frame.dock_ground(500.0);
-        assert_eq!(base.size, [500.0, SEPARATOR_PX]);
+        assert_eq!(base.size, [500.0, 1.0]);
         assert_eq!(base.rgba, BG.to_array(), "bar's ground is the empty track");
         assert_eq!(divider.rgba, CURSOR.to_array(), "separator has no track");
         assert_eq!(fill.pos, [0.0, 0.0]);
-        assert_eq!(fill.size, [125.0, SEPARATOR_PX]);
+        assert_eq!(fill.size, [125.0, 1.0]);
         assert_eq!(fill.rgba, SUCCESS.to_array(), "fill is the edge colour");
         // Opening resets every frame: the bar exists only in the frame it is told.
         frame.open_dock(BG, SUCCESS, CURSOR);
@@ -5493,20 +5506,21 @@ mod tests {
         // it would stick to a row and look as if it belonged to it.
         assert_eq!(divider.pos, [0.0, 32.0]);
         // **The rhythm is equal — written pixel by pixel.** `pad` 7, cell 18,
-        // gap 14, line 1 px. The boxes: top line [0,1], input [7,25], middle
+        // gap 14, line 1 px (a point at @1x). The boxes: top line [0,1], input [7,25], middle
         // line [32,33], context [39,57], bottom 64. The four gaps in between
         // are 6, 7, 6, 7 in order — the difference comes from the lines'
         // **own** pixels and from rounding 31.5, not from the formula. One
         // pixel cannot be equalized: the gap is even (14), the line odd (1), so
-        // the centre always falls on a half pixel. In the old state these gaps
+        // the centre always falls on a half pixel (at @2x both are even —
+        // `the_dock_lines_are_a_point_thick`). In the old state these gaps
         // were 6, 1, 1, 7.
         assert_eq!(GUTTER, 7, "the pixel table above depends on this margin");
         let row1_top = f32::from(GUTTER) + 18.0 + dock_row_gap(f32::from(GUTTER));
         assert_eq!(row1_top, 39.0);
         assert_eq!(divider.pos[1] - (f32::from(GUTTER) + 18.0), 7.0);
-        assert_eq!(row1_top - (divider.pos[1] + SEPARATOR_PX), 6.0);
+        assert_eq!(row1_top - (divider.pos[1] + 1.0), 6.0);
         assert_eq!(frame.dock_layout_px() - (row1_top + 18.0), 7.0);
-        assert_eq!(divider.size, [500.0, SEPARATOR_PX]);
+        assert_eq!(divider.size, [500.0, 1.0]);
         // The hairline is **above** the margin, at the top of the viewport:
         // that is the boundary with the grid, and putting the margin above it
         // would push the line into the grid.
@@ -5547,6 +5561,34 @@ mod tests {
             f32::from(GUTTER) + 18.0 + 2.0 * f32::from(GUTTER),
             "row gap or outer margin applied wrongly"
         );
+    }
+
+    #[test]
+    fn the_dock_lines_are_a_point_thick() {
+        // A point, not a pixel: at @2x both lines are two pixels tall — one
+        // pixel read as faint on a Retina display. The wave and the woven
+        // line's lit tip take the same thickness, or the swap to the resting
+        // line would show.
+        let mut frame = Frame::default();
+        frame.clear(
+            CellMetrics::new(18, 36, 18, 14, 2, 2.0).expect("metrics"),
+            CaretStyle::default(),
+        );
+        frame.open_dock(BG, SUCCESS, CURSOR);
+        let [_, separator, _, divider] = frame.dock_ground(500.0);
+        assert_eq!(separator.pos, [0.0, 0.0], "the top line left the edge");
+        assert_eq!(separator.size, [500.0, 2.0]);
+        assert_eq!(divider.size, [500.0, 2.0]);
+        // `pad` 14, cell 36, gap 28: the line's middle is whole at @2x, so
+        // the two rows are equally far from it — 13 pixels each side.
+        assert_eq!(divider.pos, [0.0, 63.0]);
+        assert_eq!(divider.pos[1] - (14.0 + 36.0), 13.0);
+        assert_eq!((14.0 + 36.0 + 28.0) - (divider.pos[1] + 2.0), 13.0);
+
+        frame.set_dock_progress(Some(2_500), BG);
+        let [_, base, fill, _] = frame.dock_ground(500.0);
+        assert_eq!(base.size[1], 2.0, "the upload bar's track");
+        assert_eq!(fill.size[1], 2.0, "the upload bar's fill");
     }
 
     #[test]
@@ -6471,8 +6513,16 @@ mod tests {
             wave.core[0],
             "centred on the line"
         );
-        assert_eq!(wave.core[0], 100.5, "the middle of the row the line fills");
+        assert_eq!(
+            wave.core[0], 101.0,
+            "the middle of the two rows the line fills at 2x"
+        );
         assert_eq!(wave.core[1], 2.0, "pixels per point");
+        assert_eq!(
+            wave.core[3],
+            frame.dock_ground(500.0)[1].size[1],
+            "the wave at rest is the dock's own line, its thickness too"
+        );
         assert!(
             quad.size[1] * 0.5 > WAVE_REACH_PT * 2.0,
             "room above and below for both peaks at 2x"

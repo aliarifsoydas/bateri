@@ -91,7 +91,8 @@ pub(crate) const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8U
 /// land in the middle. The `selection` pipeline reads the same block with
 /// another meaning: `core` is the highlight's colour, `shape[0]` its radius.
 /// The `wave` pipeline reads it as geometry: `core[0]` is the line's centre y,
-/// `core[1]` the pixels per point, `shape` the peaks, the phase and the ring's
+/// `core[1]` the pixels per point, `core[3]` the line's thickness in pixels,
+/// `shape` the peaks, the phase and the ring's
 /// front (the colour rides in the instance); `core[2]` = 1 picks the dust
 /// scene's ramp instead, which reads the block as `cell_bg.wgsl` says.
 /// The `dots` pipeline reads none of it but `viewport_px`.

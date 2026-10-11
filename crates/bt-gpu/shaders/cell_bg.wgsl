@@ -260,7 +260,8 @@ fn selection_fragment(in: SelectionOut) -> @location(0) vec4<f32> {
 // top, not the dock's. The colour (alpha included) rides in the instance, like
 // `cell_bg`'s; the block carries the geometry:
 //
-//   core  = (the line's centre y in window space, pixels per point, 0, 0)
+//   core  = (the line's centre y in window space, pixels per point, 0, the
+//            line's thickness in pixels)
 //   shape = (the resting wave's peak, its phase, the ring's front x, the
 //            ring's peak)
 //
@@ -274,10 +275,11 @@ fn selection_fragment(in: SelectionOut) -> @location(0) vec4<f32> {
 // The ring exists only behind its front: it spreads from the › and leaves a
 // calm line ahead of it.
 //
-// **Zero peaks are today's line, exactly.** The coverage is a one-pixel tent
-// round the curve: a line at a pixel centre covers that row fully and its
-// neighbours not at all, so with both peaks at zero the pixels are the ones the
-// dock's own hairline draws and the swap between them is invisible.
+// **Zero peaks are today's line, exactly.** The coverage is the line's
+// thickness with a one-pixel soft edge round the curve: a line `t` pixels thick
+// centred between pixel rows covers its `t` rows fully and their neighbours not
+// at all, so with both peaks at zero the pixels are the ones the dock's own
+// hairline draws and the swap between them is invisible.
 
 const TAU: f32 = 6.2831855;
 // Design lengths, points.
@@ -317,6 +319,7 @@ fn wave_fragment(in: Out) -> @location(0) vec4<f32> {
         return vec4<f32>(in.rgba.rgb, in.rgba.a * across);
     }
     let scale = imm.core.y;
+    let half = max(imm.core.w, 1.0) * 0.5;
     let x = in.position.x;
     // The distance to the curve measured across it, not straight down: a
     // steep stretch would otherwise come out thinner than a flat one. The
@@ -324,7 +327,7 @@ fn wave_fragment(in: Out) -> @location(0) vec4<f32> {
     let slope = wave_height(x + 0.5, scale) - wave_height(x - 0.5, scale);
     let across = abs(in.position.y - (imm.core.x + wave_height(x, scale)))
         * inverseSqrt(1.0 + slope * slope);
-    return vec4<f32>(in.rgba.rgb, in.rgba.a * clamp(1.0 - across, 0.0, 1.0));
+    return vec4<f32>(in.rgba.rgb, in.rgba.a * clamp(half + 0.5 - across, 0.0, 1.0));
 }
 
 // ---------------------------------------------------------------------------

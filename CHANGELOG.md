@@ -28,6 +28,12 @@ of every installed copy. A version without a section is not released.
   ground, with an amber cursor; every color reads clearly on it, comments
   included.
 
+### Changed
+
+- **The dock's two lines are a point thick.** The line above the input row
+  and the one above the folder row were a single pixel, which looked faint
+  on a Retina display; they now keep the same weight at every scale.
+
 ### Fixed
 
 - **Text inside a search match stays readable.** The highlight of a match
