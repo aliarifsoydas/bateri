@@ -135,6 +135,10 @@ pub trait PaneHost {
     /// thread's news; the screen's is the frame path's, so a tab that draws
     /// nothing hears it when it is next drawn.
     fn activity_changed(&self, pane: u64);
+    /// What the pane runs changed ([`TerminalPane::program_kind`]): the tab's icon is read again.
+    /// Nothing for an owner that draws no such icon — the embedding interface has no event for
+    /// it, and `activity_changed`'s is a command's or the screen's.
+    fn program_changed(&self, _pane: u64) {}
     /// Notification to the user (upload finished, failed, connection lost).
     fn notify(&self, pane: u64, title: &str, body: &str);
     /// Subtitle notices (today only the font's, `sync_geometry`).
@@ -1118,6 +1122,10 @@ const PROBE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 /// and the icon is not a decision the next keystroke waits for.
 const IDENTITY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How many times the identity probe looks at the process table for one command before it gives
+/// up on a program nobody names: at least ten seconds of output at [`IDENTITY_DELAY`].
+const IDENTITY_LOOKS: u16 = 40;
+
 impl ShellWake {
     /// Throws the remote-session probe to the main queue ([`RemoteProbe`]).
     fn dispatch_remote_probe(&self) {
@@ -1232,7 +1240,7 @@ impl ShellWake {
             };
             let outcome = pane.probe_identity();
             if outcome.changed {
-                pane.host().activity_changed(id);
+                pane.host().program_changed(id);
             }
             if outcome.undecided {
                 probe.rearm();
@@ -1717,12 +1725,12 @@ fn marks_notifier(id: u64, lookup: PaneLookup) -> Box<dyn Fn()> {
     })
 }
 
-/// How many commands have ended in the session — what [`Unseen`](crate::tabs::Unseen) counts
-/// against: the same two counters, so a program seen "before the end" is one the tab's reading
-/// of that end can be matched with. Wraps like they do.
-fn ended_count(session: &Session) -> u64 {
-    let activity = session.activity();
-    activity.finished.wrapping_add(activity.failed)
+/// Whether the identity probe looks again after `looks` looks at the process table of one
+/// command, `wait` being what the table left it ([`after_table`]): a command nobody names (a
+/// server, `tail -f`) is looked at this many times while it prints and then left alone — what it
+/// says of itself (`OSC 7501`) is still heard.
+fn keep_looking(wait: bool, looks: u16) -> bool {
+    wait && looks < IDENTITY_LOOKS
 }
 
 /// What a look at the process table leaves the identity probe to keep and to do: the program it
@@ -1737,11 +1745,13 @@ fn after_table(seen: Seen, line: Option<Kind>) -> (Option<Kind>, bool) {
 }
 
 /// The program of the command that just ended, from what [`TerminalPane::program_kind`] last saw
-/// (`ran`: the count of ended commands then, and the kind) and the count of ended commands now:
-/// what it saw counts only if it was during the command that ended — exactly one end since;
-/// anything older is a command that came and went unseen, and the pane was at its prompt.
-fn kind_of_end(ran: Option<(u64, Kind)>, ends: u64) -> Kind {
-    ran.filter(|(before, _)| before.wrapping_add(1) == ends)
+/// (`ran`: the command it was seen during, and the kind) and the newest command now: what it saw
+/// counts only if that is the command that ended; anything older is a command that came and went
+/// unseen, and the pane was at its prompt. By the command, not by a count of ends: a program that
+/// says it is done and then the command's own end are two ends of one command, and they may be
+/// noticed together.
+fn kind_of_end<K: PartialEq>(ran: Option<(K, Kind)>, newest: Option<K>) -> Kind {
+    ran.filter(|(seen, _)| newest.as_ref() == Some(seen))
         .map_or(Kind::Shell, |(_, kind)| kind)
 }
 
@@ -1755,10 +1765,12 @@ struct ProgramMemo {
     /// What the process table named, by the local command's generation. Only a program it named
     /// is kept: "nothing known" is asked again.
     group: Option<(u64, Kind)>,
-    /// What the pane was last seen to run, with the count of commands that had ended by then:
-    /// the program of the command that ends next, which is what the tab keeps showing for it
-    /// ([`TerminalPane::ended_kind`]).
-    ran: Option<(u64, Kind)>,
+    /// What the pane was last seen to run, and during which command: the program of the command
+    /// that ends next, which is what the tab keeps showing for it ([`TerminalPane::ended_kind`]).
+    ran: Option<(CommandId, Kind)>,
+    /// How many times the process table was looked at for the local command of this generation
+    /// without naming a program (bounded by [`IDENTITY_LOOKS`]).
+    looks: Option<(u64, u16)>,
 }
 
 /// Result of the remote-session probe ([`TerminalPane::probe_remote`]): two
@@ -4058,10 +4070,12 @@ impl TerminalPane {
             .program_app()
             .as_deref()
             .and_then(identity::from_app);
-        let line = session
+        let command = session
             .last_command()
             .filter(|command| command.phase == CommandPhase::Running)
-            .and_then(|command| memo.line.filter(|(id, _)| *id == command.id))
+            .map(|command| command.id);
+        let line = command
+            .and_then(|id| memo.line.filter(|(seen, _)| *seen == id))
             .and_then(|(_, kind)| kind);
         let group = memo
             .group
@@ -4069,10 +4083,11 @@ impl TerminalPane {
             .map(|(_, kind)| kind);
         let remote = session.remote_line().is_some();
         let kind = identity::decide(app, group, line, remote);
-        let ends = ended_count(session);
-        if memo.ran != Some((ends, kind)) {
+        if let Some(id) = command
+            && memo.ran != Some((id, kind))
+        {
             self.ivars().program_memo.set(ProgramMemo {
-                ran: Some((ends, kind)),
+                ran: Some((id, kind)),
                 ..memo
             });
         }
@@ -4081,13 +4096,14 @@ impl TerminalPane {
 
     /// The program of the command that just ended, for the tab to keep showing: by the time the
     /// end is noticed the pane is at its prompt and [`Self::program_kind`] says shell. What
-    /// [`Self::program_kind`] last saw while a command ran, if that was during the command that
-    /// ended (exactly one end since); the shell for one that came and went before anyone looked.
+    /// [`Self::program_kind`] last saw while a command ran, if that was during the newest command
+    /// (the one that ended); the shell for one that came and went before anyone looked.
     pub(crate) fn ended_kind(&self) -> Kind {
         let Some(session) = self.session() else {
             return Kind::Shell;
         };
-        kind_of_end(self.ivars().program_memo.get().ran, ended_count(session))
+        let newest = session.last_command().map(|command| command.id);
+        kind_of_end(self.ivars().program_memo.get().ran, newest)
     }
 
     /// The identity probe: reads what [`Self::program_kind`] cannot cheaply — the newest command's
@@ -4133,7 +4149,13 @@ impl TerminalPane {
                 line,
             );
             memo.group = group.map(|kind| (running, kind)).or(memo.group);
-            undecided = wait;
+            let looks = memo
+                .looks
+                .filter(|(generation, _)| *generation == running)
+                .map_or(0, |(_, looks)| looks)
+                .saturating_add(1);
+            memo.looks = Some((running, looks));
+            undecided = keep_looking(wait, looks);
         }
         self.ivars().program_memo.set(memo);
         RemoteProbeOutcome {
@@ -5564,23 +5586,39 @@ mod tests {
     }
 
     /// What a pane ran is handed over for the command that ended only if it was seen during that
-    /// one — exactly one end since — and the counts' wrap does not matter.
+    /// one; a command that came and went since leaves the shell.
     #[test]
     fn an_ended_command_keeps_the_program_seen_while_it_ran() {
         use super::{Kind, kind_of_end};
-        assert_eq!(kind_of_end(Some((4, Kind::Task)), 5), Kind::Task);
+        assert_eq!(kind_of_end(Some((7, Kind::Task)), Some(7)), Kind::Task);
         assert_eq!(
-            kind_of_end(Some((3, Kind::Task)), 5),
+            kind_of_end(Some((6, Kind::Task)), Some(7)),
             Kind::Shell,
             "a command came and went since: the pane is at its prompt"
         );
-        assert_eq!(
-            kind_of_end(Some((5, Kind::Task)), 5),
-            Kind::Shell,
-            "nothing ended since it was seen"
-        );
-        assert_eq!(kind_of_end(None, 5), Kind::Shell);
-        assert_eq!(kind_of_end(Some((u64::MAX, Kind::Editor)), 0), Kind::Editor);
+        assert_eq!(kind_of_end(None, Some(7)), Kind::Shell);
+        assert_eq!(kind_of_end(Some((7, Kind::Task)), None), Kind::Shell);
+    }
+
+    /// A program that says it is done and the command's own end are two ends of one command: the
+    /// program it was seen running stays its, however many ends were noticed together.
+    #[test]
+    fn two_ends_of_one_command_keep_its_program() {
+        use super::{Kind, kind_of_end};
+        let ran = Some(("claude -p", Kind::Task));
+        for _ends_noticed in [1, 2, 3] {
+            assert_eq!(kind_of_end(ran, Some("claude -p")), Kind::Task);
+        }
+    }
+
+    /// A command nobody names is looked at a bounded number of times, a decided one not at all.
+    #[test]
+    fn the_identity_probe_gives_up_on_a_program_nobody_names() {
+        use super::{IDENTITY_LOOKS, keep_looking};
+        assert!(keep_looking(true, 1));
+        assert!(keep_looking(true, IDENTITY_LOOKS - 1));
+        assert!(!keep_looking(true, IDENTITY_LOOKS));
+        assert!(!keep_looking(false, 1), "named: nothing left to look for");
     }
 
     #[test]

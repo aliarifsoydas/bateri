@@ -445,7 +445,7 @@ fn surface_colors(background: u32, foreground: u32, dark: bool) -> (u32, (u32, f
 }
 
 /// `t` of the way from `a` to `b`, in sRGB bytes.
-fn mix(a: u32, b: u32, t: f64) -> u32 {
+pub(crate) fn mix(a: u32, b: u32, t: f64) -> u32 {
     let channel = |shift: u32| {
         let (x, y) = (
             f64::from((a >> shift) & 0xff),
@@ -583,6 +583,10 @@ mod tests {
     fn the_surface_steps_toward_the_foreground() {
         assert_eq!(mix(0x000000, 0xffffff, 0.0), 0x000000);
         assert_eq!(mix(0x000000, 0xffffff, 1.0), 0xffffff);
+        // Each channel on its own: also the mix a deck's tiles are laid in (`tab_bar`).
+        assert_eq!(mix(0x102030, 0xf0e0d0, 0.0), 0x102030);
+        assert_eq!(mix(0x000000, 0xffffff, 0.5), 0x808080);
+        assert_eq!(mix(0x000000, 0xff8000, 0.5), 0x804000);
         let (dark, _) = surface_colors(0x000000, 0xe6e6e6, true);
         assert!(dark > 0x000000 && dark < 0x404040, "{dark:06x}");
         let (light, _) = surface_colors(0xffffff, 0x1a1a1a, false);

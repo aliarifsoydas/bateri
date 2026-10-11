@@ -28,10 +28,11 @@ use std::path::Path;
 use block2::RcBlock;
 use bt_core::{
     CURSOR_BLINK_RANGE, CURSOR_GLOW_RANGE, CURSOR_RADIUS_RANGE, CaretShape, ConfirmClose,
-    ContentEdge, CursorBlink, CursorMotion, DockArrival, DownloadConflict, Erase, KeepRunning,
-    Keypress, LETTER_SPACING_RANGE, LINE_HEIGHT_RANGE, Osc52, PreviewKeep, ReduceMotion,
-    RemoteStatsMode, RestoreWindows, SCROLLBACK_MAX, STATS_INTERVAL_RANGE, SYSTEM_THEME, Scrollbar,
-    Settings, SettingsEdit, ShellIntegration, SmoothScroll, SplitStyle, UnfocusedCaret,
+    ContentEdge, CursorBlink, CursorMotion, DockArrival, DownloadConflict, Erase, IconColors,
+    KeepRunning, Keypress, LETTER_SPACING_RANGE, LINE_HEIGHT_RANGE, Osc52, PreviewKeep,
+    ReduceMotion, RemoteStatsMode, RestoreWindows, SCROLLBACK_MAX, STATS_INTERVAL_RANGE,
+    SYSTEM_THEME, Scrollbar, Settings, SettingsEdit, ShellIntegration, SmoothScroll, SplitStyle,
+    TabIcons, UnfocusedCaret,
 };
 use bt_gpu::{FontNotice, ScrollbarMode};
 use objc2::rc::Retained;
@@ -205,11 +206,13 @@ enum Key {
     MinimumContrast,
     DimSplits,
     SplitStyle,
+    TabIcons,
+    TabIconColors,
 }
 
 impl Key {
     /// The order is the `tag` itself: `ALL[tag]`.
-    const ALL: [Key; 42] = [
+    const ALL: [Key; 44] = [
         Key::ConfirmClose,
         Key::Clipboard,
         Key::Scrollback,
@@ -252,6 +255,8 @@ impl Key {
         Key::MinimumContrast,
         Key::DimSplits,
         Key::SplitStyle,
+        Key::TabIcons,
+        Key::TabIconColors,
     ];
 
     fn tag(self) -> NSInteger {
@@ -281,6 +286,8 @@ impl Key {
             Key::MinimumContrast => "appearance.minimum_contrast",
             Key::DimSplits => "appearance.dim_unfocused_splits",
             Key::SplitStyle => "appearance.split_style",
+            Key::TabIcons => "appearance.tab_icons",
+            Key::TabIconColors => "appearance.tab_icon_colors",
             Key::Font => "font.family",
             Key::Size => "font.size",
             Key::LineHeight => "font.line_height",
@@ -461,6 +468,32 @@ impl Choice for SplitStyle {
         match self {
             SplitStyle::Cards => "Cards",
             SplitStyle::Lines => "Lines",
+        }
+    }
+}
+
+impl Choice for TabIcons {
+    fn names() -> &'static [(&'static str, Self)] {
+        Self::NAMES
+    }
+    fn title(self) -> &'static str {
+        match self {
+            TabIcons::Plain => "Plain",
+            TabIcons::Ring => "Ring",
+            TabIcons::Tile => "Tile",
+            TabIcons::Off => "None",
+        }
+    }
+}
+
+impl Choice for IconColors {
+    fn names() -> &'static [(&'static str, Self)] {
+        Self::NAMES
+    }
+    fn title(self) -> &'static str {
+        match self {
+            IconColors::Theme => "Theme",
+            IconColors::Brand => "Brand",
         }
     }
 }
@@ -1096,6 +1129,8 @@ struct Controls {
     scrollbar: Retained<NSPopUpButton>,
     content_edge: Retained<NSPopUpButton>,
     split_style: Retained<NSPopUpButton>,
+    tab_icons: Retained<NSPopUpButton>,
+    tab_icon_colors: Retained<NSPopUpButton>,
     minimum_contrast: Retained<NSPopUpButton>,
     shape: Retained<NSPopUpButton>,
     blink: Retained<NSPopUpButton>,
@@ -1283,6 +1318,8 @@ define_class!(
                 Key::Scrollbar => choice_at(index).map(SettingsEdit::Scrollbar),
                 Key::ContentEdge => choice_at(index).map(SettingsEdit::ContentEdge),
                 Key::SplitStyle => choice_at(index).map(SettingsEdit::SplitStyle),
+                Key::TabIcons => choice_at(index).map(SettingsEdit::TabIcons),
+                Key::TabIconColors => choice_at(index).map(SettingsEdit::IconColors),
                 Key::ShellIntegration => choice_at(index).map(SettingsEdit::ShellIntegration),
                 Key::Shape => choice_at(index).map(SettingsEdit::Cursor),
                 Key::Blink => choice_at(index).map(SettingsEdit::CursorBlink),
@@ -1672,6 +1709,8 @@ impl SettingsWindow {
         select_choice(&c.scrollbar, settings.scrollbar);
         select_choice(&c.content_edge, settings.content_edge);
         select_choice(&c.split_style, settings.split_style);
+        select_choice(&c.tab_icons, settings.tab_icons);
+        select_choice(&c.tab_icon_colors, settings.tab_icon_colors);
 
         select_choice(&c.shape, settings.cursor);
         select_choice(&c.blink, settings.cursor_blink);
@@ -2338,6 +2377,8 @@ impl SettingsWindow {
         let content_edge = self.popup::<ContentEdge>(Key::ContentEdge);
         let dim_splits = self.switch(Key::DimSplits);
         let split_style = self.popup::<SplitStyle>(Key::SplitStyle);
+        let tab_icons = self.popup::<TabIcons>(Key::TabIcons);
+        let tab_icon_colors = self.popup::<IconColors>(Key::TabIconColors);
         let mut appearance = Form::new(mtm);
         appearance.row(Key::Theme, "Theme:", &theme, &[&theme], None);
         appearance.row(
@@ -2412,6 +2453,20 @@ impl SettingsWindow {
             &split_style,
             &[&split_style],
             Some("Cards stand on a ground with a gap round them; lines let the panes touch with one line between them."),
+        );
+        appearance.row(
+            Key::TabIcons,
+            "Tab icons:",
+            &tab_icons,
+            &[&tab_icons],
+            Some("What a tab shows before its title about the program it runs: a bare mark, a mark in a ring, a mark on a tile, or no icon."),
+        );
+        appearance.row(
+            Key::TabIconColors,
+            "Icon colors:",
+            &tab_icon_colors,
+            &[&tab_icon_colors],
+            Some("Theme: icons use the theme's colors. Brand: programs with a colored brand keep it."),
         );
 
         // Cursor
@@ -2681,6 +2736,8 @@ impl SettingsWindow {
             scrollbar,
             content_edge,
             split_style,
+            tab_icons,
+            tab_icon_colors,
             minimum_contrast,
             shape,
             blink,
@@ -3168,7 +3225,7 @@ mod tests {
                     restore_windows = []\nkeep_running = []\nscrollbar = []\n\
                     [appearance]\ntheme = []\nlight_theme = []\ndark_theme = []\n\
                     content_edge = []\nminimum_contrast = []\ndim_unfocused_splits = []\n\
-                    split_style = []\n\
+                    split_style = []\ntab_icons = []\ntab_icon_colors = []\n\
                     [font]\nfamily = []\nsize = []\nline_height = []\nletter_spacing = []\n\
                     [clipboard]\nosc52 = []\n\
                     [motion]\ncursor_motion = []\nreduce_motion = []\nsmooth_scroll = []\n\
@@ -3230,6 +3287,8 @@ mod tests {
                 Key::Ports => SettingsEdit::ShellPorts(false),
                 Key::DimSplits => SettingsEdit::DimUnfocusedSplits(true),
                 Key::SplitStyle => SettingsEdit::SplitStyle(SplitStyle::Lines),
+                Key::TabIcons => SettingsEdit::TabIcons(TabIcons::Tile),
+                Key::TabIconColors => SettingsEdit::IconColors(IconColors::Brand),
             };
             assert_eq!(edit.path(), key.path(), "{key:?}");
         }
@@ -3294,6 +3353,8 @@ mod tests {
         check::<Scrollbar>();
         check::<ContentEdge>();
         check::<SplitStyle>();
+        check::<TabIcons>();
+        check::<IconColors>();
         check::<ShellIntegration>();
         check::<CaretShape>();
         check::<CursorBlink>();

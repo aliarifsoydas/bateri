@@ -39,6 +39,15 @@ of every installed copy. A version without a section is not released.
   on a tile with one or two empty tile edges behind it. A command that ends
   while you look at another tab leaves its icon with the tick or the dot until
   you come back, so you can read what finished.
+- **Choose how a tab draws its icon, and in which colors.** The new Tab icons
+  setting (Settings ▸ Appearance, `tab_icons`) picks between the bare mark
+  (the default), the mark inside a thin ring that tells the state by its
+  color, the mark on a tile of its kind's color with a line running round
+  the tile's edge while a command runs, and no icon at all — the small
+  indicator tabs had before. Icon colors (`tab_icon_colors`) lets Claude
+  Code, Antigravity, Gemini CLI and Qwen Code keep their own brand colors
+  instead of the theme's. Show All Tabs lists each tab with its icon too. A
+  change applies at once.
 
 ### Changed
 

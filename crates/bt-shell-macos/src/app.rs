@@ -4996,6 +4996,12 @@ impl AppDelegate {
                     window.apply_split_style();
                 }
             }
+            // The tab icons' look or colors: every tab bar draws its chips again.
+            if changes.tab_icons {
+                for window in &windows {
+                    window.refresh_bar();
+                }
+            }
             self.post_notices(Source::Write, Vec::new());
         }
         // The borrow is dropped before `set_theme`; the calls inside do not touch

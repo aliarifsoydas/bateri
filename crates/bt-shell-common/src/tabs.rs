@@ -410,8 +410,18 @@ pub const DECK_STEP: f64 = 4.0;
 /// The most edges a deck shows behind its front tile; a tab of more panes shows no more.
 pub const DECK_EDGES: usize = 2;
 
+/// The label's inset from a chip's sides: room for `×` on the left, the same on the right so the
+/// title stays centred (and the ⌘ hint sits there). The shell draws the chip's content inside it
+/// and the shortest chip is measured against it.
+pub const CHIP_PAD: f64 = 26.0;
+
 /// Space between a tab's icon (or its deck) and its title.
 pub const ICON_GAP: f64 = 6.0;
+
+/// Side of the small indicator a tab wears before its title when it has no icon (`tab_icons =
+/// "none"`): a question, a ring, a tick, a dot or an arrow, and nothing while the tab reports
+/// nothing. It takes the place of [`lead_width`] then.
+pub const INDICATOR_SIDE: f64 = 12.0;
 
 /// How many edges peek out behind the front tile of a tab with `panes` panes: one for every pane
 /// but the focused one, up to [`DECK_EDGES`]. None for a tab of one pane — it has no deck.
@@ -1250,6 +1260,63 @@ pub fn ring_turn(elapsed: Duration, reduce_motion: bool) -> Option<Turn> {
         period,
         phase: elapsed.as_secs_f64() % whole / whole,
     })
+}
+
+/// The angle, in radians clockwise from the top, of the ray from a tile's centre to the point
+/// `fraction` (a share of a turn, any real number) of the way along its edge: the edge is a
+/// square of `half` the side with corners rounded to `radius`, and the way starts at the middle
+/// of the top side and runs clockwise.
+///
+/// The line running round a tile's edge while a command runs is the edge seen through a wedge
+/// that turns about the tile's centre. A wedge turned at an even rate would race through the
+/// corners (the edge is farther off there) at twice the pace it keeps along the sides; turned by
+/// this angle at an even rate in `fraction`, its middle keeps an even pace along the edge.
+pub fn edge_angle(half: f64, radius: f64, fraction: f64) -> f64 {
+    use std::f64::consts::{FRAC_PI_2, PI, TAU};
+    enum Piece {
+        /// From one point to another.
+        Line((f64, f64), (f64, f64)),
+        /// A quarter circle about a centre, from this angle (clockwise on a screen whose y goes
+        /// down).
+        Arc((f64, f64), f64),
+    }
+    let flat = (half - radius).max(0.0);
+    let round = radius.min(half);
+    let pieces = [
+        Piece::Line((0.0, -half), (flat, -half)),
+        Piece::Arc((flat, -flat), -FRAC_PI_2),
+        Piece::Line((half, -flat), (half, flat)),
+        Piece::Arc((flat, flat), 0.0),
+        Piece::Line((flat, half), (-flat, half)),
+        Piece::Arc((-flat, flat), FRAC_PI_2),
+        Piece::Line((-half, flat), (-half, -flat)),
+        Piece::Arc((-flat, -flat), PI),
+        Piece::Line((-flat, -half), (0.0, -half)),
+    ];
+    let length = |piece: &Piece| match *piece {
+        Piece::Line((x0, y0), (x1, y1)) => (x1 - x0).hypot(y1 - y0),
+        Piece::Arc(..) => round * FRAC_PI_2,
+    };
+    let total: f64 = pieces.iter().map(length).sum();
+    let mut left = fraction.rem_euclid(1.0) * total;
+    let mut at = (0.0, -half);
+    for piece in &pieces {
+        let run = length(piece);
+        if left <= run {
+            let share = if run > 0.0 { left / run } else { 0.0 };
+            at = match *piece {
+                Piece::Line((x0, y0), (x1, y1)) => (x0 + (x1 - x0) * share, y0 + (y1 - y0) * share),
+                Piece::Arc((cx, cy), from) => {
+                    let angle = from + FRAC_PI_2 * share;
+                    (cx + round * angle.cos(), cy + round * angle.sin())
+                }
+            };
+            break;
+        }
+        left -= run;
+    }
+    let angle = at.0.atan2(-at.1);
+    if angle < 0.0 { angle + TAU } else { angle }
 }
 
 /// What the bar's one delayed wake is set from ([`Clock::delay`]).
@@ -2596,6 +2663,35 @@ mod tests {
         assert_eq!(unseen.kind(), Some(Kind::Task));
     }
 
+    /// The line round a tile's edge keeps an even pace along it: its angle from the centre passes
+    /// each quarter of the way at the quarter turns, rises all the way round and never goes back.
+    #[test]
+    fn the_edge_angle_follows_the_edge_at_an_even_pace() {
+        use std::f64::consts::{FRAC_PI_2, PI, TAU};
+        for (half, radius) in [(8.8, 5.6), (8.0, 0.0), (8.0, 8.0)] {
+            let at = |fraction| edge_angle(half, radius, fraction);
+            assert!(at(0.0).abs() < 1e-9, "{half} {radius}");
+            for (quarter, angle) in [(0.25, FRAC_PI_2), (0.5, PI), (0.75, PI + FRAC_PI_2)] {
+                assert!(
+                    (at(quarter) - angle).abs() < 1e-9,
+                    "{half} {radius} {quarter}"
+                );
+            }
+            let mut last = 0.0;
+            for step in 1..=400 {
+                let angle = at(f64::from(step) / 400.0 - 1e-9);
+                assert!(angle > last, "{half} {radius} at {step}");
+                assert!(angle <= TAU + 1e-9);
+                last = angle;
+            }
+            assert!((at(1.0) - at(0.0)).abs() < 1e-9, "a turn is a turn");
+        }
+        // At an even pace along the edge the ray swings faster across a side's middle (the edge
+        // is near) than through a corner (it is far, and slants away).
+        let swing = |from: f64, to: f64| edge_angle(8.8, 5.6, to) - edge_angle(8.8, 5.6, from);
+        assert!(swing(0.23, 0.27) > swing(0.105, 0.145));
+    }
+
     /// A deck has an edge for every pane but the one in front, two at the most; a tab of one
     /// pane has none.
     #[test]
@@ -2646,8 +2742,7 @@ mod tests {
     /// At the narrowest a chip gets, the title keeps room to be read beside the widest deck.
     #[test]
     fn the_narrowest_chip_still_reads_beside_the_widest_deck() {
-        // The chip's side padding (the close button's room) is the shell's; 26 pt a side.
-        let inner = MIN_WIDTH - 2.0 * 26.0;
+        let inner = MIN_WIDTH - 2.0 * CHIP_PAD;
         let (_, _, width) = title_row(inner, 200.0, Some(lead_width(DECK_EDGES)));
         assert!(width >= 36.0, "{width} pt for the title");
     }

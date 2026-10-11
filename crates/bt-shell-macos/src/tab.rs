@@ -141,6 +141,12 @@ impl PaneHost for TabHost {
         }
     }
 
+    fn program_changed(&self, _pane: u64) {
+        if let Some(window) = self.tab().and_then(|tab| tab.window()) {
+            window.refresh_bar();
+        }
+    }
+
     fn notify(&self, _pane: u64, title: &str, body: &str) {
         uploader::notify(Self::mtm(), title, body);
     }
