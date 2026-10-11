@@ -38,7 +38,7 @@ use bt_core::{
     BlockHandle, CellHalf, Click, MouseButton, MouseModifiers, ScrollIntent, SearchCover,
     SelectionPoint, Session, Wheel,
 };
-use bt_gpu::{CellMetrics, Origin, ScrollbarLayout};
+use bt_gpu::{CellMetrics, ContextStrip, ContextTrailing, Origin, ScrollbarLayout};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, ProtocolObject, Sel};
 use objc2::{
@@ -561,6 +561,10 @@ pub(crate) struct ViewIvars {
     /// every dock hit (the input block's clamp, the context row's column and
     /// budget) reads it, so a click on the dock's last columns is the dock's.
     dock_cols: Cell<u16>,
+    /// The context row's strip: its column budget and the leftover pixels
+    /// before its trailing zone (`grid::Grid::context`). Written with
+    /// `metrics`; the context row's columns, rectangles and budget all read it.
+    context: Cell<ContextStrip>,
     /// The hand-cursor rectangles the last `resetCursorRects` set up (what
     /// [`BateriView::sync_cursor_rects`] compares): the upload buttons' and the
     /// ⌘-hovered link's, one list.
@@ -1642,6 +1646,7 @@ impl BateriView {
             metrics: Cell::new(None),
             dock_rows: Cell::new(0),
             dock_cols: Cell::new(0),
+            context: Cell::new(ContextStrip::default()),
             cursor_rects: RefCell::new(Vec::new()),
             link: RefCell::new(LinkState::default()),
             origin: OnceCell::new(),
@@ -1693,6 +1698,7 @@ impl BateriView {
             .set(Some((grid.cell, (grid.cols, grid.rows))));
         self.ivars().dock_rows.set(dock_rows);
         self.ivars().dock_cols.set(grid.dock_cols);
+        self.ivars().context.set(grid.context);
         // The strip's width comes from the cell's scale: a new screen or font
         // re-sizes the tracking area even when the view's size is the same.
         self.track_scrollbar_strip();
@@ -2567,12 +2573,31 @@ impl BateriView {
     /// so the column the two see and the drawn fill cannot diverge.
     fn context_column(&self, in_window: NSPoint) -> Option<(u16, u16)> {
         let (metrics, _) = self.ivars().metrics.get()?;
-        let cols = self.ivars().dock_cols.get();
+        let budget = self.context_budget()?;
         let (top, rows) = self.ivars().origin.get().and_then(Origin::dock)?;
         let scale = self.window()?.backingScaleFactor();
         let at = self.convertPoint_fromView(in_window, None);
-        let col = context_col_at(metrics, top, rows, (at.x * scale, at.y * scale))?;
-        Some((col, bt_gpu::context_cols(cols, metrics)))
+        let col = context_col_at(
+            metrics,
+            top,
+            rows,
+            self.context_trailing(budget),
+            (at.x * scale, at.y * scale),
+        )?;
+        Some((col, budget))
+    }
+
+    /// Where the context row's trailing zone starts and how far the strip's
+    /// leftover moves it - what the last frame drew, read from the plan the
+    /// cells were placed by (`Session::footer_trailing`; the click and hover
+    /// re-plan the same way) and the grid's offset. `None` → the row stands
+    /// where the small grid puts it.
+    fn context_trailing(&self, budget: u16) -> Option<ContextTrailing> {
+        let session = self.ivars().session.get()?;
+        ContextTrailing::new(
+            session.footer_trailing(budget),
+            self.ivars().context.get().offset_px,
+        )
     }
 
     /// The rectangle, at view points, of the dock-local `[start, end)` column
@@ -2584,17 +2609,19 @@ impl BateriView {
         let (metrics, _) = self.ivars().metrics.get()?;
         let (top, rows) = self.ivars().origin.get().and_then(Origin::dock)?;
         let scale = self.window()?.backingScaleFactor();
-        let (x, y, width, height) = context_span_px(metrics, top, rows, start, end);
+        let trailing = self.context_trailing(self.context_budget()?);
+        let (x, y, width, height) = context_span_px(metrics, top, rows, trailing, start, end);
         Some(NSRect::new(
             NSPoint::new(x / scale, y / scale),
             NSSize::new(width / scale, height / scale),
         ))
     }
 
-    /// The context line's budget ([`bt_gpu::context_cols`]); `None` if there is no metrics.
+    /// The context line's budget (`grid::Grid::context`, the very number the
+    /// dock was laid out with); `None` if there is no metrics.
     pub(crate) fn context_budget(&self) -> Option<u16> {
-        let (metrics, _) = self.ivars().metrics.get()?;
-        Some(bt_gpu::context_cols(self.ivars().dock_cols.get(), metrics))
+        self.ivars().metrics.get()?;
+        Some(self.ivars().context.get().cols)
     }
 
     /// The upload buttons' hand cursor: AppKit's **cursor
@@ -2786,32 +2813,46 @@ fn context_band_px(metrics: CellMetrics, top: f32, rows: u16) -> (f64, f64) {
 
 /// Physical-pixel point → dock-local column on the context line; `None` if
 /// outside the band or the left padding. The column pitch is the small
-/// class's advance. The inverse of [`context_span_px`]: click, hover and the
-/// hand cursor read these two, so the column and the rectangle cannot diverge.
-fn context_col_at(metrics: CellMetrics, top: f32, rows: u16, (x, y): (f64, f64)) -> Option<u16> {
+/// class's advance, and the trailing zone's columns sit the strip's leftover
+/// further right (`trailing`, [`bt_gpu::context_col_under`]). The inverse of
+/// [`context_span_px`]: click, hover and the hand cursor read these two, so
+/// the column and the rectangle cannot diverge.
+fn context_col_at(
+    metrics: CellMetrics,
+    top: f32,
+    rows: u16,
+    trailing: Option<ContextTrailing>,
+    (x, y): (f64, f64),
+) -> Option<u16> {
     let (band_top, band_bottom) = context_band_px(metrics, top, rows);
     let x = x - f64::from(metrics.side_left_px());
     if y < band_top || y >= band_bottom || x < 0.0 {
         return None;
     }
-    // audit: `x ≥ 0` and the window width fits a `u16` column; an overflowing
-    // value only becomes a column that falls on no button.
-    Some((x / f64::from(metrics.context_cell_px())).floor() as u16)
+    bt_gpu::context_col_under(x, f64::from(metrics.context_cell_px()), trailing)
 }
 
 /// The rectangle of the dock-local `[start, end)` column range, physical
-/// pixels: `(x, y, width, height)` - the inverse of [`context_col_at`].
+/// pixels: `(x, y, width, height)` - the inverse of [`context_col_at`]. Both
+/// edges go through `bt_gpu::context_shift_px`, the function the drawing
+/// positions the cells and the buttons' fills by.
 fn context_span_px(
     metrics: CellMetrics,
     top: f32,
     rows: u16,
+    trailing: Option<ContextTrailing>,
     start: u16,
     end: u16,
 ) -> (f64, f64, f64, f64) {
     let (band_top, band_bottom) = context_band_px(metrics, top, rows);
     let cell = f64::from(metrics.context_cell_px());
-    let x = f64::from(metrics.side_left_px()) + f64::from(start) * cell;
-    let width = f64::from(end.saturating_sub(start)) * cell;
+    let edge = |col: u16| {
+        f64::from(metrics.side_left_px())
+            + f64::from(col) * cell
+            + f64::from(bt_gpu::context_shift_px(col, trailing))
+    };
+    let x = edge(start);
+    let width = edge(end.max(start)) - x;
     (x, band_top, width, band_bottom - band_top)
 }
 
@@ -2898,9 +2939,9 @@ mod tests {
         let metrics = CellMetrics::new(16, 33, 13, 8, 2, 1.0).expect("cell");
         for (top, rows) in [(500.0_f32, 2_u16), (620.0, 0)] {
             let (start, end) = (40_u16, 52_u16);
-            let (x, y, width, height) = context_span_px(metrics, top, rows, start, end);
+            let (x, y, width, height) = context_span_px(metrics, top, rows, None, start, end);
             assert_eq!(height, f64::from(metrics.cell_px().1));
-            let at = |px: f64, py: f64| context_col_at(metrics, top, rows, (px, py));
+            let at = |px: f64, py: f64| context_col_at(metrics, top, rows, None, (px, py));
             let mid = y + height / 2.0;
             assert_eq!(
                 at(x + 0.01, mid),
@@ -2929,6 +2970,98 @@ mod tests {
     }
 
     #[test]
+    fn the_trailing_zones_rectangle_and_columns_follow_the_strips_leftover() {
+        // A window whose strip leaves 5 px over: the zone (columns 40..52 here)
+        // is drawn that much further right, and the hand cursor's rectangle,
+        // the popover's anchor and the click's column all move with it. The
+        // lead does not. Pixel -> column and column -> pixel are the one
+        // function pair the drawing positions by.
+        let metrics = CellMetrics::new(16, 33, 13, 8, 2, 1.0).expect("cell");
+        let side = f64::from(metrics.side_left_px());
+        let trailing = ContextTrailing::new(Some(40), 5);
+        for (top, rows) in [(500.0_f32, 2_u16), (620.0, 0)] {
+            let (x, y, width, height) = context_span_px(metrics, top, rows, trailing, 40, 52);
+            assert_eq!(x, side + 40.0 * 13.0 + 5.0, "the zone moved");
+            assert_eq!(width, 12.0 * 13.0, "and kept its width");
+            let mid = y + height / 2.0;
+            let at = |px: f64| context_col_at(metrics, top, rows, trailing, (px, mid));
+            assert_eq!(at(x + 0.01), Some(40), "left edge is the first column");
+            assert_eq!(at(x + width - 0.01), Some(51), "inside the right edge");
+            assert_eq!(at(x + width), Some(52), "the right edge is outside");
+            // Every column of the zone: the middle of the rectangle's cells.
+            for col in 40..52_u16 {
+                let (cx, _, cw, _) = context_span_px(metrics, top, rows, trailing, col, col + 1);
+                assert_eq!(at(cx + cw / 2.0), Some(col), "column {col}");
+            }
+            // The lead is where the grid has it; the leftover's pixels belong
+            // to the column before the zone, which no control occupies.
+            let (lead, _, _, _) = context_span_px(metrics, top, rows, trailing, 3, 8);
+            assert_eq!(lead, side + 3.0 * 13.0);
+            assert_eq!(at(lead + 0.5), Some(3));
+            assert_eq!(at(side + 40.0 * 13.0 + 2.0), Some(39));
+        }
+    }
+
+    #[test]
+    fn the_ports_and_the_pointer_meet_at_the_right_margin_at_every_width() {
+        // The whole chain on real numbers: the grid's strip, the dock's plan
+        // for its budget, the rectangle the mouse derives and the column it
+        // maps back. The zone's right edge is the window's width minus the
+        // right margin whatever remainder the strip leaves, and a press in the
+        // middle of the ports finds them - on a dock with an input row and on
+        // a remote one (the context row alone).
+        let metrics = CellMetrics::new(16, 33, 13, 8, 2, 1.0)
+            .expect("cell")
+            .with_corners(20.5, 20.5);
+        let right = f64::from(metrics.side_right_px());
+        let context = bt_core::DockContext {
+            cwd: "/Users/me/web".to_owned(),
+            branch: "main".to_owned(),
+            ports: [3000, 6006]
+                .map(|port| bt_core::FooterPort { port, open: true })
+                .to_vec(),
+            ..bt_core::DockContext::default()
+        };
+        let mut leftovers = Vec::new();
+        for width in [900.0, 901.0, 905.0, 910.0, 923.0, 1100.0, 1111.0] {
+            let grid =
+                crate::grid::split_into_grid(width, 600.0, metrics, bt_gpu::DOCK_ROWS, 0.0, 0.0);
+            let budget = grid.context.cols;
+            leftovers.push(grid.context.offset_px);
+            let trailing = ContextTrailing::new(
+                bt_core::footer_trailing(&context, budget),
+                grid.context.offset_px,
+            );
+            let (start, end) =
+                bt_core::footer_span(&context, budget, bt_core::FooterControl::Ports)
+                    .expect("the ports are drawn");
+            assert_eq!(end, budget, "the zone ends at the budget");
+            for (top, rows) in [(500.0_f32, 2_u16), (620.0, 0)] {
+                let (x, y, w, h) = context_span_px(metrics, top, rows, trailing, start, end);
+                assert_eq!(x + w, width - right, "{width}: the zone's right edge");
+                let mid = y + h / 2.0;
+                let col = context_col_at(metrics, top, rows, trailing, (x + w / 2.0, mid))
+                    .expect("on the row");
+                assert_eq!(
+                    bt_core::footer_hit(&context, budget, col).map(|hit| hit.control),
+                    Some(bt_core::FooterControl::Ports),
+                    "{width}: the middle of the ports finds the ports"
+                );
+                // The press just left of the zone is the path's, not the ports'.
+                let before = context_col_at(metrics, top, rows, trailing, (x - 1.0, mid));
+                assert!(
+                    before.is_none_or(|col| bt_core::footer_hit(&context, budget, col).is_none()),
+                    "{width}: beside the ports"
+                );
+            }
+        }
+        assert!(
+            leftovers.contains(&0) && leftovers.iter().any(|&px| px > 0),
+            "widths with and without a leftover: {leftovers:?}"
+        );
+    }
+
+    #[test]
     fn a_round_corner_moves_the_pointer_mapping_with_the_drawing() {
         // The margin beside a 20.5 pt corner is 13 px, not the 8 px gutter:
         // the cell drawn at column c starts at 13 + 16·c, so a press, the
@@ -2947,10 +3080,10 @@ mod tests {
             Some(3)
         );
 
-        let (x, y, width, height) = context_span_px(metrics, 500.0, 2, 40, 52);
+        let (x, y, width, height) = context_span_px(metrics, 500.0, 2, None, 40, 52);
         assert_eq!(x, side + 40.0 * 13.0);
         let mid = y + height / 2.0;
-        let at = |px: f64| context_col_at(metrics, 500.0, 2, (px, mid));
+        let at = |px: f64| context_col_at(metrics, 500.0, 2, None, (px, mid));
         assert_eq!(at(x + 0.01), Some(40));
         assert_eq!(at(x + width - 0.01), Some(51));
         assert_eq!(at(f64::from(metrics.gutter_px()) + 0.5), None);

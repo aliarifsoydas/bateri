@@ -36,7 +36,7 @@ mod footer;
 use footer::{CANCEL_HINT, GAUGE_MAX, GaugeStep, gauge};
 pub use footer::{
     FooterControl, FooterHit, STATS_THRESHOLDS, StatsLevel, StatsMetric, StatsThreshold,
-    footer_hit, footer_span, footer_spans,
+    footer_hit, footer_span, footer_spans, footer_trailing,
 };
 use footer::{program_color, render_context};
 
@@ -110,6 +110,15 @@ pub struct Dock {
     /// here — the layout's decision, not the drawing's
     /// ([`transfer_button_at`] reads the same layout).
     pub buttons: [Option<DockButton>; 2],
+    /// The dock-local column the context row's **trailing zone** (the ports,
+    /// the load indicator, the buttons) starts at; `None` when the row has
+    /// none. The drawing side gives the zone the context strip's leftover
+    /// pixels — the zone sits flush with the window's right margin, the lead
+    /// stays at the left one — so its cells and the buttons' fills from this
+    /// column on move right by that offset. From the plan the cells are
+    /// placed by, never a second computation ([`footer_trailing`] is the
+    /// mouse's reading of the same plan).
+    pub trailing: Option<u16>,
 }
 
 /// A button of the upload row: the **dock-local** column range `[start, end)`
@@ -159,7 +168,7 @@ pub struct DockCols {
     pub input: u16,
     /// The context row's budget. A separate number, because that row is drawn
     /// in a **small point size**: more letters fit in the same pixel strip.
-    /// The drawing side supplies the number (`bt_gpu`'s `context_cols`), this
+    /// The drawing side supplies the number (the grid's context strip), this
     /// crate sees no pixels — the value is a **budget**, not a point-size
     /// decision. Passed equal to `input`, the row behaves as it does today.
     pub context: u16,
@@ -1491,6 +1500,7 @@ pub(crate) fn render_with(
             _ => theme.separator_linear(),
         },
         buttons: [None; 2],
+        trailing: None,
     };
     // **No band**: the surface without a cell. Before the context row, so its
     // buttons are not laid out either; the mark is already off (no input row).
@@ -1521,7 +1531,8 @@ pub(crate) fn render_with(
     // are correct even when ZLE is not editing the line and the user looks at
     // them while a command runs. Under the `Live` gate below it would vanish
     // on every command.
-    surface.buttons = render_context(context, theme, cols.context, input_rows, &mut sink);
+    (surface.buttons, surface.trailing) =
+        render_context(context, theme, cols.context, input_rows, &mut sink);
 
     // **Zero input rows**: the band is only the context row.
     // No caret (`owned` is already `false` — `frame()`'s fourth
@@ -3807,6 +3818,63 @@ mod tests {
     }
 
     #[test]
+    fn the_trailing_zone_starts_where_the_first_item_is_drawn() {
+        // The drawing side gives the zone the strip's leftover pixels, so the
+        // dock says where the zone begins - from the plan the cells are placed
+        // by, which is also the mouse's (`footer_trailing`).
+        let state = live("", "", "", 0);
+        let local = serving("/Users/me/web", &[6006, 3000]);
+        for cols in 0..=80 {
+            let (cells, dock) = draw_with(&state, &local, cols);
+            assert_eq!(dock.trailing, footer_trailing(&local, cols), "{cols}");
+            if let Some(start) = dock.trailing {
+                let first = cells
+                    .iter()
+                    .filter(|cell| cell.row == 1 && cell.col >= start)
+                    .map(|cell| cell.col)
+                    .min();
+                assert_eq!(first, Some(start), "the zone's first letter, at {cols}");
+                let lead_end = cells
+                    .iter()
+                    .filter(|cell| cell.row == 1 && cell.col < start)
+                    .map(|cell| cell.col + 1)
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    lead_end <= start,
+                    "the lead stays before the zone, at {cols}"
+                );
+            }
+        }
+        let (cells, dock) = draw_with(&state, &local, 50);
+        assert_eq!(dock.trailing, Some(36));
+        assert_eq!(
+            footer_span(&local, 50, FooterControl::Ports).map(|span| span.0),
+            Some(36),
+            "the ports are the zone's first item"
+        );
+        assert_eq!(row_text(&cells, 1).chars().nth(36), Some('↗'));
+        // The upload row's ports stand left of its buttons: the zone starts at
+        // the ports, the buttons are inside it.
+        let upload = DockContext {
+            ports: open_ports(&[3000]),
+            ..uploading("↑ backup.tar.gz  18.2 / 44.6 MB", 1, None)
+        };
+        let (_, dock) = draw_with(&state, &upload, 64);
+        let ports = footer_span(&upload, 64, FooterControl::Ports).expect("ports");
+        assert_eq!(dock.trailing, Some(ports.0));
+        assert!(dock.buttons[1].expect("cancel").start > ports.0);
+        // Nothing trailing is no zone: the local row alone, an empty budget,
+        // and a remote row whose indicator is not there yet.
+        for context in [context("/a", "main"), DockContext::default()] {
+            let (_, dock) = draw_with(&state, &context, 40);
+            assert_eq!(dock.trailing, None);
+            assert_eq!(footer_trailing(&context, 40), None);
+        }
+        assert_eq!(footer_trailing(&local, 0), None);
+    }
+
+    #[test]
     fn the_hit_finds_the_ports_and_the_port_under_the_column() {
         let local = serving("/a", &[3000, 6006]);
         // `/a | main` … `↗ :3000  :6006` on 40 columns: the item is 26..40.
@@ -4679,7 +4747,7 @@ mod tests {
         // **The context row's budget is separate from the input row's** and the
         // reason is the point size: that row is drawn with the small face, more
         // letters fit in the same pixel strip. The drawing side supplies the
-        // number (`bt_gpu::context_cols`); this crate takes it as a **budget**,
+        // number (the grid's context strip); this crate takes it as a **budget**,
         // not as a point size.
         let state = live("", "ls", "", 2);
         let path = "/a/bb/ccc/dddd";

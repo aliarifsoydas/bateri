@@ -446,6 +446,22 @@ fn caret_rect(
     }
 }
 
+/// One of the context row's non-glyph entries: which list it is in, its index
+/// there and its column on the row ([`Frame::set_context_trailing`]).
+#[derive(Clone, Copy)]
+struct ContextMark {
+    list: ContextList,
+    index: usize,
+    col: u16,
+}
+
+/// The dock lists a [`ContextMark`] can point into.
+#[derive(Clone, Copy)]
+enum ContextList {
+    Bg,
+    Rules,
+}
+
 /// A glyph to draw — **without uv**.
 ///
 /// Which slot the character falls into is not known here and must not be:
@@ -879,23 +895,91 @@ pub fn edge_ceiling_rows(edge: ContentEdge, cell: CellMetrics) -> u16 {
 /// copy of the row count (`Layout`'s doc).
 pub(crate) const DOCK_MAX_SHARE: f32 = 0.5;
 
-/// The context row's column budget: **the same pixel strip, a small step**.
+/// The context row's strip: the pixels between the window's two side margins,
+/// counted in the small face's columns.
 ///
-/// The dock shares the left margin with the grid ([`Frame::dock_pos`]), so
-/// the horizontal strip the two rows occupy is exactly the same; the only
-/// thing that differs is how many pixels a letter advances. The budget is
-/// therefore a ratio: `cols * cell / context cell`.
+/// The budget is `cols` whole columns from the left margin; what does not
+/// make a whole column is `offset_px`. That leftover goes **before the
+/// trailing zone** (the ports, the load indicator, the buttons), not after
+/// it: the path stays aligned with the grid's `›` and the zone ends flush with
+/// the right margin whatever the window's width — [`context_shift_px`] is
+/// the one place that says how far a column moves.
 ///
-/// The computation must be here — `bt-core` sees no pixels and must not
-/// (`dock::render`'s `context_cols` is a **budget**, not a point-size
-/// decision). It is multiplied in `u32`: 65535 columns × 65535 pixels would
-/// overflow `u16`, whereas the intermediate value only enters a ratio.
+/// Its owner is `bt-shell-common`'s `Grid` (`split_into_grid` computes it
+/// with the grid's own columns, `bt-core` sees no pixels and must not:
+/// `DockCols::context` is a **budget**, not a point-size decision); this
+/// layer carries it to the frame and the mouse reads the same value.
 ///
-/// The divisor is ≥ 1 and this is **structural**: [`CellMetrics::new`]
-/// rejects a zero context width, so there is no second gate here.
-pub fn context_cols(cols: u16, cell: CellMetrics) -> u16 {
-    let span = u32::from(cols) * u32::from(cell.cell_px().0);
-    u16::try_from(span / u32::from(cell.context_cell_px())).unwrap_or(u16::MAX)
+/// `offset_px` is whole pixels and always below one column, so a glyph keeps
+/// landing on the pixel grid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContextStrip {
+    /// The row's column budget (`bt_core::DockCols::context`).
+    pub cols: u16,
+    /// The leftover of the strip after `cols` whole columns, in pixels.
+    pub offset_px: u16,
+}
+
+/// Where the context row's trailing zone starts and how far right the strip's
+/// leftover moves it: [`context_shift_px`]'s and [`context_col_under`]'s
+/// input. Built from the dock's own column (`bt_core::Dock::trailing`, the
+/// plan the cells are placed by) and the strip's offset — never from a second
+/// reading of the row's content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextTrailing {
+    /// The dock-local column the zone's first item starts at.
+    pub col: u16,
+    /// The pixels the zone and everything after it moves right.
+    pub offset_px: u16,
+}
+
+impl ContextTrailing {
+    /// `None` when there is nothing to move: no zone, or no leftover.
+    pub fn new(col: Option<u16>, offset_px: u16) -> Option<Self> {
+        col.filter(|_| offset_px > 0)
+            .map(|col| Self { col, offset_px })
+    }
+}
+
+/// How many pixels the context row's column `col` sits right of where the
+/// small grid puts it: the strip's leftover from the trailing zone's first
+/// column on, nothing before it. **Every** reader of a context column's
+/// position goes through here — the cells ([`Frame::dock_pos`]), the buttons'
+/// fills, and the mouse's rectangles and columns ([`context_col_under`]) —
+/// so what is drawn and what is clicked cannot part.
+pub fn context_shift_px(col: u16, trailing: Option<ContextTrailing>) -> f32 {
+    match trailing {
+        Some(zone) if col >= zone.col => f32::from(zone.offset_px),
+        _ => 0.0,
+    }
+}
+
+/// The context column under `x` pixels from the strip's left edge (the side
+/// margin already taken off), at `step` pixels per column — the inverse of
+/// [`context_shift_px`]. `x` is not negative.
+///
+/// The leftover's own pixels (between the last lead column's edge and the
+/// zone's shifted start) belong to the column before the zone, which nothing
+/// clickable occupies; `None` when there is no such column (a row that is
+/// the zone alone).
+pub fn context_col_under(x: f64, step: f64, trailing: Option<ContextTrailing>) -> Option<u16> {
+    // audit: `x ≥ 0` and the window width fits a `u16` column; the cast
+    // saturates, and an overflowing value only becomes a column that falls on
+    // nothing.
+    let column = |x: f64| (x / step).floor() as u16;
+    let Some(zone) = trailing else {
+        return Some(column(x));
+    };
+    let start = f64::from(zone.col) * step + f64::from(zone.offset_px);
+    if x >= start {
+        return Some(column(x - f64::from(zone.offset_px)));
+    }
+    let col = column(x);
+    if col < zone.col {
+        Some(col)
+    } else {
+        zone.col.checked_sub(1)
+    }
 }
 
 /// The top of the context row's cell band, in pixels measured from the
@@ -1384,6 +1468,17 @@ pub(crate) struct Frame {
     /// The context row's glyphs the scene types out: the index into
     /// `dock_glyphs` and the column on the row, in push order.
     dock_letters: Vec<(usize, u16)>,
+    /// Where the context row's trailing zone starts and what the strip's
+    /// leftover moves it by ([`Frame::set_context_trailing`]); `None` → the
+    /// row stands where the small grid puts it. [`Frame::dock_pos`] reads it,
+    /// so the cells, the buttons' fills, the arrival's letters and the
+    /// effects' static match all agree. A content frame says it after the
+    /// cells are in; a motion frame keeps it, like the lists it positions.
+    context_trailing: Option<ContextTrailing>,
+    /// The context row's background and rule entries, by list and column — the
+    /// ones [`Frame::set_context_trailing`] moves after the fact, as it moves
+    /// the glyphs ([`Frame::dock_letters`] has their columns).
+    context_marks: Vec<ContextMark>,
     /// The index of the dock's › in `dock_rules`, once pushed.
     dock_sigil: Option<usize>,
     /// `dock_rules` without the ›, while the scene draws it as an effect
@@ -1512,6 +1607,8 @@ impl Frame {
         self.dock_scene = None;
         self.dock_rise_px = 0.0;
         self.dock_letters.clear();
+        self.context_trailing = None;
+        self.context_marks.clear();
         self.dock_sigil = None;
         self.dock_rules_shown.clear();
         self.dock_rules_hidden = false;
@@ -2307,12 +2404,24 @@ impl Frame {
             }
             self.dock_glyphs.push(glyph);
         }
+        // The context row's entries are remembered by list and column: the
+        // trailing zone's start is only known after the cells are in
+        // ([`Frame::set_context_trailing`]), and it moves them then. The
+        // glyphs are remembered above (`dock_letters`).
+        let context = self.is_context_row(cell.row);
         if let Some(bg) = cell.bg {
             // The caret is **no longer in this list**: it has its own slot and
             // the encode draws it after the dock's backgrounds
             // ([`Frame::push_caret`]), so the "no background after the caret"
             // guard is no longer needed either — the order is in the encode,
             // not in the list.
+            if context {
+                self.context_marks.push(ContextMark {
+                    list: ContextList::Bg,
+                    index: self.dock_bg.len(),
+                    col: cell.col,
+                });
+            }
             self.dock_bg.push(Instance {
                 pos,
                 size: [self.cell_px.0, self.cell_px.1],
@@ -2320,6 +2429,13 @@ impl Frame {
             });
         }
         if let Some(kind) = rule_kind(cell.underline) {
+            if context {
+                self.context_marks.push(ContextMark {
+                    list: ContextList::Rules,
+                    index: self.dock_rules.len(),
+                    col: cell.col,
+                });
+            }
             self.dock_rules.push(RuleCell {
                 pos,
                 kind,
@@ -2327,6 +2443,13 @@ impl Frame {
             });
         }
         if cell.strikeout {
+            if context {
+                self.context_marks.push(ContextMark {
+                    list: ContextList::Rules,
+                    index: self.dock_rules.len(),
+                    col: cell.col,
+                });
+            }
             self.dock_rules.push(RuleCell {
                 pos,
                 kind: RuleKind::Strike,
@@ -2845,6 +2968,46 @@ impl Frame {
         if let Some(dock) = &mut self.dock {
             dock.buttons = buttons;
         }
+    }
+
+    /// Says where the context row's trailing zone starts and what the
+    /// strip's leftover moves it by, and moves the context row's entries that
+    /// are already in.
+    ///
+    /// It comes **after** the cells for the same reason [`Frame::open_dock`]
+    /// does: the start is the plan `bt-core`'s dock call places the cells by
+    /// ([`bt_core::Dock::trailing`]), and that call is the one pushing them —
+    /// a second plan here would be the second copy of the row's layout. The
+    /// entries are therefore pushed where the small grid puts them and
+    /// positioned again from their columns, through [`Frame::dock_pos`]: the
+    /// same function that placed them, so a later reader (the arrival's
+    /// letters, the effects' static match, the buttons' fills) lands on the
+    /// same pixel. Call it before any of them.
+    ///
+    /// `offset_px` is the strip's ([`ContextStrip::offset_px`]); no zone or no
+    /// leftover leaves the row where it is, and costs nothing.
+    pub(crate) fn set_context_trailing(&mut self, trailing: Option<u16>, offset_px: u16) {
+        self.context_trailing = ContextTrailing::new(trailing, offset_px);
+        if self.context_trailing.is_none() {
+            return;
+        }
+        let row = self.dock_rows.saturating_sub(1);
+        // Taken and put back: positioning borrows the whole frame.
+        let letters = std::mem::take(&mut self.dock_letters);
+        for &(index, col) in &letters {
+            let pos = self.dock_pos(col, row);
+            self.dock_glyphs[index].pos = pos;
+        }
+        self.dock_letters = letters;
+        let marks = std::mem::take(&mut self.context_marks);
+        for mark in &marks {
+            let pos = self.dock_pos(mark.col, row);
+            match mark.list {
+                ContextList::Bg => self.dock_bg[mark.index].pos = pos,
+                ContextList::Rules => self.dock_rules[mark.index].pos = pos,
+            }
+        }
+        self.context_marks = marks;
     }
 
     /// The upload buttons' draws: per button **fill, then border** — both
@@ -3789,7 +3952,17 @@ impl Frame {
         } else {
             0.0
         };
-        [self.side_left_px + f32::from(col) * w, y + pad + gap]
+        // The context row's trailing zone sits the strip's leftover further
+        // right ([`context_shift_px`]); the other rows do not move.
+        let shift = if self.is_context_row(row) {
+            context_shift_px(col, self.context_trailing)
+        } else {
+            0.0
+        };
+        [
+            self.side_left_px + f32::from(col) * w + shift,
+            y + pad + gap,
+        ]
     }
 
     /// The column step in the dock's `row`, in pixels.
@@ -4737,22 +4910,154 @@ mod tests {
     }
 
     #[test]
-    fn the_context_budget_is_the_same_strip_in_small_steps() {
-        // The budget is a **ratio**: the two rows occupy the same horizontal
-        // strip (the left margin is common), the only thing that differs is how
-        // many pixels a letter advances. The number is born here because
-        // `bt-core` sees no pixels.
-        let m = |w, cw| CellMetrics::new(w, 20, cw, GUTTER, 1, 1.0).expect("metrics");
-        // 80 × 10 pixels = 800; 100 columns at an 8-pixel step.
-        assert_eq!(context_cols(80, m(10, 8)), 100);
-        // If the ratio is 1 the budget is the same too: the "no shrinking" arm
-        // is a **supported** state and its output is bit for bit today's.
-        assert_eq!(context_cols(80, m(10, 10)), 80);
-        // A ratio that does not divide evenly rounds **down**: giving one
-        // column too many would push the row out of the margin.
-        assert_eq!(context_cols(10, m(10, 3)), 33);
-        // No overflow at the degenerate extreme: the product lives in `u32` and the result is clamped.
-        assert_eq!(context_cols(u16::MAX, m(u16::MAX, 1)), u16::MAX);
+    fn the_trailing_zone_moves_by_the_leftover_and_the_lead_stays() {
+        // The context row's lead keeps the grid's alignment, the zone moves the
+        // strip's leftover right, and nothing else on the dock does: not the
+        // input row, not a column before the zone's first. Cells are pushed
+        // where the small grid puts them and the zone is said afterwards -
+        // the start comes from the dock call that pushes them.
+        let metrics = CellMetrics::new(10, 20, 8, GUTTER, 1, 1.0).expect("metrics");
+        let side = f32::from(metrics.side_left_px());
+        let at = |col, row, ch| Cell {
+            col,
+            row,
+            ch: Some(ch),
+            ..Cell::default()
+        };
+        let place = |trailing: Option<u16>, offset: u16| {
+            let mut frame = Frame::default();
+            frame.clear(metrics, CaretStyle::default());
+            frame.push_dock(at(2, 0, 'i'));
+            frame.push_dock(at(0, 1, 'a'));
+            frame.push_dock(at(9, 1, 'b'));
+            frame.push_dock(at(10, 1, 'c'));
+            frame.push_dock(Cell {
+                bg: Some(CURSOR),
+                underline: bt_core::UnderlineStyle::Single,
+                strikeout: true,
+                ..at(12, 1, 'd')
+            });
+            frame.set_context_trailing(trailing, offset);
+            frame
+        };
+        let still = place(None, 0);
+        let moved = place(Some(10), 5);
+        let (before, after) = (still.dock_glyphs(), moved.dock_glyphs());
+        assert_eq!(before.len(), after.len());
+        // The input row (0), the lead (1, 2) and the first zone column's
+        // neighbour on the left do not move.
+        for index in 0..3 {
+            assert_eq!(before[index].pos, after[index].pos, "glyph {index}");
+        }
+        // The zone's columns move exactly the leftover, in x only.
+        for index in 3..5 {
+            assert_eq!(after[index].pos[0] - before[index].pos[0], 5.0, "{index}");
+            assert_eq!(after[index].pos[1], before[index].pos[1]);
+        }
+        // Everything the cell pushed moved with it: its fill, its rules.
+        assert_eq!(moved.dock_bg()[0].pos[0] - still.dock_bg()[0].pos[0], 5.0);
+        assert!(
+            moved
+                .dock_rules()
+                .iter()
+                .zip(still.dock_rules())
+                .all(|(after, before)| after.pos[0] - before.pos[0] == 5.0),
+            "the underline and the strikeout stay under their letter"
+        );
+        assert_eq!(after[4].pos[0], side + 12.0 * 8.0 + 5.0);
+        // No zone or no leftover is the row as the grid has it.
+        for (trailing, offset) in [(None, 5), (Some(10), 0)] {
+            let same = place(trailing, offset);
+            assert_eq!(same.dock_glyphs(), still.dock_glyphs());
+        }
+        // A new frame starts from the grid again.
+        let mut again = place(Some(10), 5);
+        again.clear(metrics, CaretStyle::default());
+        again.push_dock(at(10, 1, 'c'));
+        assert_eq!(again.dock_glyphs()[0].pos[0], side + 10.0 * 8.0);
+    }
+
+    #[test]
+    fn the_buttons_fill_ends_where_the_zones_last_letter_does() {
+        // 20 small columns of 8 px between the margins plus 3 left over: the
+        // zone's last glyph ends at the strip's right edge, and the fill that
+        // is behind it ends there too - on a dock with an input row and on a
+        // remote one, where the context row is the whole dock.
+        let metrics = CellMetrics::new(10, 20, 8, GUTTER, 1, 1.0)
+            .expect("metrics")
+            .with_corners(0.0, 0.0);
+        let (left, right) = (
+            f32::from(metrics.side_left_px()),
+            f32::from(metrics.side_right_px()),
+        );
+        let window = left + 20.0 * 8.0 + 3.0 + right;
+        for input_rows in [1_u16, 0] {
+            let mut frame = Frame::default();
+            frame.clear(metrics, CaretStyle::default());
+            frame.set_dock_input_rows(Some(input_rows));
+            for col in 14..20 {
+                frame.push_dock(Cell {
+                    col,
+                    row: input_rows,
+                    ch: Some('x'),
+                    ..Cell::default()
+                });
+            }
+            frame.set_context_trailing(Some(14), 3);
+            frame.open_dock(BG, CURSOR, CURSOR);
+            frame.set_dock_buttons([
+                None,
+                Some(DockButton {
+                    start: 14,
+                    end: 20,
+                    color: CURSOR,
+                    state: ButtonState::Idle,
+                }),
+            ]);
+            let fill = frame.dock_button_draws(0.0).next().expect("fill");
+            assert_eq!(
+                fill.instance.pos[0] + fill.instance.size[0],
+                window - right,
+                "{input_rows}: the fill's right edge"
+            );
+            let last = frame.dock_glyphs().last().expect("glyph").pos[0];
+            assert_eq!(
+                last + 8.0,
+                window - right,
+                "{input_rows}: the last letter's right edge"
+            );
+        }
+    }
+
+    #[test]
+    fn a_context_column_and_its_pixel_agree_across_the_leftover() {
+        // The mouse maps a pixel back to a column and a column to a rectangle
+        // by the same function the drawing positions by: the middle of every
+        // column is that column, with and without a zone, and the leftover's
+        // own pixels belong to the column before the zone.
+        let step = 8.0;
+        let edge = |col: u16, trailing: Option<ContextTrailing>| {
+            f64::from(col) * step + f64::from(context_shift_px(col, trailing))
+        };
+        for trailing in [
+            None,
+            ContextTrailing::new(Some(0), 3),
+            ContextTrailing::new(Some(14), 5),
+            ContextTrailing::new(Some(14), 0),
+        ] {
+            for col in 0..40_u16 {
+                let mid = edge(col, trailing) + step / 2.0;
+                assert_eq!(context_col_under(mid, step, trailing), Some(col));
+            }
+        }
+        let zone = ContextTrailing::new(Some(14), 5);
+        let gap = f64::from(14) * step + 2.0;
+        assert_eq!(context_col_under(gap, step, zone), Some(13), "the leftover");
+        assert_eq!(context_col_under(14.0 * step + 5.0, step, zone), Some(14));
+        // A zone that fills the row has nothing before it to give the pixels to.
+        let all = ContextTrailing::new(Some(0), 3);
+        assert_eq!(context_col_under(1.0, step, all), None);
+        assert_eq!(context_col_under(3.0, step, all), Some(0));
     }
 
     #[test]

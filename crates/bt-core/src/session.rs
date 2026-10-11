@@ -9835,6 +9835,15 @@ impl Session {
         crate::footer_hit(&context, budget, col)
     }
 
+    /// The dock-local column the context row's trailing zone starts at
+    /// ([`crate::footer_trailing`]); `None` while nothing trails. The mouse's
+    /// reading of what the frame's [`crate::Dock::trailing`] drew. Takes only
+    /// the leaf lock.
+    pub fn footer_trailing(&self, budget: u16) -> Option<u16> {
+        let context = self.footer_context();
+        crate::footer_trailing(&context, budget)
+    }
+
     /// `control`'s dock-local column range on the context row
     /// ([`crate::footer_span`]); `None` while it is not drawn — a popover's
     /// anchor. Takes only the leaf lock.

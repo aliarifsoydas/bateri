@@ -73,8 +73,8 @@ mod surface;
 
 pub use error::GpuError;
 pub use frame::{
-    DOCK_ROWS, context_cols, context_row_offset, dock_px, edge_ceiling_rows, edge_drawn_px,
-    edge_fades, edge_reserve_px,
+    ContextStrip, ContextTrailing, DOCK_ROWS, context_col_under, context_row_offset,
+    context_shift_px, dock_px, edge_ceiling_rows, edge_drawn_px, edge_fades, edge_reserve_px,
 };
 pub use link::{DisplayLink, Layout, Origin, Pacer, TickTarget, Ticker, Waker};
 pub use metrics::{CellMetrics, FontNotice, family_notice};

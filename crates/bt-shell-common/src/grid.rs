@@ -3,7 +3,7 @@
 //! reserve — and how big the dock's share is at a given moment. Pure arithmetic every host of a
 //! terminal pane asks the same way, so it stands here once rather than in a platform shell.
 
-use bt_gpu::CellMetrics;
+use bt_gpu::{CellMetrics, ContextStrip};
 
 /// The grid derived from the window geometry + the cell size.
 ///
@@ -23,6 +23,13 @@ pub struct Grid {
     /// reserves the track. The link's dock readings and the mouse's dock hit
     /// come from here ([`split_into_grid`] is the owner).
     pub dock_cols: u16,
+    /// The dock's context row: its column budget and the leftover pixels that
+    /// go before its trailing zone. The budget counts the strip between the
+    /// two side margins in the row's small step, so the zone ends flush with
+    /// the right margin; [`split_into_grid`] is the only place either is
+    /// computed — the link's budget, the frame's offset and the mouse's
+    /// columns all read this value.
+    pub context: ContextStrip,
     /// Not a tuple but `CellMetrics`: the metrics pass from here to
     /// `DisplayLink::resize` as they are. The value stored in `Grid` alone
     /// descends to a tuple when it enters `SessionOptions` — the tuple that
@@ -86,6 +93,13 @@ pub struct Grid {
 /// where the content is cut instead, every row the height allows as before.
 /// Like the scroll bar's reserve it is a function of the mode and the cell
 /// alone — never of the history or the alternate screen.
+///
+/// **The dock's context row has a right margin of its own** ([`Grid::context`]):
+/// the grid and the input row end wherever their whole columns end (the
+/// always-up track's reserve and the sub-column leftover included), but the
+/// context row's ports, indicator and buttons sit beside the window's round
+/// bottom corner, so they keep the side margin from the **edge**, whatever the
+/// width.
 pub fn split_into_grid(
     width_px: f64,
     height_px: f64,
@@ -134,7 +148,39 @@ pub fn split_into_grid(
         cols: (grid_width / f64::from(cell_w)) as u16,
         rows: (usable_height / f64::from(cell_h)) as u16,
         dock_cols: (usable_width / f64::from(cell_w)) as u16,
+        context: context_strip(width_px, cell),
         cell,
+    }
+}
+
+/// The context row's strip in `width_px` wide pane: whole small-step columns
+/// between the two side margins, and what is left over.
+///
+/// The width is **rounded** first, because the drawn surface is
+/// (`Surface::set_size`): the zone's right edge is then exactly the surface's
+/// width minus the right margin, not a fraction of a pixel off it. Everything
+/// is `f64` for the reason `split_into_grid` gives: a window narrower than the
+/// margins goes negative and saturates to zero columns, instead of
+/// overflowing a `u16` subtraction. Unlike the grid's columns this strip does
+/// **not** give the always-up scroll bar's track up — the dock below the bar
+/// stays full width.
+///
+/// The leftover is below one column by construction, and zero where nothing
+/// fits (a degenerate or saturated width).
+fn context_strip(width_px: f64, cell: CellMetrics) -> ContextStrip {
+    let strip = width_px.round() - f64::from(cell.side_left_px()) - f64::from(cell.side_right_px());
+    let step = f64::from(cell.context_cell_px());
+    // `as u16` saturates: a negative or NaN strip is zero columns.
+    let cols = (strip / step) as u16;
+    let offset = if cols > 0 && cols < u16::MAX {
+        // audit: the remainder is below `step`, itself a `u16`.
+        (strip - f64::from(cols) * step) as u16
+    } else {
+        0
+    };
+    ContextStrip {
+        cols,
+        offset_px: offset,
     }
 }
 
@@ -418,6 +464,89 @@ mod tests {
         assert_eq!(g.rows, 0);
         // Columns stand: a short window eliminates only rows.
         assert_eq!(g.cols, 99);
+    }
+
+    #[test]
+    fn the_context_strip_ends_flush_with_the_right_margin() {
+        // A 20.5 pt corner at @2x: 25 px of margin each side, the context row
+        // in 13 px steps. Whatever the width, whole columns plus the leftover
+        // plus the two margins make the surface: the zone's last letter ends at
+        // the width minus the right margin, a remainder or none.
+        let cell = CellMetrics::new(18, 36, 13, 16, 1, 2.0)
+            .expect("non-zero cell")
+            .with_corners(20.5, 20.5);
+        let (left, right) = (
+            u32::from(cell.side_left_px()),
+            u32::from(cell.side_right_px()),
+        );
+        assert_eq!((left, right), (25, 25));
+        let mut seen = [false; 2];
+        for width in [900_u32, 901, 905, 912, 913, 925, 1000, 1779, 1780] {
+            let g = split_into_grid(
+                f64::from(width),
+                1200.0,
+                cell,
+                DOCK_ROWS,
+                NO_RESERVE,
+                NO_TOP,
+            );
+            let ContextStrip { cols, offset_px } = g.context;
+            assert!(offset_px < 13, "{width}: below one column");
+            assert_eq!(
+                left + u32::from(cols) * 13 + u32::from(offset_px) + right,
+                width,
+                "{width}: the strip fills the width"
+            );
+            seen[usize::from(offset_px > 0)] = true;
+        }
+        assert_eq!(seen, [true, true], "widths with and without a leftover");
+        // The surface is the rounded width.
+        let at =
+            |width| split_into_grid(width, 1200.0, cell, DOCK_ROWS, NO_RESERVE, NO_TOP).context;
+        assert_eq!(at(900.4), at(900.0));
+        assert_eq!(at(900.5), at(901.0));
+        // A square corner on the right asks for the gutter only there.
+        let square = cell.with_corners(20.5, 0.0);
+        let g = split_into_grid(900.0, 1200.0, square, DOCK_ROWS, NO_RESERVE, NO_TOP);
+        assert_eq!(
+            25 + u32::from(g.context.cols) * 13 + u32::from(g.context.offset_px) + 16,
+            900
+        );
+    }
+
+    #[test]
+    fn the_context_strip_keeps_the_track_columns_the_grid_gives_up() {
+        // The always-up bar's track narrows the grid; the dock below it, the
+        // context row included, stays the window's width.
+        let cell = metrics(9, 18, 8);
+        let reserve = ScrollbarMode::Always.reserve_px(cell);
+        let (open, barred) = (
+            split_into_grid(900.0, 600.0, cell, DOCK_ROWS, NO_RESERVE, NO_TOP),
+            split_into_grid(900.0, 600.0, cell, DOCK_ROWS, reserve, NO_TOP),
+        );
+        assert!(barred.cols < open.cols);
+        assert_eq!(barred.context, open.context);
+        // The context row's budget counts the same strip in smaller steps.
+        let small = CellMetrics::new(9, 18, 7, 8, 1, 1.0).expect("cell");
+        let g = split_into_grid(900.0, 600.0, small, DOCK_ROWS, NO_RESERVE, NO_TOP);
+        assert_eq!(
+            u32::from(g.context.cols) * 7 + u32::from(g.context.offset_px),
+            900 - 16
+        );
+        assert!(g.context.cols > g.dock_cols);
+    }
+
+    #[test]
+    fn a_window_narrower_than_the_margins_yields_no_context_columns() {
+        // The strip goes negative in `f64` and saturates, like the grid's
+        // columns: no columns and no leftover, never an overflowed `u16`.
+        let cell = metrics(9, 18, 8);
+        for width in [-5.0, 0.0, 4.0, 16.0] {
+            let g = split_into_grid(width, 600.0, cell, DOCK_ROWS, NO_RESERVE, NO_TOP);
+            assert_eq!(g.context, ContextStrip::default(), "{width}");
+        }
+        let g = split_into_grid(f64::NAN, 600.0, cell, DOCK_ROWS, NO_RESERVE, NO_TOP);
+        assert_eq!(g.context, ContextStrip::default());
     }
 
     #[test]

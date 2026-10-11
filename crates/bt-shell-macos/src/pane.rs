@@ -3350,6 +3350,7 @@ impl TerminalPane {
             session,
             Layout {
                 dock_cols: grid.dock_cols,
+                context: grid.context,
                 dock_rows: self.ivars().dock_rows.get(),
                 cell: grid.cell,
             },
@@ -4686,6 +4687,7 @@ impl TerminalPane {
                 grid.cell,
                 self.ivars().dock_rows.get(),
                 grid.dock_cols,
+                grid.context,
             );
         }
         // "Jump to latest" stands on the reserves that just moved.

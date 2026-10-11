@@ -74,7 +74,7 @@ pub use dock::{
     Dock, DockBudget, DockButton, DockCaret, DockCols, DockEdit, EDIT_MAX, EditCells,
     FooterControl, FooterHit, PORTS_GLYPHS, PROGRAM_GLYPHS, STATS_GLYPHS, STATS_THRESHOLDS,
     StatsLevel, StatsMetric, StatsThreshold, TEXT_COL as DOCK_TEXT_COL, UPLOAD_GLYPHS, footer_hit,
-    footer_span, footer_spans,
+    footer_span, footer_spans, footer_trailing,
 };
 pub use identity::{LC_TERMINAL, PaneUuid, TERM_PROGRAM, TERM_PROGRAM_VERSION, pane_env};
 pub use input::{Arrow, MouseButton, MouseModifiers};

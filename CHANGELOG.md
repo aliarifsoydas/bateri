@@ -57,6 +57,13 @@ of every installed copy. A version without a section is not released.
   straight edge — in a window, in a card of a split tab and beside a window
   corner in a lined split. Full screen, whose corners are square, keeps the
   margin it had.
+- **The ports and buttons on the folder line stay put at the right edge.**
+  The listening ports, the load indicator and the upload buttons used to end
+  anywhere between the window's right edge and a few points short of it,
+  depending on the window's width, and they hugged the rounded corner just as
+  the path did on the left. They now end the same distance from the right edge
+  as the text starts from the left one, at every width; the path keeps its
+  place beside the prompt's ›, and a click or hover lands on what is drawn.
 - **The dock's two lines are a point thick.** The line above the input row
   and the one above the folder row were a single pixel, which looked faint
   on a Retina display; they now keep the same weight at every scale.

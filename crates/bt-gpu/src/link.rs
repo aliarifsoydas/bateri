@@ -129,7 +129,7 @@ use bt_core::{
 
 use crate::arrival::{RISE_PT, Scene};
 use crate::blink::Blink;
-use crate::frame::Frame;
+use crate::frame::{ContextStrip, Frame};
 use crate::glyph_fx::GlyphFx;
 use crate::metrics::CellMetrics;
 use crate::motion::Motion;
@@ -831,6 +831,13 @@ struct Core {
     /// sources differ: the cell size is refreshed only if the session accepts
     /// the size, the column count is the window's own answer.
     dock_cols: Cell<u16>,
+    /// The context row's strip: its column budget and the leftover pixels that
+    /// go before its trailing zone. The budget is [`DockCols::context`]; the
+    /// leftover reaches the frame once the dock's call has said where the zone
+    /// starts ([`Frame::set_context_trailing`]). One value from `bt-shell`'s
+    /// `Grid`, written by [`DisplayLink::resize`] like `dock_cols` and for its
+    /// reason (the window's own answer, outside the cell gate).
+    context: Cell<ContextStrip>,
     /// What the content does at the pane's top edge; `Fade` until the
     /// settings say otherwise ([`DisplayLink::set_content_edge`]). The
     /// content frame reads it twice — the fill
@@ -1479,13 +1486,11 @@ impl Core {
             let dock = self.session.dock(
                 DockCols {
                     input: self.dock_cols.get(),
-                    // The context row's budget: **the same pixel width, a
-                    // smaller step**. The dock shares the gutter with the grid
-                    // (`Frame::dock_pos`), so the strip both rows occupy is the
-                    // same; the only thing that differs is how many pixels a
-                    // letter advances. The arithmetic is here, because
-                    // `bt-core` does not see pixels.
-                    context: crate::frame::context_cols(self.dock_cols.get(), self.cell.get()),
+                    // The context row's budget: the strip between the two
+                    // side margins in the small step. The arithmetic is the
+                    // grid's (`ContextStrip`), because `bt-core` does not see
+                    // pixels.
+                    context: self.context.get().cols,
                 },
                 // The number passes from where it was computed, the dock does
                 // not derive it again (`caret_in_dock`'s precedent).
@@ -1499,6 +1504,11 @@ impl Core {
                 |dock_edit| edit = Some(dock_edit),
             );
             frame.put_dock_clusters(dock_clusters);
+            // **The trailing zone moves before anything reads a context
+            // position**: the arrival's letters, the effects' static match and
+            // the buttons' fills all go through `dock_pos`, and the zone's
+            // start is only known from this dock call.
+            frame.set_context_trailing(dock.trailing, self.context.get().offset_px);
             // No mark → the input's first row is outside the vertical window.
             // **The mark is pushed with the cells, before the effects**: the
             // arrival scene hides it and turns it into an effect in
@@ -2461,14 +2471,14 @@ pub struct DisplayLink {
     waker: Waker,
 }
 
-/// The frame path's **opening geometry**: the dock's width, the dock share and
-/// the cell size.
+/// The frame path's **opening geometry**: the dock's width and its context
+/// strip, the dock share and the cell size.
 ///
-/// The three are one type because they are born at the same moment from the
+/// The four are one type because they are born at the same moment from the
 /// same place (`bt-shell`'s `Grid` and the dock decision) and enter
 /// [`DisplayLink::new`] together. As separate parameters the signature went
 /// past seven arguments — but that is not the real gain: a type says "these
-/// three change together" in the signature.
+/// change together" in the signature.
 ///
 /// **No** row count, on purpose: the grid's height is the session's
 /// (`SessionOptions.rows`) and the frame path takes it from `Cursor::rows`
@@ -2482,6 +2492,10 @@ pub struct Layout {
     /// not taken off (`Core::dock_cols`); needed for the dock to wrap its
     /// overflowing row. [`DisplayLink::resize`] refreshes it.
     pub dock_cols: u16,
+    /// The context row's strip ([`ContextStrip`]): its column budget and the
+    /// leftover pixels before its trailing zone. [`DisplayLink::resize`]
+    /// refreshes it.
+    pub context: ContextStrip,
     /// How many rows the dock has; `0` → no dock in this window.
     ///
     /// **The birth value is the session's constant** (is the
@@ -2559,6 +2573,7 @@ impl DisplayLink {
             alt_screen_changed,
             marks_published: RefCell::new(None),
             dock_cols: Cell::new(layout.dock_cols),
+            context: Cell::new(layout.context),
             content_edge: Cell::new(ContentEdge::default()),
             cell: Cell::new(layout.cell),
             // Zero: no offset until the first content frame, and that frame
@@ -3210,7 +3225,15 @@ impl DisplayLink {
     /// it coming from where it never was. The flag is planted
     /// unconditionally, not tied to `Session::resize`'s acceptance: the window
     /// may have moved even if the cell size did not.
-    pub fn resize(&self, cols: u16, rows: u16, cell: CellMetrics, dock_rows: u16, dock_cols: u16) {
+    pub fn resize(
+        &self,
+        cols: u16,
+        rows: u16,
+        cell: CellMetrics,
+        dock_rows: u16,
+        dock_cols: u16,
+        context: ContextStrip,
+    ) {
         let core = &self.core;
         // The rest of the metric (gutter, scale, rule) follows the cell size
         // whenever the cell size is the one the grid already has: the gate
@@ -3234,6 +3257,10 @@ impl DisplayLink {
         // the session: in the scroll bar's `Always` form the two differ by the
         // track (`Core::dock_cols`).
         core.dock_cols.set(dock_cols);
+        // The context row's strip is outside the gate for the same reason:
+        // it is the window's own width in the small step, and the buttons the
+        // mouse reads sit where it says.
+        core.context.set(context);
         core.geometry_changed.set(true);
         // The typing effects end too (the sibling of `Motion`'s geometry
         // snap): when the column count or the cell changes, the dock's

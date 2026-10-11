@@ -156,7 +156,7 @@ fn zero_component_metrics_cannot_be_built() {
     // hitting `Session::resize`'s zero gate.
     assert!(CellMetrics::new(0, 18, 0, 8, 1, 1.0).is_none());
     assert!(CellMetrics::new(9, 0, 9, 8, 1, 1.0).is_none());
-    // The context width is a **divisor** too (`crate::frame::context_cols`), so it goes
+    // The context width is a **divisor** too (the context strip's step), so it goes
     // through the same gate: if zero got through, the grid's would be caught while the dock's
     // context line would silently divide by zero.
     assert!(CellMetrics::new(9, 18, 0, 8, 1, 1.0).is_none());

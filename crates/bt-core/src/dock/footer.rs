@@ -255,6 +255,18 @@ struct Plan<'a> {
     items: [Option<Placed<'a>>; ITEMS],
 }
 
+impl Plan<'_> {
+    /// The context-local column the trailing zone starts at — the first
+    /// placed item's start; `None` when nothing trails (no items, or all
+    /// dropped). The one reading of "where the zone begins": the drawing
+    /// ([`render_context`]) and the mouse ([`footer_trailing`]) both take it
+    /// from here, so the pixel offset the row gives the zone moves the
+    /// same columns in both.
+    fn trailing_start(&self) -> Option<usize> {
+        self.items.iter().flatten().map(|placed| placed.start).min()
+    }
+}
+
 /// A placed item: its rung and its context-local range `[start, end)`.
 #[derive(Clone, Copy)]
 struct Placed<'a> {
@@ -475,24 +487,37 @@ fn place<'a>(
 /// small face's advance and the wide path is closed there (the precedent of the
 /// procedural characters). So a path with CJK still shifts columns here — a
 /// known limit, guarded by `the_context_line_keeps_character_columns`.
+///
+/// The second return is the dock-local column the trailing zone (the ports,
+/// the gauge, the buttons) starts at ([`Dock::trailing`]): the drawing side
+/// gives the zone the strip's leftover pixels, so it needs to know where the
+/// zone begins before it can place the zone's cells.
 pub(super) fn render_context(
     context: &DockContext,
     theme: &Theme,
     cols: u16,
     row: u16,
     sink: &mut impl FnMut(Cell),
-) -> [Option<DockButton>; 2] {
+) -> ([Option<DockButton>; 2], Option<u16>) {
     let available = usize::from(cols.saturating_sub(CONTEXT_COL));
     if available == 0 {
-        return [None; 2];
+        return ([None; 2], None);
     }
     let plan = plan(context, available);
     emit_lead(context, plan.lead, plan.lead_budget, theme, row, sink);
+    let trailing = trailing_col(&plan);
     let mut buttons = [None; 2];
     for placed in plan.items.into_iter().flatten() {
         emit_item(context, placed, theme, available, row, sink, &mut buttons);
     }
-    buttons
+    (buttons, trailing)
+}
+
+/// The dock-local column the plan's trailing zone starts at.
+fn trailing_col(plan: &Plan<'_>) -> Option<u16> {
+    // audit: `start < available ≤ budget` and `budget` is `u16`.
+    plan.trailing_start()
+        .map(|start| CONTEXT_COL + start as u16)
 }
 
 /// Draws the lead within `budget` columns.
@@ -943,6 +968,18 @@ pub fn footer_spans(
         }
     }
     spans.into_iter().flatten()
+}
+
+/// The dock-local column the context row's trailing zone starts at on a
+/// `budget`-column row; `None` while nothing trails. The mouse's half of
+/// [`Dock::trailing`], from the same plan: a column at or past it sits the
+/// strip's leftover pixels further right than the small grid says.
+pub fn footer_trailing(context: &DockContext, budget: u16) -> Option<u16> {
+    let available = usize::from(budget.saturating_sub(CONTEXT_COL));
+    if available == 0 {
+        return None;
+    }
+    trailing_col(&plan(context, available))
 }
 
 /// What lies under dock-local column `col` of the context row (`budget` is the
