@@ -207,8 +207,9 @@ keep_running = "crash"
 [appearance]
 # "system" or a theme name. "system" follows the macOS light/dark appearance;
 # any other value is a theme used in both — a file themes/NAME.toml next to
-# this one, or a built-in theme, "bateri" (dark), "bateri-light" or "linen"
-# (light).
+# this one, or a built-in theme: "bateri" or "ultraviolet" (dark),
+# "bateri-light" or "linen" (light), or a well-known palette such as
+# "catppuccin-mocha" or "nord" (the whole list is in View > Theme).
 theme = "system"
 # Theme names, used while theme = "system".
 light_theme = "bateri-light"
@@ -385,7 +386,11 @@ The menu is rebuilt every time it opens:
 
 - **Match System** — `theme = "system"`: the theme follows the macOS
   appearance (`light_theme` / `dark_theme`).
-- Built-in themes: `bateri`, `bateri-light`, `linen`.
+- Built-in themes, by title, in three groups: bateri's own (`bateri`,
+  `bateri Light`, `Linen`, `Ultraviolet`), then the [adapted palettes](#adapted-palettes) on a
+  dark background, then those on a light one. The menu shows a palette's
+  title (`Catppuccin Mocha`); the settings file takes its name
+  (`catppuccin-mocha`).
 - Every `{name}.toml` under `~/.config/bateri/themes/`, by its name. Putting a
   new file in the directory updates the menu the next time it opens. Files
   starting with a dot and `system.toml` are not listed; a file that shadows a
@@ -833,8 +838,9 @@ split_style = "cards"
   `light_theme`/`dark_theme` do not accept this value (they fall back to their
   own default and give a warning).
 - A name is first looked up as `~/.config/bateri/themes/{name}.toml`,
-  otherwise among the built-in themes. There are three built-in themes:
-  `bateri` (dark), `bateri-light` and `linen` (light).
+  otherwise among the built-in themes: bateri's own `bateri` and
+  `ultraviolet` (dark), `bateri-light` and `linen` (light), and the [adapted
+  palettes](#adapted-palettes) (`catppuccin-mocha`, `nord`, …).
 - A file with the same name **shadows** the built-in theme: a user who writes
   `themes/bateri.toml` sees their own file, not the built-in `bateri`.
 - A name found nowhere falls back to the built-in theme matching the
@@ -1941,6 +1947,105 @@ bright_cyan = "#33847b"
 bright_white = "#ddd6ca"
 ```
 
+### Embedded `ultraviolet`
+
+Vivid colors on a deep violet ground. Every colored entry reads well on the
+ground (6.2:1 and up, the comment gray included), so text keeps its color
+under the selection and the search highlights; the cursor is amber, apart
+from the gold yellow. Pick it from **View ▸ Theme ▸** or with
+`theme = "ultraviolet"`.
+
+```toml
+background = "#1b1433"
+foreground = "#ece6ff"
+dim = "#a6a0bb"
+accent = "#8796ff"
+cursor = "#ffb454"
+selection = "#3d3272"
+search_match = "#4a3b35"
+search_current = "#584736"
+success = "#5cf2a6"
+error = "#ff6e8f"
+info = "#4fe3ff"
+warning = "#ffd23f"
+
+[ansi]
+black = "#2e2556"
+red = "#ff6e8f"
+green = "#5cf2a6"
+yellow = "#ffd23f"
+blue = "#8796ff"
+magenta = "#d98aff"
+cyan = "#4fe3ff"
+white = "#cfc6ea"
+bright_black = "#9d93cc"
+bright_red = "#ff94ad"
+bright_green = "#8dffc4"
+bright_yellow = "#ffe57a"
+bright_blue = "#adb7ff"
+bright_magenta = "#e9b0ff"
+bright_cyan = "#8bedff"
+bright_white = "#ffffff"
+```
+
 Every block is tied to its built-in theme by a test
 (`documented_blocks_are_the_embedded_themes`): if the built-in theme changes
 and the block does not, the test fails.
+
+### Adapted palettes
+
+Well-known palettes from other projects, built in. Each keeps its authors'
+colors — the sixteen ANSI colors, the background and the foreground exactly
+as they made them; the values come from the
+[iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes)
+collection, which keeps one file per palette for many terminals. The roles a
+terminal palette does not carry are drawn from it the way bateri's own themes
+are made:
+
+- `dim` is the foreground blended a third of the way into the background;
+  `accent`, `success` and `error` are the palette's blue, green and red.
+- `info`, `warning` and `cursor` are the palette's cyan, yellow and cursor;
+  one that would not read on the background (3:1) is darkened on a light
+  background, lightened on a dark one, just far enough — most need nothing,
+  a light palette's yellow usually does.
+- `selection` is the palette's own when it is a highlight. Many palettes give
+  their foreground instead, for terminals that swap the colors of selected
+  text — bateri keeps the text's color — and then the selection is the
+  palette's blue laid lightly over the background, as strong as
+  `bateri`'s (or `bateri-light`'s) selection.
+- `search_match` and `search_current` are the palette's yellow laid over the
+  background, as strong as the built-in themes' search highlights.
+
+Text under the selection or a search match is held to `minimum_contrast`
+against the highlight, so it stays readable whatever color it is.
+
+To change one, write only the change: `themes/dracula.toml` with
+`background = "#000000"` is Dracula on black, and every key it leaves out
+comes from the built-in palette.
+
+| name | title | from |
+|---|---|---|
+| `catppuccin-frappe` | Catppuccin Frappé | [Catppuccin](https://github.com/catppuccin/catppuccin) (MIT) |
+| `catppuccin-latte` | Catppuccin Latte | [Catppuccin](https://github.com/catppuccin/catppuccin) (MIT) |
+| `catppuccin-macchiato` | Catppuccin Macchiato | [Catppuccin](https://github.com/catppuccin/catppuccin) (MIT) |
+| `catppuccin-mocha` | Catppuccin Mocha | [Catppuccin](https://github.com/catppuccin/catppuccin) (MIT) |
+| `dracula` | Dracula | [Dracula](https://github.com/dracula/dracula-theme) (MIT) |
+| `everforest-dark` | Everforest Dark | [Everforest](https://github.com/sainnhe/everforest) (MIT) |
+| `everforest-light` | Everforest Light | [Everforest](https://github.com/sainnhe/everforest) (MIT) |
+| `flexoki-dark` | Flexoki Dark | [Flexoki](https://github.com/kepano/flexoki) (MIT) |
+| `flexoki-light` | Flexoki Light | [Flexoki](https://github.com/kepano/flexoki) (MIT) |
+| `github-dark` | GitHub Dark | [GitHub Theme](https://github.com/primer/github-vscode-theme) (MIT) |
+| `github-light` | GitHub Light | [GitHub Theme](https://github.com/primer/github-vscode-theme) (MIT) |
+| `gruvbox-dark` | Gruvbox Dark | [Gruvbox](https://github.com/morhetz/gruvbox) (MIT) |
+| `gruvbox-light` | Gruvbox Light | [Gruvbox](https://github.com/morhetz/gruvbox) (MIT) |
+| `kanagawa-wave` | Kanagawa Wave | [Kanagawa](https://github.com/rebelot/kanagawa.nvim) (MIT) |
+| `night-owl` | Night Owl | [Night Owl](https://github.com/sdras/night-owl-vscode-theme) (MIT) |
+| `nord` | Nord | [Nord](https://github.com/nordtheme/nord) (MIT) |
+| `one-dark` | One Dark | [One Dark](https://github.com/atom/one-dark-syntax) (MIT) |
+| `rose-pine` | Rosé Pine | [Rosé Pine](https://github.com/rose-pine/rose-pine-theme) (MIT) |
+| `rose-pine-dawn` | Rosé Pine Dawn | [Rosé Pine](https://github.com/rose-pine/rose-pine-theme) (MIT) |
+| `rose-pine-moon` | Rosé Pine Moon | [Rosé Pine](https://github.com/rose-pine/rose-pine-theme) (MIT) |
+| `solarized-dark` | Solarized Dark | [Solarized](https://github.com/altercation/solarized) (MIT) |
+| `solarized-light` | Solarized Light | [Solarized](https://github.com/altercation/solarized) (MIT) |
+| `tokyo-night` | Tokyo Night | [Tokyo Night](https://github.com/folke/tokyonight.nvim) (Apache-2.0) |
+| `tokyo-night-day` | Tokyo Night Day | [Tokyo Night](https://github.com/folke/tokyonight.nvim) (Apache-2.0) |

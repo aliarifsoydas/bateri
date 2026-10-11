@@ -15,8 +15,10 @@
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
-use crate::settings::HostMark;
+use crate::settings::{HostMark, MINIMUM_CONTRAST};
 use crate::shell::Stripe;
+
+mod schemes;
 
 /// Color in the draw target's space: **linear** RGBA.
 ///
@@ -418,20 +420,182 @@ impl Theme {
         ],
     };
 
+    /// The embedded violet theme: vivid colours on a deep violet ground —
+    /// bateri's own palette, in the spirit of the neon-on-purple editor
+    /// themes, none of whose values it takes.
+    ///
+    /// The palette below is the design; the roles a palette does not carry
+    /// come from it by the rule the adapted palettes follow
+    /// ([`Theme::adapted`]), so its search highlights are `BATERI`'s weights
+    /// in its own yellow. Its criteria, the ones bateri's own themes are made
+    /// to:
+    ///
+    /// - **Every coloured entry stands at least 6.2:1 on the ground** (the
+    ///   weakest is `bright_black`, 6.26 — it is the comment colour, it must
+    ///   read), so every text colour stays above 3:1 on the selection and on
+    ///   both search highlights too (the weakest is `bright_black` on the
+    ///   current match, 3.16) without being moved.
+    /// - **Black is a visible block** on the ground (1.27), the reasoning of
+    ///   `BATERI`'s black; bright white is pure white.
+    /// - **The cursor is amber**, apart from the palette's gold yellow, or it
+    ///   would read as "yellow text"; the letter under it is drawn in the
+    ///   ground's violet.
+    /// - **The selection is a violet slate** from the ground's own family, at
+    ///   the weight of `BATERI`'s (1.59) and apart in hue from the warm search
+    ///   highlights.
+    ///
+    /// **A taste decision, not a measurement**, chosen by its ratios.
+    pub const ULTRAVIOLET: Theme = Theme::adapted(&Scheme {
+        name: "ultraviolet",
+        title: "Ultraviolet",
+        background: 0x1b1433,
+        foreground: 0xece6ff,
+        cursor: 0xffb454,
+        selection: 0x3d3272,
+        #[rustfmt::skip]
+        ansi: [
+            0x2e2556, 0xff6e8f, 0x5cf2a6, 0xffd23f, // black   red      green    yellow
+            0x8796ff, 0xd98aff, 0x4fe3ff, 0xcfc6ea, // blue    magenta  cyan     white
+            0x9d93cc, 0xff94ad, 0x8dffc4, 0xffe57a, // the bright eight, same order
+            0xadb7ff, 0xe9b0ff, 0x8bedff, 0xffffff,
+        ],
+    });
+
     /// The themes embedded in the application, by name. The user's
     /// `themes/{name}.toml` shadows the same name; that decision is in
     /// `bt-shell`'s name resolution.
     pub fn embedded(name: &str) -> Option<Theme> {
         EMBEDDED
             .iter()
-            .find(|(embedded, _)| *embedded == name)
-            .map(|(_, theme)| *theme)
+            .find(|(embedded, _, _)| *embedded == name)
+            .map(|(_, _, theme)| *theme)
     }
 
-    /// The embedded themes' names, in the table's order — View ▸ Theme ▸ lists
-    /// them in this order.
+    /// The embedded themes' names, in the table's order: bateri's own, then
+    /// the adapted palettes by title.
     pub fn embedded_names() -> impl Iterator<Item = &'static str> {
-        EMBEDDED.iter().map(|(name, _)| *name)
+        EMBEDDED.iter().map(|(name, _, _)| *name)
+    }
+
+    /// What the menus show for an embedded theme — `Catppuccin Mocha` for
+    /// `catppuccin-mocha`. The name stays what the settings file takes; a
+    /// user's theme has no title, its name is shown.
+    pub fn embedded_title(name: &str) -> Option<&'static str> {
+        EMBEDDED
+            .iter()
+            .find(|(embedded, _, _)| *embedded == name)
+            .map(|(_, title, _)| *title)
+    }
+
+    /// The embedded themes' names as View ▸ Theme ▸ groups them, a line between
+    /// groups: bateri's own, then the adapted palettes on a dark background,
+    /// then those on a light one ([`Theme::is_dark`]) — each in the table's
+    /// order, i.e. by title.
+    pub fn embedded_groups() -> [Vec<&'static str>; 3] {
+        let (own, adapted) = EMBEDDED.split_at(OWN.len());
+        let names = |dark: bool| {
+            adapted
+                .iter()
+                .filter(|(_, _, theme)| theme.is_dark() == dark)
+                .map(|(name, _, _)| *name)
+                .collect()
+        };
+        [
+            own.iter().map(|(name, _, _)| *name).collect(),
+            names(true),
+            names(false),
+        ]
+    }
+
+    /// A palette adapted from another project ([`Scheme`]) as a theme: the
+    /// scheme's own colours where bateri's roles have a counterpart, the rest
+    /// derived from them.
+    ///
+    /// **The scheme's ANSI colours, background and foreground are never
+    /// touched** — that is what makes it the theme people know. The derived
+    /// roles follow the rules bateri's own themes were made by, and every
+    /// target is a ratio one of them already stands at, so no new taste
+    /// constant enters ([`Theme::BATERI`] on a dark background,
+    /// [`Theme::BATERI_LIGHT`] on a light one — the *reference*):
+    ///
+    /// - `dim` is the foreground blended into the background ([`dim_toward`]),
+    ///   the rule `BATERI_LIGHT` follows.
+    /// - `accent`, `success` and `error` are the palette's blue, green and red
+    ///   — `BATERI`'s precedent: the roles are separate so a user can change a
+    ///   stripe without touching the text colours.
+    /// - `info` and `warning` are the palette's cyan and yellow, and `cursor`
+    ///   the scheme's own, each moved just far enough from the background to
+    ///   read on it ([`readable`]): the first two are text in the dock's
+    ///   context line and the letter under the cursor is drawn in the
+    ///   background colour. Most schemes need no move; a light scheme's
+    ///   yellow usually does.
+    /// - `selection` is the scheme's own when it is a highlight: closer to
+    ///   the background than to the foreground — many schemes give the
+    ///   foreground itself, written for terminals that swap the selected
+    ///   text's colours, which bateri does not — and standing out from the
+    ///   background at least as much as the reference's selection does in an
+    ///   unfocused window. Otherwise it is the accent laid over the
+    ///   background ([`tint`]) up to the reference's selection — `BATERI`'s
+    ///   cool slate is drawn from its accent's family too.
+    /// - `search_match` and `search_current` are the palette's yellow laid
+    ///   over the background up to the reference's two highlights — search is
+    ///   a warm family against the selection's cool one, and the current
+    ///   match stands out more.
+    ///
+    /// The text under the selection and the search highlights is held to the
+    /// minimum contrast when drawn (`session::cell_style`), so the highlights
+    /// need not leave room under every text colour of the scheme — many put a
+    /// text colour right at 3:1 on their background.
+    pub(crate) const fn adapted(scheme: &Scheme) -> Theme {
+        let ground = rgb(scheme.background);
+        let dark = Theme {
+            background: scheme.background,
+            ..Theme::BATERI
+        }
+        .is_dark();
+        let reference = if dark {
+            Theme::BATERI
+        } else {
+            Theme::BATERI_LIGHT
+        };
+        let base = reference.background_rgb();
+        let ansi = scheme.ansi;
+        let selection = rgb(scheme.selection);
+        let unfocused = dim_toward(rgb(reference.selection), base);
+        let own_selection = contrast(selection, ground)
+            < contrast(selection, rgb(scheme.foreground))
+            && contrast(selection, ground) >= contrast(unfocused, base);
+        let selection = if own_selection {
+            selection
+        } else {
+            tint(
+                rgb(ansi[4]),
+                ground,
+                contrast(rgb(reference.selection), base),
+            )
+        };
+        let yellow = rgb(ansi[3]);
+        let search_match = tint(yellow, ground, contrast(rgb(reference.search_match), base));
+        let search_current = tint(
+            yellow,
+            ground,
+            contrast(rgb(reference.search_current), base),
+        );
+        Theme {
+            background: scheme.background,
+            foreground: scheme.foreground,
+            dim: pack(dim_toward(rgb(scheme.foreground), ground)),
+            accent: ansi[4],
+            cursor: pack(readable(rgb(scheme.cursor), ground, dark)),
+            selection: pack(selection),
+            search_match: pack(search_match),
+            search_current: pack(search_current),
+            success: ansi[2],
+            error: ansi[1],
+            info: pack(readable(rgb(ansi[6]), ground, dark)),
+            warning: pack(readable(rgb(ansi[3]), ground, dark)),
+            ansi,
+        }
     }
 
     /// The default background's **sRGB** bytes (`[r, g, b]`) — the window
@@ -777,12 +941,86 @@ impl Theme {
     }
 }
 
-/// The table of embedded themes; [`Theme::embedded`] reads it.
-const EMBEDDED: [(&str, Theme); 3] = [
-    ("bateri", Theme::BATERI),
-    ("bateri-light", Theme::BATERI_LIGHT),
-    ("linen", Theme::LINEN),
+/// A terminal palette: the four roles a terminal palette carries and the
+/// sixteen ANSI colours. [`Theme::adapted`] makes a theme of it. An adapted
+/// one is another project's, as its authors chose it — written by a script
+/// from the scheme's file, never by hand (`schemes`); bateri's own
+/// [`Theme::ULTRAVIOLET`] is designed as one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Scheme {
+    /// What `[appearance] theme` takes.
+    pub(crate) name: &'static str,
+    /// What the menus show ([`Theme::embedded_title`]).
+    pub(crate) title: &'static str,
+    pub(crate) background: u32,
+    pub(crate) foreground: u32,
+    pub(crate) cursor: u32,
+    pub(crate) selection: u32,
+    pub(crate) ansi: [u32; 16],
+}
+
+/// bateri's own themes — name, title, theme — designed here.
+const OWN: [(&str, &str, Theme); 4] = [
+    ("bateri", "bateri", Theme::BATERI),
+    ("bateri-light", "bateri Light", Theme::BATERI_LIGHT),
+    ("linen", "Linen", Theme::LINEN),
+    ("ultraviolet", "Ultraviolet", Theme::ULTRAVIOLET),
 ];
+
+/// The table of embedded themes, [`Theme::embedded`] reads it: bateri's own,
+/// then the adapted palettes ([`schemes::SCHEMES`], by title), derived at
+/// compile time.
+const EMBEDDED: [(&str, &str, Theme); OWN.len() + schemes::SCHEMES.len()] = {
+    let mut table = [("", "", Theme::BATERI); OWN.len() + schemes::SCHEMES.len()];
+    let mut i = 0;
+    while i < table.len() {
+        // audit: `i` is below the table's length, the sum of the two lists';
+        // evaluated at compile time, so a slip is a build error, not a panic.
+        table[i] = if i < OWN.len() {
+            OWN[i]
+        } else {
+            let scheme = &schemes::SCHEMES[i - OWN.len()];
+            (scheme.name, scheme.title, Theme::adapted(scheme))
+        };
+        i += 1;
+    }
+    table
+};
+
+/// `color` moved toward the end of the scale away from `ground` — white on a
+/// dark ground, black on a light one — just far enough to read on it as text
+/// ([`MINIMUM_CONTRAST`], the bar bateri's own themes hold their text roles
+/// to); unchanged when it already does. Toward the end rather than toward the
+/// foreground, so the hue stays: a light theme's yellow becomes a mustard, not
+/// a grey.
+///
+/// In 8-bit sRGB and by whole percent ([`toward`]), not closed-form like
+/// [`LinearRgba::legible_on`]: the result is a theme's `0xRRGGBB` and is
+/// computed once, at compile time.
+const fn readable(color: Rgb, ground: Rgb, dark: bool) -> Rgb {
+    let end = if dark { rgb(0xffffff) } else { rgb(0x000000) };
+    let mut percent = 0;
+    while percent < 100 && contrast(toward(color, end, percent), ground) < MINIMUM_CONTRAST {
+        percent += 1;
+    }
+    toward(color, end, percent)
+}
+
+/// `color` laid over `ground` ([`over`]) just strongly enough to stand
+/// `target` apart from it ([`contrast`]) — a highlight in `color`'s hue at a
+/// chosen weight; `color` itself when even that does not reach.
+const fn tint(color: Rgb, ground: Rgb, target: f64) -> Rgb {
+    let mut percent = 0;
+    while percent < 100 && contrast(over(color, percent, ground), ground) < target {
+        percent += 1;
+    }
+    over(color, percent, ground)
+}
+
+/// An [`Rgb`] as the theme's `0xRRGGBB`.
+const fn pack(color: Rgb) -> u32 {
+    ((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32
+}
 
 /// The **single rule** for a dim (SGR 2) color: the color moves one third of
 /// the way toward the background.
@@ -1157,7 +1395,7 @@ mod tests {
         // The splits' separator (sRGB, `NSColor`) and the dock's hairlines
         // (linear, GPU) come from the same value: if they part ways, the split
         // line sits in a different tone than the dock's line.
-        for (_, theme) in EMBEDDED {
+        for (_, _, theme) in EMBEDDED {
             let [r, g, b] = theme.separator_srgb();
             let hex = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
             assert_eq!(linear_hex(hex), theme.separator_linear());
@@ -1243,6 +1481,36 @@ mod tests {
     }
 
     #[test]
+    fn ultraviolet_palette_is_pinned() {
+        // The violet theme's counterpart of `bateri_palette_is_pinned`, same
+        // reasoning; its other roles come from the adapted palettes' rule.
+        #[rustfmt::skip]
+        const EXPECTED: [(usize, u32); 19] = [
+            (0, 0x2e2556), (1, 0xff6e8f), (2, 0x5cf2a6), (3, 0xffd23f),
+            (4, 0x8796ff), (5, 0xd98aff), (6, 0x4fe3ff), (7, 0xcfc6ea),
+            (8, 0x9d93cc), (9, 0xff94ad), (10, 0x8dffc4), (11, 0xffe57a),
+            (12, 0xadb7ff), (13, 0xe9b0ff), (14, 0x8bedff), (15, 0xffffff),
+            (256, 0xece6ff), // foreground
+            (257, 0x1b1433), // background
+            (258, 0xffb454), // cursor
+        ];
+        let violet = Theme::ULTRAVIOLET;
+        for (index, hex) in EXPECTED {
+            assert_eq!(violet.default(index), rgb(hex), "{index}");
+        }
+        assert!(violet.is_dark());
+        assert_eq!(violet.selection, 0x3d3272, "its own selection is kept");
+        // Every coloured entry reads on the ground with room for the highlights.
+        for color in violet.ansi.iter().skip(1) {
+            assert!(contrast(*color, violet.background) >= 6.2, "#{color:06x}");
+        }
+        assert!(
+            contrast(violet.ansi[0], violet.background) > 1.2,
+            "black is a block"
+        );
+    }
+
+    #[test]
     fn embedded_themes_are_found_by_name() {
         assert_eq!(Theme::embedded("bateri"), Some(Theme::BATERI));
         assert_eq!(Theme::embedded("bateri-light"), Some(Theme::BATERI_LIGHT));
@@ -1253,6 +1521,168 @@ mod tests {
             "the name is case-sensitive"
         );
         assert_eq!(Theme::embedded(""), None);
+        let mocha = Theme::embedded("catppuccin-mocha").expect("an adapted theme");
+        assert_eq!((mocha.background, mocha.foreground), (0x1e1e2e, 0xcdd6f4));
+        assert_eq!(
+            Theme::embedded_title("catppuccin-mocha"),
+            Some("Catppuccin Mocha")
+        );
+        assert_eq!(Theme::embedded_title("bateri"), Some("bateri"));
+        assert_eq!(Theme::embedded_title("paper"), None);
+    }
+
+    #[test]
+    fn an_adapted_theme_keeps_the_schemes_own_colours() {
+        // The palette people know is the scheme's: its ANSI colours,
+        // background and foreground arrive untouched, and the roles that
+        // stand for a palette colour are that colour.
+        for scheme in &schemes::SCHEMES {
+            let theme = Theme::embedded(scheme.name).expect("in the table");
+            assert_eq!(theme, Theme::adapted(scheme), "{}", scheme.name);
+            assert_eq!(
+                (theme.background, theme.foreground, theme.ansi),
+                (scheme.background, scheme.foreground, scheme.ansi),
+                "{}",
+                scheme.name
+            );
+            assert_eq!(
+                (theme.accent, theme.success, theme.error),
+                (scheme.ansi[4], scheme.ansi[2], scheme.ansi[1]),
+                "{}",
+                scheme.name
+            );
+            assert_eq!(
+                rgb(theme.dim),
+                dim_toward(rgb(theme.foreground), theme.background_rgb()),
+                "{}",
+                scheme.name
+            );
+        }
+    }
+
+    #[test]
+    fn an_adapted_theme_moves_a_role_only_as_far_as_it_must() {
+        // The cursor, `info` and `warning` read on the background (the
+        // letter under the cursor is drawn in the background colour); one
+        // that already did is the scheme's colour itself.
+        for scheme in &schemes::SCHEMES {
+            let theme = Theme::adapted(scheme);
+            for (role, source) in [
+                (theme.cursor, scheme.cursor),
+                (theme.info, scheme.ansi[6]),
+                (theme.warning, scheme.ansi[3]),
+            ] {
+                let ratio = contrast(role, theme.background);
+                assert!(
+                    ratio >= MINIMUM_CONTRAST,
+                    "{}: #{role:06x} {ratio:.2}",
+                    scheme.name
+                );
+                if contrast(source, theme.background) >= MINIMUM_CONTRAST {
+                    assert_eq!(role, source, "{}", scheme.name);
+                }
+            }
+        }
+        // A light scheme's yellow on its cream (2.3:1) becomes the darker
+        // yellow that reads — the hue kept, not greyed toward the foreground.
+        let latte = Theme::embedded("catppuccin-latte").expect("in the table");
+        let warning = rgb(latte.warning);
+        assert!(
+            warning.r > warning.g && warning.g > warning.b,
+            "{warning:?}"
+        );
+    }
+
+    #[test]
+    fn an_adapted_highlight_stands_out_like_the_reference_ones() {
+        // The selection and the two search highlights stand apart from the
+        // background, and the derived ones as far as bateri's own theme of
+        // the same side does (the reference).
+        for scheme in &schemes::SCHEMES {
+            let theme = Theme::adapted(scheme);
+            let reference = if theme.is_dark() {
+                Theme::BATERI
+            } else {
+                Theme::BATERI_LIGHT
+            };
+            let apart = |role: u32, theme: &Theme| contrast(role, theme.background);
+            assert!(apart(theme.selection, &theme) > 1.0, "{}", scheme.name);
+            for (role, target) in [
+                (theme.search_match, reference.search_match),
+                (theme.search_current, reference.search_current),
+            ] {
+                assert!(
+                    apart(role, &theme) >= apart(target, &reference),
+                    "{}: #{role:06x}",
+                    scheme.name
+                );
+            }
+        }
+        // A scheme that gives the foreground as its selection (for terminals
+        // that swap the selected text's colours) gets a highlight instead.
+        let github = Theme::embedded("github-light").expect("in the table");
+        assert_ne!(github.selection, github.foreground);
+        assert!(contrast(github.selection, github.background) < 1.5);
+        // A scheme's own highlight is kept: Dracula's current-line grey.
+        let dracula = Theme::embedded("dracula").expect("in the table");
+        assert_eq!(dracula.selection, 0x44475a);
+    }
+
+    #[test]
+    fn the_embedded_groups_are_the_whole_table() {
+        let [own, dark, light] = Theme::embedded_groups();
+        assert_eq!(own, ["bateri", "bateri-light", "linen", "ultraviolet"]);
+        assert!(
+            dark.iter()
+                .all(|name| Theme::embedded(name).is_some_and(|t| t.is_dark()))
+        );
+        assert!(
+            light
+                .iter()
+                .all(|name| Theme::embedded(name).is_some_and(|t| !t.is_dark()))
+        );
+        let grouped: Vec<_> = own.iter().chain(&dark).chain(&light).copied().collect();
+        let mut all: Vec<_> = Theme::embedded_names().collect();
+        assert_eq!(grouped.len(), all.len());
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), grouped.len(), "a name is in the table twice");
+        // Each adapted group in title order: the menus list it as it comes.
+        for group in [&dark, &light] {
+            let titles: Vec<_> = group
+                .iter()
+                .map(|name| Theme::embedded_title(name).expect("titled").to_lowercase())
+                .collect();
+            assert!(titles.is_sorted(), "{titles:?}");
+        }
+        // A name is what the settings file takes and a file name: lowercase,
+        // no space.
+        for name in grouped {
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_on_a_highlight_reaches_the_floor_on_every_embedded_theme() {
+        // The guard the adapted palettes rely on: whatever text colour sits
+        // under the selection or a search match, the drawn ink reaches the
+        // floor against that highlight (`session::cell_style`).
+        for (name, _, theme) in EMBEDDED {
+            for highlight in [theme.selection, theme.search_match, theme.search_current] {
+                let ground = linear_rgba(rgb(highlight));
+                for text in [theme.foreground, theme.dim].into_iter().chain(theme.ansi) {
+                    let ink = linear_rgba(rgb(text)).legible_on(ground, MINIMUM_CONTRAST);
+                    assert!(
+                        apart(ink, ground) >= MINIMUM_CONTRAST - 1e-4,
+                        "{name}: #{text:06x} on #{highlight:06x}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1303,7 +1733,7 @@ mod tests {
         // on the light ones "lightens"; every embedded background is tested so
         // that a light theme fails if the rule goes back to multiplying toward
         // black.
-        for (_, theme) in EMBEDDED {
+        for (_, _, theme) in EMBEDDED {
             let bg = theme.background_rgb();
             for index in 259..=266 {
                 let (source, dimmed) = (theme.default(index - 259), theme.default(index));
@@ -1470,7 +1900,7 @@ mod tests {
         // The host is **text** in the context line, so the criterion is
         // text's — 3:1 on the background. `warning` is in the
         // same place (the host marked staging) with the same criterion.
-        for (_, theme) in EMBEDDED {
+        for (_, _, theme) in EMBEDDED {
             for role in [theme.info, theme.warning] {
                 let ratio = contrast(role, theme.background);
                 assert!(ratio >= 3.0, "#{role:06x} on the background {ratio:.2}");
@@ -1503,18 +1933,25 @@ mod tests {
 
     #[test]
     fn search_highlights_keep_every_readable_text_readable() {
-        // The two search highlights carry the selection's criterion (the
-        // text in its own foreground): every text color (foreground, `dim`, 16
-        // ANSI) that exceeds 3:1 on the embedded theme's background also
-        // exceeds 3:1 on the highlight. The current match must be **more
-        // distinct** than the other and the role values must say so in
-        // brightness too — a distinction left to hue alone would vanish when it
-        // fades in an unfocused window.
-        for (_, theme) in EMBEDDED {
+        // bateri's own themes were made to the selection's criterion for the
+        // two search highlights: every text color (foreground, `dim`, 16
+        // ANSI) that exceeds 3:1 on the background also exceeds 3:1 on the
+        // highlight, so the text reads without being moved. An adapted
+        // palette is not held to it — many put a text colour right at 3:1 on
+        // their background, which leaves no room for a visible highlight — and
+        // its text under a highlight is held to the floor when drawn instead
+        // (`text_on_a_highlight_reaches_the_floor_on_every_embedded_theme`).
+        //
+        // On every theme the current match must be **more distinct** than the
+        // other and the role values must say so in brightness too — a
+        // distinction left to hue alone would vanish when it fades in an
+        // unfocused window.
+        for (name, _, theme) in EMBEDDED {
+            let own = OWN.iter().any(|(own, _, _)| *own == name);
             let texts = [theme.foreground, theme.dim]
                 .into_iter()
                 .chain(theme.ansi)
-                .filter(|&text| contrast(text, theme.background) >= 3.0);
+                .filter(|&text| own && contrast(text, theme.background) >= 3.0);
             for text in texts {
                 for highlight in [theme.search_match, theme.search_current] {
                     let ratio = contrast(text, highlight);
@@ -1530,7 +1967,8 @@ mod tests {
             );
             assert!(
                 matched > 1.0 && current > matched,
-                "the current match isn't more distinct than the other: {matched:.2} / {current:.2}"
+                "{name}: the current match isn't more distinct than the other: \
+                 {matched:.2} / {current:.2}"
             );
         }
     }
@@ -1626,7 +2064,7 @@ mod tests {
         // The property behind the default: whatever a program picks from the
         // palette — the 256 colours and the named ones' dim — reads at 3:1 on
         // the background, and a colour that already did is not touched.
-        for (name, theme) in EMBEDDED {
+        for (name, _, theme) in EMBEDDED {
             let ground = theme.background_linear();
             let colours = (0..256).map(|index| theme.default(index)).chain(
                 (0..16).map(|index| dim_toward(rgb(theme.ansi[index]), rgb(theme.background))),

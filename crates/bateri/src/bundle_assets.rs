@@ -221,6 +221,7 @@ fn third_party_license_ships_with_attribution() {
         "Version 2.0",
         "MIT License",
         "Sparkle",
+        "iTerm2-Color-Schemes",
     ] {
         assert!(
             licenses.contains(needle),
@@ -233,6 +234,7 @@ fn third_party_license_ships_with_attribution() {
         "Apache License",
         "Sparkle",
         "MIT License",
+        "iTerm2-Color-Schemes",
         "THIRD-PARTY-LICENSES.txt",
     ] {
         assert!(

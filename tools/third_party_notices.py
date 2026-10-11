@@ -25,12 +25,20 @@ Choices:
   allow list stops the script: that is a dependency decision, it is not
   silently added to the list (never GPL-2.0-only — bateri is GPL-3.0-or-later).
 - Sparkle's LICENSE (MIT + external notices such as bsdiff/sais/ed25519) as is.
+- The color schemes bateri adapts (`tools/import_themes.py`, the one list a
+  theme is added to): the collection the values are read from and each
+  project the schemes come from, with its copyright line and license — MIT
+  under the MIT text given once, Apache-2.0 under the Apache text the file
+  already carries (alacritty_terminal's).
 """
 
 import json
 import os
 import subprocess
 import sys
+import textwrap
+
+import import_themes
 
 ROOT = "bateri"
 TARGET = "aarch64-apple-darwin"
@@ -192,7 +200,36 @@ def main():
             "Licensed under the MIT License, with the external notices it carries;",
             "full text below.", RULE, "", sparkle, ""]
 
+    out += theme_notices("Version 2.0" in "\n".join(out))
     sys.stdout.write("\n".join(out))
+
+
+def theme_notices(apache_given):
+    """The notices of the adapted color schemes, by project."""
+    used = {project for _, _, _, project in import_themes.THEMES}
+    projects = [(key, import_themes.PROJECTS[key]) for key in sorted(used)]
+    licenses = {project["license"] for _, project in projects}
+    if not licenses <= {"MIT", "Apache-2.0"}:
+        sys.exit(f"color schemes: a license with no notice path here: {licenses}")
+    if "Apache-2.0" in licenses and not apache_given:
+        sys.exit("color schemes: an Apache-2.0 scheme needs the Apache text in the file")
+    out = [RULE,
+           "Color schemes. bateri's adapted themes carry the colors of the",
+           "following projects. The values are read from iTerm2-Color-Schemes,",
+           "Copyright (c) 2011 to Present Mark Badolato, MIT License,",
+           import_themes.SOURCE,
+           "Each project is used under the license named with it; the MIT text",
+           "follows the list, the Apache License 2.0 text is given above.",
+           RULE, ""]
+    for key, project in projects:
+        themes = ", ".join(title for _, title, _, of in import_themes.THEMES if of == key)
+        out += [project["title"], f"  {project['copyright']}", f"  {project['url']}",
+                f"  {project['license']}",
+                *textwrap.wrap(f"bateri's themes: {themes}", 78,
+                               initial_indent="  ", subsequent_indent="    "),
+                ""]
+    out += ["MIT License", "", MIT_TEXT, ""]
+    return out
 
 
 if __name__ == "__main__":

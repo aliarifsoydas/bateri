@@ -1383,7 +1383,7 @@ define_class!(
             else {
                 return;
             };
-            let embedded: Vec<&str> = Theme::embedded_names().collect();
+            let embedded = Theme::embedded_groups();
             let user = settings::user_theme_names(&root);
             let settings = self.ivars().settings.borrow();
             crate::menu::fill_themes(self.mtm(), menu, &settings.theme, &embedded, &user);
@@ -1620,7 +1620,9 @@ define_class!(
             let Some(item) = sender.and_then(|sender| sender.downcast_ref::<NSMenuItem>()) else {
                 return;
             };
-            self.save_theme(&item.title().to_string());
+            if let Some(name) = crate::menu::theme_of_item(item) {
+                self.save_theme(&name);
+            }
         }
 
         /// Shell ▸ Mark “{host}” as ▸ {mark}: the item's `tag` is
@@ -5153,7 +5155,7 @@ impl AppDelegate {
         let settings = self.ivars().settings.borrow().clone();
         let state = self.ivars().settings_state.borrow().clone();
         let write = self.ivars().notices.borrow().get(Source::Write).to_vec();
-        let embedded: Vec<&str> = Theme::embedded_names().collect();
+        let embedded = Theme::embedded_groups();
         let user = settings::user_theme_names(&root);
         let resolved = crate::settings_window::Resolved {
             reduce: self.reduce_motion(),

@@ -352,16 +352,27 @@ mod tests {
 
     #[test]
     fn documented_blocks_are_the_embedded_themes() {
-        // `docs/SETTINGS.md` gives a full block for every embedded theme as
-        // "copy, change". Since the document **copies** values it drifts; this
-        // test ties the blocks to the embedded themes. The base is distinct: a
-        // key dropped from the block would be filled from the base and break
-        // equality, so the block has to stay complete. The list comes from the
-        // table itself: an added embedded theme has to come with its block.
+        // `docs/SETTINGS.md` gives a full block for each of bateri's own
+        // themes as "copy, change". Since the document **copies** values it
+        // drifts; this test ties the blocks to the embedded themes. The base is
+        // distinct: a key dropped from the block would be filled from the base
+        // and break equality, so the block has to stay complete. The list
+        // comes from the table itself: an added theme of bateri's own has to
+        // come with its block.
+        //
+        // An adapted palette has a row in the document's table instead: a
+        // file that shadows it takes every key it leaves out from it, so it
+        // is changed by writing only the change, and twenty-odd copied blocks
+        // would be the document's bulk.
         let doc = include_str!("../../../docs/SETTINGS.md");
-        let names: Vec<_> = Theme::embedded_names().collect();
-        assert_eq!(names, ["bateri", "bateri-light", "linen"]);
-        for name in names {
+        let [own, dark, light] = Theme::embedded_groups();
+        assert_eq!(own, ["bateri", "bateri-light", "linen", "ultraviolet"]);
+        for name in dark.iter().chain(&light) {
+            let title = Theme::embedded_title(name).expect("an embedded theme has a title");
+            let row = format!("| `{name}` | {title} |");
+            assert!(doc.contains(&row), "{row:?} not found in SETTINGS.md");
+        }
+        for name in own {
             let theme = Theme::embedded(name);
             // The heading is searched with its line ending: "`bateri`" is a
             // prefix of "`bateri-light`" and an unbounded search would read the

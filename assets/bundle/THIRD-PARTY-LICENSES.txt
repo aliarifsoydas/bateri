@@ -967,3 +967,111 @@ HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
 STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
 IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
+
+================================================================================
+Color schemes. bateri's adapted themes carry the colors of the
+following projects. The values are read from iTerm2-Color-Schemes,
+Copyright (c) 2011 to Present Mark Badolato, MIT License,
+https://github.com/mbadolato/iTerm2-Color-Schemes
+Each project is used under the license named with it; the MIT text
+follows the list, the Apache License 2.0 text is given above.
+================================================================================
+
+Catppuccin
+  Copyright (c) 2021 Catppuccin
+  https://github.com/catppuccin/catppuccin
+  MIT
+  bateri's themes: Catppuccin Frappé, Catppuccin Latte, Catppuccin Macchiato,
+    Catppuccin Mocha
+
+Dracula
+  Copyright (c) 2023 Dracula Theme
+  https://github.com/dracula/dracula-theme
+  MIT
+  bateri's themes: Dracula
+
+Everforest
+  Copyright (c) 2019 sainnhe
+  https://github.com/sainnhe/everforest
+  MIT
+  bateri's themes: Everforest Dark, Everforest Light
+
+Flexoki
+  Copyright (c) 2023 Steph Ango
+  https://github.com/kepano/flexoki
+  MIT
+  bateri's themes: Flexoki Dark, Flexoki Light
+
+GitHub Theme
+  Copyright (c) 2020 Primer
+  https://github.com/primer/github-vscode-theme
+  MIT
+  bateri's themes: GitHub Dark, GitHub Light
+
+Gruvbox
+  Copyright (c) Pavel Pertsev (morhetz)
+  https://github.com/morhetz/gruvbox
+  MIT
+  bateri's themes: Gruvbox Dark, Gruvbox Light
+
+Kanagawa
+  Copyright (c) 2021 Tommaso Laurenzi
+  https://github.com/rebelot/kanagawa.nvim
+  MIT
+  bateri's themes: Kanagawa Wave
+
+Night Owl
+  Copyright (c) 2018 Sarah Drasner
+  https://github.com/sdras/night-owl-vscode-theme
+  MIT
+  bateri's themes: Night Owl
+
+Nord
+  Copyright (c) 2016-present Sven Greb
+  https://github.com/nordtheme/nord
+  MIT
+  bateri's themes: Nord
+
+One Dark
+  Copyright (c) 2016 GitHub Inc.
+  https://github.com/atom/one-dark-syntax
+  MIT
+  bateri's themes: One Dark
+
+Rosé Pine
+  Copyright (c) 2023 Rosé Pine
+  https://github.com/rose-pine/rose-pine-theme
+  MIT
+  bateri's themes: Rosé Pine, Rosé Pine Dawn, Rosé Pine Moon
+
+Solarized
+  Copyright (c) 2011 Ethan Schoonover
+  https://github.com/altercation/solarized
+  MIT
+  bateri's themes: Solarized Dark, Solarized Light
+
+Tokyo Night
+  Copyright (c) Folke Lemaitre
+  https://github.com/folke/tokyonight.nvim
+  Apache-2.0
+  bateri's themes: Tokyo Night, Tokyo Night Day
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

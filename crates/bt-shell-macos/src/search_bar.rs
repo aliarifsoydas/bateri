@@ -412,6 +412,11 @@ pub(crate) fn selection_query(selection: &str, regex: bool) -> Option<String> {
     })
 }
 
+/// How far the surface's fill stands from the terminal's background at least,
+/// by WCAG ratio, in a dark theme and in a light one: a clear step in a dark
+/// theme, as much as Safari's find bar in a light theme. A design constant.
+const SURFACE_APART: (f64, f64) = (1.4, 1.12);
+
 /// The surface's two colours, sRGB: the fill and (border, alpha).
 ///
 /// The fill is a blend of the theme's background toward the foreground -
@@ -420,10 +425,23 @@ pub(crate) fn selection_query(selection: &str, regex: bool) -> Option<String> {
 /// constant and **enough to read as a surface apart from the terminal**: the
 /// first values (0.11 / 0.045) made the panel's fill invisible on a pure
 /// black background and the controls read like terminal text (the user saw
-/// it). A test holds the lower bound.
+/// it). A theme whose foreground stands close to its background (a soft light
+/// palette) gets less from the same ratio, so the blend goes on, a percent at
+/// a time, until the fill stands [`SURFACE_APART`] from the background.
 fn surface_colors(background: u32, foreground: u32, dark: bool) -> (u32, (u32, f64)) {
     let (lift, edge) = if dark { (0.20, 0.30) } else { (0.08, 0.24) };
-    (mix(background, foreground, lift), (foreground, edge))
+    let apart = if dark {
+        SURFACE_APART.0
+    } else {
+        SURFACE_APART.1
+    };
+    let mut step = lift;
+    let mut fill = mix(background, foreground, step);
+    while step < 1.0 && bt_core::contrast_ratio(fill, background) < apart {
+        step = (step + 0.01).min(1.0);
+        fill = mix(background, foreground, step);
+    }
+    (fill, (foreground, edge))
 }
 
 /// `t` of the way from `a` to `b`, in sRGB bytes.
@@ -509,7 +527,7 @@ fn symbol(
 
 #[cfg(test)]
 mod tests {
-    use super::{count_label, mix, selection_query, surface_colors};
+    use super::{SURFACE_APART, count_label, mix, selection_query, surface_colors};
     use bt_core::{SearchReport, SearchStatus, Theme};
 
     #[test]
@@ -569,6 +587,13 @@ mod tests {
         assert!(dark > 0x000000 && dark < 0x404040, "{dark:06x}");
         let (light, _) = surface_colors(0xffffff, 0x1a1a1a, false);
         assert!(light < 0xffffff && light > 0xe0e0e0, "{light:06x}");
+        // bateri's own themes stand apart at the fixed blend already.
+        for theme in [Theme::BATERI, Theme::BATERI_LIGHT, Theme::LINEN] {
+            let dark = theme.is_dark();
+            let lift = if dark { 0.20 } else { 0.08 };
+            let (fill, _) = surface_colors(theme.background, theme.foreground, dark);
+            assert_eq!(fill, mix(theme.background, theme.foreground, lift));
+        }
     }
 
     #[test]
@@ -576,13 +601,17 @@ mod tests {
         // The panel floats above the terminal; if its fill does not stand
         // apart from the terminal's, the controls read like terminal text
         // (the user saw it: the 0.11 step was ≈ #191919 on pure black). The
-        // lower bounds are a design constant, by WCAG ratio: a clear step in
-        // a dark theme, as much as Safari's find bar in a light theme. Every
-        // embedded theme, with the darkness the pane paints it with.
+        // lower bounds are [`SURFACE_APART`]. Every embedded theme, with the
+        // darkness the pane paints it with — the adapted palettes too, whose
+        // softer foregrounds the fixed blend alone does not lift far enough.
         for name in Theme::embedded_names() {
             let theme = Theme::embedded(name).expect("an embedded name");
             let dark = theme.is_dark();
-            let floor = if dark { 1.4 } else { 1.12 };
+            let floor = if dark {
+                SURFACE_APART.0
+            } else {
+                SURFACE_APART.1
+            };
             let (fill, _) = surface_colors(theme.background, theme.foreground, dark);
             let ratio = contrast(fill, theme.background);
             assert!(

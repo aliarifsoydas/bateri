@@ -839,29 +839,30 @@ enum ThemeItem {
 }
 
 /// The theme popup's items and the selected one's index — the order of the
-/// Theme ▸ menu (`menu::fill_themes`): Match System, embedded ones, the
-/// user's. If the name in the file is not in the list (a deleted theme) it is
+/// Theme ▸ menu (`menu::fill_themes`): Match System, the embedded groups, the
+/// user's, a separator before each group; an embedded theme shows its title
+/// (`fill_themes`). If the name in the file is not in the list (a deleted theme) it is
 /// appended at the end: the popup does not hide what the user wrote (the
 /// Font popup's rule).
 fn theme_items(
     selected: &str,
     with_system: bool,
-    embedded: &[&str],
+    embedded: &[Vec<&str>],
     user: &[String],
 ) -> (Vec<ThemeItem>, usize) {
     let mut items = Vec::new();
     if with_system {
         items.push(ThemeItem::System);
-        items.push(ThemeItem::Separator);
     }
-    items.extend(
-        embedded
-            .iter()
-            .map(|name| ThemeItem::Named((*name).to_owned())),
-    );
-    if !user.is_empty() {
-        items.push(ThemeItem::Separator);
-        items.extend(user.iter().cloned().map(ThemeItem::Named));
+    let groups = embedded
+        .iter()
+        .map(|group| group.iter().map(|name| (*name).to_owned()).collect())
+        .chain(std::iter::once(user.to_vec()));
+    for group in groups.filter(|group: &Vec<String>| !group.is_empty()) {
+        if !items.is_empty() {
+            items.push(ThemeItem::Separator);
+        }
+        items.extend(group.into_iter().map(ThemeItem::Named));
     }
     let position = |items: &[ThemeItem]| {
         items.iter().position(|item| match item {
@@ -1619,7 +1620,7 @@ impl SettingsWindow {
         resolved: Resolved,
         state: &FileState,
         write: &[String],
-        embedded: &[&str],
+        embedded: &[Vec<&str>],
         user: &[String],
     ) {
         let Some(c) = self.ivars().controls.get() else {
@@ -3065,7 +3066,9 @@ fn fill_themes(popup: &NSPopUpButton, items: &[ThemeItem], selected: usize) {
     let titles = items.iter().map(|item| match item {
         ThemeItem::System => Some("Match System".to_owned()),
         ThemeItem::Separator => None,
-        ThemeItem::Named(name) => Some(name.clone()),
+        ThemeItem::Named(name) => {
+            Some(bt_core::Theme::embedded_title(name).map_or_else(|| name.clone(), str::to_owned))
+        }
     });
     fill_popup(popup, titles, selected);
 }
@@ -3608,26 +3611,45 @@ mod tests {
     #[test]
     fn theme_list_keeps_the_file_value_visible() {
         let user = vec!["paper".to_owned()];
-        let (items, index) = theme_items(SYSTEM_THEME, true, &["bateri", "bateri-light"], &user);
+        let (items, index) =
+            theme_items(SYSTEM_THEME, true, &[vec!["bateri", "bateri-light"]], &user);
         assert_eq!(items[index], ThemeItem::System);
         assert_eq!(
             theme_edit(&items, index as NSInteger).as_deref(),
             Some(SYSTEM_THEME)
         );
-        let (items, index) = theme_items("paper", true, &["bateri"], &user);
+        let (items, index) = theme_items("paper", true, &[vec!["bateri"]], &user);
         assert_eq!(
             theme_edit(&items, index as NSInteger).as_deref(),
             Some("paper")
         );
         // A deleted theme: appended at the end and selected.
-        let (items, index) = theme_items("gone", false, &["bateri"], &[]);
+        let (items, index) = theme_items("gone", false, &[vec!["bateri"]], &[]);
         assert_eq!(index, items.len() - 1);
         assert_eq!(items[index], ThemeItem::Named("gone".to_owned()));
         assert!(!items.contains(&ThemeItem::System));
         // A separator writes nothing.
-        let (items, _) = theme_items("bateri", true, &["bateri"], &[]);
+        let (items, _) = theme_items("bateri", true, &[vec!["bateri"]], &[]);
         assert_eq!(items[1], ThemeItem::Separator);
         assert_eq!(theme_edit(&items, 1), None);
+        // The embedded groups, a separator before each; an empty one leaves
+        // no doubled line.
+        let (items, _) = theme_items(
+            "nord",
+            false,
+            &[vec!["bateri"], vec![], vec!["nord"]],
+            &user,
+        );
+        assert_eq!(
+            items,
+            [
+                ThemeItem::Named("bateri".to_owned()),
+                ThemeItem::Separator,
+                ThemeItem::Named("nord".to_owned()),
+                ThemeItem::Separator,
+                ThemeItem::Named("paper".to_owned()),
+            ]
+        );
     }
 
     #[test]

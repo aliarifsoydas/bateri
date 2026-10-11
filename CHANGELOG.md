@@ -12,6 +12,22 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **24 well-known themes, built in.** View ▸ Theme ▸ and the settings window
+  now list Catppuccin (Frappé, Latte, Macchiato, Mocha), Dracula, Everforest,
+  Flexoki, GitHub, Gruvbox, Kanagawa Wave, Night Owl, Nord, One Dark, Rosé
+  Pine (with Dawn and Moon), Solarized and Tokyo Night (with Day), dark and
+  light ones in their own groups. Each keeps its authors' colors exactly;
+  what bateri needs beyond them — the selection, the search highlights, the
+  dim text — is drawn from the same palette, so a theme looks like itself and
+  everything on it stays readable. Pick one from the menu, or write its name
+  in `[appearance] theme` (`theme = "catppuccin-mocha"`); `light_theme` and
+  `dark_theme` take them too.
+- **Ultraviolet, a new theme of bateri's own.** Vivid colors on a deep violet
+  ground, with an amber cursor; every color reads clearly on it, comments
+  included.
+
 ### Fixed
 
 - **Text inside a search match stays readable.** The highlight of a match

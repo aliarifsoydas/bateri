@@ -697,47 +697,63 @@ fn mark_holder(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
     holder
 }
 
-/// Builds Theme ▸ from scratch: "Match System", a separator, the embedded themes and
-/// (if any) the user themes after a separator. `selected` is the `theme` value in
-/// the settings; the matching item is checked.
+/// Builds Theme ▸ from scratch: "Match System", then the embedded themes in
+/// their groups ([`Theme::embedded_groups`]: bateri's own, the adapted dark
+/// palettes, the light ones) and (if any) the user themes, a separator before
+/// each group. `selected` is the `theme` value in the settings; the matching
+/// item is checked.
 ///
-/// The item's title is the theme's name and the action reads it (`selectTheme:`):
-/// the title comes from the file name, it is not translated. "Match System" is a
-/// separate action, because its title is not a name.
+/// An embedded theme's item shows its title (`Catppuccin Mocha`), a user
+/// theme's its name — the file's name, not translated. Either way the item
+/// carries the **name** as its `representedObject` and the action reads that
+/// (`selectTheme:`): a title is not what the settings file takes. "Match
+/// System" is a separate action, because it is not a theme.
+///
+/// [`Theme::embedded_groups`]: bt_core::Theme::embedded_groups
 pub(crate) fn fill_themes(
     mtm: MainThreadMarker,
     menu: &NSMenu,
     selected: &str,
-    embedded: &[&str],
+    embedded: &[Vec<&str>],
     user: &[String],
 ) {
     menu.removeAllItems();
-    let checked = |item: Retained<NSMenuItem>, on: bool| {
-        if on {
-            item.setState(NSControlStateValueOn);
+    let theme = |name: &str, title: &str| {
+        let theme = item(mtm, title, sel!(selectTheme:), "");
+        // SAFETY: `representedObject` is retained by the item and any object
+        // is accepted; `selectTheme:` reads it back as the `NSString` put here.
+        unsafe { theme.setRepresentedObject(Some(&NSString::from_str(name))) };
+        if name == selected {
+            theme.setState(NSControlStateValueOn);
         }
-        item
+        theme
     };
-    menu.addItem(&checked(
-        item(mtm, "Match System", sel!(matchSystemTheme:), ""),
-        selected == SYSTEM_THEME,
-    ));
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
-    for name in embedded {
-        menu.addItem(&checked(
-            item(mtm, name, sel!(selectTheme:), ""),
-            *name == selected,
-        ));
+    let system = item(mtm, "Match System", sel!(matchSystemTheme:), "");
+    if selected == SYSTEM_THEME {
+        system.setState(NSControlStateValueOn);
+    }
+    menu.addItem(&system);
+    for group in embedded.iter().filter(|group| !group.is_empty()) {
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        for name in group {
+            let title = bt_core::Theme::embedded_title(name).unwrap_or(name);
+            menu.addItem(&theme(name, title));
+        }
     }
     if !user.is_empty() {
         menu.addItem(&NSMenuItem::separatorItem(mtm));
     }
     for name in user {
-        menu.addItem(&checked(
-            item(mtm, name, sel!(selectTheme:), ""),
-            name == selected,
-        ));
+        menu.addItem(&theme(name, name));
     }
+}
+
+/// The theme name a Theme ▸ item carries ([`fill_themes`]).
+pub(crate) fn theme_of_item(item: &NSMenuItem) -> Option<String> {
+    let object = item.representedObject()?;
+    object
+        .downcast_ref::<NSString>()
+        .map(|name| name.to_string())
 }
 
 /// A target-less item. If `key` is empty there is no shortcut; the modifier default is Command.
