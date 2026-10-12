@@ -354,7 +354,7 @@ pub(crate) fn link_cell_at(
 ) -> Option<(i32, u16)> {
     let (cell_w, cell_h) = metrics.cell_px();
     let (cell_w, cell_h) = (f64::from(cell_w.max(1)), f64::from(cell_h.max(1)));
-    let x = view_px.0 * scale - f64::from(metrics.side_left_px());
+    let x = view_px.0 * scale - f64::from(metrics.grid_inset().left);
     let y = view_px.1 * scale - origin_px;
     if x < 0.0 || x >= cell_w * f64::from(cols) || !y.is_finite() {
         return None;
@@ -375,7 +375,7 @@ fn span_rects_px(spans: &[LinkSpan], metrics: CellMetrics, origin_px: f64) -> Ve
         .map(|span| {
             let width = f64::from(span.last.saturating_sub(span.first) + 1) * cell_w;
             [
-                f64::from(metrics.side_left_px()) + f64::from(span.first) * cell_w,
+                f64::from(metrics.grid_inset().left) + f64::from(span.first) * cell_w,
                 origin_px + f64::from(span.row) * cell_h,
                 width,
                 cell_h,

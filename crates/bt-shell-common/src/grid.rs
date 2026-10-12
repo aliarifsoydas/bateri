@@ -17,11 +17,12 @@ use bt_gpu::{CellMetrics, ContextStrip};
 pub struct Grid {
     pub cols: u16,
     pub rows: u16,
-    /// The dock's width, columns: the window's, with no scroll bar reserve
-    /// taken off — the always-up bar's track stops at the dock's top, and
-    /// the dock below it stays full width. Equal to `cols` unless the grid
-    /// reserves the track. The link's dock readings and the mouse's dock hit
-    /// come from here ([`split_into_grid`] is the owner).
+    /// The dock's width, columns: the strip between the dock's two margins
+    /// (the ruler), with no scroll bar reserve taken off — the always-up
+    /// bar's track stops at the dock's top, and the dock below it stays full
+    /// width. Equal to `cols` while the grid's frame is the ruler and the
+    /// track is no wider than the right margin. The link's dock readings and
+    /// the mouse's dock hit come from here ([`split_into_grid`] is the owner).
     pub dock_cols: u16,
     /// The dock's context row: its column budget and the leftover pixels that
     /// go before its trailing zone. The budget counts the strip between the
@@ -50,15 +51,22 @@ pub struct Grid {
 /// deliberately `pub`, so a placeholder like `CellMetrics::new(9, 18, 7, 8,
 /// 1, 1.0)` written there would revive and the two tests here would stay green.
 ///
-/// **The left margin is subtracted from the columns**: so the
-/// stripe does not overlap the text. The margin is always reserved — the
-/// accepted cost is that it stays empty in a session without integration
+/// **The grid's frame is subtracted on three sides** ([`CellMetrics::grid_inset`]):
+/// the left from the columns, so the stripe does not overlap the text; the
+/// right from the columns, so the last column stops where the dock's text
+/// does instead of running to the pane's edge with whatever sub-cell
+/// leftover the width gives (that leftover now comes on top of the right
+/// side, inside the dock's line); and the foot from the rows, so the bottom
+/// row keeps the dock's breathing room above the dock — or above the pane's
+/// edge where a program reading the keyboard itself has the band step aside,
+/// or where there is no dock. The frame is always reserved — the accepted
+/// cost is that the left stays empty in a session without integration
 /// (bash/fish, `shell.integration = false`, SSH); the alternative was a
 /// SIGWINCH at the first prompt and three consumers being updated at once.
-/// It is the **side margin** ([`CellMetrics::side_left_px`]), not the gutter:
-/// beside a round bottom corner it is wider, and the dock's width follows it
-/// the same way — the vertical arithmetic (the dock's share, the top reserve)
-/// stays on the gutter.
+/// Beside a round bottom corner the sides are wider (the ruler,
+/// [`CellMetrics::side_left_px`]), and the dock's width follows the same two
+/// margins ([`Grid::dock_cols`]) — the dock's own vertical arithmetic (its
+/// share, the top reserve) stays on the gutter.
 ///
 /// **The dock share is subtracted from the rows** and, unlike the left
 /// gutter, is **conditional**: the dock exists only in an integrated zsh
@@ -73,11 +81,12 @@ pub struct Grid {
 /// transition, not per command** — commands like `git log` that do not enter
 /// the alternate screen never move the flag, so this function is not called again either.
 ///
-/// **The scroll bar's reserve is subtracted from the grid's columns only**
-/// (`reserve_px`, [`ScrollbarMode::reserve_px`]): in the always-up form the
-/// track takes the window's right edge down to the dock's top, so the grid
-/// gives its width up and the dock does not — the dock's column count is a
-/// separate answer ([`Grid::dock_cols`]). The reserve is a function of the
+/// **The scroll bar's reserve takes the grid's right side** (`reserve_px`,
+/// [`ScrollbarMode::reserve_px`]) — the larger of the two, not their sum: in
+/// the always-up form the track stands at the window's right edge down to the
+/// dock's top, and a track wider than the right side is the room the text
+/// keeps from the edge there. The dock does not give it up — the dock's
+/// column count is a separate answer ([`Grid::dock_cols`]). The reserve is a function of the
 /// form alone, never of the history or the alternate screen: a reserve that
 /// came and went with them would resize the grid on the first line into
 /// history, every clear and every full-screen program.
@@ -86,7 +95,7 @@ pub struct Grid {
 /// [`bt_gpu::edge_reserve_px`]): with the content fading at the pane's top,
 /// that much of the height is kept free above the grid **even when the height
 /// divides into rows**, and the leftover goes **to the top** — the grid sits
-/// on the dock's share, a row at rest never enters the fade, and the drawing
+/// its foot above the dock's share, a row at rest never enters the fade, and the drawing
 /// side fades the whole leftover ([`bt_gpu::edge_drawn_px`]). Its source is the
 /// left margin, so changing the margin moves the row count too. The cost is a
 /// row less at the heights whose leftover is shorter than the reserve; zero
@@ -94,12 +103,12 @@ pub struct Grid {
 /// Like the scroll bar's reserve it is a function of the mode and the cell
 /// alone — never of the history or the alternate screen.
 ///
-/// **The dock's context row has a right margin of its own** ([`Grid::context`]):
-/// the grid and the input row end wherever their whole columns end (the
-/// always-up track's reserve and the sub-column leftover included), but the
-/// context row's ports, indicator and buttons sit beside the window's round
-/// bottom corner, so they keep the side margin from the **edge**, whatever the
-/// width.
+/// **The dock's context row keeps the right margin from the edge** ([`Grid::context`]):
+/// the grid and the input row end where their whole columns end, the
+/// sub-column leftover after them inside the right margin, but the context
+/// row's ports, indicator and buttons are right-aligned, so they end on the
+/// margin itself whatever the width — its own small-step leftover goes before
+/// its trailing zone.
 pub fn split_into_grid(
     width_px: f64,
     height_px: f64,
@@ -123,15 +132,19 @@ pub fn split_into_grid(
     // it) is preserved. Had the same subtraction been done in `u16` it would
     // **overflow** and produce a column count near 65535, a `TIOCSWINSZ` of
     // that size. No new lower bound is deliberately introduced: the end of the chain is already right.
-    let usable_width = width_px - f64::from(cell.side_left_px());
-    // The scroll bar's reserve is subtracted the same way and for the same
-    // reason: in a window narrower than the gutter and the track the
-    // difference goes negative and saturates to zero columns. The width here
-    // is unrounded and the drawn track's left edge is the texture's rounded
-    // width minus the same reserve; the text still ends at or before it,
-    // because where the text ends — the gutter plus whole cells — is a whole
-    // pixel not past `width − reserve`, so not past its floor either.
-    let grid_width = usable_width - f64::from(reserve_px);
+    let inset = cell.grid_inset();
+    // The right side is subtracted the same way and for the same reason: in a
+    // window narrower than the frame the difference goes negative and
+    // saturates to zero columns. The always-up track takes the right side's
+    // place where it is wider. The width here is unrounded and the drawn
+    // track's left edge is the texture's rounded width minus the reserve; the
+    // text still ends at or before it, because where the text ends — the left
+    // side plus whole cells — is a whole pixel not past `width − reserve`, so
+    // not past its floor either.
+    let right = f64::from(inset.right).max(f64::from(reserve_px));
+    let grid_width = width_px - f64::from(inset.left) - right;
+    // The dock spans the ruler, never the track: the bar stops at its top.
+    let dock_width = width_px - f64::from(cell.side_left_px()) - f64::from(cell.side_right_px());
     // The dock share is also **in `f64`** and for the same reason: in a window
     // shorter than the dock the difference goes negative, the division stays
     // negative and `as u16` saturates it to zero — `Session::resize` already
@@ -141,13 +154,17 @@ pub fn split_into_grid(
     // it rewritten here it would diverge for one frame on resize — the same
     // discipline as consuming `DOCK_ROWS`, no second copy is kept.
     //
-    // The top edge's reserve is subtracted the same way: it is a pixel height
-    // like the dock's share, and the window that cannot hold it gets no rows.
-    let usable_height = height_px - f64::from(bt_gpu::dock_px(dock_rows, cell)) - f64::from(top_px);
+    // The top edge's reserve and the grid's foot are subtracted the same way:
+    // pixel heights like the dock's share, and the window that cannot hold
+    // them gets no rows.
+    let usable_height = height_px
+        - f64::from(bt_gpu::dock_px(dock_rows, cell))
+        - f64::from(top_px)
+        - f64::from(inset.foot);
     Grid {
         cols: (grid_width / f64::from(cell_w)) as u16,
         rows: (usable_height / f64::from(cell_h)) as u16,
-        dock_cols: (usable_width / f64::from(cell_w)) as u16,
+        dock_cols: (dock_width / f64::from(cell_w)) as u16,
         context: context_strip(width_px, cell),
         cell,
     }
@@ -254,40 +271,99 @@ mod tests {
     }
 
     #[test]
-    fn the_gutter_costs_columns() {
-        // The left gutter is deducted from columns: so the stripe does not
-        // sit on top of the text. 900 pixels, 9-pixel cells → 100 columns with no gutter; an 8-pixel
-        // gutter takes one column, and so does 9 pixels (a full cell).
+    fn the_frame_costs_columns_on_both_sides_and_a_row_at_the_foot() {
+        // The grid's frame is deducted on three sides: the left so the stripe
+        // does not sit on top of the text, the right so the last column stops
+        // where the dock's text does, the foot so the bottom row keeps the
+        // dock's breathing room. 900 × 600 pixels, 9×18 cells → 100 columns and
+        // 33 rows with no frame; an 8-pixel frame leaves `884 / 9 = 98`
+        // columns and `592 / 18 = 32` rows.
         let plain = split_into_grid(900.0, 600.0, metrics(9, 18, 0), NO_DOCK, NO_RESERVE, NO_TOP);
-        let gutter = split_into_grid(900.0, 600.0, metrics(9, 18, 8), NO_DOCK, NO_RESERVE, NO_TOP);
-        assert_eq!(plain.cols, 100);
-        assert_eq!(gutter.cols, 99, "the gutter takes one column");
-        // Rows **do not see** the gutter as a left margin: it is only on the left.
+        let framed = split_into_grid(900.0, 600.0, metrics(9, 18, 8), NO_DOCK, NO_RESERVE, NO_TOP);
+        assert_eq!((plain.cols, plain.rows), (100, 33));
+        assert_eq!(framed.cols, 98, "the two sides take two columns");
+        assert_eq!(framed.rows, 32, "the foot takes a row");
         // The top edge's reserve, which in `Fade` is the gutter again, is its own
         // parameter (`top_px`, zero here) and its own test
         // (`the_fade_keeps_the_margin_free_at_the_top_and_takes_the_leftover`).
-        assert_eq!(gutter.rows, plain.rows);
-        // The gutter travels with the metrics: the value that built the grid gives it back
-        // and the draw origin and mouse mapping read the same value.
-        assert_eq!(gutter.cell.gutter_px(), 8);
+        // The frame travels with the metrics: the value that built the grid
+        // gives it back and the draw origin and mouse mapping read the same value.
+        assert_eq!(
+            framed.cell.grid_inset(),
+            bt_gpu::GridInset {
+                left: 8,
+                right: 8,
+                foot: 8
+            }
+        );
+    }
+
+    #[test]
+    fn the_grid_ends_inside_the_docks_right_margin_at_every_width() {
+        // A 20.5 pt corner at @2x, 17 px cells: 25 px of margin each side. The
+        // grid's last column never passes the dock's right margin, and what the
+        // width leaves under a column stays inside it — the room after the
+        // text is the margin plus less than a cell, never less than the margin.
+        let cell = CellMetrics::new(17, 40, 13, 16, 1, 2.0)
+            .expect("non-zero cell")
+            .with_corners(20.5, 20.5);
+        for width in 1700_u32..1800 {
+            let g = split_into_grid(
+                f64::from(width),
+                1200.0,
+                cell,
+                DOCK_ROWS,
+                NO_RESERVE,
+                NO_TOP,
+            );
+            let text_end = 25 + u32::from(g.cols) * 17;
+            assert!(text_end + 25 <= width, "{width}: past the margin");
+            assert!(
+                width - text_end - 25 < 17,
+                "{width}: a whole column left out"
+            );
+            // The dock's input row counts the same strip.
+            assert_eq!(g.dock_cols, g.cols, "{width}");
+        }
+        // The window the measure was taken in: 900 pt is 104 columns to the
+        // edge but 102 inside the margin, 16 px of leftover after them.
+        let g = split_into_grid(1800.0, 1200.0, cell, DOCK_ROWS, NO_RESERVE, NO_TOP);
+        assert_eq!(g.cols, 102);
+        assert_eq!(1800 - 25 - u32::from(g.cols) * 17, 25 + 16);
+    }
+
+    #[test]
+    fn a_grid_frame_of_its_own_moves_the_grid_and_not_the_dock() {
+        // The hook a dockless state would use: with no frame the grid runs to
+        // the edges and keeps no foot, the dock's columns stay on the ruler.
+        let ruled = CellMetrics::new(9, 18, 9, 8, 1, 1.0).expect("non-zero cell");
+        let flush = ruled.with_grid_inset(bt_gpu::GridInset::ZERO);
+        let (a, b) = (
+            split_into_grid(900.0, 600.0, ruled, NO_DOCK, NO_RESERVE, NO_TOP),
+            split_into_grid(900.0, 600.0, flush, NO_DOCK, NO_RESERVE, NO_TOP),
+        );
+        assert_eq!((a.cols, a.rows), (98, 32));
+        assert_eq!((b.cols, b.rows), (100, 33));
+        assert_eq!(b.dock_cols, a.dock_cols, "the dock left its ruler");
     }
 
     #[test]
     fn a_round_corner_costs_columns_beyond_the_gutter_and_only_sideways() {
-        // A 20.5 pt corner at @2x: the margin is 25 px beside a 16 px gutter.
-        // At 1780 px of 18 px cells the gutter leaves exactly 98 columns
-        // (1764 / 18) and the corner's margin only 97.5 of them.
+        // A 20.5 pt corner at @2x: the margin is 25 px beside a 16 px gutter,
+        // on both sides. At 1796 px of 18 px cells the gutter leaves exactly
+        // 98 columns (1764 / 18) and the corner's margins only 97 of them.
         let flat = CellMetrics::new(18, 36, 18, 16, 1, 2.0).expect("non-zero cell");
         let round = flat.with_corners(20.5, 20.5);
         assert_eq!(round.side_left_px(), 25);
-        let at = |cell| split_into_grid(1780.0, 1200.0, cell, DOCK_ROWS, NO_RESERVE, NO_TOP);
+        let at = |cell| split_into_grid(1796.0, 1200.0, cell, DOCK_ROWS, NO_RESERVE, NO_TOP);
         let (flat_grid, round_grid) = (at(flat), at(round));
-        assert_eq!(flat_grid.cols, 98, "(1780 - 16) / 18");
-        assert_eq!(round_grid.cols, 97, "(1780 - 25) / 18");
+        assert_eq!(flat_grid.cols, 98, "(1796 - 2 * 16) / 18");
+        assert_eq!(round_grid.cols, 97, "(1796 - 2 * 25) / 18");
         // The dock's width follows the same margin.
         assert_eq!(flat_grid.dock_cols, 98);
         assert_eq!(round_grid.dock_cols, 97);
-        // Rows are the gutter's arithmetic: a corner does not change them.
+        // Rows are the gutter's arithmetic — the dock's share and the grid's
+        // foot: a corner does not change them.
         assert_eq!(round_grid.rows, flat_grid.rows);
         assert_eq!(
             bt_gpu::dock_px(DOCK_ROWS, round),
@@ -296,6 +372,7 @@ mod tests {
         // The metrics travel with the grid: the draw origin and the mouse
         // read the margin the columns were counted with.
         assert_eq!(round_grid.cell.side_left_px(), 25);
+        assert_eq!(round_grid.cell.grid_inset().left, 25);
     }
 
     #[test]
@@ -315,10 +392,11 @@ mod tests {
             NO_RESERVE,
             NO_TOP,
         );
-        // 600 / 18 = 33.3 → 33.
-        assert_eq!(without.rows, 33);
+        // The grid's foot alone: (600 − 8) / 18 = 32.9 → 32.
+        assert_eq!(without.rows, 32);
         // The dock takes **two rows, two breathing gutters and one row gap**:
-        // 2×18 + 2×8 + 16 = 68 px, i.e. 532 / 18 = 29.5 → 29. The row gap
+        // 2×18 + 2×8 + 16 = 68 px, and the foot 8 more, i.e. 524 / 18 = 29.1 →
+        // 29. The row gap
         // (`dock_row_gap`) is **twice** the outer gutter, because a line
         // passes through its middle and one gutter falls on each side of the line; if left out of the sum
         // it would come to 52 px, which gives 30 rows and the difference becomes **visible**.
@@ -342,14 +420,15 @@ mod tests {
         let edge = |height: f64, dock_rows: u16, rows: u16| {
             bt_gpu::edge_drawn_px(ContentEdge::Fade, height as f32, dock_rows, rows, cell)
         };
-        // (height, dock, rows cut, rows faded, the fade)
-        // 600 with the dock: 532 / 18 = 29.5, a 10 px leftover — the same rows.
-        // 596 with the dock: 528 / 18 = 29.3, a 6 px leftover — a row less.
-        // 600 without: 600 / 18 = 33.3, a 6 px leftover — a row less.
+        // (height, dock, rows cut, rows faded, the fade), the grid's 8 px foot
+        // kept free in both modes:
+        // 608 with the dock: 532 / 18 = 29.6, a 10 px leftover — the same rows.
+        // 604 with the dock: 528 / 18 = 29.3, a 6 px leftover — a row less.
+        // 590 without: 582 / 18 = 32.3, a 6 px leftover — a row less.
         for (height, dock_rows, cut_rows, fade_rows, fade_px) in [
-            (600.0, DOCK_ROWS, 29, 29, 10.0),
-            (596.0, DOCK_ROWS, 29, 28, 24.0),
-            (600.0, NO_DOCK, 33, 32, 24.0),
+            (608.0, DOCK_ROWS, 29, 29, 10.0),
+            (604.0, DOCK_ROWS, 29, 28, 24.0),
+            (590.0, NO_DOCK, 32, 31, 24.0),
         ] {
             let cut = split_into_grid(900.0, height, cell, dock_rows, NO_RESERVE, NO_TOP);
             let fade = split_into_grid(900.0, height, cell, dock_rows, NO_RESERVE, top);
@@ -400,31 +479,32 @@ mod tests {
 
     #[test]
     fn the_always_up_scroll_bar_costs_grid_columns_and_not_dock_columns() {
-        // 900 px, 9 px cells, an 8 px gutter: 99 columns. The always-up
-        // form's track is 16 pt — 16 px at @1x — so the grid ends at 892 px
-        // − 16: 876 / 9 = 97 columns. The dock below the track keeps the
-        // window's 99, and the rows do not see the track at all.
+        // 900 px, 9 px cells, an 8 px frame: 98 columns. The always-up
+        // form's track is 16 pt — 16 px at @1x — wider than the 8 px right
+        // side, so it takes the side's place: `(900 − 8 − 16) / 9 = 97`
+        // columns. The dock below the track keeps its 98, and the rows do not
+        // see the track at all.
         let cell = metrics(9, 18, 8);
         let reserve = ScrollbarMode::Always.reserve_px(cell);
         let plain = split_into_grid(900.0, 600.0, cell, DOCK_ROWS, NO_RESERVE, NO_TOP);
         let always = split_into_grid(900.0, 600.0, cell, DOCK_ROWS, reserve, NO_TOP);
-        assert_eq!((plain.cols, plain.dock_cols), (99, 99));
+        assert_eq!((plain.cols, plain.dock_cols), (98, 98));
         assert_eq!(always.cols, 97, "the track's columns stayed in the grid");
-        assert_eq!(always.dock_cols, 99, "the dock lost columns to the track");
+        assert_eq!(always.dock_cols, 98, "the dock lost columns to the track");
         assert_eq!(always.rows, plain.rows, "the track took rows");
         // The text ends left of the track: nothing runs under the bar.
-        let text_end = f64::from(cell.gutter_px()) + f64::from(always.cols) * 9.0;
+        let text_end = f64::from(cell.grid_inset().left) + f64::from(always.cols) * 9.0;
         assert!(text_end <= 900.0 - f64::from(reserve), "{text_end}");
         // The self-hiding forms reserve nothing.
         for mode in [ScrollbarMode::Auto, ScrollbarMode::Never] {
             let grid =
                 split_into_grid(900.0, 600.0, cell, DOCK_ROWS, mode.reserve_px(cell), NO_TOP);
-            assert_eq!((grid.cols, grid.dock_cols), (99, 99), "{mode:?}");
+            assert_eq!((grid.cols, grid.dock_cols), (98, 98), "{mode:?}");
         }
-        // Narrower than the gutter and the track: no columns — the
+        // Narrower than the frame and the track: no columns — the
         // subtraction is `f64` and saturates, it does not wrap to 65535.
         let narrow = split_into_grid(20.0, 600.0, cell, NO_DOCK, reserve, NO_TOP);
-        assert_eq!((narrow.cols, narrow.dock_cols), (0, 1));
+        assert_eq!((narrow.cols, narrow.dock_cols), (0, 0));
     }
 
     #[test]
@@ -463,7 +543,7 @@ mod tests {
         );
         assert_eq!(g.rows, 0);
         // Columns stand: a short window eliminates only rows.
-        assert_eq!(g.cols, 99);
+        assert_eq!(g.cols, 98);
     }
 
     #[test]
@@ -560,7 +640,7 @@ mod tests {
         let g = split_into_grid(4.0, 600.0, metrics(9, 18, 8), NO_DOCK, NO_RESERVE, NO_TOP);
         assert_eq!(g.cols, 0);
         // Rows stand: a narrow window eliminates only columns.
-        assert_eq!(g.rows, 33);
+        assert_eq!(g.rows, 32);
     }
 
     #[test]

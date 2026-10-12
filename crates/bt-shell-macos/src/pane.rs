@@ -4058,7 +4058,9 @@ impl TerminalPane {
     /// for the same reason as the scroll bar's: a larger limit would not fit
     /// split layouts saved before it and would reset them. Where the content
     /// fades at the top, the smallest pane can therefore have a row less than
-    /// [`MIN_PANE_ROWS`].
+    /// [`MIN_PANE_ROWS`]. **And without the grid's right side and foot**
+    /// ([`CellMetrics::grid_inset`]), the same reason again: the smallest pane
+    /// can have a column or two and a row less than the two constants.
     pub fn min_size(&self) -> Option<NSSize> {
         let scale = self.window()?.backingScaleFactor();
         let cell = self.cell_metrics(scale);
@@ -4069,7 +4071,8 @@ impl TerminalPane {
             .borrow()
             .as_ref()
             .map_or(self.ivars().dock_rows.get(), |birth| birth.integration.1);
-        let width = f64::from(cell.side_left_px()) + f64::from(MIN_PANE_COLS) * f64::from(cell_w);
+        let width =
+            f64::from(cell.grid_inset().left) + f64::from(MIN_PANE_COLS) * f64::from(cell_w);
         let height = f64::from(bt_gpu::dock_px(dock_rows, cell))
             + f64::from(MIN_PANE_ROWS) * f64::from(cell_h);
         Some(NSSize::new(width / scale, height / scale))

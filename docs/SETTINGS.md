@@ -582,8 +582,9 @@ the first line has gone into history.
   it out about a second after the last scroll. Output arriving below never
   shows it, and while it waits to fade the window draws nothing.
 - `"always"` keeps a wider bar on screen in a faint track of its own, and the
-  text makes room for the track: the grid has that many fewer columns, so
-  nothing runs under the bar. The dock below stays full width. The track is
+  text makes room for the track: it stops left of the track instead of at
+  the dock's right margin, so nothing runs under the bar. The dock below
+  stays full width. The track is
   kept in full-screen programs and before there is history too, empty, so a
   program never sees its window resized when it starts or exits.
 - `"never"` never shows it.

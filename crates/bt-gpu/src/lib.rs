@@ -77,7 +77,7 @@ pub use frame::{
     context_shift_px, dock_px, edge_ceiling_rows, edge_drawn_px, edge_fades, edge_reserve_px,
 };
 pub use link::{DisplayLink, Layout, Origin, Pacer, TickTarget, Ticker, Waker};
-pub use metrics::{CellMetrics, FontNotice, family_notice};
+pub use metrics::{CellMetrics, FontNotice, GridInset, family_notice};
 pub use renderer::Renderer;
 pub use scrollbar::{Mode as ScrollbarMode, ScrollbarLayout, strip_px as scrollbar_strip_px};
 pub use stats::{MIN_SAMPLES, Samples, Stats};

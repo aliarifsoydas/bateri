@@ -37,17 +37,55 @@ pub fn family_notice(family: &str) -> Option<FontNotice> {
     bt_atlas::family_issue(family).map(FontNotice::from)
 }
 
+/// The frame the grid's text keeps inside its pane, in pixels: how far its
+/// first column starts from the left edge, how far its last column may come
+/// to the right edge, and how much clear room its bottom row keeps above
+/// whatever is under it — the dock's top, or the pane's bottom edge where no
+/// dock is drawn.
+///
+/// **The grid's own value, apart from the dock's margins** (the ruler,
+/// [`CellMetrics::side_left_px`]): today [`CellMetrics::with_corners`] builds
+/// it from the ruler — the grid's sides are the dock's sides and its foot is
+/// the dock's breathing room, so the two surfaces line up on both sides and
+/// mirror each other across the dock's top — but a state that wants the text
+/// elsewhere (edge to edge, say) changes this one value
+/// ([`CellMetrics::with_grid_inset`]) and every grid reader follows. Only in
+/// a state **without a dock**: with one, the grid leaving the ruler would
+/// stand its text off the dock's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GridInset {
+    /// From the pane's left edge to the grid's first column.
+    pub left: u16,
+    /// The least room between the grid's last column and the pane's right
+    /// edge; the columns' sub-cell leftover comes on top of it.
+    pub right: u16,
+    /// The clear room between the grid's bottom row and what is below it.
+    pub foot: u16,
+}
+
+impl GridInset {
+    /// No frame: the grid starts at the pane's left edge and runs to its
+    /// right and bottom edges.
+    pub const ZERO: Self = Self {
+        left: 0,
+        right: 0,
+        foot: 0,
+    };
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CellMetrics {
     cell_px: (u16, u16),
     context_cell_px: u16,
     gutter_px: u16,
-    /// The left and right margins the grid and the dock start and end
-    /// inside, in pixels — the **horizontal** margin, kept apart from the
-    /// gutter ([`CellMetrics::side_left_px`]). Both equal the gutter until
-    /// [`CellMetrics::with_corners`] says the pane's bottom corners are round.
+    /// The dock's left and right margins, in pixels — the **horizontal**
+    /// ruler, kept apart from the gutter ([`CellMetrics::side_left_px`]). Both
+    /// equal the gutter until [`CellMetrics::with_corners`] says the pane's
+    /// bottom corners are round.
     side_left_px: u16,
     side_right_px: u16,
+    /// The grid's frame ([`GridInset`]): the ruler and the gutter today.
+    grid_inset: GridInset,
     rule_px: u16,
     /// Physical pixels per point — the backing scale the atlas was opened at.
     ///
@@ -106,6 +144,7 @@ impl PartialEq for CellMetrics {
             && self.gutter_px == other.gutter_px
             && self.side_left_px == other.side_left_px
             && self.side_right_px == other.side_right_px
+            && self.grid_inset == other.grid_inset
             && self.rule_px == other.rule_px
             && self.scale.to_bits() == other.scale.to_bits()
     }
@@ -159,6 +198,11 @@ impl CellMetrics {
             gutter_px: gutter,
             side_left_px: gutter,
             side_right_px: gutter,
+            grid_inset: GridInset {
+                left: gutter,
+                right: gutter,
+                foot: gutter,
+            },
             rule_px: rule,
             scale,
         })
@@ -203,12 +247,34 @@ impl CellMetrics {
     /// row gap and the top fade stay on the gutter ([`CellMetrics::gutter_px`]).
     /// Pixels come from the gutter's own conversion ([`points_px`]), so at a
     /// fractional scale the margin and the gutter cannot round apart.
+    ///
+    /// **The grid's frame is rebuilt from the ruler here** ([`GridInset`]):
+    /// its sides are the two margins and its foot the gutter, so the grid's
+    /// text keeps the dock's distance from the curve too — its bottom row
+    /// stands `gutter` above the pane's bottom edge where no dock is drawn,
+    /// which is the height the concentric rule assumes. A state that wants
+    /// another frame sets it after this ([`CellMetrics::with_grid_inset`]).
     pub fn with_corners(self, left_pt: f64, right_pt: f64) -> Self {
+        let side_left_px = side_px(self.gutter_px, left_pt, self.scale);
+        let side_right_px = side_px(self.gutter_px, right_pt, self.scale);
         Self {
-            side_left_px: side_px(self.gutter_px, left_pt, self.scale),
-            side_right_px: side_px(self.gutter_px, right_pt, self.scale),
+            side_left_px,
+            side_right_px,
+            grid_inset: GridInset {
+                left: side_left_px,
+                right: side_right_px,
+                foot: self.gutter_px,
+            },
             ..self
         }
+    }
+
+    /// These metrics with the grid's frame replaced: every grid reader — the
+    /// columns, the rows, the draw origin, the mouse, the padding's paint —
+    /// follows; the dock keeps the ruler. The doc of [`GridInset`] says when
+    /// a frame other than the ruler's is sound.
+    pub fn with_grid_inset(self, grid_inset: GridInset) -> Self {
+        Self { grid_inset, ..self }
     }
 
     /// (width, height).
@@ -237,19 +303,28 @@ impl CellMetrics {
         self.gutter_px
     }
 
-    /// The margin on the left that the grid and the dock start **after**, in
-    /// pixels: the gutter on a square corner, more where the corner is round
-    /// ([`CellMetrics::with_corners`]). Every horizontal reader — the draw
-    /// origin, the mouse mapping, the column count — reads it from here; the
-    /// vertical ones stay on [`CellMetrics::gutter_px`].
+    /// The dock's left margin — the ruler — in pixels: the gutter on a square
+    /// corner, more where the corner is round ([`CellMetrics::with_corners`]).
+    /// Every horizontal reader of the dock — its cells, its columns, the
+    /// context row, the mouse on it — reads it from here; the grid reads its
+    /// own frame ([`CellMetrics::grid_inset`]), which is this ruler today.
     pub fn side_left_px(self) -> u16 {
         self.side_left_px
     }
 
-    /// The margin on the right, the same rule as [`CellMetrics::side_left_px`]
-    /// with the bottom right corner.
+    /// The dock's right margin, the same rule as [`CellMetrics::side_left_px`]
+    /// with the bottom right corner: the input row's columns and the context
+    /// row's trailing zone end inside it.
     pub fn side_right_px(self) -> u16 {
         self.side_right_px
+    }
+
+    /// The grid's frame ([`GridInset`]): where its first column starts, the
+    /// least room after its last one and the room under its bottom row. Every
+    /// grid reader — the column and row arithmetic, the draw origin, the
+    /// mouse, the padding's paint, the top fade's height — reads it from here.
+    pub fn grid_inset(self) -> GridInset {
+        self.grid_inset
     }
 
     /// The thickness of the rule line, in pixels — the font's **own**
@@ -393,5 +468,43 @@ mod tests {
         // not grow with the corner.
         assert_eq!(metrics.gutter_px(), 16);
         assert_eq!(metrics.cell_px(), (9, 18));
+    }
+
+    #[test]
+    fn the_grid_frame_is_the_ruler_and_the_gutter() {
+        // Before the corners: the gutter on every side and under the grid.
+        assert_eq!(
+            flat(2.0).grid_inset(),
+            GridInset {
+                left: 16,
+                right: 16,
+                foot: 16
+            }
+        );
+        // Beside the corners: the dock's margins on the sides, the dock's
+        // breathing room under the grid — the two surfaces line up.
+        let round = flat(2.0).with_corners(20.5, 0.0);
+        let inset = round.grid_inset();
+        assert_eq!((inset.left, inset.right), (25, 16));
+        assert_eq!(
+            (inset.left, inset.right),
+            (round.side_left_px(), round.side_right_px())
+        );
+        assert_eq!(inset.foot, round.gutter_px());
+    }
+
+    #[test]
+    fn a_grid_frame_of_its_own_leaves_the_ruler() {
+        // The hook a dockless state would use: the grid runs edge to edge,
+        // the dock's margins stay where the corners put them, and the change
+        // is geometry.
+        let round = flat(2.0).with_corners(20.5, 20.5);
+        let flush = round.with_grid_inset(GridInset::ZERO);
+        assert_eq!(flush.grid_inset(), GridInset::ZERO);
+        assert_eq!((flush.side_left_px(), flush.side_right_px()), (25, 25));
+        assert_eq!(flush.gutter_px(), 16);
+        assert_ne!(flush, round);
+        // Corners told again rebuild the frame from the ruler.
+        assert_eq!(flush.with_corners(20.5, 20.5), round);
     }
 }

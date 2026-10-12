@@ -175,9 +175,50 @@ impl OutOfGrid {
 /// starting at the grid's left thus includes cell 0 in the selection; a
 /// "fix" moving to `rem_euclid` would turn the remainder positive and leave
 /// it out (the `dragging_left_of_the_grid_clamps_to_the_left_half` guard).
+///
+/// The grid's columns start on the grid's frame ([`CellMetrics::grid_inset`]);
+/// the dock's input block asks the same arithmetic from the ruler
+/// ([`dock_point_to_cell`]).
 pub(crate) fn point_to_cell(
     view_px: (f64, f64),
     metrics: CellMetrics,
+    origin_px: f64,
+    outside: OutOfGrid,
+    scale: f64,
+    cols: u16,
+    rows: u16,
+) -> Option<SelectionPoint> {
+    let left = metrics.grid_inset().left;
+    cell_at(
+        view_px, metrics, left, origin_px, outside, scale, cols, rows,
+    )
+}
+
+/// [`point_to_cell`] for the dock's input block: its columns start on the
+/// dock's left margin ([`CellMetrics::side_left_px`]), where the drawing puts
+/// the dock's cells.
+pub(crate) fn dock_point_to_cell(
+    view_px: (f64, f64),
+    metrics: CellMetrics,
+    origin_px: f64,
+    outside: OutOfGrid,
+    scale: f64,
+    cols: u16,
+    rows: u16,
+) -> Option<SelectionPoint> {
+    let left = metrics.side_left_px();
+    cell_at(
+        view_px, metrics, left, origin_px, outside, scale, cols, rows,
+    )
+}
+
+/// The one body of [`point_to_cell`] and [`dock_point_to_cell`]: `left_px`
+/// is the surface's horizontal start.
+#[allow(clippy::too_many_arguments)]
+fn cell_at(
+    view_px: (f64, f64),
+    metrics: CellMetrics,
+    left_px: u16,
     origin_px: f64,
     outside: OutOfGrid,
     scale: f64,
@@ -192,7 +233,7 @@ pub(crate) fn point_to_cell(
     // The view is `isFlipped`, so y arrives in the grid's direction (from the
     // top): no flipping back. The grid's size is told by `cols`/`rows`, not
     // the view - a point in the window margin sticks to the last cell.
-    let x = view_px.0 * scale - f64::from(metrics.side_left_px());
+    let x = view_px.0 * scale - f64::from(left_px);
     // The vertical origin is subtracted the same way as the padding and **in
     // `f64`**: with bottom-sticking the blank area is **at the top** and on a
     // click there the difference goes negative. Done in `u16` it would
@@ -254,7 +295,7 @@ pub(crate) fn cover_of(
     let (cell_w, cell_h) = metrics.cell_px();
     let (cell_w, cell_h) = (f64::from(cell_w.max(1)), f64::from(cell_h.max(1)));
     let first_row = ((bottom_px - origin_px) / cell_h).ceil();
-    let from_col = ((left_px - f64::from(metrics.side_left_px())) / cell_w).floor();
+    let from_col = ((left_px - f64::from(metrics.grid_inset().left)) / cell_w).floor();
     SearchCover {
         // `as` saturates: no overflow in a giant window either.
         first_row: first_row as i32,
@@ -2533,7 +2574,7 @@ impl BateriView {
                 1,
             ),
         };
-        point_to_cell((point.x, point.y), metrics, top, outside, scale, cols, rows)
+        dock_point_to_cell((point.x, point.y), metrics, top, outside, scale, cols, rows)
     }
 
     /// A key, a press, the wheel or a mouse move: the remote load indicator
@@ -2879,7 +2920,7 @@ mod tests {
         let top = crate::view::dock_input_top_px(600.0, cell, bt_gpu::DOCK_ROWS);
         let last = grid.dock_cols - 1;
         let x = f64::from(cell.side_left_px()) + (f64::from(last) + 0.25) * 9.0;
-        let hit = crate::view::point_to_cell(
+        let hit = crate::view::dock_point_to_cell(
             (x, top + 4.0),
             cell,
             top,
@@ -2921,7 +2962,7 @@ mod tests {
         let click = (40.0, height - 9.0);
         let dock_top = height + f64::from(metrics.gutter_px());
         assert_eq!(
-            point_to_cell(click, metrics, dock_top, OutOfGrid::Reject, 1.0, 40, 0),
+            dock_point_to_cell(click, metrics, dock_top, OutOfGrid::Reject, 1.0, 40, 0),
             None,
             "a zero-row dock takes no point"
         );

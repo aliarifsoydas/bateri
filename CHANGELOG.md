@@ -12,6 +12,22 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+### Changed
+
+- **The text keeps the same margins as the dock, on every side.** The right
+  edge of the text used to run almost to the window's edge, a few points
+  from it and a different amount at every width, while the dock's own text
+  stopped well inside; now the text stops where the dock's text does, and
+  whatever the width leaves under a column stays inside that margin. The
+  bottom row also keeps the dock's breathing room above the dock instead of
+  touching it, and where the dock steps aside — Claude Code and other
+  programs that read the keyboard themselves, full-screen programs such as
+  vim or htop, vim on a server over ssh — the last row now stands that same
+  margin above the window's bottom or the status bar's line, so the window's
+  rounded corner no longer clips the last column. Programs that paint their
+  own background still reach the window's edges. The cost is a column or two
+  and sometimes a row fewer in the same window.
+
 ## [0.14.0] - 2026-10-12
 
 ### Changed

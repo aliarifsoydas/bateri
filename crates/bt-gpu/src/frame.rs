@@ -856,9 +856,9 @@ pub fn edge_reserve_px(edge: ContentEdge, cell: CellMetrics) -> f32 {
 
 /// The **drawn** height of the content's top fade, in pixels from the
 /// window's top: the whole leftover the grid's rows leave above them once the
-/// grid sits on the dock's PTY share — `band_top(height, dock_px(share)) −
-/// rows · cell`, clamped at zero. Zero in `Line` and `Cut`: the leftover stays
-/// below the grid and nothing fades.
+/// grid sits its foot above the dock's PTY share — `band_top(height,
+/// dock_px(share)) − foot − rows · cell`, clamped at zero. Zero in `Line` and
+/// `Cut`: the leftover stays below the grid and nothing fades.
 ///
 /// `dock_rows` is the PTY share's rows (the number the row arithmetic
 /// subtracted, one on a remote alternate screen), not the drawn band's; `rows`
@@ -877,8 +877,10 @@ pub fn edge_drawn_px(
     if !edge_fades(edge) {
         return 0.0;
     }
-    (band_top(height_px, dock_px(dock_rows, cell)) - f32::from(rows) * f32::from(cell.cell_px().1))
-        .max(0.0)
+    (band_top(height_px, dock_px(dock_rows, cell))
+        - f32::from(cell.grid_inset().foot)
+        - f32::from(rows) * f32::from(cell.cell_px().1))
+    .max(0.0)
 }
 
 /// How many history rows the fill band must stand above the grid's top to
@@ -1034,44 +1036,6 @@ fn dock_height(rows: u16, cell_h: f32, pad: f32) -> f32 {
     }
     let gap = if rows >= 2 { dock_row_gap(pad) } else { 0.0 };
     f32::from(rows) * cell_h + 2.0 * pad + gap
-}
-
-/// The **breath** between the grid's bottom row and the top of a dock band
-/// that is shorter than its share, in pixels: how much higher than the band's
-/// top the grid stops.
-///
-/// A remote session's band is the context row alone and the grid is drawn
-/// lower by the input row it gave up; lowered all the way, the remote
-/// prompt's row — and the block caret on it — stood glued to the band's top
-/// line (the user: "zero contact"). Keeping one `pad` of that drop above the
-/// line mirrors the `pad` below it, the dock's own breathing room, and costs
-/// no row: the share already holds it.
-///
-/// **A function of the band's current excess, not of its shape**, so it rides
-/// the band's animation with no state of its own: zero at rest with one input
-/// row or more (`excess ≥ 0`, nothing to spare), rising to `pad` at the
-/// remote shape's drop (one cell plus the row gap) and falling back to zero
-/// at the whole share (no band: a program reading the keyboard itself keeps
-/// its grid on the window's bottom). Both legs keep the grid's drop
-/// (`−excess − breath`) rising with the excess, so a slide never turns back.
-/// A one-row share (a remote alternate screen) has no input row to give up:
-/// zero. Rounded to whole pixels, like the excess itself, so the grid stays
-/// on the device grid.
-///
-/// The formula's single copy; its two readers are the grid's origin
-/// ([`Frame::grid_breath`]) and the grid caret's target (`link.rs`'s
-/// `grid_caret_at`) — the caret target gives the origin back, so a copy that
-/// diverged would stand the caret off its letter.
-pub(crate) fn grid_breath_px(excess_px: f32, share_rows: u16, cell_h: f32, pad: f32) -> f32 {
-    let share = dock_height(share_rows, cell_h, pad);
-    let remote = dock_height(2, cell_h, pad) - dock_height(1, cell_h, pad);
-    let drop = -excess_px;
-    if drop <= 0.0 || share <= remote {
-        return 0.0;
-    }
-    let rise = drop / remote;
-    let fall = (share - drop) / (share - remote);
-    (pad * rise.min(fall).clamp(0.0, 1.0)).round()
 }
 
 /// The gap **between** the dock's rows, in pixels.
@@ -1256,7 +1220,7 @@ pub(crate) struct Frame {
     caret_style: CaretStyle,
     /// The gutter: the dock's breathing room, the row gap, the top fade and
     /// the caret glow are measured in it (the **vertical** margin; the
-    /// horizontal start is `side_left_px`).
+    /// horizontal starts are `side_left_px` and `grid_left_px`).
     ///
     /// A value [`Frame::clear`] carries rather than a field, for the same
     /// reason as `cell_px` (both arrive with one [`CellMetrics`]): when the
@@ -1264,11 +1228,15 @@ pub(crate) struct Frame {
     /// separate constant it could diverge from the `cols` computation — its
     /// having a single source for all three is the condition for the gutter.
     gutter_px: f32,
-    /// The grid's and the dock's actual left start: the gutter on a square
-    /// corner, more beside a round one ([`CellMetrics::side_left_px`]). The
-    /// horizontal readers (`pos_at`, `dock_pos`, `padding`) start here; the
-    /// vertical ones stay on `gutter_px`.
+    /// The dock's left start, the ruler: the gutter on a square corner, more
+    /// beside a round one ([`CellMetrics::side_left_px`]). The dock's cells
+    /// (`dock_pos`) start here; the vertical readers stay on `gutter_px`.
     side_left_px: f32,
+    /// The grid's left start, from its frame ([`CellMetrics::grid_inset`]):
+    /// the grid's cells, the fill band's, the stripe, the caret (`pos_at`)
+    /// and the padding's paint start here. The ruler today, so the two
+    /// surfaces' text lines up.
+    grid_left_px: f32,
     /// The grid's columns and rows in this frame (`Cursor::cols`, `rows`):
     /// the padding needs a row's last column.
     grid_cols: u16,
@@ -1697,6 +1665,7 @@ impl Frame {
         self.rule_px = f32::from(metrics.rule_px());
         self.gutter_px = f32::from(metrics.gutter_px());
         self.side_left_px = f32::from(metrics.side_left_px());
+        self.grid_left_px = f32::from(metrics.grid_inset().left);
         self.scale = metrics.scale() as f32;
         // At least a pixel: a degenerate scale must not erase the lines.
         self.separator_px = metrics.pt_px(SEPARATOR_PT).max(1.0);
@@ -1796,8 +1765,8 @@ impl Frame {
     ///
     /// **The fade is the fraction's static twin** ([`Frame::edge_px`]): it
     /// lowers the grid's whole world by the leftover the rows leave at the
-    /// pane's top, so the grid sits on the dock's share and a row at rest
-    /// never enters the fade. Like the fraction it moves the caret with the
+    /// pane's top, so the grid sits its foot above the dock's share and a row
+    /// at rest never enters the fade. Like the fraction it moves the caret with the
     /// grid — the caret's target carries it and its rectangle gives the
     /// origin back ([`Frame::grid_caret`]) — and unlike the fraction it never
     /// changes between content frames, so a motion frame keeps it. Being a
@@ -1805,28 +1774,15 @@ impl Frame {
     /// mouse's publication and the caret follow it with no second reader.
     /// Zero (`Cut`, `Line`) is today's frame.
     ///
-    /// **The breath lifts it back** ([`Frame::grid_breath`]): above a band
-    /// shorter than its share the grid stops that much short of the band's
-    /// top, and the same subtraction carries the fill band, the mouse and the
-    /// caret's slot with it.
+    /// **The grid's foot needs no term of its own**: the rows were cut with
+    /// it kept free ([`crate::CellMetrics::grid_inset`]), so it is in the fade's
+    /// height in `Fade` and in the leftover under the grid in `Cut` and
+    /// `Line`. A band shorter than its share — the remote shape, or none at
+    /// all — lowers the grid by the excess alone and the foot comes down with
+    /// it: the bottom row keeps the same room above the band's top line, or
+    /// above the window's bottom, as above the share at rest.
     pub(crate) fn origin_px(&self) -> f32 {
-        self.origin_px + self.frac_px + self.edge_px
-            - self.band_excess().unwrap_or(0.0)
-            - self.grid_breath()
-    }
-
-    /// The gap kept between the grid's bottom row and the band's top in this
-    /// frame, pixels ([`grid_breath_px`] of the band's current, clamped
-    /// excess); zero in a frame whose band was not told.
-    pub(crate) fn grid_breath(&self) -> f32 {
-        self.band_excess().map_or(0.0, |excess| {
-            grid_breath_px(
-                excess,
-                self.dock_share.unwrap_or(DOCK_ROWS),
-                self.cell_px.1,
-                self.gutter_px,
-            )
-        })
+        self.origin_px + self.frac_px + self.edge_px - self.band_excess().unwrap_or(0.0)
     }
 
     /// The height of the content's top fade, pixels from the window's top;
@@ -4012,12 +3968,12 @@ impl Frame {
     }
 
     /// The pane's padding painted with the grid's edge cells, in **window
-    /// space**: the gutter at the left, what the columns leave at the right,
-    /// above the grid and below it. A program that paints its own background
-    /// (btop, a vim colour scheme) then reaches the card's edge on every side,
-    /// instead of standing in a frame of the theme's background as wide as
-    /// the arithmetic left on each side — 8 pt at the left, a few points at
-    /// the right, the row leftover above.
+    /// space**: the grid's frame at the left, the right side and the columns'
+    /// leftover at the right, the fade's strip above the grid and its foot
+    /// below it ([`CellMetrics::grid_inset`]). A program that paints its own
+    /// background (btop, a vim colour scheme) then reaches the card's edge on
+    /// every side, instead of standing in a frame of the theme's background as
+    /// wide as the frame on each side.
     ///
     /// A row lends its ends only when the program painted it to both ends —
     /// every column a background of its own, so a shell's line with the
@@ -4044,7 +4000,7 @@ impl Frame {
             return out;
         }
         let top = self.origin_px();
-        let left = self.side_left_px;
+        let left = self.grid_left_px;
         let right = left + f32::from(cols) * w;
         let right_w = viewport[0] - right;
         let bottom = top + f32::from(rows) * h;
@@ -4224,14 +4180,15 @@ impl Frame {
     /// Had they diverged, a settled caret could drift half a pixel from the
     /// letter under it.
     ///
-    /// The left margin is also added **only here**: column 0 starts where the
-    /// margin ends and background, glyph, rule and caret all four go through
-    /// this line. Had it been added in a second place the margin would be
-    /// applied twice.
+    /// The grid's left side is also added **only here**: column 0 starts
+    /// where the grid's frame ends and background, glyph, rule and caret all
+    /// four go through this line. Had it been added in a second place the
+    /// side would be applied twice. The dock's cells start on the ruler
+    /// instead ([`Frame::dock_pos`]).
     fn pos_at(&self, at: [f32; 2]) -> [f32; 2] {
         let (w, h) = self.cell_px;
         debug_assert!(w > 0.0 && h > 0.0, "clear(metrics) was not called");
-        [self.side_left_px + at[0] * w, at[1] * h]
+        [self.grid_left_px + at[0] * w, at[1] * h]
     }
 }
 
@@ -6306,37 +6263,16 @@ mod tests {
     }
 
     #[test]
-    fn the_grid_breathes_above_a_remote_band_only() {
+    fn a_short_band_lowers_the_grid_by_its_excess_alone() {
         // @1x, 18 px cell: the share is two cells and four margins, the remote
         // band's drop one cell plus the row gap (two margins).
         let pad = f32::from(GUTTER);
         let share = dock_height(DOCK_ROWS, 18.0, pad);
         let remote = dock_height(2, 18.0, pad) - dock_height(1, 18.0, pad);
         assert_eq!((share, remote), (36.0 + 4.0 * pad, 18.0 + 2.0 * pad));
-        let breath = |excess: f32| grid_breath_px(excess, DOCK_ROWS, 18.0, pad);
-        // At rest: nothing with an input row (or more), the dock's margin over
-        // the remote band, nothing with no band at all.
-        assert_eq!(breath(0.0), 0.0, "local");
-        assert_eq!(breath(36.0), 0.0, "three input rows");
-        assert_eq!(breath(-remote), pad, "remote");
-        assert_eq!(breath(-share), 0.0, "no band");
-        // A one-row share (a remote alternate screen) has nothing to give up.
-        assert_eq!(grid_breath_px(0.0, 1, 18.0, pad), 0.0);
-        assert_eq!(grid_breath_px(-34.0, 1, 18.0, pad), 0.0);
-        // Every slide between the shapes moves the grid one way: its drop
-        // never shrinks while the band's excess falls, pixel by pixel.
-        let mut last = f32::NEG_INFINITY;
-        for px in 0..=share as u16 {
-            let excess = -f32::from(px);
-            let drop = -excess - breath(excess);
-            assert!(
-                drop >= last,
-                "the grid turned back at {excess}: {drop} < {last}"
-            );
-            assert!((0.0..=pad).contains(&breath(excess)), "{excess}");
-            last = drop;
-        }
-        // The frame reads the same function: a settled remote band.
+        // The grid's foot is not a term of the origin: a settled remote band
+        // lowers the grid by its drop and nothing else, so the foot the rows
+        // kept free under the grid comes down with it.
         let metrics = CellMetrics::new(9, 18, 9, GUTTER, 1, 1.0).expect("metrics");
         let mut frame = Frame::default();
         frame.clear(metrics, CaretStyle::default());
@@ -6344,8 +6280,24 @@ mod tests {
         frame.set_dock_band(600.0, -remote / 18.0);
         frame.open_dock(BG, CURSOR, CURSOR, BAND);
         frame.set_origin_rows(5.0);
-        assert_eq!(frame.grid_breath(), pad);
-        assert_eq!(frame.origin_px(), 5.0 * 18.0 + remote - pad);
+        assert_eq!(frame.origin_px(), 5.0 * 18.0 + remote);
+        // The fade is where the foot is: what the rows leave above them once
+        // the grid sits its foot above the share — `⌊(600 − 64 − 7 − 7) / 18⌋
+        // = 29` rows, `600 − 64 − 7 − 29·18 = 7` px of fade.
+        let foot = f32::from(metrics.grid_inset().foot);
+        assert_eq!(foot, pad);
+        let rows = ((600.0 - share - pad - foot) / 18.0) as u16;
+        assert_eq!(rows, 29);
+        assert_eq!(
+            edge_drawn_px(ContentEdge::Fade, 600.0, DOCK_ROWS, rows, metrics),
+            600.0 - share - foot - f32::from(rows) * 18.0
+        );
+        // A frame of its own moves the fade with it: no foot, a taller fade.
+        let flush = metrics.with_grid_inset(crate::GridInset::ZERO);
+        assert_eq!(
+            edge_drawn_px(ContentEdge::Fade, 600.0, DOCK_ROWS, rows, flush),
+            600.0 - share - f32::from(rows) * 18.0
+        );
     }
 
     /// A cell of a dock with three input rows: `row` 0..3 input, 3 context.

@@ -4382,16 +4382,17 @@ fn a_frame_without_the_top_edge_draws_todays_picture() {
 #[test]
 fn the_production_edge_fades_the_band_and_a_lifted_grid_and_cut_draws_todays_picture() {
     // The fade **through the content arm's seam** (`link::place_edge`), not a forced height:
-    // the mode reaching the drawn fade is what the guards above cannot see. A dock-less 64 px
+    // the mode reaching the drawn fade is what the guards above cannot see. A dock-less 70 px
     // window, a 8×12 cell and a 6 px margin, cut into rows the way the row arithmetic cuts it
-    // in `Fade`: `⌊(64 − 6) / 12⌋ = 4` rows, the 16 px leftover the fade at the top.
+    // in `Fade` — the reserve and the grid's foot kept free: `⌊(70 − 6 − 6) / 12⌋ = 4` rows,
+    // the 16 px leftover the fade at the top.
     //
     // A resting grid never enters the fade, so two frames put something there: a fill band
     // standing above the grid at rest, and the grid's own top row lifted into it (an offset of
     // minus a row — what a band taller than the share does). Direction only, the pixel tests'
     // rule for a fractional alpha: the fade's top is nearer the clear colour than its middle,
     // its middle than its bottom, and the first row under it is untouched.
-    const EDGE: usize = 64;
+    const EDGE: usize = 70;
     let r = renderer();
     let cell = grid_with_gutter(8, 12, 6);
     let rows = 4;
