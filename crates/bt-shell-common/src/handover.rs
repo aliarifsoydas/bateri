@@ -116,6 +116,7 @@ use bt_core::{Journal, JournalCut, PaneUuid};
 
 use crate::jobs::{self, ShellParent};
 use crate::journal::{BaseSink, CompactRequest, Region, Registration};
+use crate::program::identity::Kind;
 use crate::restore;
 use crate::ssh_route::{self, SUN_PATH};
 
@@ -514,6 +515,18 @@ fn write_tab(wire: &Wire<'_>, tab: &str) -> io::Result<()> {
     let len = u32::try_from(tab.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
     wire.write_all(&len.to_le_bytes())?;
     wire.write_all(tab.as_bytes())
+}
+
+/// What a pane shows it runs, on the bound connection: its kind's word the
+/// way a tab is written ([`write_tab`]), empty for none.
+fn write_program(wire: &Wire<'_>, program: Option<Kind>) -> io::Result<()> {
+    write_tab(wire, program.map_or("", Kind::word))
+}
+
+/// [`write_program`]'s inverse; a word this build does not know is none.
+fn read_program(wire: &Wire<'_>, total: &mut u64) -> Result<Option<Kind>, HandoverError> {
+    let word = read_field(wire, u64::from(wire.u32()?), WORD_LIMIT, total)?;
+    Ok(std::str::from_utf8(&word).ok().and_then(Kind::from_word))
 }
 
 /// Reads one frame: the header first (a version this binary does not know
@@ -1072,12 +1085,20 @@ fn layout_bundle(blob: &[u8]) -> Option<&str> {
 /// A pane's blob: the platform shell's state for one frozen session
 /// (`bt_core::Frozen` minus the master and the tail, which cross as the
 /// frame's fd and buffer). Versioned on its own: a new bateri reads this
-/// version and the one before it; there is none before it yet.
+/// version and the one before it.
 ///
 /// ```text
 /// "BTPS" | version u32 | cols u16 | rows u16 | flags u32 (bit 0: login)
 /// vt | core | input | history: each len u64, bytes
+/// version 2: program: len u64, its kind's word (`Kind::word`)
 /// ```
+///
+/// Version 2 carries what the pane showed it ran: the next bateri can no
+/// longer read the command's line once it has scrolled away, and the table
+/// does not see past `ssh`. **A pane with no program is written as version
+/// 1**, byte for byte: a bateri rolled back to the version before cannot
+/// read version 2 and lets that pane's program go, so only a pane that has
+/// something to carry pays for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaneState {
     /// The grid's size the VT is laid out for (`bt_core::Frozen::cols`).
@@ -1095,23 +1116,44 @@ pub struct PaneState {
     /// freeze: a pane that falls back gets it from here (in memory, so
     /// `restore_windows = "layout"` keeps its promise).
     pub history: Vec<u8>,
+    /// What the pane showed it ran (the tab's icon), while a command ran;
+    /// `None` for the shell and the server, which the next bateri tells by
+    /// itself — and which then cost no version 2.
+    pub program: Option<Kind>,
 }
 
 const PANE_MAGIC: [u8; 4] = *b"BTPS";
 
 /// The pane blob's version.
-pub const PANE_VERSION: u32 = 1;
+pub const PANE_VERSION: u32 = 2;
+
+/// The version a pane without a program is written as ([`PaneState`]).
+const PANE_PROGRAMLESS: u32 = 1;
+
+/// The longest program word the bound connection carries; [`Kind::word`]'s
+/// are far below.
+const WORD_LIMIT: u64 = 64;
 
 /// The `login` bit of a pane blob's flags.
 const LOGIN: u32 = 1;
 
 impl PaneState {
     pub fn encode(&self) -> Vec<u8> {
+        let word = self.program.map(Kind::word);
         let mut out = Vec::with_capacity(
-            32 + self.vt.len() + self.core.len() + self.input.len() + self.history.len(),
+            48 + self.vt.len()
+                + self.core.len()
+                + self.input.len()
+                + self.history.len()
+                + word.map_or(0, str::len),
         );
         out.extend_from_slice(&PANE_MAGIC);
-        out.extend_from_slice(&PANE_VERSION.to_le_bytes());
+        let version = if word.is_some() {
+            PANE_VERSION
+        } else {
+            PANE_PROGRAMLESS
+        };
+        out.extend_from_slice(&version.to_le_bytes());
         out.extend_from_slice(&self.cols.to_le_bytes());
         out.extend_from_slice(&self.rows.to_le_bytes());
         let flags = match self.parent {
@@ -1119,16 +1161,22 @@ impl PaneState {
             ShellParent::Direct => 0,
         };
         out.extend_from_slice(&flags.to_le_bytes());
-        for field in [&self.vt, &self.core, &self.input, &self.history] {
+        let word = word.map(str::as_bytes);
+        for field in [&self.vt, &self.core, &self.input, &self.history]
+            .into_iter()
+            .map(Vec::as_slice)
+            .chain(word)
+        {
             out.extend_from_slice(&(field.len() as u64).to_le_bytes());
             out.extend_from_slice(field);
         }
         out
     }
 
-    /// `None` for anything that is not exactly one blob of
-    /// [`PANE_VERSION`]: an unknown flag bit, a field past the end, a byte
-    /// past the last field.
+    /// `None` for anything that is not exactly one blob of [`PANE_VERSION`]
+    /// or the one before it: an unknown flag bit, a field past the end, a
+    /// byte past the last field. A program word this build does not know (a
+    /// newer bateri's kind) is no program, not damage.
     pub fn decode(bytes: &[u8]) -> Option<PaneState> {
         let mut rest = bytes;
         let mut take = |len: usize| -> Option<&[u8]> {
@@ -1140,7 +1188,7 @@ impl PaneState {
             return None;
         }
         let version = u32::from_le_bytes(take(4)?.try_into().ok()?);
-        if version != PANE_VERSION {
+        if version != PANE_VERSION && version != PANE_PROGRAMLESS {
             return None;
         }
         let cols = u16::from_le_bytes(take(2)?.try_into().ok()?);
@@ -1154,7 +1202,7 @@ impl PaneState {
             let len = u64::from_le_bytes(take(8)?.try_into().ok()?);
             Some(take(usize::try_from(len).ok()?)?.to_vec())
         };
-        let state = PaneState {
+        let mut state = PaneState {
             cols,
             rows,
             parent,
@@ -1162,7 +1210,12 @@ impl PaneState {
             core: field()?,
             input: field()?,
             history: field()?,
+            program: None,
         };
+        if version == PANE_VERSION {
+            let word = field()?;
+            state.program = std::str::from_utf8(&word).ok().and_then(Kind::from_word);
+        }
         rest.is_empty().then_some(state)
     }
 }
@@ -1731,20 +1784,23 @@ fn drop_duplicates(arrival: &mut Arrival) {
 //              flags u32 (bit 0: login is the child, bit 1: unconfirmed,
 //                         bit 2: journaled)
 //              taken from: len u32, socket path | blob: len u64, bytes
+//              program: len u32, word (empty: none)
 //              journaled: 'F' + region | base: cut, len u64, bytes
 //              → PANE_REFUSED tab, if the holder cannot keep it
 //              → BASE_TAKEN tab | cut, if it keeps a journaled one
 //              → BASE_REFUSED tab, if it keeps the pane but not its region
 //   DROP tab | CONFIRM tab | LAYOUT len u64, bytes
-//   STATE      tab | blob: len u64, bytes
+//   STATE      tab | blob: len u64, bytes | program: len u32, word
 //   BASE       tab | cut | base: len u64, bytes → BASE_TAKEN tab | cut,
 //              or BASE_REFUSED tab for a pane it keeps no journal of
 //   PING → PONG | QUIT
 //   HANDOVER   then a frame, byte for byte → READY or REFUSED
 // ```
 //
-// A tab is its length as `u32` and its text, as in the frame; a cut is the
-// journal's two positions, `pty u64 | side u64`. A base (`bt-core`'s,
+// A tab is its length as `u32` and its text, as in the frame, and so is a
+// program — the word of what the pane shows it runs (`Kind::word`), which a
+// crash bundle's pane state carries on; a cut is the journal's two
+// positions, `pty u64 | side u64`. A base (`bt-core`'s,
 // opaque here) replaces the pane's previous one; [`BASE_TAKEN`] is the
 // holder's word that it keeps it — only then does bateri free the journal
 // before the cut (the module doc of [`crate::journal`]).
@@ -1879,6 +1935,9 @@ pub struct BoundPane {
     /// `bt-core`'s state blob now: a crash right after the registration
     /// still leaves a bundle to give.
     pub blob: Vec<u8>,
+    /// What the pane shows it runs now ([`PaneState::program`]): a pane
+    /// carried on registers the program it brought.
+    pub program: Option<Kind>,
     /// A copy of the PTY master; sent and closed here.
     pub master: OwnedFd,
     /// The socket of the holder this pane was taken from, until that holder
@@ -1937,7 +1996,7 @@ struct Outbox {
     orders: VecDeque<Order>,
     /// The newest unsent layout and per-pane states.
     layout: Option<Vec<u8>>,
-    states: Vec<(PaneUuid, Vec<u8>)>,
+    states: Vec<(PaneUuid, Vec<u8>, Option<Kind>)>,
     /// Nothing more is queued: the writer flushes and ends.
     closed: bool,
 }
@@ -2141,7 +2200,7 @@ impl Bound {
     pub fn release(&self, tab: &PaneUuid) {
         lock(&self.shared.outbox)
             .states
-            .retain(|(pending, _)| pending != tab);
+            .retain(|(pending, ..)| pending != tab);
         lock(&self.shared.journals).retain(|(known, _)| known != tab);
         self.order(Order::Drop(tab.clone()));
     }
@@ -2164,16 +2223,20 @@ impl Bound {
         self.shared.wake.notify_all();
     }
 
-    /// A pane's newer `bt-core` state blob; only the newest unsent one per
-    /// pane is written.
-    pub fn state(&self, tab: &PaneUuid, blob: Vec<u8>) {
+    /// A pane's newer `bt-core` state blob and what it shows it runs; only
+    /// the newest unsent pair per pane is written.
+    pub fn state(&self, tab: &PaneUuid, blob: Vec<u8>, program: Option<Kind>) {
         let mut outbox = lock(&self.shared.outbox);
         if outbox.closed {
             return;
         }
-        match outbox.states.iter_mut().find(|(pending, _)| pending == tab) {
-            Some(pending) => pending.1 = blob,
-            None => outbox.states.push((tab.clone(), blob)),
+        match outbox
+            .states
+            .iter_mut()
+            .find(|(pending, ..)| pending == tab)
+        {
+            Some(pending) => (pending.1, pending.2) = (blob, program),
+            None => outbox.states.push((tab.clone(), blob, program)),
         }
         drop(outbox);
         self.shared.wake.notify_all();
@@ -2367,7 +2430,7 @@ fn write_batch(
     shared: &Shared,
     orders: VecDeque<Order>,
     layout: Option<Vec<u8>>,
-    states: Vec<(PaneUuid, Vec<u8>)>,
+    states: Vec<(PaneUuid, Vec<u8>, Option<Kind>)>,
 ) -> io::Result<()> {
     let moved = || {
         lock(&shared.news).progress += 1;
@@ -2385,10 +2448,11 @@ fn write_batch(
         write_field(wire, &layout)?;
         moved();
     }
-    for (tab, blob) in states {
+    for (tab, blob, program) in states {
         wire.write_all(&[MSG_STATE])?;
         write_tab(wire, tab.as_str())?;
         write_field(wire, &blob)?;
+        write_program(wire, program)?;
         moved();
     }
     for order in last {
@@ -2430,6 +2494,7 @@ fn write_order(wire: &Wire<'_>, order: Order) -> io::Result<()> {
             wire.write_all(&len.to_le_bytes())?;
             wire.write_all(&from)?;
             write_field(wire, &pane.blob)?;
+            write_program(wire, pane.program)?;
             if let Some(journal) = &pane.journal {
                 let registration = &journal.registration;
                 wire.arm(true)?;
@@ -2709,6 +2774,8 @@ struct Registered {
     parent: ShellParent,
     /// `bt-core`'s newest state blob.
     blob: Vec<u8>,
+    /// What the pane showed it ran, sent with the blob.
+    program: Option<Kind>,
     master: OwnedFd,
     exit: OwnedFd,
     taken_from: Option<PathBuf>,
@@ -3037,6 +3104,7 @@ impl Registry {
         let flags = wire.u32()?;
         let from = read_field(wire, u64::from(wire.u32()?), PATH_LIMIT, &mut total)?;
         let blob = read_field(wire, wire.u64()?, FIELD_LIMIT, &mut total)?;
+        let program = read_program(wire, &mut total)?;
         // The whole message is read before anything is decided: a refusal
         // must leave the stream at the next message.
         let journaled = flags & ADD_JOURNALED != 0;
@@ -3090,6 +3158,7 @@ impl Registry {
                 ShellParent::Direct
             },
             blob,
+            program,
             master,
             exit,
             taken_from,
@@ -3142,13 +3211,15 @@ impl Registry {
         Ok(())
     }
 
-    /// A pane's newer blob.
+    /// A pane's newer blob and program.
     fn state(&mut self, wire: &Wire<'_>) -> Result<(), HandoverError> {
         let mut total = 0u64;
         let tab = read_tab(wire, &mut total)?;
         let blob = read_field(wire, wire.u64()?, FIELD_LIMIT, &mut total)?;
+        let program = read_program(wire, &mut total)?;
         if let Some(pane) = self.panes.iter_mut().find(|pane| pane.tab == tab) {
             pane.blob = blob;
+            pane.program = program;
         }
         Ok(())
     }
@@ -3199,6 +3270,7 @@ fn hold_after_crash(
                 core: std::mem::take(&mut pane.blob),
                 input: Vec::new(),
                 history,
+                program: pane.program,
             };
             (state, tail)
         })
@@ -3247,6 +3319,7 @@ fn blob_len(state: &PaneState) -> u64 {
     [&state.vt, &state.core, &state.input, &state.history]
         .iter()
         .fold(48u64, |len, field| len.saturating_add(field.len() as u64))
+        .saturating_add(state.program.map_or(0, |kind| 8 + kind.word().len() as u64))
 }
 
 /// Keeps a crash bundle readable: the next bateri refuses a whole frame with
@@ -4817,6 +4890,7 @@ mod tests {
             core: b"core".to_vec(),
             input: b"ls\r".to_vec(),
             history: b"history".to_vec(),
+            program: None,
         }
     }
 
@@ -4825,27 +4899,91 @@ mod tests {
     /// flag — a half-read blob would replay a wrong screen.
     #[test]
     fn a_pane_state_round_trips_and_refuses_damage() {
-        let state = state();
-        let bytes = state.encode();
-        assert_eq!(PaneState::decode(&bytes), Some(state.clone()));
-        let direct = PaneState {
-            parent: ShellParent::Direct,
-            history: Vec::new(),
-            ..state
+        let programmed = PaneState {
+            program: Some(Kind::Agent(crate::program::identity::Agent::ClaudeCode)),
+            ..state()
         };
-        assert_eq!(PaneState::decode(&direct.encode()), Some(direct));
-        for cut in 0..bytes.len() {
-            assert_eq!(PaneState::decode(&bytes[..cut]), None, "cut at {cut}");
+        for state in [state(), programmed] {
+            let bytes = state.encode();
+            assert_eq!(PaneState::decode(&bytes), Some(state.clone()));
+            let direct = PaneState {
+                parent: ShellParent::Direct,
+                history: Vec::new(),
+                ..state
+            };
+            assert_eq!(PaneState::decode(&direct.encode()), Some(direct));
+            for cut in 0..bytes.len() {
+                assert_eq!(PaneState::decode(&bytes[..cut]), None, "cut at {cut}");
+            }
+            let mut longer = bytes.clone();
+            longer.push(0);
+            assert_eq!(PaneState::decode(&longer), None);
+            let mut version = bytes.clone();
+            version[4] = 3;
+            assert_eq!(PaneState::decode(&version), None);
+            let mut flags = bytes.clone();
+            flags[12] = 2;
+            assert_eq!(PaneState::decode(&flags), None);
         }
-        let mut longer = bytes.clone();
-        longer.push(0);
-        assert_eq!(PaneState::decode(&longer), None);
-        let mut version = bytes.clone();
-        version[4] = 2;
-        assert_eq!(PaneState::decode(&version), None);
-        let mut flags = bytes.clone();
-        flags[12] = 2;
-        assert_eq!(PaneState::decode(&flags), None);
+    }
+
+    /// A pane state as version 1 wrote it, byte for byte: the bateri before
+    /// the program wrote only this, and a bateri rolled back to it reads only
+    /// this. It stays when the format moves on.
+    const PANE_V1_FIXTURE: &[u8] = b"BTPS\x01\x00\x00\x00\x50\x00\x18\x00\x01\x00\x00\x00\
+        \x01\x00\x00\x00\x00\x00\x00\x00v\
+        \x01\x00\x00\x00\x00\x00\x00\x00c\
+        \x01\x00\x00\x00\x00\x00\x00\x00i\
+        \x01\x00\x00\x00\x00\x00\x00\x00h";
+
+    /// Version 2, byte for byte: version 1's fields, then the program's word.
+    const PANE_V2_FIXTURE: &[u8] = b"BTPS\x02\x00\x00\x00\x50\x00\x18\x00\x01\x00\x00\x00\
+        \x01\x00\x00\x00\x00\x00\x00\x00v\
+        \x01\x00\x00\x00\x00\x00\x00\x00c\
+        \x01\x00\x00\x00\x00\x00\x00\x00i\
+        \x01\x00\x00\x00\x00\x00\x00\x00h\
+        \x06\x00\x00\x00\x00\x00\x00\x00editor";
+
+    fn fixture_state(program: Option<Kind>) -> PaneState {
+        PaneState {
+            cols: 80,
+            rows: 24,
+            parent: ShellParent::Login,
+            vt: b"v".to_vec(),
+            core: b"c".to_vec(),
+            input: b"i".to_vec(),
+            history: b"h".to_vec(),
+            program,
+        }
+    }
+
+    #[test]
+    fn the_previous_pane_state_is_read_byte_for_byte() {
+        assert_eq!(
+            PaneState::decode(PANE_V1_FIXTURE),
+            Some(fixture_state(None))
+        );
+        assert_eq!(
+            PaneState::decode(PANE_V2_FIXTURE),
+            Some(fixture_state(Some(Kind::Editor)))
+        );
+        assert_eq!(fixture_state(Some(Kind::Editor)).encode(), PANE_V2_FIXTURE);
+    }
+
+    /// Only a pane with something to carry pays for version 2: a bateri
+    /// rolled back to version 1 lets go of a pane it cannot read.
+    #[test]
+    fn a_pane_without_a_program_is_written_as_the_previous_version() {
+        assert_eq!(fixture_state(None).encode(), PANE_V1_FIXTURE);
+    }
+
+    /// A newer bateri's kind is no program to this one, not a pane to drop.
+    #[test]
+    fn a_program_word_this_build_does_not_know_is_no_program() {
+        let mut newer = PANE_V2_FIXTURE.to_vec();
+        let at = newer.len() - b"editor".len();
+        newer[at..].copy_from_slice(b"future");
+        assert_eq!(PaneState::decode(&newer), Some(fixture_state(None)));
     }
 
     /// The layout blob names the bundle that wrote it: a dev package's
@@ -5344,6 +5482,7 @@ mod tests {
             start: start_time(shell.id()).expect("start time"),
             parent: ShellParent::Direct,
             blob: blob.to_vec(),
+            program: None,
             master: master.try_clone().unwrap(),
             taken_from: None,
             journal: None,
@@ -5403,7 +5542,7 @@ mod tests {
         let start = start_time(shell.id()).unwrap();
         bound.layout(b"old layout".to_vec());
         bound.layout(b"layout".to_vec());
-        bound.state(&tab(ID), b"newer".to_vec());
+        bound.state(&tab(ID), b"newer".to_vec(), Some(Kind::Editor));
         assert!(bound.ping(HAND_WAIT), "the holder does not answer");
         assert_eq!(
             owner_of(&dir),
@@ -5444,6 +5583,7 @@ mod tests {
                 core: b"newer".to_vec(),
                 input: Vec::new(),
                 history: Vec::new(),
+                program: Some(Kind::Editor),
             }
         );
         assert!(
@@ -5646,6 +5786,7 @@ mod tests {
                 start,
                 parent: ShellParent::Direct,
                 blob: session.state_blob(),
+                program: None,
                 master: session
                     .with_pty_fd(|fd| fd.try_clone_to_owned().ok())
                     .expect("master"),
@@ -5663,7 +5804,7 @@ mod tests {
         assert!(session.resize(30, 8, (9, 18)));
         session.write(b"go\n");
         wait_until("the screen did not arrive", || shows(&session, "ALT-END"));
-        bound.state(&tab(ID), session.state_blob());
+        bound.state(&tab(ID), session.state_blob(), None);
         assert!(bound.ping(HAND_WAIT), "the holder does not answer");
         assert!(!journal.is_broken());
         // The output went past the trigger: a base reached the holder, which
@@ -5970,6 +6111,7 @@ mod tests {
             start: 1,
             parent: ShellParent::Login,
             blob: Vec::new(),
+            program: None,
             master,
             taken_from: None,
             journal: None,
@@ -6164,6 +6306,7 @@ mod tests {
             start: taken.start,
             parent: ShellParent::Direct,
             blob: b"younger".to_vec(),
+            program: None,
             master: taken.master.try_clone().unwrap(),
             taken_from: Some(older_socket.clone()),
             journal: None,
@@ -6389,6 +6532,7 @@ mod tests {
             start,
             parent: ShellParent::Direct,
             blob: Vec::new(),
+            program: None,
             master: copy,
             taken_from: Some(dir.join(HANDOVER_SOCKET)),
             journal: None,
@@ -6458,12 +6602,13 @@ mod tests {
                         start,
                         parent: ShellParent::Direct,
                         blob: Vec::new(),
+                        program: None,
                         master,
                         taken_from: None,
                         journal: None,
                     });
                     for n in 0..STATES {
-                        bound.state(&tab(id), n.to_string().into_bytes());
+                        bound.state(&tab(id), n.to_string().into_bytes(), None);
                         bound.layout(format!("{id} {n}").into_bytes());
                         if n % 50 == 0 {
                             assert!(bound.ping(HAND_WAIT));

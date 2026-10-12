@@ -771,9 +771,10 @@ pub(crate) trait Holder {
     ) -> Option<Box<dyn crate::journal::BaseSink>>;
     /// The pane is gone: the holder lets its program go.
     fn release(&self, pane: &PaneUuid);
-    /// The pane's state now (`Session::state_blob`), for a restore after a
-    /// crash.
-    fn state(&self, pane: &PaneUuid, blob: Vec<u8>);
+    /// The pane's state now (`Session::state_blob`) and the program it shows
+    /// ([`TerminalPane::program_kind`], the shell and the server left out),
+    /// for a restore after a crash.
+    fn state(&self, pane: &PaneUuid, blob: Vec<u8>, program: Option<Kind>);
     /// The layout changed: the holder's copy of it is written again once the
     /// burst settles.
     fn layout_changed(&self);
@@ -1242,6 +1243,7 @@ impl ShellWake {
             let outcome = pane.probe_identity();
             if outcome.changed {
                 pane.host().program_changed(id);
+                pane.push_state();
             }
             if outcome.undecided {
                 probe.rearm();
@@ -1575,8 +1577,10 @@ impl Wake for ShellWake {
 
     fn program_status_changed(&self) {
         // Reader thread, lock-free: a program said what it is doing — the
-        // tab's ring, its waiting mark and its finished tick alone hear it.
+        // tab's ring, its waiting mark and its finished tick hear it, and the
+        // holder, which carries the program it named on.
         self.announce_activity();
+        self.push_state_soon();
     }
 
     fn remote_up(&self) {
@@ -1736,10 +1740,11 @@ fn keep_looking(wait: bool, looks: u16) -> bool {
 
 /// What a look at the process table leaves the identity probe to keep and to do: the program it
 /// named, if it did, and whether to look again at the next output — only while neither it nor the
-/// command's line has named one. A line that names a program is enough to rest on: the table
-/// would only second it. A shell in the foreground is no answer and looks again: it is most often
-/// a program's launcher in the moment before it replaces itself with the program (Pi's `sh`,
-/// Cursor CLI's `bash`), and kept as one it would stand over the line that named the program.
+/// command's line (or the decision carried over from the bateri before) has named one. A line
+/// that names a program is enough to rest on: the table would only second it. A shell in the
+/// foreground is no answer and looks again: it is most often a program's launcher in the moment
+/// before it replaces itself with the program (Pi's `sh`, Cursor CLI's `bash`), and kept as one
+/// it would stand over the line that named the program.
 fn after_table(seen: Seen, line: Option<Kind>) -> (Option<Kind>, bool) {
     match seen {
         Seen::Kind(Kind::Shell) => (None, true),
@@ -1759,6 +1764,14 @@ fn kind_of_end<K: PartialEq>(ran: Option<(K, Kind)>, newest: Option<K>) -> Kind 
         .map_or(Kind::Shell, |(_, kind)| kind)
 }
 
+/// The kind carried over from the bateri before (`carried`: the command it ran then, and the
+/// kind) while `newest` is still that command; any other command is one it never saw.
+fn carried_kind<K: PartialEq>(carried: Option<(K, Kind)>, newest: Option<K>) -> Option<Kind> {
+    carried
+        .filter(|(seen, _)| newest.as_ref() == Some(seen))
+        .map(|(_, kind)| kind)
+}
+
 /// What the pane has read of the program it runs, kept for the tab's icon
 /// ([`TerminalPane::program_kind`]). Main thread only.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1775,6 +1788,10 @@ struct ProgramMemo {
     /// How many times the process table was looked at for the local command of this generation
     /// without naming a program (bounded by [`IDENTITY_LOOKS`]).
     looks: Option<(u64, u16)>,
+    /// What the bateri this pane was carried over from showed it ran, by the command that ran
+    /// then: by now that command's line has mostly scrolled away and the table does not see
+    /// past `ssh`, so the old decision stands in for the line while that command runs.
+    carried: Option<(CommandId, Kind)>,
 }
 
 /// Result of the remote-session probe ([`TerminalPane::probe_remote`]): two
@@ -3280,14 +3297,17 @@ impl TerminalPane {
         // carried history and the note.
         let adopting = adopt.is_some();
         let mut nudge = false;
+        let mut carried = None;
         let (session, shell_parent) = match adopt {
             Some(adopted) => {
                 let taken_from = adopted.taken_from.clone();
                 let note = adopted.note;
                 nudge = adopted.nudge;
+                let program = adopted.state.program;
                 match adopt_session(options.clone(), adopted, grid, &wake) {
                     Ok((session, parent)) => {
                         self.ivars().taken_from.replace(taken_from);
+                        carried = program;
                         (session, parent)
                     }
                     Err((error, history)) => {
@@ -3315,6 +3335,19 @@ impl TerminalPane {
         // thread, so where the last reference drops is clear (see `shutdown`).
         let _ = self.ivars().session.set(Arc::clone(&session));
         let _ = self.ivars().shell_parent.set(shell_parent);
+        // What the pane showed it ran before it was carried over, kept for the command that ran
+        // then (`ProgramMemo::carried`) — before the registration below, which sends it on.
+        if let Some(kind) = carried
+            && let Some(command) = session
+                .last_command()
+                .filter(|command| command.phase == CommandPhase::Running)
+        {
+            let memo = self.ivars().program_memo.get();
+            self.ivars().program_memo.set(ProgramMemo {
+                carried: Some((command.id, kind)),
+                ..memo
+            });
+        }
         // A pane carried over mid-command (an update, a crash) saw that command start in the
         // process it came from, and no start comes here to look its program up: it is looked up
         // now, or the tab would show the shell until the next command.
@@ -3549,6 +3582,7 @@ impl TerminalPane {
             start,
             parent,
             blob: session.state_blob(),
+            program: self.carried_program(),
             master,
             taken_from: self.ivars().taken_from.take(),
             journal,
@@ -3568,9 +3602,10 @@ impl TerminalPane {
         true
     }
 
-    /// Sends this pane's current `bt-core` state to the bound holder —
-    /// the shell's edges and, delayed, the mirror's changes
-    /// ([`ShellWake`]'s two sends). A no-op without a holder or once closed.
+    /// Sends this pane's current `bt-core` state and program to the bound
+    /// holder — the shell's edges, a program that said what it is or was
+    /// found to be, and, delayed, the mirror's changes ([`ShellWake`]'s
+    /// sends). A no-op without a holder or once closed.
     pub(crate) fn push_state(&self) {
         let Some(keeper) = self.ivars().keeper.as_deref() else {
             return;
@@ -3579,7 +3614,11 @@ impl TerminalPane {
             return;
         }
         if let Some(session) = self.session() {
-            keeper.state(&self.ivars().uuid, session.state_blob());
+            keeper.state(
+                &self.ivars().uuid,
+                session.state_blob(),
+                self.carried_program(),
+            );
         }
     }
 
@@ -4130,7 +4169,8 @@ impl TerminalPane {
     }
 
     /// Which program the pane runs now, as its tab's icon draws it: what the program said of
-    /// itself (`app=` of `OSC 7501`), else what the process table named, else what the command's
+    /// itself (`app=` of `OSC 7501`), else what the process table named, else what the bateri
+    /// the pane was carried over from showed for the same command, else what the command's
     /// line said — the shell when no command runs, the server in a remote session none of them
     /// knows ([`identity::decide`]). Read live from the three, so a program that speaks up later
     /// is heard on the tab's next refresh; the readings that cost a screen walk or a syscall are
@@ -4155,12 +4195,14 @@ impl TerminalPane {
         let line = command
             .and_then(|id| memo.line.filter(|(seen, _)| *seen == id))
             .and_then(|(_, kind)| kind);
+        // The old process's whole decision, line included: under what is live, over the line.
+        let carried = carried_kind(memo.carried, command);
         let group = memo
             .group
             .filter(|(generation, _)| *generation == running)
             .map(|(_, kind)| kind);
         let remote = session.remote_line().is_some();
-        let kind = identity::decide(app, group, line, remote);
+        let kind = identity::decide(app, group, carried.or(line), remote);
         if let Some(id) = command
             && memo.ran != Some((id, kind))
         {
@@ -4182,6 +4224,13 @@ impl TerminalPane {
         };
         let newest = session.last_command().map(|command| command.id);
         kind_of_end(self.ivars().program_memo.get().ran, newest)
+    }
+
+    /// What a handover carries of [`Self::program_kind`] to the next bateri: a program, not the
+    /// shell or the server — those it tells by itself, and a pane carrying none is written in
+    /// the format a rolled-back bateri still reads (`handover::PaneState`).
+    fn carried_program(&self) -> Option<Kind> {
+        Some(self.program_kind()).filter(|kind| !matches!(kind, Kind::Shell | Kind::Remote))
     }
 
     /// The identity probe: reads what [`Self::program_kind`] cannot cheaply — the newest command's
@@ -4221,10 +4270,14 @@ impl TerminalPane {
         if session.remote_line().is_none()
             && memo.group.map(|(generation, _)| generation) != Some(running)
         {
-            let line = memo.line.and_then(|(_, kind)| kind);
+            let newest = session.last_command().map(|command| command.id);
+            let named = memo
+                .line
+                .and_then(|(_, kind)| kind)
+                .or(carried_kind(memo.carried, newest));
             let (group, wait) = after_table(
                 identity::find(parent, session.child_pid(), &SystemTable),
-                line,
+                named,
             );
             memo.group = group.map(|kind| (running, kind)).or(memo.group);
             let looks = memo
@@ -4592,7 +4645,7 @@ impl TerminalPane {
     /// what the holder carries: the master, the child's pid and start time,
     /// the pane's state ([`PaneState`](crate::handover::PaneState): the
     /// VT, `bt-core`'s blob, the unsent input, the scrollback for a
-    /// fallback) and the tail as the buffer's head.
+    /// fallback, the program it shows) and the tail as the buffer's head.
     ///
     /// The second half of the return is the pane's session-restore history
     /// (`Session::frozen_history`, also inside the state) for the caller's
@@ -4613,6 +4666,7 @@ impl TerminalPane {
         let parent = *self.ivars().shell_parent.get()?;
         let pid = session.child_pid();
         let start = jobs::start_time(pid)?;
+        let program = self.carried_program();
         self.quiesce(false);
         let frozen = match session.freeze() {
             Ok(frozen) => frozen,
@@ -4633,6 +4687,7 @@ impl TerminalPane {
             core: frozen.blob,
             input: frozen.input,
             history: history.clone(),
+            program,
         };
         let held = crate::handover::HeldPane::new(
             self.ivars().uuid.clone(),
@@ -5667,6 +5722,22 @@ mod tests {
             (None, true),
             "a launcher script before it execs is no answer, and does not hide the line"
         );
+    }
+
+    /// What the bateri before showed stands only for the command it was carried with.
+    #[test]
+    fn a_carried_program_stands_for_the_command_it_came_with_only() {
+        use super::{Kind, carried_kind};
+        use bt_shell_common::program::identity::Agent;
+        let claude = Kind::Agent(Agent::ClaudeCode);
+        assert_eq!(carried_kind(Some((7, claude)), Some(7)), Some(claude));
+        assert_eq!(
+            carried_kind(Some((7, claude)), Some(8)),
+            None,
+            "a command started after the handover is not the one it ran"
+        );
+        assert_eq!(carried_kind(Some((7, claude)), None), None);
+        assert_eq!(carried_kind::<u32>(None, Some(7)), None);
     }
 
     /// What a pane ran is handed over for the command that ended only if it was seen during that

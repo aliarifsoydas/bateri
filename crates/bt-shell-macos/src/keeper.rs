@@ -37,6 +37,7 @@ use objc2::MainThreadMarker;
 
 use crate::handover::{self, Bound, BoundPane};
 use crate::journal::BaseSink;
+use crate::program::identity::Kind;
 use crate::ssh_route::Masters;
 
 /// How many times one run replaces a holder that died while bound. A holder
@@ -340,13 +341,13 @@ impl Keeper {
         }
     }
 
-    /// A registered pane's newer `bt-core` state.
-    pub(crate) fn state(&self, tab: &PaneUuid, blob: Vec<u8>) {
+    /// A registered pane's newer `bt-core` state and the program it shows.
+    pub(crate) fn state(&self, tab: &PaneUuid, blob: Vec<u8>, program: Option<Kind>) {
         if !self.registered.borrow().contains(tab) {
             return;
         }
         if let Some(bound) = self.bound.borrow().as_ref() {
-            bound.state(tab, blob);
+            bound.state(tab, blob, program);
         }
     }
 
@@ -514,8 +515,8 @@ impl crate::pane::Holder for Keeper {
         Keeper::release(self, pane);
     }
 
-    fn state(&self, pane: &PaneUuid, blob: Vec<u8>) {
-        Keeper::state(self, pane, blob);
+    fn state(&self, pane: &PaneUuid, blob: Vec<u8>, program: Option<Kind>) {
+        Keeper::state(self, pane, blob, program);
     }
 
     fn layout_changed(&self) {

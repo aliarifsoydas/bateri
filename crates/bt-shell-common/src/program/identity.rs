@@ -28,10 +28,12 @@
 //! [`decide`] orders them: the program's own word, then the process table, then
 //! the command line, else the shell — or the server, in a remote session.
 //!
-//! **Only the script's name is taken from an argv.** The command line of a
-//! process carries passwords ([`crate::jobs::ProcArgs`]); here it is compared
-//! against the table and dropped — nothing of it is kept, shown or printed, and
-//! no environment variable is asked for.
+//! **Only a name is taken from an argv**: the script's an interpreter runs, or
+//! the program's own when the kernel names its file instead (a versioned
+//! install). The command line of a process carries passwords
+//! ([`crate::jobs::ProcArgs`]); here it is compared against the table and
+//! dropped — nothing else of it is kept, shown or printed, and no environment
+//! variable is asked for.
 
 use super::{
     Family, Member, PythonRuns, ancestors_in, base, classify, command_below, first_positional,
@@ -85,6 +87,74 @@ pub enum Kind {
     Files,
     /// A shell running as root (`sudo -i`, `su`).
     Root,
+}
+
+impl Kind {
+    /// The kind's word in a handover's pane state (`crate::handover::PaneState`): written by
+    /// one bateri, read by the next, so a word never changes once released — a new kind is a
+    /// new word. No wildcard: a new kind is a decision.
+    pub fn word(self) -> &'static str {
+        match self {
+            Kind::Shell => "shell",
+            Kind::Remote => "remote",
+            Kind::Agent(agent) => match agent {
+                Agent::ClaudeCode => "claude-code",
+                Agent::Codex => "codex",
+                Agent::OpenCode => "opencode",
+                Agent::Antigravity => "antigravity",
+                Agent::GeminiCli => "gemini-cli",
+                Agent::Pi => "pi",
+                Agent::Herdr => "herdr",
+                Agent::CursorCli => "cursor-cli",
+                Agent::CopilotCli => "copilot-cli",
+                Agent::QwenCode => "qwen-code",
+                Agent::KimiCli => "kimi-cli",
+                Agent::Other => "agent",
+            },
+            Kind::Editor => "editor",
+            Kind::Repl => "repl",
+            Kind::Database => "database",
+            Kind::Container => "container",
+            Kind::Monitor => "monitor",
+            Kind::Git => "git",
+            Kind::Task => "task",
+            Kind::Pager => "pager",
+            Kind::Files => "files",
+            Kind::Root => "root",
+        }
+    }
+
+    /// [`Self::word`]'s inverse; `None` for a word this build does not know (a newer
+    /// bateri's kind), which is no kind rather than an error.
+    pub fn from_word(word: &str) -> Option<Kind> {
+        Some(match word {
+            "shell" => Kind::Shell,
+            "remote" => Kind::Remote,
+            "claude-code" => Kind::Agent(Agent::ClaudeCode),
+            "codex" => Kind::Agent(Agent::Codex),
+            "opencode" => Kind::Agent(Agent::OpenCode),
+            "antigravity" => Kind::Agent(Agent::Antigravity),
+            "gemini-cli" => Kind::Agent(Agent::GeminiCli),
+            "pi" => Kind::Agent(Agent::Pi),
+            "herdr" => Kind::Agent(Agent::Herdr),
+            "cursor-cli" => Kind::Agent(Agent::CursorCli),
+            "copilot-cli" => Kind::Agent(Agent::CopilotCli),
+            "qwen-code" => Kind::Agent(Agent::QwenCode),
+            "kimi-cli" => Kind::Agent(Agent::KimiCli),
+            "agent" => Kind::Agent(Agent::Other),
+            "editor" => Kind::Editor,
+            "repl" => Kind::Repl,
+            "database" => Kind::Database,
+            "container" => Kind::Container,
+            "monitor" => Kind::Monitor,
+            "git" => Kind::Git,
+            "task" => Kind::Task,
+            "pager" => Kind::Pager,
+            "files" => Kind::Files,
+            "root" => Kind::Root,
+            _ => return None,
+        })
+    }
 }
 
 /// One kind's names: what a process, a script or a command is called, and what
@@ -313,7 +383,8 @@ fn of_script(script: &str) -> Option<Kind> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Process {
     /// The process's name as the table gives it (the kernel's: the interpreter's
-    /// on macOS, the script's on Linux).
+    /// on macOS, the script's on Linux), or the one it was started by when the
+    /// kernel's names nothing ([`Process::read`]).
     pub name: String,
     /// The group's member the guide bar's [`classify`] reads: a record only for
     /// the names it can use (interpreters, clients, shells, tools).
@@ -353,8 +424,22 @@ impl Process {
 
     /// `pid` as the table has it; `None` when its name is unreadable. The
     /// record is the **argv alone**, no variable asked for.
+    ///
+    /// A name nothing knows is asked again of the record ([`started_as`]): the
+    /// kernel names a process after the file it executed, and a program
+    /// installed as a versioned file behind a link (Claude Code's
+    /// `~/.local/bin/claude` → `…/claude/versions/2.1.296`) is called by its
+    /// version there. One more record read per unknown member and look.
     fn read(pid: u32, table: &impl ProcessTable) -> Option<Self> {
-        let name = table.name(pid)?;
+        let mut name = table.name(pid)?;
+        if !wanted(&name)
+            && by_name(&name).is_none()
+            && let Some(started) = table
+                .procargs(pid, &[])
+                .and_then(|record| started_as(&record))
+        {
+            name = started;
+        }
         let (uid, record) = if wanted(&name) {
             (table.uid(pid), table.procargs(pid, &[]))
         } else {
@@ -367,6 +452,21 @@ impl Process {
     fn uid(&self) -> Option<u32> {
         self.member.candidate.as_ref().and_then(|c| c.uid)
     }
+}
+
+/// The name a process was started by, when it is one the table knows: the
+/// path it was executed by, else its argv[0]. Only that name is kept of the
+/// record.
+fn started_as(record: &ProcArgs) -> Option<String> {
+    [
+        Some(record.exec.as_str()),
+        record.args.first().map(String::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .map(base)
+    .find(|name| by_name(name).is_some())
+    .map(str::to_owned)
 }
 
 /// What a process is by its name, else by the script an interpreter runs.
@@ -739,6 +839,20 @@ mod tests {
     }
 
     #[test]
+    fn every_kind_has_a_word_of_its_own_that_reads_back() {
+        let mut words = std::collections::HashSet::new();
+        for kind in crate::icon::KINDS {
+            assert_eq!(Kind::from_word(kind.word()), Some(kind), "{kind:?}");
+            assert!(words.insert(kind.word()), "{kind:?} shares its word");
+        }
+        // The words are a handover's format: the released ones stay as they are.
+        assert_eq!(Kind::Agent(Agent::ClaudeCode).word(), "claude-code");
+        assert_eq!(Kind::Editor.word(), "editor");
+        assert_eq!(Kind::from_word("a-kind-from-a-newer-bateri"), None);
+        assert_eq!(Kind::from_word(""), None);
+    }
+
+    #[test]
     fn every_agent_is_known_by_its_own_name() {
         for (name, which) in AGENTS {
             assert_eq!(by_name(name), Some(agent(which)), "{name}");
@@ -750,6 +864,46 @@ mod tests {
             assert_eq!(seen(&table), kind(agent(which)), "{installed}");
             assert_eq!(from_line(name), Some(agent(which)), "{name} typed");
         }
+    }
+
+    #[test]
+    fn a_program_the_kernel_names_by_its_versioned_file_is_known_by_the_name_it_was_started_by() {
+        // Claude Code's installer links `~/.local/bin/claude` to the versioned file; macOS
+        // names the process after the file (measured: `2.1.296`), the path keeps the link.
+        let linked = login_shell(200).exec(
+            200,
+            101,
+            200,
+            ("2.1.296", "/Users/me/.local/bin/claude"),
+            &["claude", "--resume"],
+            &[],
+        );
+        assert_eq!(seen(&linked), kind(agent(Agent::ClaudeCode)));
+        // A relative start leaves the resolved file as the path: argv[0] names it.
+        let resolved = login_shell(200).exec(
+            200,
+            101,
+            200,
+            ("2.1.296", "/Users/me/.local/share/claude/versions/2.1.296"),
+            &["claude"],
+            &[],
+        );
+        assert_eq!(seen(&resolved), kind(agent(Agent::ClaudeCode)));
+        // Its helpers share the group and name nothing; the agent stays the answer.
+        let helpers = linked
+            .run(201, 200, 200, &["npm", "exec", "some-server"])
+            .run(202, 200, 200, &["caffeinate", "-i"]);
+        assert_eq!(seen(&helpers), kind(agent(Agent::ClaudeCode)));
+        // A versioned file nothing knows by any name is still nothing.
+        let unknown = login_shell(200).exec(
+            200,
+            101,
+            200,
+            ("1.0.0", "/opt/tool/versions/1.0.0"),
+            &["tool"],
+            &[],
+        );
+        assert_eq!(seen(&unknown), Seen::Nothing);
     }
 
     #[test]

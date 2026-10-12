@@ -740,6 +740,8 @@ impl ProcessTable for Libproc {
     /// First `proc_name` (the long name), otherwise the short info's `comm`: the
     /// former fails on root-owned processes (measured, zero on `launchd`), the
     /// latter is truncated at 16 characters but readable on every process.
+    /// Both are the executed file's name, not argv[0]: a program started
+    /// through a link to a versioned file is called by its version.
     fn name(&self, pid: u32) -> Option<String> {
         let c_pid = c_int::try_from(pid).ok()?;
         // The size of `pbi_name`: twice `MAXCOMLEN`.

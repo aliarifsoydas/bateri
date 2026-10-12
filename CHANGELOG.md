@@ -22,6 +22,18 @@ of every installed copy. A version without a section is not released.
   folder is gone by then, the new tab starts at home as before, and a later
   `ssh` you type in that tab starts at home as usual.
 
+### Fixed
+
+- **Tabs keep their program icons when bateri reopens.** After bateri was
+  quit, updated or crashed with programs left running, the tabs it took back
+  showed the terminal icon (or the server's, over ssh) instead of the
+  program's: the command you typed had long scrolled away, and bateri often
+  recognized the program only from it. Now each tab carries the icon it showed
+  over to the reopened bateri, which keeps it for as long as that program
+  runs. Claude Code is also recognized again in a reopened tab on its own: its
+  installer starts it from a file named after its version, and bateri now
+  reads the name it was started by as well.
+
 ## [0.13.0] - 2026-10-12
 
 ### Changed

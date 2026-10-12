@@ -7515,6 +7515,7 @@ mod tests {
             core: b"core".to_vec(),
             input: Vec::new(),
             history: history.to_vec(),
+            program: None,
         }
     }
 
