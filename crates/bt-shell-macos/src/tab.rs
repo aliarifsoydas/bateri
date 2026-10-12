@@ -497,6 +497,18 @@ impl TerminalTab {
         self.ivars().container.zoomed()
     }
 
+    /// The pane that fills the tab's whole area, if one does: the lone pane,
+    /// or the zoomed one. A split tab's panes share the area, so none of them
+    /// alone decides the window's size.
+    pub(crate) fn filling_pane(&self) -> Option<Retained<TerminalPane>> {
+        let panes = self.panes();
+        match self.zoomed() {
+            Some(id) => panes.into_iter().find(|pane| pane.id() == id),
+            None if panes.len() == 1 => panes.into_iter().next(),
+            None => None,
+        }
+    }
+
     /// Sets or drops the zoom; the links of hidden panes sleep, those of
     /// returning ones ask for a frame (if the window is visible).
     fn set_zoom(&self, zoomed: Option<u64>) {

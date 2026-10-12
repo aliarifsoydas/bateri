@@ -170,6 +170,41 @@ pub fn split_into_grid(
     }
 }
 
+/// The pane size, in pixels, nearest to `width_px` × `height_px` at which
+/// [`split_into_grid`] leaves nothing over — its inverse: whole columns
+/// between the grid's two sides (the always-up track in the right side's
+/// place where wider) and whole rows between the top edge's reserve, the
+/// grid's foot and the dock's share. What a window resizing a whole cell at
+/// a time asks of its lone pane: at the fitted size the text keeps exactly
+/// the frame on every side and the top's strip its least height.
+///
+/// The nearest whole count, so a dragged edge stays within half a cell of the
+/// pointer; never under one column or one row. The arguments are
+/// [`split_into_grid`]'s, so the two cannot disagree about the frame.
+pub fn fitted_size(
+    width_px: f64,
+    height_px: f64,
+    cell: CellMetrics,
+    dock_rows: u16,
+    reserve_px: f32,
+    top_px: f32,
+) -> (f64, f64) {
+    let (cell_w, cell_h) = cell.cell_px();
+    let inset = cell.grid_inset();
+    let sides = f64::from(inset.left) + f64::from(inset.right).max(f64::from(reserve_px));
+    let ends =
+        f64::from(bt_gpu::dock_px(dock_rows, cell)) + f64::from(top_px) + f64::from(inset.foot);
+    // `f64::max` keeps the number over a NaN: a degenerate size fits one cell.
+    let whole = |length: f64, fixed: f64, step: u16| {
+        let step = f64::from(step);
+        fixed + ((length - fixed) / step).round().max(1.0) * step
+    };
+    (
+        whole(width_px, sides, cell_w),
+        whole(height_px, ends, cell_h),
+    )
+}
+
 /// The context row's strip in `width_px` wide pane: whole small-step columns
 /// between the two side margins, and what is left over.
 ///
@@ -330,6 +365,60 @@ mod tests {
         let g = split_into_grid(1800.0, 1200.0, cell, DOCK_ROWS, NO_RESERVE, NO_TOP);
         assert_eq!(g.cols, 102);
         assert_eq!(1800 - 25 - u32::from(g.cols) * 17, 25 + 16);
+    }
+
+    #[test]
+    fn the_fitted_size_leaves_nothing_over_and_is_the_nearest() {
+        // The measure's pane: a 20.5 pt corner at @2x, 17×40 cells, the fade's
+        // 16 px reserve, the dock's share. At every size the fitted one cuts
+        // into whole columns and rows with nothing left — the text keeps the
+        // frame exactly and the fade its reserve — within half a cell of the
+        // size asked for.
+        let cell = CellMetrics::new(17, 40, 13, 16, 1, 2.0)
+            .expect("non-zero cell")
+            .with_corners(20.5, 20.5);
+        let top = bt_gpu::edge_reserve_px(ContentEdge::Fade, cell);
+        for (width, height) in [
+            (1800.0, 1120.0),
+            (1802.0, 1140.0),
+            (1808.0, 1158.0),
+            (1816.0, 1100.0),
+        ] {
+            let (w, h) = fitted_size(width, height, cell, DOCK_ROWS, NO_RESERVE, top);
+            let g = split_into_grid(w, h, cell, DOCK_ROWS, NO_RESERVE, top);
+            assert_eq!(
+                w,
+                25.0 + f64::from(g.cols) * 17.0 + 25.0,
+                "{width}: a column's leftover"
+            );
+            let ends = f64::from(bt_gpu::dock_px(DOCK_ROWS, cell)) + f64::from(top) + 16.0;
+            assert_eq!(
+                h,
+                ends + f64::from(g.rows) * 40.0,
+                "{height}: a row's leftover"
+            );
+            assert!((w - width).abs() <= 8.5, "{width} → {w}: not the nearest");
+            assert!(
+                (h - height).abs() <= 20.0,
+                "{height} → {h}: not the nearest"
+            );
+            // The fade is its reserve and nothing more.
+            let fade = bt_gpu::edge_drawn_px(ContentEdge::Fade, h as f32, DOCK_ROWS, g.rows, cell);
+            assert_eq!(fade, top, "{height}");
+        }
+        // The always-up track takes the right side's place where it is wider.
+        let reserve = ScrollbarMode::Always.reserve_px(cell);
+        let (w, _) = fitted_size(1800.0, 1120.0, cell, DOCK_ROWS, reserve, top);
+        let g = split_into_grid(w, 1120.0, cell, DOCK_ROWS, reserve, top);
+        assert_eq!(w, 25.0 + f64::from(g.cols) * 17.0 + f64::from(reserve));
+        // Never under a cell, whatever is asked.
+        let tiny = fitted_size(0.0, 0.0, cell, DOCK_ROWS, NO_RESERVE, top);
+        assert_eq!(tiny.0, 25.0 + 17.0 + 25.0);
+        assert!(
+            fitted_size(f64::NAN, 1120.0, cell, DOCK_ROWS, NO_RESERVE, top)
+                .0
+                .is_finite()
+        );
     }
 
     #[test]

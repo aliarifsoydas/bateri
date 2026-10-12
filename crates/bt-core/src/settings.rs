@@ -1426,6 +1426,13 @@ pub struct Settings {
     /// `[appearance] split_style`: cards on a ground or panes divided by a
     /// line ([`SplitStyle`]). Doesn't enter `TerminalOptions`.
     pub split_style: SplitStyle,
+    /// `[appearance] resize_in_steps`: whether a window dragged by its edge
+    /// grows and shrinks a whole cell at a time, so a lone pane's text keeps
+    /// the same margin on both sides and the top edge's strip its least
+    /// height. Off by default: the window follows the pointer, and what the
+    /// width leaves under a column stays inside the right margin. Doesn't
+    /// enter `TerminalOptions`.
+    pub resize_in_steps: bool,
     /// `[appearance] tab_icons`: whether a tab's chip shows the program it
     /// runs as an icon before its title — the program's mark on a tile, like
     /// an application's icon, a split tab's as a deck — or, off, only the small
@@ -1513,6 +1520,7 @@ impl Default for Settings {
             minimum_contrast: MINIMUM_CONTRAST,
             dim_unfocused_splits: false,
             split_style: SplitStyle::default(),
+            resize_in_steps: false,
             tab_icons: true,
             tab_icon_colors: IconColors::default(),
             font: FontOptions::default(),
@@ -1619,6 +1627,9 @@ pub enum SettingsEdit {
     DimUnfocusedSplits(bool),
     /// The settings window's "Split style": `[appearance] split_style`.
     SplitStyle(SplitStyle),
+    /// The settings window's "Resize in steps": `[appearance]
+    /// resize_in_steps`.
+    ResizeInSteps(bool),
     /// The settings window's "Tab icons": `[appearance] tab_icons`.
     TabIcons(bool),
     /// The settings window's "Icon colors": `[appearance] tab_icon_colors`.
@@ -1709,6 +1720,11 @@ impl SettingsEdit {
                 "appearance.dim_unfocused_splits",
             ),
             Self::SplitStyle(_) => ("appearance", "split_style", "appearance.split_style"),
+            Self::ResizeInSteps(_) => (
+                "appearance",
+                "resize_in_steps",
+                "appearance.resize_in_steps",
+            ),
             Self::TabIcons(_) => ("appearance", "tab_icons", "appearance.tab_icons"),
             Self::IconColors(_) => (
                 "appearance",
@@ -1787,6 +1803,7 @@ impl SettingsEdit {
             | Self::RemoteIntegration(on)
             | Self::ShellPorts(on)
             | Self::DimUnfocusedSplits(on)
+            | Self::ResizeInSteps(on)
             | Self::TabIcons(on) => (*on).into(),
             Self::CursorRadius(value)
             | Self::CursorGlow(value)
@@ -1918,6 +1935,11 @@ dim_unfocused_splits = false
 # lines lets the panes touch with one thin line between them, for the most
 # room.
 split_style = "cards"
+# true | false. Resizes a window a whole cell at a time while you drag its
+# edge, so a lone pane's text keeps the same margin on both sides and the
+# strip at its top its least height. Off: the window follows the pointer, and
+# what the width leaves under a column stays inside the right margin.
+resize_in_steps = false
 # true | false. Shows the program a tab runs as an icon before its title: the
 # program's mark on a tile, like an application's icon, with a line running
 # round the tile's edge while a command runs; a split tab shows a deck of
@@ -2337,6 +2359,15 @@ stats_interval = 3
                         &mut parsed.diagnostics,
                     );
                 }
+                if let Some(item) = appearance.get("resize_in_steps") {
+                    parsed.settings.resize_in_steps = boolean(
+                        text,
+                        item,
+                        "appearance.resize_in_steps",
+                        fallback.resize_in_steps,
+                        &mut parsed.diagnostics,
+                    );
+                }
                 if let Some(item) = appearance.get("tab_icons") {
                     parsed.settings.tab_icons = boolean(
                         text,
@@ -2365,6 +2396,7 @@ stats_interval = 3
                 parsed.settings.minimum_contrast = fallback.minimum_contrast;
                 parsed.settings.dim_unfocused_splits = fallback.dim_unfocused_splits;
                 parsed.settings.split_style = fallback.split_style;
+                parsed.settings.resize_in_steps = fallback.resize_in_steps;
                 parsed.settings.tab_icons = fallback.tab_icons;
                 parsed.settings.tab_icon_colors = fallback.tab_icon_colors;
             }
@@ -2648,6 +2680,7 @@ stats_interval = 3
             contrast: self.minimum_contrast != new.minimum_contrast,
             dim_splits: self.dim_unfocused_splits != new.dim_unfocused_splits,
             split_style: self.split_style != new.split_style,
+            resize_in_steps: self.resize_in_steps != new.resize_in_steps,
             tab_icons: self.tab_icons != new.tab_icons
                 || self.tab_icon_colors != new.tab_icon_colors,
             ports: self.shell_ports != new.shell_ports,
@@ -3354,6 +3387,10 @@ pub struct Changes {
     /// split tab out again, as cards or divided by a line. A field of its
     /// own, for [`Self::caret`]'s reason.
     pub split_style: bool,
+    /// [`Settings::resize_in_steps`] changed: turned on, the platform shell
+    /// fits every window to its lone pane's cells at once instead of at the
+    /// next drag. A field of its own, for [`Self::caret`]'s reason.
+    pub resize_in_steps: bool,
     /// [`Settings::tab_icons`] or [`Settings::tab_icon_colors`] changed: the
     /// platform shell draws every tab bar again. One field for both, because
     /// the shell does the same for either; a field of its own, for
@@ -4180,6 +4217,7 @@ mod tests {
             ("appearance", "minimum_contrast"),
             ("appearance", "dim_unfocused_splits"),
             ("appearance", "split_style"),
+            ("appearance", "resize_in_steps"),
             ("appearance", "tab_icons"),
             ("appearance", "tab_icon_colors"),
             ("font", "size"),
@@ -4360,6 +4398,7 @@ mod tests {
                 contrast: false,
                 dim_splits: false,
                 split_style: false,
+                resize_in_steps: false,
                 tab_icons: false,
                 ports: false,
             }
@@ -4399,6 +4438,7 @@ mod tests {
             minimum_contrast: 4.5,
             dim_unfocused_splits: true,
             split_style: SplitStyle::Lines,
+            resize_in_steps: true,
             tab_icons: false,
             tab_icon_colors: IconColors::Brand,
             font: FontOptions::default(),
@@ -4593,6 +4633,7 @@ mod tests {
             contrast: false,
             dim_splits: false,
             split_style: false,
+            resize_in_steps: false,
             tab_icons: false,
             ports: false,
         };
@@ -4669,6 +4710,38 @@ mod tests {
         assert_eq!(
             written,
             "[appearance]\ntheme = \"system\"\nfuture = 1\ndim_unfocused_splits = true\n"
+        );
+    }
+
+    #[test]
+    fn resize_in_steps_is_read() {
+        // Off by default: the window follows the pointer, the way most
+        // terminals resize.
+        assert!(!Settings::default().resize_in_steps);
+        assert!(clean("[appearance]\nresize_in_steps = true\n").resize_in_steps);
+        assert!(!clean("[appearance]\nresize_in_steps = false\n").resize_in_steps);
+        // A wrong type is rejected with the default and a diagnostic of its own.
+        let (settings, diagnostic) = rejected("[appearance]\nresize_in_steps = 1\n");
+        assert!(!settings.resize_in_steps);
+        assert_eq!(diagnostic.key, Some("appearance.resize_in_steps"));
+        // A change is its own news: it goes to the windows, nothing else.
+        let after = clean("[appearance]\nresize_in_steps = true\n");
+        assert_eq!(
+            Settings::default().changes(&after),
+            Changes {
+                resize_in_steps: true,
+                ..Changes::default()
+            }
+        );
+        // The edit writes the one line and keeps what it doesn't know.
+        let written = Settings::with_edit(
+            "[appearance]\ntheme = \"system\"\nfuture = 1\n",
+            &SettingsEdit::ResizeInSteps(true),
+        )
+        .expect("writable text");
+        assert_eq!(
+            written,
+            "[appearance]\ntheme = \"system\"\nfuture = 1\nresize_in_steps = true\n"
         );
     }
 
@@ -4758,6 +4831,7 @@ mod tests {
                 contrast: false,
                 dim_splits: false,
                 split_style: false,
+                resize_in_steps: false,
                 tab_icons: false,
                 ports: false,
             }
@@ -4913,6 +4987,7 @@ found {found}; using \"spring\""
                 contrast: false,
                 dim_splits: false,
                 split_style: false,
+                resize_in_steps: false,
                 tab_icons: false,
                 ports: false,
             }
@@ -5008,6 +5083,7 @@ found {found}; using \"system\""
                 contrast: false,
                 dim_splits: false,
                 split_style: false,
+                resize_in_steps: false,
                 tab_icons: false,
                 ports: false,
             }
@@ -6137,6 +6213,7 @@ found 1.5; using 0.1"
                     contrast: false,
                     dim_splits: false,
                     split_style: false,
+                    resize_in_steps: false,
                     tab_icons: false,
                     ports: false,
                 },
@@ -6241,6 +6318,7 @@ found 1.5; using 0.1"
                 contrast: false,
                 dim_splits: false,
                 split_style: false,
+                resize_in_steps: false,
                 tab_icons: false,
                 ports: false,
             }
@@ -6349,6 +6427,7 @@ found 1.5; using 0.1"
                 contrast: false,
                 dim_splits: false,
                 split_style: false,
+                resize_in_steps: false,
                 tab_icons: false,
                 ports: false,
             }
@@ -6884,6 +6963,7 @@ cursor = \"spring\"
             SettingsEdit::MinimumContrast(ratio) => settings.minimum_contrast = two(ratio),
             SettingsEdit::DimUnfocusedSplits(on) => settings.dim_unfocused_splits = on,
             SettingsEdit::SplitStyle(style) => settings.split_style = style,
+            SettingsEdit::ResizeInSteps(on) => settings.resize_in_steps = on,
             SettingsEdit::TabIcons(on) => settings.tab_icons = on,
             SettingsEdit::IconColors(colors) => settings.tab_icon_colors = colors,
             SettingsEdit::FontFamily(name) => {
@@ -6965,6 +7045,7 @@ cursor = \"spring\"
             SettingsEdit::MinimumContrast(4.5),
             SettingsEdit::DimUnfocusedSplits(true),
             SettingsEdit::SplitStyle(SplitStyle::Lines),
+            SettingsEdit::ResizeInSteps(true),
             SettingsEdit::TabIcons(false),
             SettingsEdit::IconColors(IconColors::Brand),
             SettingsEdit::FontFamily("Menlo".to_owned()),

@@ -208,11 +208,12 @@ enum Key {
     SplitStyle,
     TabIcons,
     TabIconColors,
+    ResizeInSteps,
 }
 
 impl Key {
     /// The order is the `tag` itself: `ALL[tag]`.
-    const ALL: [Key; 44] = [
+    const ALL: [Key; 45] = [
         Key::ConfirmClose,
         Key::Clipboard,
         Key::Scrollback,
@@ -257,6 +258,7 @@ impl Key {
         Key::SplitStyle,
         Key::TabIcons,
         Key::TabIconColors,
+        Key::ResizeInSteps,
     ];
 
     fn tag(self) -> NSInteger {
@@ -286,6 +288,7 @@ impl Key {
             Key::MinimumContrast => "appearance.minimum_contrast",
             Key::DimSplits => "appearance.dim_unfocused_splits",
             Key::SplitStyle => "appearance.split_style",
+            Key::ResizeInSteps => "appearance.resize_in_steps",
             Key::TabIcons => "appearance.tab_icons",
             Key::TabIconColors => "appearance.tab_icon_colors",
             Key::Font => "font.family",
@@ -1145,6 +1148,7 @@ struct Controls {
     remote_integration: Retained<NSSwitch>,
     ports: Retained<NSSwitch>,
     dim_splits: Retained<NSSwitch>,
+    resize_in_steps: Retained<NSSwitch>,
     /// The panes' rows: the lock, the dependent row and the row's
     /// diagnostic come from here.
     rows: Vec<Row>,
@@ -1358,6 +1362,7 @@ define_class!(
                 Some(Key::RemoteIntegration) => Some(SettingsEdit::RemoteIntegration(on)),
                 Some(Key::Ports) => Some(SettingsEdit::ShellPorts(on)),
                 Some(Key::DimSplits) => Some(SettingsEdit::DimUnfocusedSplits(on)),
+                Some(Key::ResizeInSteps) => Some(SettingsEdit::ResizeInSteps(on)),
                 Some(Key::TabIcons) => Some(SettingsEdit::TabIcons(on)),
                 _ => None,
             };
@@ -1728,6 +1733,7 @@ impl SettingsWindow {
         set_switch(&c.remote_integration, settings.remote_integration);
         set_switch(&c.ports, settings.shell_ports);
         set_switch(&c.dim_splits, settings.dim_unfocused_splits);
+        set_switch(&c.resize_in_steps, settings.resize_in_steps);
         let files = &settings.remote_files;
         let (items, index) = size_items(files.preview_max_size, PREVIEW_SIZE_PRESETS);
         fill_sizes(&c.preview_max_size, &items, index);
@@ -2363,6 +2369,7 @@ impl SettingsWindow {
         let content_edge = self.popup::<ContentEdge>(Key::ContentEdge);
         let dim_splits = self.switch(Key::DimSplits);
         let split_style = self.popup::<SplitStyle>(Key::SplitStyle);
+        let resize_in_steps = self.switch(Key::ResizeInSteps);
         let tab_icons = self.switch(Key::TabIcons);
         let tab_icon_colors = self.popup::<IconColors>(Key::TabIconColors);
         let mut appearance = Form::new(mtm);
@@ -2439,6 +2446,13 @@ impl SettingsWindow {
             &split_style,
             &[&split_style],
             Some("Cards stand on a ground with a gap round them; lines let the panes touch with one line between them."),
+        );
+        appearance.row(
+            Key::ResizeInSteps,
+            "Resize in steps:",
+            &resize_in_steps,
+            &[&resize_in_steps],
+            Some("Resize a window a whole cell at a time while you drag its edge, so the text keeps the same margin on both sides. Off: the window follows the pointer."),
         );
         appearance.row(
             Key::TabIcons,
@@ -2751,6 +2765,7 @@ impl SettingsWindow {
             remote_integration,
             ports,
             dim_splits,
+            resize_in_steps,
             rows,
         };
         (panes, controls)
@@ -3211,7 +3226,7 @@ mod tests {
                     restore_windows = []\nkeep_running = []\nscrollbar = []\n\
                     [appearance]\ntheme = []\nlight_theme = []\ndark_theme = []\n\
                     content_edge = []\nminimum_contrast = []\ndim_unfocused_splits = []\n\
-                    split_style = []\ntab_icons = []\ntab_icon_colors = []\n\
+                    split_style = []\nresize_in_steps = []\ntab_icons = []\ntab_icon_colors = []\n\
                     [font]\nfamily = []\nsize = []\nline_height = []\nletter_spacing = []\n\
                     [clipboard]\nosc52 = []\n\
                     [motion]\ncursor_motion = []\nreduce_motion = []\nsmooth_scroll = []\n\
@@ -3272,6 +3287,7 @@ mod tests {
                 Key::RemoteIntegration => SettingsEdit::RemoteIntegration(false),
                 Key::Ports => SettingsEdit::ShellPorts(false),
                 Key::DimSplits => SettingsEdit::DimUnfocusedSplits(true),
+                Key::ResizeInSteps => SettingsEdit::ResizeInSteps(true),
                 Key::SplitStyle => SettingsEdit::SplitStyle(SplitStyle::Lines),
                 Key::TabIcons => SettingsEdit::TabIcons(false),
                 Key::TabIconColors => SettingsEdit::IconColors(IconColors::Brand),

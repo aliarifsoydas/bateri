@@ -5030,6 +5030,13 @@ impl AppDelegate {
                     window.apply_split_style();
                 }
             }
+            // Turned on, every window takes the step its next drag would:
+            // fitted to its lone pane's cells at once (a no-op when off).
+            if changes.resize_in_steps {
+                for window in &windows {
+                    window.fit_to_cells();
+                }
+            }
             // The tab icons' look or colors: every tab bar draws its chips again.
             if changes.tab_icons {
                 for window in &windows {

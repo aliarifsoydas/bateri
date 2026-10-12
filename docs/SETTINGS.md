@@ -83,7 +83,8 @@ of `[remote]` and the two keys of the load indicator (`stats`,
 looks, `[appearance] content_edge` ("Content edge") and
 `[appearance] minimum_contrast` ("Minimum contrast", under the themes) and
 `[appearance] dim_unfocused_splits` ("Dim unfocused splits") and
-`[appearance] split_style` ("Split style") and `[appearance] tab_icons`
+`[appearance] split_style` ("Split style") and `[appearance]
+resize_in_steps` ("Resize in steps") and `[appearance] tab_icons`
 ("Tab icons") with `tab_icon_colors` ("Icon colors"); on
 folder rows
 Change… opens a folder
@@ -236,6 +237,11 @@ dim_unfocused_splits = false
 # lines lets the panes touch with one thin line between them, for the most
 # room.
 split_style = "cards"
+# true | false. Resizes a window a whole cell at a time while you drag its
+# edge, so a lone pane's text keeps the same margin on both sides and the
+# strip at its top its least height. Off: the window follows the pointer, and
+# what the width leaves under a column stays inside the right margin.
+resize_in_steps = false
 # true | false. Shows the program a tab runs as an icon before its title: the
 # program's mark on a tile, like an application's icon, with a line running
 # round the tile's edge while a command runs; a split tab shows a deck of
@@ -827,6 +833,7 @@ content_edge = "fade"
 minimum_contrast = 3.0
 dim_unfocused_splits = false
 split_style = "cards"
+resize_in_steps = false
 tab_icons = true
 tab_icon_colors = "theme"
 ```
@@ -840,6 +847,7 @@ tab_icon_colors = "theme"
 | `minimum_contrast` | decimal, `1.0`–`21.0` | `3.0` | the least contrast ratio a program's text keeps against its background; `1` turns it off |
 | `dim_unfocused_splits` | `true` \| `false` | `false` | dim the panes of a split tab that don't have the focus |
 | `split_style` | `"cards"` \| `"lines"` | `"cards"` | how a split tab sets its panes apart: cards on a ground, or panes divided by a line |
+| `resize_in_steps` | `true` \| `false` | `false` | resize a window a whole cell at a time while its edge is dragged |
 | `tab_icons` | `true` \| `false` | `true` | show the program a tab runs as an icon on a tile before its title |
 | `tab_icon_colors` | `"theme"` \| `"brand"` | `"theme"` | whether the icon uses the theme's colors only, or keeps the program's own color where it has one |
 
@@ -940,6 +948,16 @@ tab_icon_colors = "theme"
 - `dim_unfocused_splits = true` brings back the veil over the panes that
   don't have the focus: the theme's background at 30% over their text, as
   other terminals do. It applies at once.
+- The text keeps the dock's margins on both sides. A window's width is
+  rarely a whole number of columns, so what is left under a column — up to
+  one cell — sits after the last column, inside the right margin, and the
+  top's strip grows by what is left under a row. `resize_in_steps = true`
+  resizes the window a whole cell at a time while you drag its edge, as
+  Terminal does: a tab with one pane then has the same margin on both sides
+  and the strip at its top its least height, and the window snaps to that
+  size as soon as you turn it on. It does not reach a split tab, full
+  screen, a window tiled or filled by macOS, or the moment after ⌘+ or ⌘−:
+  those keep the leftover inside the margin until the next drag.
 
 ### `[font]`
 

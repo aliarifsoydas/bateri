@@ -567,6 +567,20 @@ define_class!(
             self.layout_changed();
         }
 
+        // `[appearance] resize_in_steps`: an edge the user drags moves a
+        // whole cell at a time. Only the user's drag (`inLiveResize`): a frame
+        // set by macOS — tiling, Fill, zoom, a restored layout — is taken as
+        // given, or a tiled window would leave a gap beside its neighbour.
+        #[unsafe(method(windowWillResize:toSize:))]
+        fn window_will_resize(&self, sender: &NSWindow, size: NSSize) -> NSSize {
+            let stepping = sender.inLiveResize()
+                && app::delegate(self.mtm()).is_some_and(|app| app.settings().resize_in_steps);
+            if !stepping {
+                return size;
+            }
+            self.stepped_size(size).unwrap_or(size)
+        }
+
         // On a move between screens the size (points) does not change but the
         // scale does; nobody but us writes that in a layer-hosting view.
         //
@@ -2800,6 +2814,59 @@ impl TerminalWindow {
         }
         window.makeKeyAndOrderFront(None);
         self.ivars().root.lay_out();
+        self.fit_to_cells();
+    }
+
+    /// The window's frame size nearest to `size` at which the pane filling the
+    /// selected tab leaves no leftover — its text keeps exactly the dock's
+    /// margins and the top's strip its least height ([`TerminalPane::fitted_size`]).
+    /// `None` where no single pane decides it: a split tab, full screen (the
+    /// screen decides), no tab.
+    fn stepped_size(&self, size: NSSize) -> Option<NSSize> {
+        let window = &self.ivars().window;
+        if window.styleMask().contains(NSWindowStyleMask::FullScreen) {
+            return None;
+        }
+        let pane = self.try_selected_tab()?.filling_pane()?;
+        // The tab's area is the content below the title row, and the filling
+        // pane is all of it.
+        let row = self.ivars().root.title_row();
+        let content = window
+            .contentRectForFrameRect(NSRect::new(NSPoint::ZERO, size))
+            .size;
+        let fitted = pane.fitted_size(NSSize::new(content.width, content.height - row))?;
+        let content = NSSize::new(fitted.width, fitted.height + row);
+        Some(
+            window
+                .frameRectForContentRect(NSRect::new(NSPoint::ZERO, content))
+                .size,
+        )
+    }
+
+    /// Fits the window to its lone pane's cells now, when
+    /// `[appearance] resize_in_steps` is on: the step a drag would have
+    /// taken, applied once — the top-left corner stays, the window grows or
+    /// shrinks by less than a cell. A new window and the setting turned on
+    /// ask; a restored or macOS-placed frame is left as it was.
+    pub(crate) fn fit_to_cells(&self) {
+        let on = app::delegate(self.mtm()).is_some_and(|app| app.settings().resize_in_steps);
+        if !on {
+            return;
+        }
+        let window = &self.ivars().window;
+        let frame = window.frame();
+        let Some(size) = self.stepped_size(frame.size) else {
+            return;
+        };
+        if size == frame.size {
+            return;
+        }
+        // AppKit's origin is the bottom-left corner: the top edge stays put.
+        let top = frame.origin.y + frame.size.height;
+        window.setFrame_display(
+            NSRect::new(NSPoint::new(frame.origin.x, top - size.height), size),
+            true,
+        );
     }
 
     /// Timed run only (`make smoke`): keeps the window above every other

@@ -3838,6 +3838,41 @@ impl TerminalPane {
             .with_corners(left, right)
     }
 
+    /// The pane size, in points, nearest to `size` at which the grid leaves
+    /// nothing over ([`grid::fitted_size`], with the arithmetic's own inputs:
+    /// this pane's cell, scroll bar form, top edge and dock) — what a window
+    /// resizing a whole cell at a time asks of the pane that fills it. `None`
+    /// off a window.
+    pub(crate) fn fitted_size(&self, size: NSSize) -> Option<NSSize> {
+        let scale = self.window()?.backingScaleFactor();
+        let ivars = self.ivars();
+        let cell = self.cell_metrics(scale);
+        let reserve = ivars.scrollbar.get().reserve_px(cell);
+        let top = bt_gpu::edge_reserve_px(ivars.content_edge.get(), cell);
+        let (width, height) = grid::fitted_size(
+            size.width * scale,
+            size.height * scale,
+            cell,
+            self.reserved_dock_rows(),
+            reserve,
+            top,
+        );
+        Some(NSSize::new(width / scale, height / scale))
+    }
+
+    /// The dock rows the grid's arithmetic reserves: before
+    /// [`TerminalPane::start`] the birth package's (the one `start` will
+    /// set), so a size asked for before the shell exists is the size it will
+    /// have — session restore checks the saved tree against the smallest
+    /// pane, and a new window is fitted to its cells, before any shell starts.
+    fn reserved_dock_rows(&self) -> u16 {
+        self.ivars()
+            .birth
+            .borrow()
+            .as_ref()
+            .map_or(self.ivars().dock_rows.get(), |birth| birth.integration.1)
+    }
+
     /// The pane is lifted for arranging ([`crate::arrange`]), or set down:
     /// its frame reads at the focused strength while lifted.
     pub(crate) fn set_raised(&self, raised: bool) {
@@ -4065,12 +4100,7 @@ impl TerminalPane {
         let scale = self.window()?.backingScaleFactor();
         let cell = self.cell_metrics(scale);
         let (cell_w, cell_h) = cell.cell_px();
-        let dock_rows = self
-            .ivars()
-            .birth
-            .borrow()
-            .as_ref()
-            .map_or(self.ivars().dock_rows.get(), |birth| birth.integration.1);
+        let dock_rows = self.reserved_dock_rows();
         let width =
             f64::from(cell.grid_inset().left) + f64::from(MIN_PANE_COLS) * f64::from(cell_w);
         let height = f64::from(bt_gpu::dock_px(dock_rows, cell))

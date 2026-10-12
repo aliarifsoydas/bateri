@@ -12,6 +12,16 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **Resize in steps.** A new setting, Resize in steps (`[appearance]
+  resize_in_steps`, off by default), resizes a window a whole cell at a time
+  while you drag its edge, as Terminal does: a tab with one pane then keeps
+  exactly the same margin on both sides and the thinnest strip at its top,
+  and the window snaps to that size as soon as you turn it on. Split tabs,
+  full screen, windows macOS tiles or fills, and the moment after ⌘+ or ⌘−
+  keep resizing freely until the next drag.
+
 ### Changed
 
 - **The text keeps the same margins as the dock, on every side.** The right
