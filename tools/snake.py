@@ -43,6 +43,30 @@ KEYS = {
 # The smallest board that still plays: below it the pane shows a note.
 MIN_W, MIN_H = 8, 5
 
+# How a body cell is drawn, from the directions of its two neighbors. A turn
+# loses the quadrant at its outer corner, the one away from both neighbors,
+# so the bend reads as rounded; a quadrant is a quarter of one column, the
+# finest step the block characters offer. Terminals that draw block elements
+# themselves (bateri does) keep them seamless with the full blocks around.
+BENDS = {
+    frozenset((UP, RIGHT)): "▜█",  # outer corner bottom left
+    frozenset((UP, LEFT)): "█▛",  # bottom right
+    frozenset((DOWN, RIGHT)): "▟█",  # top left
+    frozenset((DOWN, LEFT)): "█▙",  # top right
+}
+# The tail's tip, by the way it points: the end narrows the same way.
+TIPS = {LEFT: "▐█", RIGHT: "█▌", UP: "▟▙", DOWN: "▜▛"}
+
+
+def segment(snake, i):
+    """The two columns body cell `i` of `snake` (head first) is drawn with."""
+    x, y = snake[i]
+    toward = lambda n: (n[0] - x, n[1] - y)
+    ahead = toward(snake[i - 1])
+    if i == len(snake) - 1:
+        return TIPS.get((-ahead[0], -ahead[1]), "██")
+    return BENDS.get(frozenset((ahead, toward(snake[i + 1]))), "██")
+
 
 class Game:
     """The rules, with no screen: the board is `w` × `h` cells."""
@@ -246,8 +270,9 @@ class Screen:
         for (x, y), slot in game.food.items():
             self.put(y + 1, 2 * x + 1, "██", self.color[f"food{slot}"])
         snake = list(game.snake)
-        for x, y in snake[1:]:
-            self.put(y + 1, 2 * x + 1, "██", self.color["body"])
+        for i in range(1, len(snake)):
+            x, y = snake[i]
+            self.put(y + 1, 2 * x + 1, segment(snake, i), self.color["body"])
         hx, hy = snake[0]
         eyes = {RIGHT: " :", LEFT: ": ", UP: "••", DOWN: "••"}[game.heading]
         head = self.color["alert"] if game.over else self.color["head"]
