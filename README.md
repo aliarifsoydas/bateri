@@ -15,7 +15,7 @@ glides instead of jumping, and an idle window draws nothing at all.
 - **Command blocks.** Each prompt and its output form a block, marked in the
   gutter with a chevron colored by how the command ended. Commands that run
   longer than a second show their duration.
-- **Input dock.** In zsh, the line you are editing moves to a dock at the
+- **Input dock.** In zsh and fish, the line you are editing moves to a dock at the
   bottom of the window with your current directory and git branch beneath it.
   It wraps, grows for multi-line input, supports mouse selection and editing,
   and animates typing and deleting (configurable, or off).
@@ -55,14 +55,14 @@ bateri's EdDSA key and verified before it is installed.
 
 ## Shell integration
 
-bateri sets up **zsh** automatically when it starts a shell. It never writes to
-your dotfiles: the integration is loaded through `ZDOTDIR` and your own
-startup files run as usual. This is what enables command blocks, the input
-dock and the ssh status bar.
+bateri sets up **zsh** and **fish** automatically when it starts a shell. It
+never writes to your dotfiles: the integration is loaded through `ZDOTDIR`
+(zsh) or `XDG_DATA_DIRS` (fish) and your own startup files run as usual. This
+is what enables command blocks, the input dock and the ssh status bar.
 
 If you prefer to keep your own prompt and edit on the grid like a classic
 terminal, set `integration = "blocks"` (blocks and marks stay, the dock goes)
-or `"off"` in the `[shell]` section of your settings. bash and fish support is
+or `"off"` in the `[shell]` section of your settings. bash support is
 planned.
 
 ## Configuration

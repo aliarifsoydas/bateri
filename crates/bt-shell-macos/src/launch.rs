@@ -121,13 +121,10 @@ pub(crate) fn integration_env(
     // derives **three** things from it (should the prompt be reset, should the
     // mirror be set up, should the branch be printed) and all three are the
     // answer to "is there a dock in this session". The terminal gives the
-    // decision, the shell is not asked (`ShellIntegration::wants_dock`).
-    //
-    // fish has no dock yet whatever the setting: its dock would have no source
-    // to draw from, and an empty dock with a caret stuck in it is worse than
-    // none. Its block marks are the integration, the input line stays the
-    // user's.
-    if !setting.wants_dock() || kind == child::ShellKind::Fish {
+    // decision, the shell is not asked (`ShellIntegration::wants_dock`). fish
+    // is no exception: its dock reads the line from the grid, so it needs no
+    // mirror, only the script's prompt.
+    if !setting.wants_dock() {
         env.push(("BATERI_DOCK".to_owned(), "off".to_owned()));
     }
     env

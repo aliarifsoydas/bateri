@@ -910,17 +910,17 @@ pub enum ShellIntegration {
     /// If it is a shell we recognize the wrapper is installed; otherwise nothing
     /// happens.
     ///
-    /// In a shell that can mirror (zsh today) the dock opens too and the prompt
-    /// becomes the terminal's.
+    /// In zsh and fish the dock opens too and the prompt becomes the terminal's.
     #[default]
     Auto,
     /// The wrapper is installed but the **input line is not taken**: command
     /// blocks and marks work, the dock doesn't open, the prompt is the user's.
     ///
-    /// **Not an invented tier, the structure itself.** The dock is tied to ZLE's
-    /// mirror; when the bash (`--rcfile`) and fish (`vendor_conf.d`) scripts are
-    /// born, those shells will have marks but no dock. This value only gives the
-    /// zsh user the right to **choose** the same state.
+    /// **Not an invented tier, the structure itself.** The dock needs a source
+    /// for the line (zsh's ZLE mirror, fish's own drawing read back from the
+    /// grid); when the bash (`--rcfile`) script is born, that shell will have
+    /// marks but no dock. This value only gives the zsh and fish user the right
+    /// to **choose** the same state.
     ///
     /// It replaced `[shell] prompt`: a separate key produced
     /// **two prompts** on screen (the user's in the grid, the dock's below) and

@@ -2033,6 +2033,10 @@ pub(crate) mod tests {
     ///
     /// `HOME` and the XDG directories are the test's own: fish writes its history and universal
     /// variables there, and the user's real configuration is never read.
+    ///
+    /// The session has a dock unless `extra` says `BATERI_DOCK=off`, the way the application
+    /// reserves the share (`launch::dock_rows_at_birth`): one decision, the script's and the
+    /// session's.
     fn spawn_fish(
         fish: &Fish,
         home: &Path,
@@ -2071,6 +2075,7 @@ pub(crate) mod tests {
         for (key, value) in extra {
             env.insert((*key).to_owned(), value.clone());
         }
+        let dock = env.get("BATERI_DOCK").is_none_or(|value| value != "off");
         Session::spawn(
             SessionOptions {
                 // `-l -i`: the shape of our session (`login` makes argv[0] `-fish`).
@@ -2091,7 +2096,7 @@ pub(crate) mod tests {
                     blink: CursorBlink::default(),
                 },
                 theme: Theme::BATERI,
-                dock: false,
+                dock,
                 cluster: false,
                 initial_input: None,
                 shell_marks: false,
@@ -2286,7 +2291,12 @@ pub(crate) mod tests {
             &home,
             "function fish_prompt\n  echo \"top [$status|$pipestatus]\"\n  echo -n '> '\nend\n",
         );
-        let session = spawn_fish(&fish, &home, Some("/a"), &[]);
+        let session = spawn_fish(
+            &fish,
+            &home,
+            Some("/a"),
+            &[("BATERI_DOCK", "off".to_owned())],
+        );
         wait_until("prompt marks did not arrive", || {
             session
                 .shell_state()
@@ -2329,6 +2339,276 @@ pub(crate) mod tests {
             blocks.as_slice()
         );
         session.shutdown();
+    }
+
+    /// The line the dock shows, as the frame reads it from the grid and publishes it. The frame
+    /// is what publishes, so every look is a frame; `blocks` is the caller's so the scratch the
+    /// frame fills lives as long as the test does.
+    fn fish_dock(session: &Session, blocks: &std::cell::RefCell<Blocks>) -> DockState {
+        screen(session, &mut blocks.borrow_mut());
+        let mut state = DockState::default();
+        session.dock_state(&mut state);
+        state
+    }
+
+    /// A fish session with a dock, a prompt of the user's and a right prompt of the user's,
+    /// both unique so that a claim "it is not drawn" cannot be fooled by other text.
+    fn spawn_fish_dock(fish: &Fish, root: &TempRoot) -> Session {
+        let home = root.0.join("home");
+        write_fish_config(
+            &home,
+            "function fish_prompt\n  echo -n 'FISHPROMPTXY> '\nend\n\
+             function fish_right_prompt\n  echo -n 'RIGHTXY'\nend\n",
+        );
+        let session = spawn_fish(fish, &home, Some("/a"), &[]);
+        wait_until("prompt marks did not arrive", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.phase == ShellPhase::Input)
+        });
+        session
+    }
+
+    #[test]
+    fn the_fish_dock_shows_the_line_fish_draws() {
+        // The real test of the fish dock: a real fish draws its prompt, colors and suggestion
+        // and the terminal reads the line back from the grid. In one round:
+        //
+        // 1. The user's prompt and right prompt are not drawn: the dock's prompt is the
+        //    terminal's (the same decision as zsh's), and the typed line is in the dock, in
+        //    fish's own colors, the suggestion apart from what was typed, the caret after it.
+        // 2. The grid does not show it a second time — a line that wraps included.
+        // 3. After Enter the command is a block on the grid, and the next prompt is a dock
+        //    again.
+        let Some(fish) = fish() else { return };
+        let root = TempRoot::new("fish-dock");
+        let session = spawn_fish_dock(&fish, &root);
+        let blocks = std::cell::RefCell::new(Blocks::default());
+        let rows = || screen(&session, &mut blocks.borrow_mut());
+
+        // A command the suggestion can come from.
+        session.write(b"echo sugarcane\n");
+        wait_until("the first command did not finish", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.phase == ShellPhase::Input && state.last_exit == Some(0))
+        });
+        let before = rows().iter().filter(|row| row.contains("echo su")).count();
+        assert_eq!(before, 1, "the finished command's line: {:?}", rows());
+
+        // 1.
+        session.write(b"echo su");
+        wait_until("the dock did not show the typed line", || {
+            let dock = fish_dock(&session, &blocks);
+            dock.status == DockStatus::Live && dock.buffer == "echo su"
+        });
+        let dock = fish_dock(&session, &blocks);
+        assert_eq!(dock.postdisplay, "garcane", "the suggestion: {dock:?}");
+        assert_eq!(
+            dock.cursor, 7,
+            "the caret is after what was typed: {dock:?}"
+        );
+        // The suggestion is a run of its own, drawn unlike what was typed (fish's colors).
+        let (typed, suggestion) = match dock.highlights.as_slice() {
+            [.., typed, suggestion] => (typed, suggestion),
+            other => panic!("fish's colors did not reach the dock: {other:?}"),
+        };
+        assert_eq!((suggestion.start, suggestion.end), (7, 14), "{dock:?}");
+        assert_ne!(typed.style, suggestion.style, "{dock:?}");
+        let drawn = rows().join("\n");
+        assert!(
+            !drawn.contains("FISHPROMPTXY") && !drawn.contains("RIGHTXY"),
+            "the user's prompt was drawn on the grid:\n{drawn}"
+        );
+        // 2.
+        assert_eq!(
+            rows().iter().filter(|row| row.contains("echo su")).count(),
+            before,
+            "the typed line was drawn on the grid too:\n{drawn}"
+        );
+        session.write("x".repeat(100).as_bytes());
+        wait_until("the dock did not show the wrapped line", || {
+            let dock = fish_dock(&session, &blocks);
+            dock.status == DockStatus::Live
+                && dock.buffer.ends_with("xxxxxxxxxx")
+                && dock.buffer.len() == 107
+        });
+        let drawn = rows().join("\n");
+        assert!(
+            !drawn.contains("xxxxxxxxxx"),
+            "the wrapped line was drawn on the grid too:\n{drawn}"
+        );
+        // A resize repaints the prompt under the same anchor and reflows the line: it stays in
+        // the dock, whole, and off the grid at either width.
+        for cols in [50, 80] {
+            let _ = session.resize(cols, 20, (9, 18));
+            wait_until("the dock lost the line in a resize", || {
+                let dock = fish_dock(&session, &blocks);
+                dock.status == DockStatus::Live && dock.buffer.len() == 107
+            });
+            let drawn = rows().join("\n");
+            assert!(
+                !drawn.contains("xxxxxxxxxx"),
+                "the line was drawn on the grid at {cols} columns:\n{drawn}"
+            );
+        }
+        // Back to what was typed first: erase the x's.
+        session.write("\u{8}".repeat(100).as_bytes());
+        wait_until("the dock did not show the shortened line", || {
+            fish_dock(&session, &blocks).buffer == "echo su"
+        });
+
+        // 3.
+        session.write(b"\n");
+        wait_until("the command did not finish", || {
+            shown(&session, "su")
+                && session.shell_state().is_some_and(|state| {
+                    state.phase == ShellPhase::Input && state.last_exit == Some(0)
+                })
+                && rows().iter().filter(|row| row.contains("echo su")).count() == 2
+        });
+        let mut now = Blocks::default();
+        screen(&session, &mut now);
+        assert_eq!(
+            now.as_slice().len(),
+            2,
+            "the commands' anchors were not on the grid: {:?}",
+            now.as_slice()
+        );
+        wait_until("the next prompt was not a dock", || {
+            let dock = fish_dock(&session, &blocks);
+            dock.status == DockStatus::Live && dock.buffer.is_empty()
+        });
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_job_notice_stays_on_the_grid_under_a_fish_dock() {
+        // fish prints a background job's end under the open link of the prompt that is on
+        // screen, then draws the prompt again from its cache — the same anchor URI, a fresh
+        // link id. The notice stays in the grid (it is output) and the dock holds the new
+        // prompt's line only. Typed BEFORE the job ends: the harder order, as fish redraws the
+        // line it holds.
+        let Some(fish) = fish() else { return };
+        let root = TempRoot::new("fish-dock-job");
+        let session = spawn_fish_dock(&fish, &root);
+        let blocks = std::cell::RefCell::new(Blocks::default());
+        session.write(b"sleep 2 &\n");
+        wait_until("the job did not start", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.phase == ShellPhase::Input && state.last_exit == Some(0))
+        });
+        session.write(b"xy");
+        wait_until("the dock did not show the typed line", || {
+            let dock = fish_dock(&session, &blocks);
+            dock.status == DockStatus::Live && dock.buffer == "xy"
+        });
+        wait_until("the job's notice was not on the grid", || {
+            shown(&session, "has ended")
+        });
+        let dock = fish_dock(&session, &blocks);
+        assert_eq!(
+            (dock.status, dock.buffer.as_str()),
+            (DockStatus::Live, "xy"),
+            "the dock lost the line, or took the notice into it: {dock:?}"
+        );
+        let rows = screen(&session, &mut blocks.borrow_mut());
+        assert!(
+            rows.iter().any(|row| row.contains("has ended")),
+            "the notice went with the dock's line:\n{}",
+            rows.join("\n")
+        );
+        // fish abandons the old prompt's row where it stood (the notice goes under it), so the
+        // grid keeps one `xy`: the old, outside the dock's range. The new prompt's is in the dock
+        // only; a second one on the grid would be the double image.
+        assert_eq!(
+            rows.iter().filter(|row| row.trim() == "xy").count(),
+            1,
+            "the typed line was drawn on the grid as well as in the dock:\n{}",
+            rows.join("\n")
+        );
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_fish_dock_takes_back_a_prompt_defined_later() {
+        // A prompt the user (or a theme) defines after the wrapper is the terminal's again at
+        // the next prompt: the event defines it at every prompt.
+        let Some(fish) = fish() else { return };
+        let root = TempRoot::new("fish-dock-redefine");
+        let session = spawn_fish_dock(&fish, &root);
+        session.write(b"function fish_prompt; echo -n 'NEWXY> '; end\n");
+        session.write(b"true\n");
+        wait_until("the command did not finish", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.phase == ShellPhase::Input && state.last_exit == Some(0))
+        });
+        let blocks = std::cell::RefCell::new(Blocks::default());
+        wait_until("the next prompt was not a dock", || {
+            let dock = fish_dock(&session, &blocks);
+            dock.status == DockStatus::Live && dock.buffer.is_empty()
+        });
+        let rows = screen(&session, &mut blocks.borrow_mut());
+        assert!(
+            !rows.iter().any(|row| row.starts_with("NEWXY>")),
+            "the later prompt was drawn:\n{}",
+            rows.join("\n")
+        );
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_fish_blocks_setting_keeps_the_prompt_and_opens_no_dock() {
+        // `integration = "blocks"` (`BATERI_DOCK=off`): the user's prompt and the line stay in
+        // the grid, and nothing is read back from it.
+        let Some(fish) = fish() else { return };
+        let root = TempRoot::new("fish-blocks");
+        let home = root.0.join("home");
+        write_fish_config(
+            &home,
+            "function fish_prompt\n  echo -n 'FISHPROMPTXY> '\nend\n",
+        );
+        let session = spawn_fish(
+            &fish,
+            &home,
+            Some("/a"),
+            &[("BATERI_DOCK", "off".to_owned())],
+        );
+        wait_until("prompt marks did not arrive", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.phase == ShellPhase::Input)
+        });
+        session.write(b"echo hi");
+        wait_until("the line was not on the grid", || {
+            shown(&session, "FISHPROMPTXY> echo hi")
+        });
+        let blocks = std::cell::RefCell::new(Blocks::default());
+        let dock = fish_dock(&session, &blocks);
+        assert_ne!(dock.status, DockStatus::Live, "{dock:?}");
+        assert!(dock.buffer.is_empty(), "{dock:?}");
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_fish_script_finishes_the_line_before_it_starts_the_command() {
+        // `8133;e` hands the line from the dock to the grid in one step: Enter has moved the
+        // cursor down a row and, without it, the dock would show the empty row until `C`. The
+        // order is the script's whole point and a real fish cannot show it (the gap is a
+        // frame); the text of the handler can.
+        let path = fish_wrapper_dir()
+            .expect("fish wrapper not found")
+            .join("vendor_conf.d/bateri.fish");
+        let script = std::fs::read_to_string(path).expect("the script");
+        let start = script
+            .find("function __bateri_start --on-event fish_preexec")
+            .expect("the preexec handler");
+        let body = &script[start..start + script[start..].find("\nend\n").expect("its end")];
+        let end = body.find("8133;e").expect("`e` in the handler");
+        let command = body.find("133;C").expect("`C` in the handler");
+        assert!(end < command, "{body}");
     }
 
     #[test]

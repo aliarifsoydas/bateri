@@ -1392,23 +1392,34 @@ terminal works as it is.
   bateri's own directory. The files in that directory load **your** startup
   files, put `ZDOTDIR` back to its original value (or unset it) and add the
   marks to the shell's own hooks. Your command history (`HISTFILE`) also stays
-  in its own directory. In a shell that can mirror its line (today only zsh)
-  the **dock** opens too: the line you type moves to the bottom of the window
-  and bateri draws the prompt.
-- **fish** gets the command blocks, the stripe, the duration counter, the
-  working directory and the `ssh` integration, and its input line stays yours,
-  as with `"blocks"`: the dock is zsh's for now. bateri's directory is put at
-  the front of `XDG_DATA_DIRS`, where fish reads `vendor_conf.d` from, and the
-  file in it takes the entry out of the variable again before your
-  `config.fish` runs. Your prompt keeps running — the marks go around its
-  output — and a `fish_prompt` you define later is picked up at the next
-  prompt. A `ssh` function of your own is left alone. `fish --no-config` reads
-  no `vendor_conf.d`, so it gets no marks.
+  in its own directory. The **dock** opens too: the line you type moves to
+  the bottom of the window and bateri draws the prompt.
+- **fish** gets the same: the command blocks, the stripe, the duration
+  counter, the working directory, the `ssh` integration and the dock. bateri's
+  directory is put at the front of `XDG_DATA_DIRS`, where fish reads
+  `vendor_conf.d` from, and the file in it takes the entry out of the variable
+  again before your `config.fish` runs; nothing is written to your fish files.
+  fish does not hand the terminal its line, so the dock reads the line fish
+  *draws* — your typing in fish's own colors, its gray suggestion apart from
+  what you typed — and bateri draws the prompt: your `fish_prompt`,
+  `fish_right_prompt` and `fish_mode_prompt` are not shown (see [Getting your
+  prompt back](#getting-your-prompt-back)), and one you define later is taken
+  back at the next prompt. A `ssh` function of your own is left alone. What
+  differs from zsh:
+  - selecting text in the dock and then typing does not replace it (the
+    selection drops and the key goes to fish);
+  - a multi-line command with the caret on one of its upper lines shows the
+    lines below the caret on the grid, not in the dock; with the caret on the
+    last line (the usual case while typing) all of it is in the dock;
+  - the completion list (Tab) and the history pager (Ctrl-R) are drawn by fish
+    on the grid, above the dock; with Ctrl-R the dock holds the line fish is
+    previewing and the `search:` field under it;
+  - `fish --no-config` reads no `vendor_conf.d`, so it gets no marks and no
+    dock — the line you type stays in the grid.
 - **`"blocks"`** — the same setup, but **the input line stays yours**: the
   dock does not open, the line you type stays in the grid, and your prompt
-  (p10k, starship, a `PS1` you wrote by hand) shows as it is. Command blocks,
-  marks and colors keep working. A shell that cannot mirror its line editor
-  works this way whatever the setting.
+  (p10k, starship, a `PS1` or `fish_prompt` you wrote by hand) shows as it is.
+  Command blocks, marks and colors keep working.
 - **`"off"`** — nothing is set up.
 - **Your files are not written.** Not a single line is added to `.zshrc` or
   any other rc file; integration is just an environment variable, so turning
@@ -1464,7 +1475,9 @@ and the whole file becomes unreadable (the title bar says so).
 
 Since the default is `"auto"`, anyone with a prompt set up **cannot see it**
 after updating: `"auto"` hands the prompt over to the terminal and moves the
-line you type into the dock. The way back is a single line:
+line you type into the dock. In fish that is `fish_prompt`,
+`fish_right_prompt` and `fish_mode_prompt` all three. The way back is a single
+line:
 
 ```toml
 [shell]
@@ -1486,7 +1499,7 @@ screen (yours in the grid, the dock's at the bottom) and the cursor jumped
 between them. Since saying "the prompt should be mine" already means "the line
 should stay in the grid", the key was retired.
 
-The handover happens only in **zsh**. bash, fish, the far side of SSH and an
+The handover happens in **zsh** and **fish**. bash, the far side of SSH and an
 `integration = "off"` session already show your prompt as it is.
 
 #### Listening ports

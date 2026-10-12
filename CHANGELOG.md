@@ -14,11 +14,15 @@ of every installed copy. A version without a section is not released.
 
 ### Added
 
-- **Command blocks in fish.** When fish is your login shell, bateri now draws
-  the stripe beside each command, the duration of a long one, and follows the
-  directory you are in, and the `ssh` integration reaches servers from fish
-  too. Your prompt stays exactly as it is, with its colors and its right
-  prompt; nothing is written to your fish files. The dock is still zsh's.
+- **fish gets the dock.** When fish is your login shell, the line you type
+  now moves to the dock at the bottom of the window, in fish's own colors with
+  its gray suggestion, and bateri draws the prompt, as it does for zsh. The
+  stripe beside each command, the duration of a long one and the directory you
+  are in come with it, and the `ssh` integration reaches servers from fish
+  too. Nothing is written to your fish files. To keep your own fish prompt, set
+  `[shell] integration = "blocks"`: the command blocks stay and the dock
+  goes. Selecting text in the dock and typing over it does not work in fish
+  yet.
 - **Resize in steps.** A new setting, Resize in steps (`[appearance]
   resize_in_steps`, off by default), resizes a window a whole cell at a time
   while you drag its edge, as Terminal does: a tab with one pane then keeps

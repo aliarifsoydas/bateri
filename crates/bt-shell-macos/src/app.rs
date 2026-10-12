@@ -7398,7 +7398,6 @@ mod tests {
             vec![
                 pair("BATERI_FISH_DIR", "/opt/bateri/shell"),
                 pair("XDG_DATA_DIRS", "/opt/bateri/shell:/a:/b"),
-                pair("BATERI_DOCK", "off"),
             ]
         );
     }
@@ -7422,28 +7421,43 @@ mod tests {
                         "/opt/bateri/shell:/usr/local/share:/usr/share"
                     ),
                     pair("BATERI_XDG_UNSET", "1"),
-                    pair("BATERI_DOCK", "off"),
                 ]
             );
         }
     }
 
     #[test]
-    fn fish_has_no_dock_whatever_the_setting() {
-        // The dock needs a source fish does not give yet. A dock gutter with no
-        // line to fill it is an empty dock and a caret stuck in it: the share is
-        // not reserved and the script is told so (one decision, two readers).
+    fn fish_gets_its_dock_by_the_same_rule_as_zsh() {
+        // The dock reads fish's line from the grid, so the one decision is the
+        // user's: `"auto"` sends nothing and reserves the share, `"blocks"`
+        // tells the script (one decision, two readers) and reserves none.
         let user = Inputs::User { config_root: None };
-        for setting in [ShellIntegration::Auto, ShellIntegration::Blocks] {
-            let (shell, dir) = fish_and_dir();
-            let env = shell_integration_env(&user, setting, shell, dir, None, Some("/a".into()));
-            assert!(env.contains(&pair("BATERI_DOCK", "off")), "{setting:?}");
-            assert_eq!(dock_rows_at_birth(&env, setting), 0, "{setting:?}");
-        }
-        // zsh is untouched by it.
-        let (shell, dir) = zsh_and_dir();
-        let env = shell_integration_env(&user, ShellIntegration::Auto, shell, dir, None, None);
+        let (shell, dir) = fish_and_dir();
+        let env = shell_integration_env(
+            &user,
+            ShellIntegration::Auto,
+            shell,
+            dir,
+            None,
+            Some("/a".into()),
+        );
+        assert!(
+            !env.iter().any(|(key, _)| key == "BATERI_DOCK"),
+            "the default tier wrote the dock decision to fish: {env:?}"
+        );
         assert_eq!(dock_rows_at_birth(&env, ShellIntegration::Auto), DOCK_ROWS);
+
+        let (shell, dir) = fish_and_dir();
+        let env = shell_integration_env(
+            &user,
+            ShellIntegration::Blocks,
+            shell,
+            dir,
+            None,
+            Some("/a".into()),
+        );
+        assert!(env.contains(&pair("BATERI_DOCK", "off")), "{env:?}");
+        assert_eq!(dock_rows_at_birth(&env, ShellIntegration::Blocks), 0);
     }
 
     #[test]
