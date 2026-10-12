@@ -7,7 +7,7 @@
 //! pane — bateri's tabs, or an application that embeds one — speaks it.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use bt_core::{
@@ -38,6 +38,20 @@ pub struct Identity {
     /// `None`: no integration — the pane is a plain terminal, without the
     /// dock and the command blocks.
     pub zsh_wrapper_dir: Option<PathBuf>,
+    /// The same for fish (bateri's `Resources/shell/fish`, the directory that
+    /// holds `vendor_conf.d`). `None`: a fish pane gets no integration, as a
+    /// zsh pane without [`Self::zsh_wrapper_dir`].
+    pub fish_wrapper_dir: Option<PathBuf>,
+}
+
+impl Identity {
+    /// The script directory of a shell kind.
+    pub(crate) fn script_dir(&self, kind: child::ShellKind) -> Option<PathBuf> {
+        match kind {
+            child::ShellKind::Zsh => self.zsh_wrapper_dir.clone(),
+            child::ShellKind::Fish => self.fish_wrapper_dir.clone(),
+        }
+    }
 }
 
 /// The wrapper's environment `wrapper` ([`integration_env`]) completed: the
@@ -61,34 +75,67 @@ pub(crate) fn with_dock(
 /// run never does (its gate is the application's).
 ///
 /// `shell` and `script_dir` are **closures**: in the session of a user who
-/// says `"off"` neither is ever consulted.
+/// says `"off"` neither is ever consulted, and `script_dir` is asked only for
+/// the kind of shell the user runs.
 ///
-/// `zdotdir` is **eager**: it is our own process's environment, not an entry
-/// open to the user's world, and in the hermetic arm its value never reaches the child anyway.
+/// `zdotdir` and `data_dirs` are **eager**: they are our own process's
+/// environment (`ZDOTDIR`, `XDG_DATA_DIRS`), not entries open to the user's
+/// world, and in the hermetic arm their values never reach the child anyway.
 ///
 /// The return is a `Vec`, not an `Option`: the environment set up can be not
-/// one pair but **two** (if the user has an original `ZDOTDIR` the second goes
-/// too) and the caller chains it next to `locale_env()`.
+/// one pair but several and the caller chains it next to `locale_env()`.
 pub(crate) fn integration_env(
     setting: ShellIntegration,
     shell: impl FnOnce() -> Option<PathBuf>,
-    script_dir: impl FnOnce() -> Option<PathBuf>,
+    script_dir: impl FnOnce(child::ShellKind) -> Option<PathBuf>,
     zdotdir: Option<OsString>,
+    data_dirs: Option<OsString>,
 ) -> Vec<(String, String)> {
     if !setting.installs_wrapper() {
         return Vec::new();
     }
     // A shell we do not recognize silently falls back: the terminal works as
     // today, only the marks do not arrive.
-    if !shell().is_some_and(|shell| child::is_zsh(&shell)) {
-        return Vec::new();
-    }
-    // A non-UTF-8 path is the same silent fallback: `SessionOptions.env`
-    // wants a `String` and a session without integration is better than a
-    // half-set-up `ZDOTDIR`.
-    let Some(dir) = script_dir().and_then(|dir| dir.into_os_string().into_string().ok()) else {
+    let Some(kind) = shell().as_deref().and_then(child::ShellKind::of) else {
         return Vec::new();
     };
+    // A non-UTF-8 path is the same silent fallback: `SessionOptions.env`
+    // wants a `String` and a session without integration is better than a
+    // half-set-up one.
+    let Some(dir) = script_dir(kind).and_then(|dir| dir.into_os_string().into_string().ok()) else {
+        return Vec::new();
+    };
+    let mut env = match kind {
+        child::ShellKind::Zsh => zsh_env(dir, zdotdir),
+        child::ShellKind::Fish => fish_env(&dir, data_dirs),
+    };
+    if env.is_empty() {
+        return env;
+    }
+    // **Sent only where there is no dock** (the same shape as `BATERI_ZDOTDIR`
+    // being conditional): in the default arm we add not a single byte to the
+    // environment and the script's "no variable → the prompt is the terminal's" rule becomes the default's **only** record. If it were
+    // written in two places, when one changed the other would silently age.
+    //
+    // The variable's name states the decision, not its result: the script
+    // derives **three** things from it (should the prompt be reset, should the
+    // mirror be set up, should the branch be printed) and all three are the
+    // answer to "is there a dock in this session". The terminal gives the
+    // decision, the shell is not asked (`ShellIntegration::wants_dock`).
+    //
+    // fish has no dock yet whatever the setting: its dock would have no source
+    // to draw from, and an empty dock with a caret stuck in it is worse than
+    // none. Its block marks are the integration, the input line stays the
+    // user's.
+    if !setting.wants_dock() || kind == child::ShellKind::Fish {
+        env.push(("BATERI_DOCK".to_owned(), "off".to_owned()));
+    }
+    env
+}
+
+/// zsh's half of [`integration_env`]: `ZDOTDIR` points at the wrapper's
+/// directory, with the user's own beside it.
+fn zsh_env(dir: String, zdotdir: Option<OsString>) -> Vec<(String, String)> {
     // The user's original `ZDOTDIR`: the script will put it back. All three
     // arms say "the second pair should not go" but their reasons differ:
     let original = match zdotdir {
@@ -122,18 +169,53 @@ pub(crate) fn integration_env(
     if let Some(original) = original {
         env.push(("BATERI_ZDOTDIR".to_owned(), original));
     }
-    // **Sent only at the `blocks` tier** (the same shape as `BATERI_ZDOTDIR`
-    // being conditional): in the default arm we add not a single byte to the
-    // environment and the script's "no variable → the prompt is the terminal's" rule becomes the default's **only** record. If it were
-    // written in two places, when one changed the other would silently age.
-    //
-    // The variable's name states the decision, not its result: the script
-    // derives **three** things from it (should the prompt be reset, should the
-    // mirror be set up, should the branch be printed) and all three are the
-    // answer to "is there a dock in this session". The terminal gives the
-    // decision, the shell is not asked (`ShellIntegration::wants_dock`).
-    if !setting.wants_dock() {
-        env.push(("BATERI_DOCK".to_owned(), "off".to_owned()));
+    env
+}
+
+/// fish's half of [`integration_env`]: our directory goes first in
+/// `XDG_DATA_DIRS`, where fish reads `vendor_conf.d` from, and the script takes
+/// it out again.
+///
+/// `dir` is the wrapper's directory; the entry is its parent, the directory
+/// that holds `fish/`. `BATERI_FISH_DIR` names the entry so the script can find
+/// it in the list.
+///
+/// **An unset `XDG_DATA_DIRS` is not "just ours".** fish computes its
+/// `vendor_conf.d`, `functions` and `completions` search paths from the
+/// variable at startup, so a list holding only our directory would drop the
+/// two the specification names as the default for an unset variable
+/// (`/usr/local/share` and `/usr/share`) for the whole session. They are
+/// written after ours instead, and `BATERI_XDG_UNSET` tells the script that
+/// taking ours out means unsetting the variable again. An empty value counts as
+/// unset, as an empty `ZDOTDIR` does.
+fn fish_env(dir: &str, data_dirs: Option<OsString>) -> Vec<(String, String)> {
+    // The list is `:`-separated, so an entry cannot hold one.
+    let Some(entry) = child::fish_data_dir(Path::new(dir))
+        .and_then(Path::to_str)
+        .filter(|entry| !entry.contains(':'))
+    else {
+        return Vec::new();
+    };
+    let theirs = match data_dirs {
+        None => None,
+        Some(value) if value.is_empty() => None,
+        // Rejecting is the neighboring arms' rule for an unusable value: a
+        // list we could not hand back would be lost to the user's children.
+        Some(value) => match value.into_string() {
+            Ok(value) => Some(value),
+            Err(_) => return Vec::new(),
+        },
+    };
+    let mut env = vec![("BATERI_FISH_DIR".to_owned(), entry.to_owned())];
+    match theirs {
+        Some(theirs) => env.push(("XDG_DATA_DIRS".to_owned(), format!("{entry}:{theirs}"))),
+        None => {
+            env.push((
+                "XDG_DATA_DIRS".to_owned(),
+                format!("{entry}:/usr/local/share:/usr/share"),
+            ));
+            env.push(("BATERI_XDG_UNSET".to_owned(), "1".to_owned()));
+        }
     }
     env
 }
@@ -141,7 +223,7 @@ pub(crate) fn integration_env(
 /// Adds `BATERI_BIN` to a session's shell integration: the path of the
 /// helper program ([`Identity::helper`], bateri's own executable in bateri), which the wrapper's `ssh` function asks for the wrapping
 /// decision (`bateri ssh-argv`). Only where the wrapper is installed — an
-/// empty `env` stays empty, so neither the timed run nor a non-zsh shell nor
+/// empty `env` stays empty, so neither the timed run nor a shell without a script nor
 /// `[shell] integration = "off"` gets it — and only a UTF-8 path
 /// (`SessionOptions.env` wants a `String`; without it the function falls back
 /// to plain `ssh`). With it, `BATERI_SSH_INSTANCE`: the masters' instance
@@ -166,12 +248,15 @@ pub(crate) fn with_helper(
 
 /// The dock share to reserve while the session is born.
 ///
-/// **Both conditions are necessary and separate questions.** If `integration`
+/// **All conditions are necessary and separate questions.** If `integration`
 /// is empty the wrapper was never set up — hermetic run, `"off"`, an
 /// unrecognized shell, a non-UTF-8 script path — i.e. there is no mirror to
 /// fill the dock. `wants_dock` is **the user's choice**: at the `"blocks"`
 /// tier the wrapper is set up (blocks and marks are its whole reason) but the
-/// input line stays in the grid, i.e. no share is reserved.
+/// input line stays in the grid, i.e. no share is reserved. And a wrapper
+/// that was told `BATERI_DOCK=off` ([`integration_env`]) draws no dock
+/// whatever the setting says, so the share is not reserved for it either: the
+/// two answers come from one decision, not two that could drift.
 ///
 /// Deriving one from the other would bring back a closed defect:
 /// **two prompts** on screen (the user's in the grid, the dock's
@@ -180,7 +265,10 @@ pub(crate) fn dock_rows_at_birth(
     integration: &[(String, String)],
     setting: ShellIntegration,
 ) -> u16 {
-    if integration.is_empty() || !setting.wants_dock() {
+    let told_off = integration
+        .iter()
+        .any(|(key, value)| key == "BATERI_DOCK" && value == "off");
+    if integration.is_empty() || !setting.wants_dock() || told_off {
         0
     } else {
         DOCK_ROWS

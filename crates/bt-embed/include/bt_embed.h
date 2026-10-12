@@ -78,7 +78,7 @@ typedef void (*BtEventHandler)(void *context, const BtEvent *event);
 #define BT_EVENT_QUESTIONS 10u
 /* A command started: text = its line (NULL when the screen no longer shows
  * it), flag = it runs in our remote shell, bt_event_started. Needs the shell
- * integration (bt_pane_config_set_zsh_scripts). */
+ * integration (bt_pane_config_set_zsh_scripts, _fish_scripts). */
 #define BT_EVENT_COMMAND_STARTED 11u
 /* A command ended: as COMMAND_STARTED, with bt_event_exit_code and
  * bt_event_duration_ms. A start the host did not see comes first; only a
@@ -183,6 +183,10 @@ bool bt_pane_config_set_helper(BtPaneConfig *config, const char *path);
  * empty: no integration — a plain terminal, without the dock and the command
  * blocks. */
 bool bt_pane_config_set_zsh_scripts(BtPaneConfig *config, const char *dir);
+/* The same for fish (bateri's Resources/shell/fish, the directory that holds
+ * vendor_conf.d). NULL or empty: a fish pane gets no integration. Read when the
+ * user's shell is fish, as the zsh directory is when it is zsh. */
+bool bt_pane_config_set_fish_scripts(BtPaneConfig *config, const char *dir);
 /* Where the shell starts. NULL or empty: the user's home. */
 bool bt_pane_config_set_working_directory(BtPaneConfig *config, const char *dir);
 /* Adds name=value to the shell's environment. The locale's and the shell

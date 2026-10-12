@@ -1384,9 +1384,9 @@ ports = true
 > back](#getting-your-prompt-back).
 
 Integration lets the shell tell the terminal "the prompt started here, the
-command ran here, it ended with this code". Today it exists only for **zsh**;
-in another shell (bash, fish) `"auto"` does nothing either and the terminal
-works as it is.
+command ran here, it ended with this code". Today it exists for **zsh** and
+**fish**; in another shell (bash) `"auto"` does nothing either and the
+terminal works as it is.
 
 - **`"auto"` (the default)** — if the shell is zsh, `ZDOTDIR` points to
   bateri's own directory. The files in that directory load **your** startup
@@ -1395,12 +1395,20 @@ works as it is.
   in its own directory. In a shell that can mirror its line (today only zsh)
   the **dock** opens too: the line you type moves to the bottom of the window
   and bateri draws the prompt.
+- **fish** gets the command blocks, the stripe, the duration counter, the
+  working directory and the `ssh` integration, and its input line stays yours,
+  as with `"blocks"`: the dock is zsh's for now. bateri's directory is put at
+  the front of `XDG_DATA_DIRS`, where fish reads `vendor_conf.d` from, and the
+  file in it takes the entry out of the variable again before your
+  `config.fish` runs. Your prompt keeps running — the marks go around its
+  output — and a `fish_prompt` you define later is picked up at the next
+  prompt. A `ssh` function of your own is left alone. `fish --no-config` reads
+  no `vendor_conf.d`, so it gets no marks.
 - **`"blocks"`** — the same setup, but **the input line stays yours**: the
   dock does not open, the line you type stays in the grid, and your prompt
   (p10k, starship, a `PS1` you wrote by hand) shows as it is. Command blocks,
-  marks and colors keep working. When bash and fish support arrives, those
-  shells will already work this way — the dock depends on mirroring the line
-  editor.
+  marks and colors keep working. A shell that cannot mirror its line editor
+  works this way whatever the setting.
 - **`"off"`** — nothing is set up.
 - **Your files are not written.** Not a single line is added to `.zshrc` or
   any other rc file; integration is just an environment variable, so turning

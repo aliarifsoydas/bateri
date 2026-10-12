@@ -22,6 +22,13 @@ commit. Pushing is a separate step.
 
 ### Added
 
+- `bt_pane_config_set_fish_scripts(config, dir)`: the shell integration's
+  fish scripts (bateri's `Resources/shell/fish`, the directory that holds
+  `vendor_conf.d`), beside `bt_pane_config_set_zsh_scripts`. A pane whose shell
+  is fish reads it: command blocks, the stripe, the working directory and the
+  `ssh` function's remote integration come to it as they do to a zsh pane, and
+  `BT_EVENT_COMMAND_STARTED`, `_FINISHED` and `_DIRECTORY` follow. Without it a
+  fish pane works as before, with no integration. The dock stays zsh's.
 - `bt_pane_set_corner_radii(pane, left, right)`: the radii, in points, of the
   pane's bottom left and right corners — the window's or the card's curve the
   text keeps clear of. The columns, the prompt row and the pointer start

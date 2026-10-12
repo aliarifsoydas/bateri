@@ -298,6 +298,7 @@ pub unsafe extern "C" fn bt_pane_config_new(id: u64, app_name: *const c_char) ->
                 app_name: app_name.to_owned(),
                 helper: None,
                 zsh_wrapper_dir: None,
+                fish_wrapper_dir: None,
             },
             settings: Settings::default(),
             theme: Theme::BATERI,
@@ -375,6 +376,26 @@ pub unsafe extern "C" fn bt_pane_config_set_zsh_scripts(
     unsafe {
         with_config(config, false, |config| {
             config.identity.zsh_wrapper_dir = path_arg(dir);
+            true
+        })
+    }
+}
+
+/// The shell integration's fish scripts (bateri's `Resources/shell/fish`, the directory that
+/// holds `vendor_conf.d`). NULL or empty: a fish pane gets no integration. It is read when the
+/// user's shell is fish, as `bt_pane_config_set_zsh_scripts`'s directory is when it is zsh.
+///
+/// # Safety
+/// As [`bt_pane_config_set_helper`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bt_pane_config_set_fish_scripts(
+    config: *mut BtPaneConfig,
+    dir: *const c_char,
+) -> bool {
+    // SAFETY: the caller's promises.
+    unsafe {
+        with_config(config, false, |config| {
+            config.identity.fish_wrapper_dir = path_arg(dir);
             true
         })
     }

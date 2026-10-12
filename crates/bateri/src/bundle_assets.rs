@@ -32,6 +32,11 @@ fn shell_asset_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/shell/zsh")
 }
 
+/// The input directory of the fish wrapper (`assets/shell/fish`).
+fn fish_asset_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/shell/fish")
+}
+
 fn read_asset(name: &str) -> String {
     let path = asset(name);
     std::fs::read_to_string(&path)
@@ -176,6 +181,44 @@ fn zsh_wrapper_inventory_is_exactly_what_the_bundle_copies() {
             "zdotdir.zsh"
         ],
         "the assets/shell/zsh inventory changed; `make bundle`'s copy and cmp \
+         lists must be updated too"
+    );
+}
+
+/// The fish wrapper's inventory is **exactly** one file, `vendor_conf.d/bateri.fish`.
+///
+/// For the reasons of the zsh test above: `make bundle` copies the file by name
+/// and `cmp`s it, so a second file added to the directory never enters the
+/// package while everything stays green. fish makes it matter more than zsh
+/// does — the package's `shell/` directory is an `XDG_DATA_DIRS` entry, and fish
+/// reads a `functions/` or `completions/` directory in it just as it reads
+/// `vendor_conf.d`: whatever lands in this tree runs in the user's shell.
+#[test]
+fn fish_wrapper_inventory_is_exactly_what_the_bundle_copies() {
+    fn walk(dir: &Path, prefix: &str, found: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{} could not be read: {e}", dir.display()))
+        {
+            let entry = entry.expect("directory entry could not be read");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == ".DS_Store" {
+                continue;
+            }
+            let path = format!("{prefix}{name}");
+            if entry.path().is_dir() {
+                walk(&entry.path(), &format!("{path}/"), found);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&fish_asset_dir(), "", &mut found);
+    found.sort();
+    assert_eq!(
+        found,
+        ["vendor_conf.d/bateri.fish"],
+        "the assets/shell/fish inventory changed; `make bundle`'s copy and cmp \
          lists must be updated too"
     );
 }

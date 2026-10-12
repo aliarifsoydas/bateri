@@ -119,6 +119,7 @@ fn main() {
         app_name: "embed-test".to_owned(),
         helper: None,
         zsh_wrapper_dir: None,
+        fish_wrapper_dir: None,
     });
     let config = embed::Config::new(
         mtm,

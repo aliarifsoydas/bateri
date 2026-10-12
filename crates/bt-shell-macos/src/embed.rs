@@ -181,8 +181,9 @@ pub fn shell_integration(
     let wrapper = launch::integration_env(
         setting,
         child::shell,
-        || identity.zsh_wrapper_dir.clone(),
+        |kind| identity.script_dir(kind),
         std::env::var_os("ZDOTDIR"),
+        std::env::var_os("XDG_DATA_DIRS"),
     );
     launch::with_dock(identity, setting, wrapper, masters.map(Masters::instance))
 }

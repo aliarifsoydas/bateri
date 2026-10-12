@@ -13,8 +13,8 @@
 //! why it is not followed.
 //!
 //! Which shell runs ([`shell`]) and where the shell integration script lives
-//! ([`zsh_wrapper_dir`]) are here too: both belong to the shell's birth and both must be
-//! answered **before the spawn**.
+//! ([`zsh_wrapper_dir`], [`fish_wrapper_dir`]) are here too: both belong to the shell's birth
+//! and both must be answered **before the spawn**.
 //!
 //! The decisions are in pure functions ([`home_directory`], [`decide_locale`], [`is_zsh`]):
 //! the only places where the system is read are a few thin wrappers, the rest is tested.
@@ -315,6 +315,33 @@ pub fn is_zsh(shell: &Path) -> bool {
     shell.file_name().is_some_and(|name| name == "zsh")
 }
 
+/// Whether the shell is fish: the last component of the path is exactly `fish`, for the
+/// reasons [`is_zsh`] gives for zsh.
+pub fn is_fish(shell: &Path) -> bool {
+    shell.file_name().is_some_and(|name| name == "fish")
+}
+
+/// A shell bateri has an integration script for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellKind {
+    Zsh,
+    Fish,
+}
+
+impl ShellKind {
+    /// The kind of shell at `path`; `None` for one without a script (the terminal then works as
+    /// it always did, only the marks do not arrive).
+    pub fn of(shell: &Path) -> Option<Self> {
+        if is_zsh(shell) {
+            Some(Self::Zsh)
+        } else if is_fish(shell) {
+            Some(Self::Fish)
+        } else {
+            None
+        }
+    }
+}
+
 /// The zsh wrapper's directory: `Contents/Resources/shell/zsh` in the bundle, the repo's
 /// `assets/shell/zsh` in a debug build.
 ///
@@ -332,12 +359,36 @@ pub fn is_zsh(shell: &Path) -> bool {
 /// the integration is not installed; where a Linux package puts the script is the packaging
 /// set's question (out of scope here). The repo branch works on both platforms.
 pub fn zsh_wrapper_dir() -> Option<PathBuf> {
-    bundle_shell_dir()
-        .and_then(wrapper_dir)
-        .or_else(repo_wrapper_dir)
+    script_dir("zsh", "bateri.zsh")
 }
 
-/// The repo's `assets/shell/zsh` — **exists only in a debug build**.
+/// The fish wrapper's directory: `Contents/Resources/shell/fish` in the bundle, the repo's
+/// `assets/shell/fish` in a debug build — resolved like [`zsh_wrapper_dir`], and verified by the
+/// presence of the body (`vendor_conf.d/bateri.fish`).
+///
+/// What fish is pointed at is this directory's **parent**: fish reads
+/// `<entry of XDG_DATA_DIRS>/fish/vendor_conf.d`, so the entry that makes it find the body is the
+/// directory that holds `fish/` ([`fish_data_dir`]).
+pub fn fish_wrapper_dir() -> Option<PathBuf> {
+    script_dir("fish", "vendor_conf.d/bateri.fish")
+}
+
+/// The `XDG_DATA_DIRS` entry that makes fish read the wrapper in `wrapper` (the directory
+/// [`fish_wrapper_dir`] returns): its parent.
+pub fn fish_data_dir(wrapper: &Path) -> Option<&Path> {
+    wrapper
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+}
+
+/// `{shell}/{name}` from the bundle or, in a debug build, the repo.
+fn script_dir(name: &str, body: &str) -> Option<PathBuf> {
+    bundle_shell_dir()
+        .and_then(|shell| wrapper_dir(shell, name, body))
+        .or_else(|| repo_wrapper_dir(name, body))
+}
+
+/// The repo's `assets/shell/{name}` — **exists only in a debug build**.
 ///
 /// `#[cfg]`, not `cfg!` (found in code review): the latter is a runtime `bool`, so the
 /// development machine's absolute path embedded via `env!("CARGO_MANIFEST_DIR")` went through
@@ -346,19 +397,23 @@ pub fn zsh_wrapper_dir() -> Option<PathBuf> {
 /// release that branch is not compiled at all" in the doc above is true only with this
 /// distinction.
 #[cfg(debug_assertions)]
-fn repo_wrapper_dir() -> Option<PathBuf> {
-    wrapper_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/shell"))
+fn repo_wrapper_dir(name: &str, body: &str) -> Option<PathBuf> {
+    wrapper_dir(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/shell"),
+        name,
+        body,
+    )
 }
 
 #[cfg(not(debug_assertions))]
-fn repo_wrapper_dir() -> Option<PathBuf> {
+fn repo_wrapper_dir(_name: &str, _body: &str) -> Option<PathBuf> {
     None
 }
 
-/// `{shell}/zsh`, only if the body is a readable file.
-fn wrapper_dir(shell: PathBuf) -> Option<PathBuf> {
-    let dir = shell.join("zsh");
-    dir.join("bateri.zsh").is_file().then_some(dir)
+/// `{shell}/{name}`, only if `body` is a readable file in it.
+fn wrapper_dir(shell: PathBuf, name: &str, body: &str) -> Option<PathBuf> {
+    let dir = shell.join(name);
+    dir.join(body).is_file().then_some(dir)
 }
 
 /// The bundle's `Contents/Resources/shell`: `…/bateri.app/Contents/MacOS/bateri` → two
@@ -632,6 +687,33 @@ pub(crate) mod tests {
         // questioned: `/bin/zsh/` is a directory, so exec fails and the session never opens —
         // whether the integration was installed stops mattering.
         assert!(is_zsh(Path::new("/bin/zsh/")));
+    }
+
+    #[test]
+    fn fish_is_recognized_by_name_not_by_path() {
+        assert!(is_fish(Path::new("/opt/homebrew/bin/fish")));
+        assert!(is_fish(Path::new("fish")));
+        assert!(!is_fish(Path::new("/bin/zsh")));
+        assert!(!is_fish(Path::new("/usr/local/bin/fish-3")));
+        assert!(!is_fish(Path::new("")));
+        assert_eq!(
+            ShellKind::of(Path::new("/opt/homebrew/bin/fish")),
+            Some(ShellKind::Fish)
+        );
+        assert_eq!(ShellKind::of(Path::new("/bin/zsh")), Some(ShellKind::Zsh));
+        assert_eq!(ShellKind::of(Path::new("/bin/bash")), None);
+    }
+
+    #[test]
+    fn the_fish_wrapper_ships_with_the_crate() {
+        // The repo branch (tests run in a debug build): the body is readable, and
+        // the entry fish is pointed at is the directory that holds `fish/`.
+        let dir = fish_wrapper_dir().expect("fish wrapper not found in the repo branch");
+        assert!(dir.ends_with("fish"));
+        assert!(dir.join("vendor_conf.d/bateri.fish").is_file());
+        let entry = fish_data_dir(&dir).expect("no parent");
+        assert!(entry.join("fish/vendor_conf.d/bateri.fish").is_file());
+        assert_eq!(fish_data_dir(Path::new("fish")), None);
     }
 
     #[test]
@@ -1894,5 +1976,525 @@ pub(crate) mod tests {
             drawn.contains("2.0s") || drawn.contains("2.1s")
         });
         session.shutdown();
+    }
+
+    // ── fish ─────────────────────────────────────────────────────────────
+
+    /// The fish on this machine, held for the test's length.
+    struct Fish {
+        path: PathBuf,
+        /// One fish session at a time: each starts a fish that asks the terminal about itself
+        /// and waits for the answers, beside the rest of the suite's shells; in turn their
+        /// load on the machine stays what one test makes of it.
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    /// The fish on this machine, or `None` after the line the other real-shell tests print for
+    /// a missing tool. The version is printed too: the wrapper is checked on whichever fish runs
+    /// the test, and a green run says which one that was.
+    fn fish() -> Option<Fish> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let on_path = std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("fish"))
+                .find(|candidate| candidate.is_file())
+        });
+        let found = on_path.or_else(|| {
+            [
+                "/opt/homebrew/bin/fish",
+                "/usr/local/bin/fish",
+                "/usr/bin/fish",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|candidate| candidate.is_file())
+        });
+        let Some(path) = found else {
+            println!("SKIPPED: no fish on this machine");
+            return None;
+        };
+        let version = std::process::Command::new(&path)
+            .arg("--version")
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .unwrap_or_default();
+        println!("fish: {version} ({})", path.display());
+        Some(Fish {
+            path,
+            _serial: SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        })
+    }
+
+    /// A real fish session with the wrapper installed the way the application installs it
+    /// (`launch::integration_env`'s fish arm): our directory first in `XDG_DATA_DIRS`, with
+    /// `data_dirs` after it, or with fish's defaults and `BATERI_XDG_UNSET` when `None`.
+    ///
+    /// `HOME` and the XDG directories are the test's own: fish writes its history and universal
+    /// variables there, and the user's real configuration is never read.
+    fn spawn_fish(
+        fish: &Fish,
+        home: &Path,
+        data_dirs: Option<&str>,
+        extra: &[(&str, String)],
+    ) -> Session {
+        let wrapper = fish_wrapper_dir().expect("fish wrapper not found");
+        let entry = fish_data_dir(&wrapper)
+            .and_then(Path::to_str)
+            .expect("the wrapper's entry")
+            .to_owned();
+        let mut env = HashMap::from([
+            ("HOME".to_owned(), home.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".to_owned(),
+                home.join(".config").display().to_string(),
+            ),
+            (
+                "XDG_DATA_HOME".to_owned(),
+                home.join(".local/share").display().to_string(),
+            ),
+            ("BATERI_FISH_DIR".to_owned(), entry.clone()),
+        ]);
+        match data_dirs {
+            Some(theirs) => {
+                env.insert("XDG_DATA_DIRS".to_owned(), format!("{entry}:{theirs}"));
+            }
+            None => {
+                env.insert(
+                    "XDG_DATA_DIRS".to_owned(),
+                    format!("{entry}:/usr/local/share:/usr/share"),
+                );
+                env.insert("BATERI_XDG_UNSET".to_owned(), "1".to_owned());
+            }
+        }
+        for (key, value) in extra {
+            env.insert((*key).to_owned(), value.clone());
+        }
+        Session::spawn(
+            SessionOptions {
+                // `-l -i`: the shape of our session (`login` makes argv[0] `-fish`).
+                command: Some((
+                    fish.path.display().to_string(),
+                    vec!["-l".to_owned(), "-i".to_owned()],
+                )),
+                working_directory: Some(home.to_owned()),
+                home: Some(home.to_owned()),
+                env,
+                cols: 80,
+                rows: 20,
+                cell_px: (9, 18),
+                terminal: TerminalOptions {
+                    scrollback: 100,
+                    osc52: Osc52::Off,
+                    cursor: CaretShape::default(),
+                    blink: CursorBlink::default(),
+                },
+                theme: Theme::BATERI,
+                dock: false,
+                cluster: false,
+                initial_input: None,
+                shell_marks: false,
+                pane_uuid: None,
+                hostname: None,
+                replay: None,
+                journal: None,
+            },
+            Arc::new(SilentWake),
+        )
+        .expect("could not open the session")
+    }
+
+    /// `config.fish` of a fake home.
+    fn write_fish_config(home: &Path, text: &str) -> PathBuf {
+        let dir = home.join(".config/fish");
+        std::fs::create_dir_all(&dir).expect("could not set up the fake home directory");
+        let path = dir.join("config.fish");
+        std::fs::write(&path, text).expect("config.fish not written");
+        path
+    }
+
+    fn shown(session: &Session, text: &str) -> bool {
+        screen(session, &mut Blocks::default())
+            .iter()
+            .any(|row| row.contains(text))
+    }
+
+    #[test]
+    fn the_fish_wrapper_loads_the_users_files_and_reports_marks() {
+        // The real test of the fish wrapper: a real fish, a real PTY and a real user
+        // configuration. In one round:
+        //
+        // 1. The user's `config.fish` was read — after ours, with a broken line in it —
+        //    and the prompt it defines is the one drawn: the integration adds marks to it,
+        //    it does not replace it.
+        // 2. Our entry is out of `XDG_DATA_DIRS` by the time `config.fish` runs, and the
+        //    user's own list is what is left.
+        // 3. The marks arrive: a finished command's code, the block's duration (fish prints
+        //    its own, identity-less marks beside ours, and neither may steal the clock), the
+        //    block anchors on the grid, the working directory.
+        // 4. Nothing of the user's was written: `config.fish` is as it was and the universal
+        //    variables hold nothing of ours.
+        let Some(fish) = fish() else { return };
+        let root = TempRoot::new("fish-wrapper");
+        let home = root.0.join("home");
+        let config = "set -g SEEN_CONFIG 1\n\
+                      function fish_prompt\n  echo -n '$ '\nend\n\
+                      bateri_missing_command\n\
+                      echo \"$SEEN_CONFIG [$XDG_DATA_DIRS] [$BATERI_FISH_DIR] [$BATERI_DOCK]\" \
+                      > $HOME/config_seen\n";
+        let config_path = write_fish_config(&home, config);
+        std::fs::create_dir_all(home.join("sub dir")).expect("sub dir");
+
+        let session = spawn_fish(
+            &fish,
+            &home,
+            Some("/usr/local/share:/opt/user/share"),
+            &[("BATERI_DOCK", "off".to_owned())],
+        );
+        wait_until("prompt marks did not arrive", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.phase == ShellPhase::Input)
+        });
+        assert!(shown(&session, "$"), "the user's prompt is not drawn");
+
+        // 2: ours is out, the user's list stays; the dock decision and the directory
+        // variable are ours and out of the environment too.
+        let seen = home.join("config_seen");
+        wait_until("config.fish did not run", || seen.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&seen).expect("config_seen").trim(),
+            "1 [/usr/local/share:/opt/user/share] [] []",
+            "our entry was not taken out of XDG_DATA_DIRS or a variable of ours leaked"
+        );
+
+        // 3: the code, the directory, the anchors and the duration.
+        session.write(b"false\n");
+        wait_until("the command's exit code did not reach the state", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.last_exit == Some(1))
+        });
+        session.write(b"cd 'sub dir'\n");
+        wait_until("the directory did not reach the session", || {
+            session
+                .working_directory()
+                .is_some_and(|dir| dir.ends_with("sub dir"))
+        });
+        // The two finished commands' anchors are on the grid, each with its stripe (the failed
+        // one's differs from the other's); the prompt waiting for input has none yet.
+        let mut blocks = Blocks::default();
+        screen(&session, &mut blocks);
+        assert_eq!(
+            blocks.as_slice().len(),
+            2,
+            "the prompts' anchors were not on the grid: {:?}",
+            blocks.as_slice()
+        );
+        assert_ne!(blocks.as_slice()[0].stripe, blocks.as_slice()[1].stripe);
+        // A command that exceeds the threshold: the counter appears only when our `D` found the
+        // clock the first `C` planted.
+        session.write(b"sleep 2\n");
+        wait_until("finished command's duration not shown", || {
+            let drawn = screen(&session, &mut Blocks::default()).join("\n");
+            drawn.contains("2.0s") || drawn.contains("2.1s")
+        });
+
+        // 4.
+        session.write(b"exit\n");
+        wait_until("history was not written to the fake home", || {
+            home.join(".local/share/fish/fish_history").is_file()
+        });
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("config.fish"),
+            config,
+            "config.fish was written to"
+        );
+        let variables = home.join(".config/fish/fish_variables");
+        if variables.is_file() {
+            let text = std::fs::read_to_string(&variables).expect("fish_variables");
+            assert!(
+                !text.to_lowercase().contains("bateri"),
+                "a universal variable of ours was written: {text}"
+            );
+        }
+        session.shutdown();
+    }
+
+    #[test]
+    fn fish_gets_the_data_dirs_it_would_have_had() {
+        // `XDG_DATA_DIRS` unset is not "just ours": fish computes its `vendor_conf.d`,
+        // `functions` and `completions` paths from the variable at startup, and ours alone would
+        // drop the two the specification names as the default for the whole session. The
+        // terminal writes them after ours; the script takes ours out and unsets the variable
+        // again, because the user had none.
+        let Some(fish) = fish() else { return };
+        for (name, theirs, expected) in
+            [("unset", None, "U"), ("set", Some("/opt/user/share"), "S")]
+        {
+            let root = TempRoot::new(&format!("fish-data-dirs-{name}"));
+            let home = root.0.join("home");
+            write_fish_config(&home, "");
+            let session = spawn_fish(&fish, &home, theirs, &[]);
+            wait_until("prompt marks did not arrive", || {
+                session
+                    .shell_state()
+                    .is_some_and(|state| state.phase == ShellPhase::Input)
+            });
+            // The variable's state, and whether fish still has the directory the
+            // specification names as the default.
+            session.write(
+                b"echo (set -q XDG_DATA_DIRS; and echo S; or echo U)(contains /usr/share/fish/vendor_conf.d $__fish_vendor_confdirs; and echo Y; or echo N)\n",
+            );
+            // Whether fish still has the default directory matters when the variable was unset;
+            // with the user's own list it depends on the install (a distribution's fish also
+            // compiles its vendor directories in).
+            wait_until(
+                &format!("{name}: the variable's state was not shown"),
+                || {
+                    shown(&session, &format!("{expected}Y"))
+                        || shown(&session, &format!("{expected}N"))
+                },
+            );
+            if theirs.is_none() {
+                assert!(
+                    shown(&session, "UY"),
+                    "{name}: fish lost /usr/share/fish/vendor_conf.d"
+                );
+            }
+            if let Some(theirs) = theirs {
+                session.write(b"echo \"[$XDG_DATA_DIRS]\"\n");
+                wait_until("the user's list was not shown", || {
+                    shown(&session, &format!("[{theirs}]"))
+                });
+            }
+            session.shutdown();
+        }
+    }
+
+    #[test]
+    fn the_fish_prompt_keeps_its_status_and_follows_a_redefinition() {
+        // The wrapper runs the user's prompt, it does not replace it, and it runs it FIRST:
+        // `$status` and `$pipestatus` are what fish handed the prompt. Any command before the
+        // user's function would overwrite them. And a prompt the user (or a theme) defines
+        // later is taken back at the next prompt.
+        let Some(fish) = fish() else { return };
+        let root = TempRoot::new("fish-prompt");
+        let home = root.0.join("home");
+        write_fish_config(
+            &home,
+            "function fish_prompt\n  echo \"top [$status|$pipestatus]\"\n  echo -n '> '\nend\n",
+        );
+        let session = spawn_fish(&fish, &home, Some("/a"), &[]);
+        wait_until("prompt marks did not arrive", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.phase == ShellPhase::Input)
+        });
+        session.write(b"true | false | true; false\n");
+        wait_until("the status was not in the prompt", || {
+            shown(&session, "top [1|1]")
+        });
+        session.write(b"true | false\n");
+        wait_until("the pipe status was not in the prompt", || {
+            shown(&session, "top [1|0 1]")
+        });
+
+        // A new definition: wrapped again at the next prompt, so the block it opens is still
+        // anchored (a finished command's stripe is what shows it).
+        session.write(b"function fish_prompt; echo -n 'NEW> '; end\n");
+        wait_until("the new prompt was not drawn", || shown(&session, "NEW>"));
+        session.write(b"true\n");
+        wait_until("the command did not finish", || {
+            shown(&session, "NEW> true")
+        });
+        wait_until("the command's code did not arrive", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.last_exit == Some(0))
+        });
+        let mut blocks = Blocks::default();
+        let rows = screen(&session, &mut blocks);
+        let typed = rows
+            .iter()
+            .position(|row| row.starts_with("NEW> true"))
+            .expect("the typed line");
+        assert!(
+            blocks
+                .as_slice()
+                .iter()
+                .any(|block| usize::from(block.row) == typed),
+            "a prompt defined after the wrapper has no anchor: row {typed} vs {:?}",
+            blocks.as_slice()
+        );
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_fish_wrappers_ssh_function_asks_the_binary() {
+        // `ssh` is the user's until the first prompt: a function of their own wins, and
+        // otherwise ours asks the binary (`bateri ssh-argv`, one parser) for the wrapped
+        // arguments, NUL-separated, an empty one included.
+        let Some(fish) = fish() else { return };
+        let root = TempRoot::new("fish-ssh");
+        let home = root.0.join("home");
+        let bin = root.0.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let log = root.0.join("asked");
+        let script = |path: PathBuf, body: String| {
+            std::fs::write(&path, body).expect("script");
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .expect("chmod");
+        };
+        let fall = root.0.join("fall");
+        script(
+            bin.join("bateri"),
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1 $2\" in\n\
+                 'ssh-argv --tty') printf -- '-t\\0x\\0y z\\0\\0BOOT\\0' ;;\n\
+                 ssh-fell-back*) [ -f '{}' ] && printf -- 'PLAIN\\0x\\0' ;;\nesac\nexit 0\n",
+                log.display(),
+                fall.display()
+            ),
+        );
+        let code = root.0.join("code");
+        script(
+            bin.join("ssh"),
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '[%s]' \"$a\"; done; echo\n\
+                 [ -f '{0}' ] && exit \"$(cat '{0}')\"\nexit 0\n",
+                code.display()
+            ),
+        );
+        let spawn = |rc: &str| {
+            // The stand-ins first on `PATH`, after the system's login files (macOS's
+            // `path_helper` rewrites it for a login shell).
+            write_fish_config(
+                &home,
+                &format!(
+                    "set -gx PATH {} $PATH\nfunction fish_prompt; echo -n '$ '; end\n{rc}",
+                    bin.display()
+                ),
+            );
+            spawn_fish(
+                &fish,
+                &home,
+                Some("/a"),
+                &[
+                    ("BATERI_DOCK", "off".to_owned()),
+                    ("BATERI_BIN", bin.join("bateri").display().to_string()),
+                    ("BATERI_SSH_INSTANCE", "0a1b2c3d".to_owned()),
+                    ("BATERI_SSH_CWD", "/srv/my app".to_owned()),
+                ],
+            )
+        };
+
+        let session = spawn("");
+        wait_until("prompt marks did not arrive", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.phase == ShellPhase::Input)
+        });
+        session.write(
+            b"ssh x 'y z'; ssh x | cat; echo \"[\"(set -q BATERI_BIN BATERI_SSH_INSTANCE BATERI_SSH_CWD; echo $status)\"]\"\n",
+        );
+        wait_until("the wrapped call did not run", || {
+            shown(&session, "[-t][x][y z][][BOOT]") && shown(&session, "[3]")
+        });
+        let asked = std::fs::read_to_string(&log).expect("the binary was asked");
+        // `--block` is the command's own block: the first prompt's; the folder went with the
+        // first call and not the second; the wrapped call asked the fallback with its arguments.
+        assert_eq!(
+            asked,
+            "ssh-argv --tty --block 1 --instance 0a1b2c3d --cwd /srv/my app -- x y z\n\
+             ssh-fell-back --rc 0 --instance 0a1b2c3d -- -t x y z  BOOT\n\
+             ssh-argv --block 1 --instance 0a1b2c3d -- x\n"
+        );
+        std::fs::remove_file(&log).expect("log");
+
+        // A fallback answer is rerun plain; the code is the rerun's.
+        std::fs::write(&fall, "").expect("fall");
+        std::fs::write(&code, "7").expect("code");
+        session.write(b"ssh x; echo \"rc=$status\"\n");
+        wait_until("the plain rerun did not run", || {
+            shown(&session, "[PLAIN][x]") && shown(&session, "rc=7")
+        });
+        // Inside a multiplexer nothing is wrapped.
+        std::fs::remove_file(&fall).expect("fall");
+        std::fs::write(&code, "255").expect("code");
+        session.write(b"env TMUX=t fish -c 'true'; set -x TMUX t; ssh x; echo \"r2=$status\"\n");
+        wait_until("the tmux call did not run", || shown(&session, "r2=255"));
+        session.shutdown();
+
+        // A user's own `ssh` function wins: ours is not defined over it.
+        let session = spawn("function ssh; echo USER-SSH; end\n");
+        wait_until("prompt marks did not arrive", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.phase == ShellPhase::Input)
+        });
+        session.write(b"ssh x\n");
+        wait_until("the user's ssh did not run", || shown(&session, "USER-SSH"));
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_fish_wrapper_forks_git_only_for_a_dock() {
+        // The branch is the dock's context line and nothing else reads it: without a dock
+        // (`BATERI_DOCK=off`) it is a `git` fork per prompt for no consumer. The stand-in `git`
+        // records that it was asked.
+        let Some(fish) = fish() else { return };
+        let root = TempRoot::new("fish-git");
+        let home = root.0.join("home");
+        let bin = root.0.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let log = root.0.join("git_asked");
+        let git = bin.join("git");
+        std::fs::write(
+            &git,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\necho main\n", log.display()),
+        )
+        .expect("git");
+        std::fs::set_permissions(&git, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        for (dock, extra) in [(false, "off"), (true, "")] {
+            let _ = std::fs::remove_file(&log);
+            write_fish_config(
+                &home,
+                &format!(
+                    "set -gx PATH {} $PATH\nfunction fish_prompt; echo -n '$ '; end\n",
+                    bin.display()
+                ),
+            );
+            let env: Vec<(&str, String)> = if dock {
+                Vec::new()
+            } else {
+                vec![("BATERI_DOCK", extra.to_owned())]
+            };
+            let session = spawn_fish(&fish, &home, Some("/a"), &env);
+            wait_until("prompt marks did not arrive", || {
+                session
+                    .shell_state()
+                    .is_some_and(|state| state.phase == ShellPhase::Input)
+            });
+            session.write(b"true\n");
+            wait_until("the second prompt did not arrive", || {
+                session
+                    .shell_state()
+                    .is_some_and(|state| state.last_exit == Some(0))
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let asked = std::fs::read_to_string(&log).unwrap_or_default();
+            if dock {
+                assert!(
+                    asked.starts_with("rev-parse --abbrev-ref HEAD"),
+                    "the branch was not asked at a dock's prompt: {asked:?}"
+                );
+            } else {
+                assert!(asked.is_empty(), "git was forked without a dock: {asked:?}");
+            }
+            session.shutdown();
+        }
     }
 }

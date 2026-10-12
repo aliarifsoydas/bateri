@@ -152,6 +152,12 @@ fn main() {
     ))
     .canonicalize()
     .expect("the shell integration's scripts");
+    let fish_scripts = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../assets/shell/fish"
+    ))
+    .canonicalize()
+    .expect("the shell integration's fish scripts");
     // SAFETY: every string is alive for its call; the configuration is consumed by the open; the
     // context outlives the pane.
     unsafe {
@@ -180,6 +186,14 @@ fn main() {
             config,
             c(scripts.to_str().expect("a UTF-8 path")).as_ptr()
         ));
+        assert!(bt_pane_config_set_fish_scripts(
+            config,
+            c(fish_scripts.to_str().expect("a UTF-8 path")).as_ptr()
+        ));
+        assert!(
+            !bt_pane_config_set_fish_scripts(null_mut(), c("/x").as_ptr()),
+            "no configuration, no setter"
+        );
         assert!(bt_pane_config_set_command(
             config,
             c(concat!(

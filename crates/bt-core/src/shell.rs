@@ -8328,6 +8328,88 @@ mod tests {
         );
     }
 
+    /// **A stream recorded from a real fish** (4.9.3, the wrapper loaded, the default prompt, a
+    /// git repository on the branch `main`, the dock decision left to the default so the branch
+    /// is printed), replayed through the scanner.
+    ///
+    /// fish prints its own OSC 133 beside ours, without an identity — `A` with
+    /// `click_events`, `B`, `C` with the command line, `D` — and its own OSC 7 with the host's
+    /// name, and the ledger has to come out as if only ours were there. The record keeps fish's
+    /// order: its `C` and `D` come BEFORE ours, its `A` and `B` after, so a command ends once for
+    /// the clock and once for the book. Each command's chunk is split at its `D` with a pause, so
+    /// the duration is a real one and neither of fish's marks may take it.
+    #[test]
+    fn a_recorded_fish_stream_opens_and_closes_every_block() {
+        const FIRST_PROMPT: &[u8] = b"\r\x1b]7;file://mymac/home/user\x07\x1b]133;A;bt_block=1\x07\x1b]7;file:///home/user\x07\x1b]8133;b;\x07\x1b]0;~\x1b\\\x1b[m\x1b]11;?\x1b\\\x1b[6n\x1b[0c\x1b[?2004h\x1b[?2031h\x1b[>4;1m\x1b=\x1b]133;A;click_events=1\x1b\\\x1b]8;;bateri://block/1\x07\x1b[92muser\x1b[m@\x1b[mmymac\x1b[m \x1b[32m~\x1b[m\x1b[m> \x1b]133;B\x07\x1b]133;B\x1b\\\x1b[K\r\x1b[23C";
+        const CD_INTO_A_REPOSITORY: &[u8] = b"cd \r\x1b[26C\x1b[?2004l\x1b[?2031l\x1b[>4;0m\x1b>proj\r\x1b[30C\x1b[7Dcd \x1b[36mproj\x1b[39m\r\x1b[30C\r\n\x1b[m\x1b]133;C;cmdline_url=cd%20proj\x1b\\\x1b]8;;\x07\x1b]133;C\x07\x1b]0;cd proj ~\x1b\\\x1b[m\r\x1b]7;file://mymac/home/user/proj\x07\x1b]133;D;0\x1b\\\x1b]133;D;0;bt_block=1\x07\x1b[?25h\x1b[2m\xe2\x8f\x8e\x1b[m                                                                               \r\xe2\x8f\x8e \r\x1b[K\x1b]133;A;bt_block=2\x07\x1b]7;file:///home/user/proj\x07\x1b]8133;b;bWFpbg==\x07\x1b]7;file://mymac/home/user/proj\x07\x1b]0;~/proj\x1b\\\x1b[m\x1b]11;?\x1b\\\x1b[6n\x1b[0c\x1b[?2004h\x1b[?2031h\x1b[>4;1m\x1b=\x1b]133;A;click_events=1\x1b\\\x1b]8;;bateri://block/2\x07\x1b[92muser\x1b[m@\x1b[mmymac\x1b[m \x1b[32m~/proj\x1b[m (main)\x1b[m> \x1b]133;B\x07\x1b]133;B\x1b\\\x1b[K\r\x1b[35C";
+        const A_FAILING_COMMAND: &[u8] = b"sleep \r\x1b[41C0.3;\r\x1b[45C \r\x1b[46C\x1b[?2004l\x1b[?2031l\x1b[>4;0m\x1b>false\r\x1b[51C\x1b[16Dsleep \x1b[36m0.3\x1b[32m;\x1b[39m false\r\x1b[51C\r\n\x1b[m\x1b]133;C;cmdline_url=sleep%200.3%3B%20false\x1b\\\x1b]8;;\x07\x1b]133;C\x07\x1b]0;sleep 0.3; false ~/proj\x1b\\\x1b[m\r\x1b]133;D;1\x1b\\\x1b]133;D;1;bt_block=2\x07\x1b[?25h\x1b[2m\xe2\x8f\x8e\x1b[m                                                                               \r\xe2\x8f\x8e \r\x1b[K\x1b]133;A;bt_block=3\x07\x1b]7;file:///home/user/proj\x07\x1b]8133;b;bWFpbg==\x07\x1b]7;file://mymac/home/user/proj\x07\x1b]0;~/proj\x1b\\\x1b[m\x1b]11;?\x1b\\\x1b[6n\x1b[0c\x1b[?2004h\x1b[?2031h\x1b[>4;1m\x1b=\x1b]133;A;click_events=1\x1b\\\x1b]8;;bateri://block/3\x07\x1b[92muser\x1b[m@\x1b[mmymac\x1b[m \x1b[32m~/proj\x1b[m (main)\x1b[m \x1b[m\x1b[31m[\x1b[31;1m1\x1b[m\x1b[31m]\x1b[m\x1b[m> \x1b]133;B\x07\x1b]133;B\x1b\\\x1b[K\r\x1b[39C";
+        const AN_EMPTY_ENTER: &[u8] = b"\x1b[?2004l\x1b[?2031l\x1b[>4;0m\x1b>\r\n\x1b[m\x1b[2m\xe2\x8f\x8e\x1b[m                                                                               \r\xe2\x8f\x8e \r\x1b[K\x1b]133;A;bt_block=4\x07\x1b]7;file:///home/user/proj\x07\x1b]8133;b;bWFpbg==\x07\x1b]7;file://mymac/home/user/proj\x07\x1b]0;~/proj\x1b\\\x1b[m\x1b]11;?\x1b\\\x1b[6n\x1b[0c\x1b[?2004h\x1b[?2031h\x1b[>4;1m\x1b=\x1b]133;A;click_events=1\x1b\\\x1b]8;;bateri://block/4\x07\x1b[92muser\x1b[m@\x1b[mmymac\x1b[m \x1b[32m~/proj\x1b[m (main)\x1b[m \x1b[m\x1b[31m[\x1b[31m1\x1b[m\x1b[31m]\x1b[m\x1b[m> \x1b]133;B\x07\x1b]133;B\x1b\\\x1b[K\r\x1b[39C";
+        const A_SUCCEEDING_COMMAND: &[u8] = b"\x1b[?2004l\x1b[?2031l\x1b[>4;0m\x1b>true\r\x1b[43C\r\n\x1b[m\x1b]133;C;cmdline_url=true\x1b\\\x1b]8;;\x07\x1b]133;C\x07\x1b]0;true ~/proj\x1b\\\x1b[m\r\x1b]133;D;0\x1b\\\x1b]133;D;0;bt_block=4\x07\x1b[?25h\x1b[2m\xe2\x8f\x8e\x1b[m                                                                               \r\xe2\x8f\x8e \r\x1b[K\x1b]133;A;bt_block=5\x07\x1b]7;file:///home/user/proj\x07\x1b]8133;b;bWFpbg==\x07\x1b]7;file://mymac/home/user/proj\x07\x1b]0;~/proj\x1b\\\x1b[m\x1b]11;?\x1b\\\x1b[6n\x1b[0c\x1b[?2004h\x1b[?2031h\x1b[>4;1m\x1b=\x1b]133;A;click_events=1\x1b\\\x1b]8;;bateri://block/5\x07\x1b[92muser\x1b[m@\x1b[mmymac\x1b[m \x1b[32m~/proj\x1b[m (main)\x1b[m> \x1b]133;B\x07\x1b]133;B\x1b\\\x1b[K\r\x1b[35C";
+        let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
+        // The host's name in fish's OSC 7 is the machine's: supplied, it is local.
+        let mut scanner = Scanner::new().hostname(Some("mymac".to_owned()));
+        let mut feed = |log: &mut ShellLog, bytes: &[u8]| {
+            scanner.feed(bytes, |event| {
+                log.apply_scan(event);
+            });
+        };
+        let ran = |feed: &mut dyn FnMut(&mut ShellLog, &[u8]), log: &mut ShellLog, chunk: &[u8]| {
+            let at = chunk
+                .windows(8)
+                .position(|window| window == b"\x1b]133;D;")
+                .expect("a command's D");
+            feed(log, &chunk[..at]);
+            std::thread::sleep(Duration::from_millis(60));
+            feed(log, &chunk[at..]);
+        };
+        let running = RunningBlocks::default();
+
+        feed(&mut log, FIRST_PROMPT);
+        assert_eq!(log.local.state.map(|s| s.phase), Some(ShellPhase::Input));
+        assert_eq!(log.context.cwd, "/home/user");
+        assert_eq!(log.context.branch, "");
+        assert!(
+            log.context.remote.is_none(),
+            "fish's own OSC 7 made a remote slot"
+        );
+
+        // `cd proj` is block 1; its prompt is block 2, in the repository.
+        ran(&mut feed, &mut log, CD_INTO_A_REPOSITORY);
+        assert_eq!(log.context.cwd, "/home/user/proj");
+        assert_eq!(log.context.branch, "main");
+        assert_eq!(
+            log.stripe(BlockKey::Local(1), running),
+            Some(Stripe::Success)
+        );
+        assert!(
+            log.duration(BlockKey::Local(1), running)
+                .is_some_and(|measured| measured >= Duration::from_millis(50)),
+            "a mark of fish's own took the clock: {:?}",
+            log.duration(BlockKey::Local(1), running)
+        );
+
+        ran(&mut feed, &mut log, A_FAILING_COMMAND);
+        assert_eq!(log.stripe(BlockKey::Local(2), running), Some(Stripe::Error));
+        assert!(
+            log.duration(BlockKey::Local(2), running)
+                .is_some_and(|measured| measured >= Duration::from_millis(50))
+        );
+        assert_eq!(log.local.state.map(|s| s.phase), Some(ShellPhase::Input));
+
+        // Enter on an empty line: a new prompt, a new block, no command in between.
+        feed(&mut log, AN_EMPTY_ENTER);
+        assert_eq!(log.last_block(), Some(BlockKey::Local(4)));
+        assert_eq!(log.stripe(BlockKey::Local(3), running), None);
+
+        ran(&mut feed, &mut log, A_SUCCEEDING_COMMAND);
+        assert_eq!(
+            log.stripe(BlockKey::Local(4), running),
+            Some(Stripe::Success)
+        );
+        assert_eq!(log.last_block(), Some(BlockKey::Local(5)));
+        assert_eq!(log.ends, Ends { ok: 2, failed: 1 });
+    }
+
     /// The buffer's ceiling takes the longest representable text.
     ///
     /// [`Counter::CAPACITY`] is a derivation, not a guess: the duration is `u32`

@@ -803,13 +803,14 @@ fn shell_integration_env(
     inputs: &Inputs,
     setting: ShellIntegration,
     shell: impl FnOnce() -> Option<PathBuf>,
-    script_dir: impl FnOnce() -> Option<PathBuf>,
+    script_dir: impl FnOnce(child::ShellKind) -> Option<PathBuf>,
     zdotdir: Option<OsString>,
+    data_dirs: Option<OsString>,
 ) -> Vec<(String, String)> {
     if matches!(inputs, Inputs::Hermetic) {
         return Vec::new();
     }
-    launch::integration_env(setting, shell, script_dir, zdotdir)
+    launch::integration_env(setting, shell, script_dir, zdotdir, data_dirs)
 }
 
 /// The daily preview sweep's period — "once a day", a design
@@ -2462,6 +2463,7 @@ impl AppDelegate {
                 app_name: "bateri".to_owned(),
                 helper: std::env::current_exe().ok(),
                 zsh_wrapper_dir: child::zsh_wrapper_dir(),
+                fish_wrapper_dir: child::fish_wrapper_dir(),
             }),
             restore_lock: RefCell::new(None),
             arrival: RefCell::new(arrival),
@@ -4666,8 +4668,9 @@ impl AppDelegate {
             &self.inputs(),
             setting,
             child::shell,
-            || identity.zsh_wrapper_dir.clone(),
+            |kind| identity.script_dir(kind),
             std::env::var_os("ZDOTDIR"),
+            std::env::var_os("XDG_DATA_DIRS"),
         );
         launch::with_dock(
             identity,
@@ -7065,11 +7068,11 @@ mod tests {
     /// The fixed input of the arm where integration is installed: zsh + a directory with a body.
     fn zsh_and_dir() -> (
         impl FnOnce() -> Option<PathBuf>,
-        impl FnOnce() -> Option<PathBuf>,
+        impl FnOnce(child::ShellKind) -> Option<PathBuf>,
     ) {
         (
             || Some(PathBuf::from("/bin/zsh")),
-            || Some(PathBuf::from("/opt/bateri/shell/zsh")),
+            |kind| (kind == child::ShellKind::Zsh).then(|| PathBuf::from("/opt/bateri/shell/zsh")),
         )
     }
 
@@ -7081,7 +7084,7 @@ mod tests {
         // stay in the grid.
         let user = Inputs::User { config_root: None };
         let (shell, dir) = zsh_and_dir();
-        let env = shell_integration_env(&user, ShellIntegration::Blocks, shell, dir, None);
+        let env = shell_integration_env(&user, ShellIntegration::Blocks, shell, dir, None, None);
         assert!(
             env.iter().any(|(key, _)| key == "ZDOTDIR"),
             "blocks did not install the wrapper: blocks would die too"
@@ -7095,7 +7098,7 @@ mod tests {
         // `"auto"` sets up the same environment and **reserves** the gutter: what
         // separates the two tiers is not the environment but this decision.
         let (shell, dir) = zsh_and_dir();
-        let env = shell_integration_env(&user, ShellIntegration::Auto, shell, dir, None);
+        let env = shell_integration_env(&user, ShellIntegration::Auto, shell, dir, None, None);
         assert_eq!(dock_rows_at_birth(&env, ShellIntegration::Auto), DOCK_ROWS);
 
         // If the wrapper was never installed there is no gutter whatever the tier:
@@ -7122,8 +7125,9 @@ mod tests {
                 &Inputs::Hermetic,
                 setting,
                 || panic!("timed run resolved the shell"),
-                || panic!("timed run looked for the script"),
+                |_| panic!("timed run looked for the script"),
                 Some("/home/someone/zsh".into()),
+                None,
             );
             assert!(
                 env.is_empty(),
@@ -7318,7 +7322,8 @@ mod tests {
             &Inputs::User { config_root: None },
             ShellIntegration::Off,
             || panic!("\"off\" resolved the shell"),
-            || panic!("\"off\" looked for the script"),
+            |_| panic!("\"off\" looked for the script"),
+            None,
             None,
         );
         assert!(env.is_empty());
@@ -7332,13 +7337,15 @@ mod tests {
             &user,
             ShellIntegration::Auto,
             || Some(PathBuf::from("/bin/bash")),
-            || panic!("script looked up for a non-zsh shell"),
+            |_| panic!("script looked up for a shell without one"),
+            None,
             None,
         );
         assert!(env.is_empty(), "wrapper installed for bash");
         // The shell could not be resolved at all (passwd unreadable, no `$SHELL`): the same silent
         // fallback.
-        let env = shell_integration_env(&user, ShellIntegration::Auto, || None, || None, None);
+        let env =
+            shell_integration_env(&user, ShellIntegration::Auto, || None, |_| None, None, None);
         assert!(env.is_empty(), "wrapper installed for a shell-less session");
         // The shell is zsh but there is no script (missing package): a session without integration
         // is better than a half-installed `ZDOTDIR` — the user's configuration
@@ -7347,10 +7354,162 @@ mod tests {
             &user,
             ShellIntegration::Auto,
             || Some(PathBuf::from("/bin/zsh")),
-            || None,
+            |_| None,
+            None,
             None,
         );
         assert!(env.is_empty(), "betiksiz ZDOTDIR kuruldu");
+    }
+
+    /// A fish at `/opt/homebrew/bin/fish` with its script directory; zsh's is never asked.
+    fn fish_and_dir() -> (
+        impl FnOnce() -> Option<PathBuf>,
+        impl FnOnce(child::ShellKind) -> Option<PathBuf>,
+    ) {
+        (
+            || Some(PathBuf::from("/opt/homebrew/bin/fish")),
+            |kind| {
+                assert_eq!(kind, child::ShellKind::Fish, "fish asked for zsh's scripts");
+                Some(PathBuf::from("/opt/bateri/shell/fish"))
+            },
+        )
+    }
+
+    fn pair(key: &str, value: &str) -> (String, String) {
+        (key.to_owned(), value.to_owned())
+    }
+
+    #[test]
+    fn fish_reads_the_wrapper_through_the_data_dirs() {
+        let user = Inputs::User { config_root: None };
+        // The user's list: ours goes first and the script finds its entry by
+        // `BATERI_FISH_DIR`. There is no `ZDOTDIR`: that is zsh's.
+        let (shell, dir) = fish_and_dir();
+        let env = shell_integration_env(
+            &user,
+            ShellIntegration::Auto,
+            shell,
+            dir,
+            Some("/home/someone/zsh".into()),
+            Some("/a:/b".into()),
+        );
+        assert_eq!(
+            env,
+            vec![
+                pair("BATERI_FISH_DIR", "/opt/bateri/shell"),
+                pair("XDG_DATA_DIRS", "/opt/bateri/shell:/a:/b"),
+                pair("BATERI_DOCK", "off"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unset_data_dirs_keeps_fishs_defaults() {
+        // fish computes its `vendor_conf.d`, `functions` and `completions` paths
+        // from the variable at startup: ours alone would drop the two the
+        // specification names as the default for an unset one, for the whole
+        // session. An empty value is unset.
+        let user = Inputs::User { config_root: None };
+        for unset in [None, Some(OsString::new())] {
+            let (shell, dir) = fish_and_dir();
+            let env = shell_integration_env(&user, ShellIntegration::Auto, shell, dir, None, unset);
+            assert_eq!(
+                env,
+                vec![
+                    pair("BATERI_FISH_DIR", "/opt/bateri/shell"),
+                    pair(
+                        "XDG_DATA_DIRS",
+                        "/opt/bateri/shell:/usr/local/share:/usr/share"
+                    ),
+                    pair("BATERI_XDG_UNSET", "1"),
+                    pair("BATERI_DOCK", "off"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn fish_has_no_dock_whatever_the_setting() {
+        // The dock needs a source fish does not give yet. A dock gutter with no
+        // line to fill it is an empty dock and a caret stuck in it: the share is
+        // not reserved and the script is told so (one decision, two readers).
+        let user = Inputs::User { config_root: None };
+        for setting in [ShellIntegration::Auto, ShellIntegration::Blocks] {
+            let (shell, dir) = fish_and_dir();
+            let env = shell_integration_env(&user, setting, shell, dir, None, Some("/a".into()));
+            assert!(env.contains(&pair("BATERI_DOCK", "off")), "{setting:?}");
+            assert_eq!(dock_rows_at_birth(&env, setting), 0, "{setting:?}");
+        }
+        // zsh is untouched by it.
+        let (shell, dir) = zsh_and_dir();
+        let env = shell_integration_env(&user, ShellIntegration::Auto, shell, dir, None, None);
+        assert_eq!(dock_rows_at_birth(&env, ShellIntegration::Auto), DOCK_ROWS);
+    }
+
+    #[test]
+    fn fish_falls_back_to_no_integration_when_it_cannot_be_set_up() {
+        let user = Inputs::User { config_root: None };
+        // No script for it (missing package): zsh's directory is not fish's.
+        let env = shell_integration_env(
+            &user,
+            ShellIntegration::Auto,
+            || Some(PathBuf::from("/opt/homebrew/bin/fish")),
+            |_| None,
+            None,
+            None,
+        );
+        assert!(env.is_empty(), "wrapper installed without a script");
+        // A list the user's children could not get back: not a half-installed one.
+        use std::os::unix::ffi::OsStringExt as _;
+        let (shell, dir) = fish_and_dir();
+        let env = shell_integration_env(
+            &user,
+            ShellIntegration::Auto,
+            shell,
+            dir,
+            None,
+            Some(OsString::from_vec(vec![0x2f, 0xff, 0xfe])),
+        );
+        assert!(env.is_empty(), "wrapper installed with a non-UTF-8 list");
+        // The list is `:`-separated: an entry cannot hold one.
+        let env = shell_integration_env(
+            &user,
+            ShellIntegration::Auto,
+            || Some(PathBuf::from("/usr/bin/fish")),
+            |_| Some(PathBuf::from("/opt/a:b/shell/fish")),
+            None,
+            None,
+        );
+        assert!(env.is_empty(), "wrapper installed at a path with a colon");
+        // `"off"` is absolute for fish too.
+        let env = shell_integration_env(
+            &user,
+            ShellIntegration::Off,
+            || panic!("\"off\" resolved the shell"),
+            |_| panic!("\"off\" looked for the script"),
+            None,
+            None,
+        );
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn zsh_gets_nothing_of_fishs() {
+        let user = Inputs::User { config_root: None };
+        let (shell, dir) = zsh_and_dir();
+        let env = shell_integration_env(
+            &user,
+            ShellIntegration::Auto,
+            shell,
+            dir,
+            None,
+            Some("/a:/b".into()),
+        );
+        assert!(
+            !env.iter()
+                .any(|(key, _)| key.contains("XDG") || key.contains("FISH")),
+            "zsh got fish's environment: {env:?}"
+        );
     }
 
     #[test]
@@ -7359,7 +7518,7 @@ mod tests {
         // The user has no `ZDOTDIR`: only our own directory goes to the script
         // and `BATERI_ZDOTDIR`'s **absence** means "the user had none either".
         let (shell, dir) = zsh_and_dir();
-        let env = shell_integration_env(&user, ShellIntegration::Auto, shell, dir, None);
+        let env = shell_integration_env(&user, ShellIntegration::Auto, shell, dir, None, None);
         assert_eq!(
             env,
             vec![("ZDOTDIR".to_owned(), "/opt/bateri/shell/zsh".to_owned())]
@@ -7373,6 +7532,7 @@ mod tests {
             shell,
             dir,
             Some(OsString::new()),
+            None,
         );
         assert_eq!(
             env.len(),
@@ -7388,6 +7548,7 @@ mod tests {
             shell,
             dir,
             Some("/home/someone/zsh".into()),
+            None,
         );
         assert_eq!(
             env,
@@ -7407,7 +7568,7 @@ mod tests {
         // would silently go stale.
         let user = Inputs::User { config_root: None };
         let (shell, dir) = zsh_and_dir();
-        let env = shell_integration_env(&user, ShellIntegration::Auto, shell, dir, None);
+        let env = shell_integration_env(&user, ShellIntegration::Auto, shell, dir, None, None);
         assert!(
             !env.iter().any(|(key, _)| key == "BATERI_DOCK"),
             "the default tier wrote something to the environment"
@@ -7418,7 +7579,7 @@ mod tests {
         // that goes to the script; not reserving the dock gutter is a separate decision and is on this side
         // (`ShellIntegration::wants_dock`, `birth`).
         let (shell, dir) = zsh_and_dir();
-        let env = shell_integration_env(&user, ShellIntegration::Blocks, shell, dir, None);
+        let env = shell_integration_env(&user, ShellIntegration::Blocks, shell, dir, None, None);
         assert_eq!(
             env,
             vec![
@@ -7433,7 +7594,8 @@ mod tests {
             &user,
             ShellIntegration::Off,
             || panic!("\"off\" resolved the shell"),
-            || panic!("\"off\" looked for the script"),
+            |_| panic!("\"off\" looked for the script"),
+            None,
             None,
         );
         assert!(env.is_empty());
@@ -7454,6 +7616,7 @@ mod tests {
             shell,
             dir,
             Some("/opt/bateri/shell/zsh".into()),
+            None,
         );
         assert_eq!(
             env,
@@ -7479,6 +7642,7 @@ mod tests {
             shell,
             dir,
             Some(OsString::from_vec(vec![0x2f, 0xff, 0xfe])),
+            None,
         );
         assert!(env.is_empty(), "wrapper installed with a non-UTF-8 ZDOTDIR");
     }

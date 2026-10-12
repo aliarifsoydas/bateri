@@ -2,7 +2,7 @@
 // application on the way, as a product that embeds the pane would have it.
 //
 // With no argument it is the check `make embed-swift` runs: the pane's shell, with the shell
-// integration (`BT_EMBED_ZSH`), is given a variable and a directory and a command that writes both
+// integration (`BT_EMBED_ZSH`, and `BT_EMBED_FISH` for a fish user), is given a variable and a directory and a command that writes both
 // to a file and fails; its start and end must reach this host as events, with its exit code, and
 // the host then types `exit` — the shell's exit must reach it too, and the file must hold what was
 // given. Before that, the layout engine answers a drag and plans its landing. With `--interactive`
@@ -211,6 +211,9 @@ if !interactive {
         exit(1)
     }
     _ = bt_pane_config_set_zsh_scripts(config, scripts)
+    if let fishScripts = ProcessInfo.processInfo.environment["BT_EMBED_FISH"] {
+        _ = bt_pane_config_set_fish_scripts(config, fishScripts)
+    }
     _ = bt_pane_config_set_command(
         config, "printf '%s|%s' \"$BT_EMBED_PROBE\" \"$PWD\" > \"$BT_EMBED_OUT\"; false")
 }
