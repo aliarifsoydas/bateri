@@ -50,6 +50,13 @@ of every installed copy. A version without a section is not released.
   happened to be split, so it came and went with the window's size and the
   moment.
 
+### Fixed
+
+- **fish on a server keeps its own directories.** Over ssh, a server whose
+  fish had no `XDG_DATA_DIRS` of its own lost `/usr/local/share` and
+  `/usr/share` from its search paths for the session, so completions and
+  functions installed there went missing; they stay now.
+
 ## [0.14.0] - 2026-10-12
 
 ### Changed

@@ -2766,6 +2766,15 @@ mod remote_shells {
             wait_until("fish: XDG_DATA_DIRS kept ours", || {
                 screen_has(&session, "[x=]")
             });
+            // ...and fish still has the directories it would have used for an unset
+            // variable: the bootstrap wrote them after ours, so fish's search paths
+            // (computed at startup) did not shrink to ours alone.
+            session.write(
+                b"echo vendor=(contains /usr/share/fish/vendor_conf.d $__fish_vendor_confdirs; and echo kept; or echo lost)\n",
+            );
+            wait_until("fish: the default vendor directory was lost", || {
+                screen_has(&session, "vendor=kept")
+            });
             draws_remote_blocks(&session, "fish");
             close(&session);
         }

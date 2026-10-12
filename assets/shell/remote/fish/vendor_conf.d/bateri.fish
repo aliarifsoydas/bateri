@@ -15,12 +15,14 @@ if set -q BATERI_FISH_DIR
     if set -l __bateri_at (contains -i -- $BATERI_FISH_DIR $__bateri_dirs)
         set -e __bateri_dirs[$__bateri_at]
     end
-    if set -q __bateri_dirs[1]
-        set -gx XDG_DATA_DIRS (string join : -- $__bateri_dirs)
-    else
+    # Unset stays unset: the bootstrap wrote fish's own defaults after ours so
+    # that fish's search paths survived the startup, and says so.
+    if set -q BATERI_XDG_UNSET; or not set -q __bateri_dirs[1]
         set -e XDG_DATA_DIRS
+    else
+        set -gx XDG_DATA_DIRS (string join : -- $__bateri_dirs)
     end
-    set -e BATERI_FISH_DIR
+    set -e BATERI_FISH_DIR BATERI_XDG_UNSET
 end
 
 # The blocks' parent: the local `ssh` block the bootstrap

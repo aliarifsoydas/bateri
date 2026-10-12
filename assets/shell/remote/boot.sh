@@ -233,10 +233,23 @@ case $bt_shell in
   fish)
     # fish reads `vendor_conf.d` from every `XDG_DATA_DIRS` entry; ours is put
     # first and our file takes it out again (`BATERI_FISH_DIR` names it).
-    # Unset stays unset: fish then falls back to its own data directory.
+    #
+    # Unset stays unset, but not as "just ours": fish computes its
+    # `vendor_conf.d`, `functions` and `completions` paths from the variable at
+    # startup, so a list holding only our directory would drop the two the
+    # specification names as the default for an unset one
+    # (`/usr/local/share` and `/usr/share`) for the whole session. They are
+    # written after ours and `BATERI_XDG_UNSET` tells our file to unset the
+    # variable again when it takes ours out.
     BATERI_FISH_DIR=$bt_dir
     export BATERI_FISH_DIR
-    XDG_DATA_DIRS=$bt_dir${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}
+    if [ -n "${XDG_DATA_DIRS-}" ]; then
+      XDG_DATA_DIRS=$bt_dir:$XDG_DATA_DIRS
+    else
+      XDG_DATA_DIRS=$bt_dir:/usr/local/share:/usr/share
+      BATERI_XDG_UNSET=1
+      export BATERI_XDG_UNSET
+    fi
     export XDG_DATA_DIRS
     bt_login
     ;;
