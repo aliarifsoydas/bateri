@@ -2022,6 +2022,7 @@ fn style_at(state: &DockState, index: usize) -> HighlightStyle {
             bold: style.bold || applied.bold,
             underline: style.underline || applied.underline,
             standout: style.standout || applied.standout,
+            italic: style.italic || applied.italic,
         };
     }
     style
@@ -2463,7 +2464,7 @@ fn cell(
         fg,
         bg,
         bold: style.bold,
-        italic: false,
+        italic: style.italic,
         underline: if style.underline {
             UnderlineStyle::Single
         } else {
@@ -2840,6 +2841,35 @@ mod tests {
         let x = cells.iter().find(|cell| cell.ch == Some('x')).expect("x");
         assert_eq!(x.fg, THEME.dock_ground_linear());
         assert_eq!(x.bg, Some(THEME.foreground_linear()));
+    }
+
+    #[test]
+    fn an_italic_range_is_drawn_italic_and_overlaps_merge_it() {
+        // The grid source reads SGR 3 from the cells; the mirror never sets it.
+        // Records overlap and the flags OR: an italic record under a bold one
+        // gives bold italic, and the text outside stays upright.
+        let mut state = live("", "abc", "", 3);
+        state.highlights.push(Highlight {
+            start: 0,
+            end: 2,
+            style: HighlightStyle {
+                italic: true,
+                ..HighlightStyle::default()
+            },
+        });
+        state.highlights.push(Highlight {
+            start: 1,
+            end: 3,
+            style: HighlightStyle {
+                bold: true,
+                ..HighlightStyle::default()
+            },
+        });
+        let (cells, _) = draw(&state, COLS);
+        let at = |ch| cells.iter().find(|cell| cell.ch == Some(ch)).expect("cell");
+        assert!(at('a').italic && !at('a').bold);
+        assert!(at('b').italic && at('b').bold);
+        assert!(!at('c').italic && at('c').bold);
     }
 
     #[test]

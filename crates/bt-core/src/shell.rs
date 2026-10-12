@@ -537,6 +537,38 @@ impl Clone for DockState {
 }
 
 impl DockState {
+    /// Whether both states draw the same line: every field but the `answers`
+    /// stamp, which says when the line arrived, not what it says. The
+    /// exhaustive destructuring is the point — a field added later cannot be
+    /// forgotten here.
+    pub(crate) fn same_line(&self, other: &Self) -> bool {
+        let Self {
+            status,
+            predisplay,
+            buffer,
+            postdisplay,
+            prebuffer,
+            cursor,
+            highlights,
+            display_chars,
+            last_ink,
+            insert_keymap,
+            answers: _,
+            cluster,
+        } = self;
+        *status == other.status
+            && *predisplay == other.predisplay
+            && *buffer == other.buffer
+            && *postdisplay == other.postdisplay
+            && *prebuffer == other.prebuffer
+            && *cursor == other.cursor
+            && *highlights == other.highlights
+            && *display_chars == other.display_chars
+            && *last_ink == other.last_ink
+            && *insert_keymap == other.insert_keymap
+            && *cluster == other.cluster
+    }
+
     /// Empties the text and the ranges; the capacities stay.
     ///
     /// The state is written by the **caller**: not leaving stale text is the shared
@@ -1329,6 +1361,10 @@ pub struct HighlightStyle {
     pub underline: bool,
     /// `standout` — zsh's reverse video; the counterpart of SGR 7.
     pub standout: bool,
+    /// Italic. zsh's `region_highlight` has no such word, so the mirror never
+    /// sets it; the grid source ([`ShellLog::dock_grid`]) does, because the
+    /// cells it reads carry SGR 3.
+    pub italic: bool,
 }
 
 /// The color of a style component; it is **not** bound to the theme here.
@@ -2005,6 +2041,18 @@ pub(crate) struct ShellLog {
     /// `line-finish` did not run (an interrupted line) does not carry the capability
     /// to the next prompt's `w`; the wrong direction is "no editing".
     pub(crate) dock_editable: bool,
+    /// Whether the shell said **at this prompt** that its input line is read
+    /// from the grid (`8133;g`) rather than mirrored: the shell has no line
+    /// editor state to hand over, but it draws the line, and the frame reads
+    /// the cells ([`crate::grid_input`]) and publishes them to [`Self::dock`]
+    /// as if a mirror had arrived.
+    ///
+    /// Its lifetime is the prompt's, like [`Self::dock_editable`]'s: every `A`
+    /// (an identity-less one too — fish prints its own on each redraw, and the
+    /// script's `g` comes after it in the prompt string) and `line-finish`
+    /// (`e`, after which the line belongs to the grid) clear it. A prompt that
+    /// never prints `g` keeps the mirror's behaviour byte for byte.
+    pub(crate) dock_grid: bool,
     /// The **expected** result of the last editing command: until the
     /// mirror answers that command, the editing gate looks at this line
     /// ([`DockPrediction`]). Its lifetime is only one generation — any intervening
@@ -2326,6 +2374,12 @@ pub(crate) struct SuppressedInput {
     /// The identity of the block being written; [`crate::Session::frame`] finds its
     /// **row** from the anchor — the shell does not know which row it is on.
     pub(crate) block: u32,
+    /// The line is read from the grid ([`ShellLog::dock_grid`]) and the frame
+    /// finds the rows to hide from the cells themselves. The fields below that
+    /// describe a mirror (`blank`, `from_anchor`, `last_ink`, `insert_keymap`)
+    /// are not asked and carry their safe values: nothing in the grid arm is
+    /// stale, and nothing can be typed through it.
+    pub(crate) grid: bool,
     /// The mirror has **no characters at all**: neither in the display
     /// (`PREDISPLAY ++ BUFFER ++ POSTDISPLAY`) nor in `PREBUFFER` — the freshness
     /// gate's empty-mirror question (`Session::frame`'s `blank_mirror`).
@@ -2373,6 +2427,7 @@ impl ShellLog {
             dock_selection: None,
             dock_scroll: None,
             dock_editable: false,
+            dock_grid: false,
             dock_pending: None,
             command: 0,
             paste_since_remote: false,
@@ -2461,6 +2516,7 @@ impl ShellLog {
                 // identity-less `A` never reaches here (the gate above).
                 outcome.title = self.context.clear_remote();
                 self.dock_editable = false;
+                self.dock_grid = false;
                 self.dock_pending = None;
                 // The phase, the clock's reset and the block ([`BlockTrack::prompt`]).
                 self.local.prompt(id);
@@ -2897,6 +2953,7 @@ impl ShellLog {
                 self.dock_selection = None;
                 self.dock_scroll = None;
                 self.dock_editable = false;
+                self.dock_grid = false;
                 self.dock_pending = None;
                 // An empty line is an answer too: see [`DockState::answers`]. A held line too —
                 // `e` is ⏎'s answer and the freshness gate asks it throughout the hold (the
@@ -2933,6 +2990,12 @@ impl ShellLog {
             }
             DockEvent::Editable => {
                 self.dock_editable = true;
+                return false;
+            }
+            // Like the editing widget's word, a capability of this prompt: it
+            // changes who writes the mirror, not what the mirror says.
+            DockEvent::Grid => {
+                self.dock_grid = true;
                 return false;
             }
         }
@@ -2987,9 +3050,16 @@ impl ShellLog {
     /// end at the same clock, `line-finish` timing is the same as before the hold. The
     /// mirror itself stays `Live` throughout the hold: drawing, band and suppression
     /// read it.
+    ///
+    /// **A grid-sourced prompt is the dock's from its first frame**: until the
+    /// frame has read the line and published it the mirror is `Idle`, which on
+    /// its own would hand the caret to the grid for that one frame and take it
+    /// back — the jump a prompt arriving without a mirror used to cause.
     fn caret_status(&self) -> DockStatus {
         if self.end_since.is_some() {
             DockStatus::Idle
+        } else if self.dock_grid && self.dock.status == DockStatus::Idle {
+            DockStatus::Live
         } else {
             self.dock.status
         }
@@ -3166,12 +3236,32 @@ impl ShellLog {
     ///   is the previous (finished) block and suppression would start from the
     ///   **wrong** row.
     pub(crate) fn suppressed_input(&self) -> Option<SuppressedInput> {
-        if self.local.state?.phase != ShellPhase::Input || self.dock.status != DockStatus::Live {
+        if self.local.state?.phase != ShellPhase::Input {
+            return None;
+        }
+        if self.dock_grid {
+            // The grid is the source, so there is no mirror to be fresh or
+            // stale and no text to measure: the frame finds the rows itself.
+            return match self.local.blocks.last()? {
+                (block, Outcome::Pending { .. }) => Some(SuppressedInput {
+                    block,
+                    grid: true,
+                    blank: false,
+                    from_anchor: false,
+                    last_ink: None,
+                    insert_keymap: false,
+                    answers: self.dock.answers,
+                }),
+                (_, Outcome::Finished { .. }) => None,
+            };
+        }
+        if self.dock.status != DockStatus::Live {
             return None;
         }
         match self.local.blocks.last()? {
             (block, Outcome::Pending { .. }) => Some(SuppressedInput {
                 block,
+                grid: false,
                 blank: self.dock.display_chars == 0 && self.dock.prebuffer.is_empty(),
                 from_anchor: !self.dock.prebuffer.is_empty() || self.end_since.is_some(),
                 last_ink: self.dock.last_ink,
@@ -3196,6 +3286,40 @@ impl ShellLog {
         into.push_str(&self.dock.buffer);
         into.push_str(&self.dock.postdisplay);
         self.dock.cursor
+    }
+
+    /// Publishes a line the frame read from the grid ([`Self::dock_grid`]) as
+    /// the mirror, through the mirror's own entry ([`Self::apply_dock`]) so the
+    /// selection's and the scroll's deletion rules, the `answers` stamp and
+    /// every reader of [`Self::dock`] stay one path. `true` if it was written.
+    ///
+    /// **The gate is asked again here, under the lock.** The frame decided to
+    /// read before the `Term` lock and the reader thread can have written `e`
+    /// or `A` since; a stale publication would bring a finished line back to
+    /// life (`apply_dock`'s `Update` also ends a held `line-finish`). The
+    /// remote and raw-program arms are the same as the caret's: there the dock
+    /// has no input row to fill.
+    ///
+    /// **Only a changed line is written**, so the stamp advances together with
+    /// the text — a frame for an unrelated reason (a command's output, the
+    /// clock) must not look like an answer to the user's last key. `answers`
+    /// is read by the caller after the cells, never before: a stamp ahead of
+    /// the text only loosens the typing animation's glyph bound.
+    pub(crate) fn publish_grid(&mut self, staged: &DockState, answers: u64) -> bool {
+        let open = self.dock_grid
+            && self.end_since.is_none()
+            && self.context.remote.is_none()
+            && !self.raw_active()
+            && self
+                .local
+                .state
+                .is_some_and(|state| state.phase == ShellPhase::Input);
+        if !open || (self.dock.status == DockStatus::Live && self.dock.same_line(staged)) {
+            return false;
+        }
+        self.apply_dock(DockEvent::Update(staged), answers);
+        self.observe_caret();
+        true
     }
 
     /// Who owns the caret at this moment and the remainder of the hold — the ledger-
@@ -3848,6 +3972,9 @@ pub(crate) enum DockEvent<'a> {
     /// The editing widget is bound at this prompt (`line-init`); does not touch
     /// the mirror's state ([`ShellLog::dock_editable`]).
     Editable,
+    /// The input line of this prompt is read from the grid, not mirrored
+    /// ([`ShellLog::dock_grid`]); does not touch the mirror's state.
+    Grid,
 }
 
 /// The state machine that pulls two OSC numbers out of the stream.
@@ -4090,6 +4217,7 @@ impl Scanner {
                         }
                         DockOutcome::Branch => ScanEvent::Dock(DockEvent::Branch(&self.branch)),
                         DockOutcome::Editable => ScanEvent::Dock(DockEvent::Editable),
+                        DockOutcome::Grid => ScanEvent::Dock(DockEvent::Grid),
                         DockOutcome::Setup(Some(fault)) => ScanEvent::RemoteSetup(fault),
                         DockOutcome::Info(Some(nonce)) => ScanEvent::RemoteUp(nonce),
                         // An unknown code is a newer bootstrap's: nothing to say.
@@ -4484,6 +4612,7 @@ enum DockOutcome {
     Unavailable(DockFault),
     Branch,
     Editable,
+    Grid,
     /// `f`: the remote bootstrap's fault code; `None` for an unknown code.
     Setup(Option<RemoteSetupFault>),
     /// `i`: the remote bootstrap's information; `Some(nonce)` for a
@@ -4579,6 +4708,9 @@ fn parse_dock(
         // bound is held on would show up to the user as different behavior.
         b"o" => unavailable(line, DockFault::Overflow),
         b"w" => DockOutcome::Editable,
+        // The grid source's word: no body, so there is nothing to corrupt and
+        // nothing a newer script could add that an older reader must refuse.
+        b"g" => DockOutcome::Grid,
         b"f" => DockOutcome::Setup(fields.next().and_then(RemoteSetupFault::from_code)),
         b"i" => DockOutcome::Info(match (fields.next(), fields.next(), fields.next()) {
             (Some(b"up"), Some(nonce), None) => remote_nonce(nonce),
@@ -4977,14 +5109,15 @@ const STATE_HEADER: &str = "bateri-state";
 /// The state blob's version: the old bateri writes it, the new one
 /// reads it across an update. A change of the format increments it.
 ///
-/// Version 2: a running command's clock is its wall-clock start, not how
-/// long it had run when the blob was written — a blob read hours later (a
-/// crash or a quit kept the program running meanwhile) counts the gap.
-///
 /// Version 3: every ledger entry carries its block's start
 /// ([`Outcome::Finished`]'s `started`), so a block run before an update
-/// still says what time it ran; a version 2 entry reads with the start
-/// unknown (`0`), except the running command's, which its clock gives.
+/// still says what time it ran. (A running command's clock has been its
+/// wall-clock start since version 2: a blob read hours later counts the
+/// gap.)
+///
+/// Version 4: the grid source's flag ([`ShellLog::dock_grid`]) crosses, so a
+/// fish prompt on screen across an update keeps its dock; a version 3 blob
+/// reads as "no grid source".
 ///
 /// **Only forward once released.** A bateri rolled back to the version
 /// before reads this one as unknown (the reader is strict,
@@ -4992,12 +5125,12 @@ const STATE_HEADER: &str = "bateri-state";
 /// restore path brings its layout back, not its program — and a held pane
 /// takes a fresh shell state ([`crate::AdoptMode`]). A released bump is
 /// therefore never undone, a mistake in it is fixed by the next version.
-const STATE_VERSION: u32 = 3;
+const STATE_VERSION: u32 = 4;
 
-/// The first version whose ledger entries carry their block's start
-/// ([`CarriedTrack::parse`]). Once [`STATE_OLDEST`] reaches it, the
-/// start-less branch is dead and goes.
-const STATE_STARTS: u32 = 3;
+/// The first version that carries the grid source's flag
+/// ([`ShellLog::dock_grid`]). Once [`STATE_OLDEST`] reaches it, the branch
+/// that reads an older blob as "no grid source" is dead and goes.
+const STATE_GRID: u32 = 4;
 
 /// The oldest version the reader still takes: the current one and the one
 /// before it.
@@ -5110,16 +5243,8 @@ impl CarriedTrack {
         )
     }
 
-    /// One trail of a blob of `version`: an entry is `p/{start}` or
-    /// `{exit}/{elapsed}/{start}`; before [`STATE_STARTS`] it has no start
-    /// (`p`, `{exit}/{elapsed}`). Each version takes only its own form.
-    ///
-    /// A start-less blob still knows one start: a planted clock was planted
-    /// by a `C` of the ledger's last open block — the block that `C` would
-    /// stamp ([`BlockTrack::command`]) — so a command running across the
-    /// update keeps its time of day. Every other start-less entry reads as
-    /// unknown.
-    fn parse(fields: &[&str], version: u32) -> Option<Self> {
+    /// One trail of a blob: an entry is `p/{start}` or `{exit}/{elapsed}/{start}`.
+    fn parse(fields: &[&str]) -> Option<Self> {
         let [phase, exit, running, first, entries] = fields else {
             return None;
         };
@@ -5137,18 +5262,14 @@ impl CarriedTrack {
             None if last_exit.is_none() => None,
             None => return None,
         };
-        let mut entries = if *entries == "-" {
+        let entries = if *entries == "-" {
             Vec::new()
         } else {
             entries
                 .split(',')
                 .map(|entry| {
-                    let (fate, started) = if version < STATE_STARTS {
-                        (entry, 0)
-                    } else {
-                        let (fate, started) = entry.rsplit_once('/')?;
-                        (fate, started.parse().ok()?)
-                    };
+                    let (fate, started) = entry.rsplit_once('/')?;
+                    let started = started.parse().ok()?;
                     if fate == "p" {
                         return Some(Outcome::Pending { started });
                     }
@@ -5162,12 +5283,6 @@ impl CarriedTrack {
                 .collect::<Option<Vec<_>>>()?
         };
         let running_since_ms: Option<u64> = parse_number(running)?;
-        if version < STATE_STARTS
-            && let Some(since) = running_since_ms
-            && let Some(Outcome::Pending { started }) = entries.last_mut()
-        {
-            *started = u32::try_from(since / 1000).unwrap_or(0);
-        }
         Some(Self {
             state,
             running_since_ms,
@@ -5210,6 +5325,9 @@ pub(crate) struct Carried {
     /// none until the next key) must cross as stale, not as fresh.
     dock_fresh: bool,
     dock_editable: bool,
+    /// [`ShellLog::dock_grid`]: without it a fish prompt on screen across the
+    /// update would have no dock until its next `A`.
+    dock_grid: bool,
     command: u64,
     login: Option<u64>,
     remote_up: Option<(u64, String)>,
@@ -5283,6 +5401,7 @@ impl Carried {
             format!("prebuffer {}", render_text(Some(&dock.prebuffer))),
             format!("dock-fresh {}", u8::from(self.dock_fresh)),
             format!("editable {}", u8::from(self.dock_editable)),
+            format!("dock-grid {}", u8::from(self.dock_grid)),
             format!("command {}", self.command),
             format!("login {}", render_number(self.login)),
             match &self.remote_up {
@@ -5306,6 +5425,7 @@ impl Carried {
                 (style.bold, 'b'),
                 (style.underline, 'u'),
                 (style.standout, 's'),
+                (style.italic, 'i'),
             ]
             .iter()
             .filter(|(on, _)| *on)
@@ -5388,8 +5508,8 @@ impl Carried {
         };
         let number = |values: Vec<&str>| -> Option<Option<u64>> { parse_number(&one(values)?) };
 
-        let local = CarriedTrack::parse(&take("local")?, version)?;
-        let remote = CarriedTrack::parse(&take("remote")?, version)?;
+        let local = CarriedTrack::parse(&take("local")?)?;
+        let remote = CarriedTrack::parse(&take("remote")?)?;
         let remote_shell = match one(take("remote-shell")?)?.as_str() {
             "-" => None,
             shell => {
@@ -5454,6 +5574,11 @@ impl Carried {
         };
         let dock_fresh = flag(take("dock-fresh")?)?;
         let dock_editable = flag(take("editable")?)?;
+        let dock_grid = if version >= STATE_GRID {
+            flag(take("dock-grid")?)?
+        } else {
+            false
+        };
         let command = one(take("command")?)?.parse().ok()?;
         let login = number(take("login")?)?;
         let remote_up = match take("remote-up")?.as_slice() {
@@ -5483,6 +5608,7 @@ impl Carried {
             dock,
             dock_fresh,
             dock_editable,
+            dock_grid,
             command,
             login,
             remote_up,
@@ -5514,6 +5640,7 @@ impl ShellLog {
             dock: self.dock.clone(),
             dock_fresh: self.dock.answers == answered,
             dock_editable: self.dock_editable,
+            dock_grid: self.dock_grid,
             command: self.command,
             login: self.login,
             remote_up: self.remote_up.clone(),
@@ -5553,6 +5680,7 @@ impl ShellLog {
         };
         self.dock.cluster = cluster;
         self.dock_editable = carried.dock_editable;
+        self.dock_grid = carried.dock_grid;
         self.command = carried.command;
         self.login = carried.login;
         self.remote_up = carried.remote_up;
@@ -5657,6 +5785,7 @@ fn parse_carried_highlight(fields: &[&str]) -> Option<Highlight> {
                 'b' => &mut style.bold,
                 'u' => &mut style.underline,
                 's' => &mut style.standout,
+                'i' => &mut style.italic,
                 _ => return None,
             };
             *slot = true;
@@ -6340,6 +6469,7 @@ mod tests {
         Unavailable(DockFault),
         Branch(String),
         Editable,
+        Grid,
     }
 
     fn dock_events_of_chunks(chunks: &[&[u8]]) -> Vec<DockSnapshot> {
@@ -6354,6 +6484,7 @@ mod tests {
                         DockEvent::Unavailable(fault) => DockSnapshot::Unavailable(fault),
                         DockEvent::Branch(branch) => DockSnapshot::Branch(branch.to_owned()),
                         DockEvent::Editable => DockSnapshot::Editable,
+                        DockEvent::Grid => DockSnapshot::Grid,
                     });
                 }
             });
@@ -7884,6 +8015,175 @@ mod tests {
         log.apply_scan(ScanEvent::Dock(DockEvent::End));
         assert_eq!(log.dock.status, DockStatus::Idle);
         assert_eq!(log.dock.buffer, "");
+    }
+
+    #[test]
+    fn the_grid_word_is_a_bodiless_8133_word() {
+        assert_eq!(
+            dock_events_of_chunks(&[b"\x1b]8133;g\x07"]),
+            [DockSnapshot::Grid]
+        );
+        // Cut anywhere, and with a body a newer script might add.
+        assert_eq!(
+            dock_events_of_chunks(&[b"\x1b]81", b"33;g", b";future\x07"]),
+            [DockSnapshot::Grid]
+        );
+    }
+
+    /// A fish prompt as the script prints it: our `A`, the grid word, `B`.
+    fn grid_prompt_events(log: &mut ShellLog, id: u32) {
+        log.apply_scan(ScanEvent::Mark(Mark::PromptStart { id: Some(id) }));
+        log.apply_scan(ScanEvent::Dock(DockEvent::Grid));
+        log.apply_scan(ScanEvent::Mark(Mark::PromptEnd));
+    }
+
+    fn typed(text: &str) -> DockState {
+        DockState {
+            status: DockStatus::Live,
+            buffer: text.to_owned(),
+            cursor: text.chars().count(),
+            display_chars: text.chars().count(),
+            ..DockState::default()
+        }
+    }
+
+    #[test]
+    fn a_grid_line_is_published_as_the_mirror_while_its_prompt_is_open() {
+        let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
+        // No prompt, no word: nothing to publish, and the mirror's gate is
+        // the one in force.
+        assert!(!log.publish_grid(&typed("ls"), 1));
+        grid_prompt_events(&mut log, 1);
+        let input = log.suppressed_input().expect("the prompt is open");
+        assert!(input.grid && input.block == 1);
+        assert!(
+            !input.insert_keymap,
+            "nothing can be typed through a grid line"
+        );
+
+        assert!(log.publish_grid(&typed("ls"), 3));
+        assert_eq!(
+            (log.dock.status, log.dock.buffer.as_str()),
+            (DockStatus::Live, "ls")
+        );
+        assert_eq!(log.dock.answers, 3);
+        // The same line again is not an answer to anything.
+        assert!(!log.publish_grid(&typed("ls"), 4));
+        assert_eq!(log.dock.answers, 3, "the stamp moved without the text");
+        assert!(log.publish_grid(&typed("lsx"), 5));
+        assert_eq!(log.dock.answers, 5);
+
+        // `line-finish` hands the line to the grid: the held copy stays for the
+        // hold, but nothing publishes over it and the word is gone.
+        log.apply_scan(ScanEvent::Dock(DockEvent::End));
+        assert!(!log.dock_grid && log.holding_end());
+        assert!(!log.publish_grid(&typed("lsxy"), 6));
+        assert_eq!(log.dock.buffer, "lsx");
+        assert!(!log.suppressed_input().is_some_and(|input| input.grid));
+    }
+
+    #[test]
+    fn the_grid_word_lasts_one_prompt_and_not_a_remote_one() {
+        let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
+        grid_prompt_events(&mut log, 1);
+        assert!(log.dock_grid);
+        // fish prints an identity-less `A` on every redraw, the script's word
+        // comes after it in the prompt string: the `A` forgets, the word is back.
+        log.apply_scan(ScanEvent::Mark(Mark::PromptStart { id: None }));
+        assert!(!log.dock_grid);
+        log.apply_scan(ScanEvent::Dock(DockEvent::Grid));
+        assert!(log.dock_grid);
+        // A new prompt that never says it is not grid-sourced.
+        log.apply_scan(ScanEvent::Mark(Mark::PromptStart { id: Some(2) }));
+        assert!(!log.dock_grid);
+
+        // Behind ssh the only 8133 that can arrive is the far end's.
+        log.apply_scan(ScanEvent::Mark(Mark::PromptEnd));
+        log.apply_scan(ScanEvent::Mark(Mark::CommandStart));
+        assert!(log.set_remote(Some(&RemoteTarget::ssh("prod"))));
+        log.apply_scan(ScanEvent::Dock(DockEvent::Grid));
+        assert!(!log.dock_grid, "the remote shell's word was taken");
+    }
+
+    #[test]
+    fn a_grid_prompt_owns_the_caret_before_its_first_line() {
+        // Until the frame has read the line the mirror is `Idle`; the caret must
+        // not go to the grid for that frame and come back.
+        let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
+        log.apply_scan(ScanEvent::Mark(Mark::PromptStart { id: Some(1) }));
+        log.apply_scan(ScanEvent::Mark(Mark::PromptEnd));
+        // Past the Dock→Grid hold, which would mask the raw answer.
+        let later = Instant::now() + Duration::from_secs(1);
+        assert_eq!(log.caret(later).home, CaretHome::Grid, "no word, no mirror");
+        log.apply_scan(ScanEvent::Dock(DockEvent::Grid));
+        assert_eq!(log.dock.status, DockStatus::Idle);
+        assert_eq!(log.caret(later).home, CaretHome::Dock);
+    }
+
+    #[test]
+    fn a_published_grid_line_follows_the_mirrors_selection_rule() {
+        let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
+        grid_prompt_events(&mut log, 1);
+        assert!(log.publish_grid(&typed("git status"), 1));
+        let word = DockPoint {
+            index: 0,
+            half: CellHalf::Left,
+        };
+        log.dock_selection = Some(DockSelection::new(
+            SelectKind::Word,
+            word,
+            word,
+            &log.dock.buffer,
+            false,
+        ));
+        // The suggestion changing does not move the selected text.
+        let mut next = typed("git status");
+        next.postdisplay = " -s".to_owned();
+        assert!(log.publish_grid(&next, 2));
+        assert!(
+            log.dock_selection.is_some(),
+            "a new suggestion deleted the selection"
+        );
+        // The text changing does.
+        next.buffer = "git statu".to_owned();
+        assert!(log.publish_grid(&next, 3));
+        assert_eq!(log.dock_selection, None);
+    }
+
+    /// fish prints its own identity-less marks beside ours; in the recorded
+    /// order a redraw is: our `A`, fish's `A`, then the prompt string — our
+    /// anchor, the grid word, our `B` — and fish's `B`. The word comes after
+    /// fish's `A`, so it survives every redraw, and fish's `C` and `D` around a
+    /// command (before ours) do not bring it back to life.
+    #[test]
+    fn fishs_own_marks_do_not_take_the_grid_word_back() {
+        const PROMPT: &[u8] = b"\x1b]133;A;bt_block=1\x07\x1b[?2004h\x1b]133;A;click_events=1\x1b\\\x1b]8;;bateri://block/1\x07 \x1b[90m \x1b[m\x1b]8133;g\x07\x1b]133;B\x07\x1b]133;B\x1b\\\x1b[K\r\x1b[2C";
+        // A redraw (window resize, a job notice): no `A` of ours, fish's own
+        // again, and the cached prompt string with the word in it.
+        const REDRAW: &[u8] = b"\x1b]133;A;click_events=1\x1b\\\x1b]8;;bateri://block/1\x07 \x1b[90m \x1b[m\x1b]8133;g\x07\x1b]133;B\x07\x1b]133;B\x1b\\";
+        const COMMAND: &[u8] = b"ls\r\n\x1b]133;C;cmdline_url=ls\x1b\\\x1b]8;;\x07\x1b]133;C\x07\x1b]133;D;0\x1b\\\x1b]133;D;0;bt_block=1\x07";
+        let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
+        let mut scanner = Scanner::new();
+        let mut feed = |log: &mut ShellLog, bytes: &[u8]| {
+            scanner.feed(bytes, |event| {
+                log.apply_scan(event);
+            });
+        };
+        feed(&mut log, PROMPT);
+        assert!(log.dock_grid && log.suppressed_input().is_some_and(|input| input.grid));
+        feed(&mut log, b"\x1b]133;A;click_events=1\x1b\\");
+        assert!(!log.dock_grid, "fish's own `A` should forget the word");
+        feed(&mut log, REDRAW);
+        assert!(log.dock_grid, "the word did not survive a redraw");
+        assert_eq!(log.local.state.map(|s| s.phase), Some(ShellPhase::Input));
+        assert_eq!(log.last_block(), Some(BlockKey::Local(1)));
+
+        feed(&mut log, COMMAND);
+        assert!(
+            log.suppressed_input().is_none(),
+            "the command's line is the grid's"
+        );
+        assert_eq!(log.local.state.map(|s| s.phase), Some(ShellPhase::Finished));
     }
 
     #[test]
@@ -10083,6 +10383,7 @@ mod tests {
                         bold: true,
                         underline: false,
                         standout: true,
+                        italic: false,
                     },
                 },
                 Highlight {
@@ -10094,6 +10395,7 @@ mod tests {
                         bold: false,
                         underline: true,
                         standout: false,
+                        italic: true,
                     },
                 },
             ],
@@ -10238,15 +10540,18 @@ mod tests {
         );
         assert!(swap(&current, &header(0)).is_none());
         assert!(swap(&current, &format!("bateri-session {STATE_VERSION}")).is_none());
-        // Each version takes only its own entry form: this blob's entries
-        // under a start-less header, and a current entry without its start.
-        assert!(swap(&current, &header(STATE_STARTS - 1)).is_none());
+        // An entry without its start is not a blob of any version.
         assert!(swap(",p/1791108000\n", ",p\n").is_none());
         assert!(swap("-/0/0,", "-/0,").is_none());
         assert!(swap("p/1791108000", "p/x").is_none());
         assert!(swap("ours 1", "ours 2").is_none());
         assert!(swap("ours 1", "ours 1\nours 1").is_none());
         assert!(swap("ours 1", "ours 1\nnew-key 1").is_none());
+        assert!(
+            swap("dock-grid 0\n", "").is_none(),
+            "the flag is mandatory in this version"
+        );
+        assert!(swap("dock-grid 0", "dock-grid 2").is_none());
         assert!(swap("command 41", "command x").is_none());
         assert!(swap("cwd +", "cwd ").is_none());
         assert!(swap("remote-setup decode", "remote-setup gone").is_none());
@@ -10308,6 +10613,7 @@ mod tests {
                 ScanEvent::Dock(DockEvent::End) => "end".to_owned(),
                 ScanEvent::Dock(DockEvent::Branch(branch)) => format!("branch {branch}"),
                 ScanEvent::Dock(DockEvent::Editable) => "editable".to_owned(),
+                ScanEvent::Dock(DockEvent::Grid) => "grid".to_owned(),
                 ScanEvent::Dock(DockEvent::Unavailable(fault)) => format!("fault {fault:?}"),
                 ScanEvent::PasteOn => "paste".to_owned(),
                 ScanEvent::RemoteSetup(fault) => format!("setup {}", fault.code()),
@@ -10349,90 +10655,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_2_fixture_still_reads() {
-        // Written by version 2 — the one before the current: the running
-        // command's clock is its wall-clock start (here
-        // 2026-10-04T10:00:00Z) and the entries carry no start. The reader
-        // takes the current version and the one before it, so this fixture
-        // stays as it is until two bumps later.
-        let fixture = "bateri-state 2\n\
-                       local running 0 1791108000000 7 0/120,p\n\
-                       remote - - - 0 -\n\
-                       remote-shell -\n\
-                       cwd +/tmp\n\
-                       branch +\n\
-                       remote-cwd +\n\
-                       remote-setup -\n\
-                       reconnect -\n\
-                       dock idle 0 0 - 1\n\
-                       predisplay +\n\
-                       buffer +\n\
-                       postdisplay +\n\
-                       prebuffer +\n\
-                       dock-fresh 0\n\
-                       editable 1\n\
-                       command 8\n\
-                       login -\n\
-                       remote-up -\n\
-                       typed -\n\
-                       ours 1\n\
-                       command-open 1\n\
-                       cleared -\n\
-                       end\n";
-        let carried = Carried::decode(fixture.as_bytes()).unwrap();
-        assert_eq!(carried.local.running_since_ms, Some(1_791_108_000_000));
-        assert_eq!(carried.local.first, 7);
-        // A version 2 entry's start is unknown, but the running block's is
-        // its clock's.
-        assert_eq!(
-            carried.local.entries,
-            [
-                Outcome::Finished {
-                    exit: Some(0),
-                    elapsed_ms: 120,
-                    started: 0
-                },
-                Outcome::Pending {
-                    started: 1_791_108_000
-                }
-            ]
-        );
-        assert!(carried.remote.entries.is_empty());
-        // Written again, it is version 3's: the same fields, every entry
-        // with its start.
-        let again = String::from_utf8(carried.encode()).unwrap();
-        assert_eq!(
-            again,
-            "bateri-state 3\n\
-             local running 0 1791108000000 7 0/120/0,p/1791108000\n\
-             remote - - - 0 -\n\
-             remote-shell -\n\
-             cwd +/tmp\n\
-             branch +\n\
-             remote-cwd +\n\
-             remote-setup -\n\
-             reconnect -\n\
-             dock idle 0 0 - 1\n\
-             predisplay +\n\
-             buffer +\n\
-             postdisplay +\n\
-             prebuffer +\n\
-             dock-fresh 0\n\
-             editable 1\n\
-             command 8\n\
-             login -\n\
-             remote-up -\n\
-             typed -\n\
-             ours 1\n\
-             command-open 1\n\
-             cleared -\n\
-             end\n"
-        );
-    }
-
-    #[test]
-    fn the_version_3_fixture_reads_and_writes_byte_for_byte() {
-        // Written by version 3 — the current one: every entry ends in its
+    fn the_version_3_fixture_still_reads_and_is_written_as_version_4() {
+        // Written by version 3 — the one before the current: every entry ends in its
         // block's start, in Unix seconds, `0` when unknown. Here local
         // block 8, an `ssh` started at 2026-10-04T10:00:00Z, runs the
         // remote shell; the local block before it finished two minutes
@@ -10495,7 +10719,16 @@ mod tests {
             ]
         );
         assert_eq!(carried.remote.running_since_ms, Some(1_791_108_040_000));
-        assert_eq!(carried.encode(), fixture.as_bytes());
+        // A version 3 blob has no grid source; written again it is version 4's
+        // — the same fields and the flag after `editable`.
+        assert!(!carried.dock_grid);
+        let again = String::from_utf8(carried.encode()).unwrap();
+        assert_eq!(
+            again,
+            fixture
+                .replace("bateri-state 3\n", "bateri-state 4\n")
+                .replace("editable 1\n", "editable 1\ndock-grid 0\n")
+        );
         // The starts reach the ledgers.
         let mut fresh = ShellLog::new(100);
         fresh.restore(carried, 0);
@@ -10513,6 +10746,49 @@ mod tests {
                 started: 1_791_108_010
             })
         );
+    }
+
+    #[test]
+    fn the_version_4_fixture_reads_and_writes_byte_for_byte() {
+        // Written by version 4 — the current one: the grid source's flag
+        // follows `editable`, and a highlight's flags may carry `i` (italic),
+        // which only a grid-sourced line sets.
+        let fixture = "bateri-state 4\n\
+                       local running 0 1791108000000 6 0/120/1791107880,p/1791108000\n\
+                       remote - - - 0 -\n\
+                       remote-shell -\n\
+                       cwd +/tmp\n\
+                       branch +\n\
+                       remote-cwd +\n\
+                       remote-setup -\n\
+                       reconnect -\n\
+                       dock live 3 6 +a 0\n\
+                       predisplay +\n\
+                       buffer +gits\n\
+                       postdisplay +ta\n\
+                       prebuffer +\n\
+                       dock-fresh 1\n\
+                       editable 0\n\
+                       dock-grid 1\n\
+                       command 8\n\
+                       login -\n\
+                       remote-up -\n\
+                       typed -\n\
+                       ours 1\n\
+                       command-open 0\n\
+                       cleared -\n\
+                       hl 0 3 r112233 - bi\n\
+                       end\n";
+        let carried = Carried::decode(fixture.as_bytes()).unwrap();
+        assert!(carried.dock_grid && !carried.dock_editable);
+        assert_eq!(carried.encode(), fixture.as_bytes());
+        // It lands in the ledger, and an `A` clears it as it does the editing word.
+        let mut fresh = ShellLog::new(100);
+        fresh.restore(carried, 0);
+        assert!(fresh.dock_grid);
+        assert!(fresh.dock.highlights[0].style.italic);
+        fresh.apply(Mark::PromptStart { id: None });
+        assert!(!fresh.dock_grid);
     }
 
     /// The point of version 2: the time a blob spends in a holder (a night

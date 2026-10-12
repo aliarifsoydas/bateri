@@ -83,6 +83,7 @@ use crate::cluster::{ClusterId, Clusters};
 use crate::color::{self, LinearRgba, Theme};
 use crate::commands::{CommandId, CommandState, command_state};
 use crate::dock::{self, Dock, DockBudget, DockCols, DockEdit, DockPoint};
+use crate::grid_input;
 use crate::handler::ClusterHandler;
 use crate::identity::{LC_TERMINAL, PaneUuid, TERM_PROGRAM, TERM_PROGRAM_VERSION};
 // The journal's side record comes in under an alias: `Side` is alacritty's
@@ -1277,6 +1278,14 @@ pub struct Blocks {
     /// The mirror's reading ([`crate::shell::DockState::cluster`]) — in the
     /// same lock round as the text, from the same record.
     input_cluster: bool,
+    /// The input line read back from the grid this frame, for a prompt whose
+    /// shell does not mirror its line editor ([`crate::grid_input`]); valid
+    /// only while [`Self::line_read`]. Written under the `Term` lock and
+    /// published to the shell ledger after it is released, so the buffer is
+    /// here — it keeps its capacity across frames like [`Self::input`].
+    line: DockState,
+    /// Whether [`Self::line`] was read in this frame.
+    line_read: bool,
 }
 
 impl Blocks {
@@ -5487,8 +5496,12 @@ impl Session {
             let mut log = lock(&self.shell);
             let end_left = log.expire_end(now);
             let suppressed = log.suppressed_input();
-            if suppressed.is_some() {
-                blocks.input_caret = log.display_into(&mut blocks.input);
+            if let Some(input) = suppressed {
+                // A grid-sourced prompt has no mirror text to lay out: its
+                // rows come from the cells, below.
+                if !input.grid {
+                    blocks.input_caret = log.display_into(&mut blocks.input);
+                }
                 blocks.input_cluster = log.dock.cluster;
             }
             (
@@ -5699,7 +5712,35 @@ impl Session {
         // A block whose anchor is **not visible** in the window leaves `None` and
         // the suppression never runs: in a window scrolled backwards the input row
         // is not visible anyway, and if it is visible it is safe to show too much, not too little.
-        let mut suppress_from: Option<u16> = None;
+        //
+        // **A grid-sourced prompt** (`SuppressedInput::grid`) has no mirror to
+        // measure from, so both ends and the dock's line are read from the
+        // cells here, in one walk ([`grid_input`]): the top is the run of the
+        // anchor's link id on the cursor's row, the bottom the cursor's row and
+        // its soft wraps. The upper end is set before the loop, so the loop's
+        // "first row of the block's anchor" does not take it back to the
+        // oldest prompt a job notification was printed under. An input line
+        // that is not on the window (scrolled back) hides nothing.
+        blocks.line_read = false;
+        let grid_found = suppressed_block
+            .filter(|input| input.grid && !alt_screen)
+            .and_then(|input| {
+                grid_input::locate(&term, cursor_point.line.0, rows, |uri| {
+                    block_key(uri) == Some(BlockKey::Local(input.block))
+                })
+            });
+        if let Some(found) = grid_found {
+            blocks.line.cluster = blocks.input_cluster;
+            grid_input::read(&term, found, cursor_point, colors, &theme, &mut blocks.line);
+            blocks.line_read = true;
+        }
+        let grid_hidden = grid_found
+            .filter(|_| (0..rows).contains(&cursor_row))
+            .map(|found| {
+                let row_of = |line: i32| (line + offset).clamp(0, rows.saturating_sub(1)) as u16;
+                (row_of(found.top), row_of(found.bottom))
+            });
+        let mut suppress_from: Option<u16> = grid_hidden.map(|(from, _)| from);
         // The suppression's **lower** end. The cursor's row is **not enough**: ZLE
         // moves the caret freely within the buffer and on a wrapped line when
         // Ctrl-A or the up arrow takes the cursor to the first row the tail stays
@@ -5736,7 +5777,7 @@ impl Session {
         // grid's wrapping. Counted by character, an NFD file name (`é` = two
         // characters, one column) over-rounded the row and hid the first row of
         // the completion list beneath it. A review had caught it.
-        let span = suppressed_block.map(|_| {
+        let span = suppressed_block.filter(|input| !input.grid).map(|_| {
             let (above, below) = dock::grid_span(
                 &blocks.input,
                 blocks.input_caret,
@@ -5749,7 +5790,7 @@ impl Session {
                 u16::try_from(below).unwrap_or(u16::MAX),
             )
         });
-        let suppress_to = suppressed_block.zip(span).and_then(|(input, (_, below))| {
+        let mirror_to = suppressed_block.zip(span).and_then(|(input, (_, below))| {
             let to = cursor_screen_row
                 .saturating_add(below)
                 .min(grid_rows.saturating_sub(1));
@@ -5835,6 +5876,8 @@ impl Session {
                 answered || (last_ink_in_row(&term, to, offset) == input.last_ink && at_anchor);
             fresh.then_some(to)
         });
+        // A grid-sourced line has no mirror to be stale: its rows are the ones read above.
+        let suppress_to = mirror_to.or(grid_hidden.map(|(_, to)| to));
         // The range's **upper floor**, the other direction of the same arithmetic:
         // how many rows the text before the caret holds above the cursor's row.
         //
@@ -6609,6 +6652,23 @@ impl Session {
             }
         }
 
+        // The input band's rows for a given need: a closure because a grid-sourced
+        // line is published after the `Term` lock is released and the need —
+        // hence this answer — is then asked again with the line just read.
+        let input_rows_of = |needed_rows: usize| -> u16 {
+            if !self.dock {
+                1
+            } else if remote {
+                0
+            } else if alt_screen {
+                1
+            } else if raw {
+                0
+            } else {
+                budget.fit(needed_rows, grid_rows)
+            }
+        };
+
         // **The cursor is built after the loops** and the reason is two fields:
         // `content_rows` is known only when the grid loop ends and `fill` after
         // that. All of the cursor's inputs (shape, point, row, visibility) were
@@ -6651,17 +6711,7 @@ impl Session {
             //
             // **Zero for a program reading the keyboard itself** too, after the
             // alternate screen: the input row is the program's own now.
-            input_rows: if !self.dock {
-                1
-            } else if remote {
-                0
-            } else if alt_screen {
-                1
-            } else if raw {
-                0
-            } else {
-                budget.fit(needed_rows, grid_rows)
-            },
+            input_rows: input_rows_of(needed_rows),
             // **No band** for that program, unless the upload row is shown or
             // the program was recognized: the row a transfer writes stays
             // visible until it lingers out, and a recognized program's guide
@@ -6723,6 +6773,18 @@ impl Session {
             shell_ready,
         };
         drop(term);
+        // **A grid-sourced line is published here**, as soon as the `Term` lock
+        // is gone (the leaf lock does not go under it) and in this same frame:
+        // the dock is drawn right after `frame()` from the ledger, and the
+        // band's height depends on the line just read, so the input rows are
+        // asked again from it. The stamp is read after the cells, never before.
+        if blocks.line_read {
+            let answers = self.key_gen.load(Ordering::Acquire);
+            let mut log = lock(&self.shell);
+            if log.publish_grid(&blocks.line, answers) {
+                cursor.input_rows = input_rows_of(dock::needed_rows(&log.dock, budget.cols));
+            }
+        }
         // **The stale hover drops here**, after the `Term` lock (a leaf lock does
         // not go under it), and only if the slot still holds the copy this frame
         // checked: a hover set in between is the view's newer answer. The news is
@@ -12171,7 +12233,7 @@ mod tests {
 
     use super::*;
     use crate::settings::HostMark;
-    use crate::shell::{DockContext, DockFault, DockState, DockStatus, ShellPhase};
+    use crate::shell::{DockContext, DockFault, DockState, DockStatus, HighlightColor, ShellPhase};
 
     /// The tests' theme: the embedded dark theme, like `bt-shell`'s timed run.
     const THEME: Theme = Theme::BATERI;
@@ -14743,6 +14805,267 @@ mod tests {
         );
         assert!(cursor.visible, "{cursor:?}");
         assert_eq!(cursor.content_rows, 3, "{cursor:?}");
+        session.shutdown();
+    }
+
+    /// A fish-shaped dock prompt for `printf`: the block's anchor with its link
+    /// left open, two real spaces — the second in the suggestion's style
+    /// (bright black) — the grid source's word, and `B`. The shape the fish
+    /// script prints for its dock.
+    fn grid_prompt(id: u32) -> String {
+        format!("\\033]133;A;bt_block={id}\\007{}", grid_repaint(id))
+    }
+
+    /// The prompt as fish prints it again from its cache: the same anchor URI
+    /// (a fresh link id), the spaces, `g` and `B`, without an `A`.
+    fn grid_repaint(id: u32) -> String {
+        format!(
+            "\\033]8;;bateri://block/{id}\\007 \\033[90m \\033[m\
+             \\033]8133;g\\007\\033]133;B\\007"
+        )
+    }
+
+    /// A docked session running `printf` of `body` after a finished first
+    /// block: the rows are `$ cmd1`, `out`, then whatever `body` prints.
+    fn spawn_grid_session(body: &str, wake: Arc<TestWake>) -> Session {
+        spawn_docked_session(
+            &format!(
+                "printf '{}cmd1{}{body}'; sleep 5",
+                anchored_prompt(1),
+                ran(1, 0, "out"),
+            ),
+            wake,
+        )
+    }
+
+    /// Frames until the published line satisfies `ready` at the `Input` phase;
+    /// returns that frame's cells and cursor and the line it published.
+    fn wait_grid_line(
+        session: &Session,
+        what: &str,
+        ready: impl Fn(&DockState) -> bool,
+    ) -> (Vec<Cell>, Cursor, DockState) {
+        let mut state = DockState::default();
+        let frame = |state: &mut DockState| {
+            let mut cells = Vec::new();
+            let cursor = session.frame(
+                |cell| cells.push(cell),
+                |_| (),
+                &mut Blocks::default(),
+                &mut SelectionRuns::default(),
+                &mut SearchRuns::default(),
+                &mut TrackMarks::default(),
+                &mut Clusters::default(),
+                ScrollGlide::default(),
+                BUDGET,
+            );
+            session.dock_state(state);
+            // The band's height follows the line published in this very frame,
+            // not the one that was there before it.
+            if state.status == DockStatus::Live {
+                assert_eq!(
+                    cursor.input_rows,
+                    BUDGET.fit(dock::needed_rows(state, BUDGET.cols), cursor.rows),
+                    "the band lagged the line it was drawn with: {state:?}"
+                );
+            }
+            (cells, cursor)
+        };
+        wait_until(what, Duration::from_secs(5), || {
+            frame(&mut state);
+            ready(&state) && session.shell_state().map(|s| s.phase) == Some(ShellPhase::Input)
+        });
+        // Whatever else the child printed has landed once the frames settle.
+        wait_settled(session);
+        let (cells, cursor) = frame(&mut state);
+        (cells, cursor, state)
+    }
+
+    #[test]
+    fn a_grid_sourced_line_is_read_with_its_colors_and_suggestion() {
+        // fish draws `git sta` in red and the suggestion `rt` in bright
+        // black, then the caret sits after `sta`. The dock gets the typed
+        // text, the suggestion apart, the two styles and the caret; the grid
+        // gives the row up.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_grid_session(
+            &format!(
+                "{}\\033[91mgit\\033[m \\033[91msta\\033[90mrt\\033[m\\033[2D",
+                grid_prompt(2)
+            ),
+            wake,
+        );
+        let (cells, cursor, line) = wait_grid_line(&session, "the line was not read", |state| {
+            state.status == DockStatus::Live && state.buffer == "git sta"
+        });
+        assert_eq!(line.predisplay, "");
+        assert_eq!(line.postdisplay, "rt", "{line:?}");
+        assert_eq!(line.cursor, 7, "{line:?}");
+        assert_eq!(line.display_chars, 9);
+        assert!(
+            !line.insert_keymap,
+            "nothing can be typed through a grid line"
+        );
+        let [typed, space_after, suggestion] = line.highlights.as_slice() else {
+            panic!("expected three colored runs, got {:?}", line.highlights);
+        };
+        let _ = space_after;
+        assert_eq!((typed.start, typed.end), (0, 3), "{line:?}");
+        assert_eq!((suggestion.start, suggestion.end), (7, 9), "{line:?}");
+        assert!(matches!(typed.style.fg, Some(HighlightColor::Rgb(_))));
+        assert_ne!(typed.style, suggestion.style, "red and gray read as one");
+        // The second run is `sta`, the same red as `git`.
+        assert_eq!(line.highlights[1].style, typed.style);
+        assert_eq!((line.highlights[1].start, line.highlights[1].end), (4, 7));
+        // The history stays, the input row is the dock's.
+        assert_eq!(row_glyphs(&cells, 0), "$cmd1");
+        assert_eq!(row_glyphs(&cells, 1), "out");
+        assert_eq!(row_glyphs(&cells, 2), "", "the input row is in the grid");
+        assert!(cursor.caret_in_dock && !cursor.visible, "{cursor:?}");
+        assert_eq!(cursor.content_rows, 2, "{cursor:?}");
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_job_notice_under_the_old_prompt_stays_in_the_grid() {
+        // fish prints the notice under the open link of the prompt it
+        // interrupts, then repaints the cached prompt: the same anchor URI
+        // again, a fresh link id. Only the repainted prompt's row is the
+        // dock's; the old prompt, its text and the notice stay.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_grid_session(
+            &format!(
+                "{}xx\\r\\nJob 1 has ended\\r\\n{}ls",
+                grid_prompt(2),
+                grid_repaint(2)
+            ),
+            wake,
+        );
+        let (cells, cursor, line) = wait_grid_line(&session, "the line was not read", |state| {
+            state.buffer == "ls"
+        });
+        assert_eq!(
+            row_glyphs(&cells, 2),
+            "xx",
+            "the old prompt's row was hidden"
+        );
+        assert_eq!(
+            row_glyphs(&cells, 3),
+            "Job1hasended",
+            "the notice was hidden"
+        );
+        assert_eq!(
+            row_glyphs(&cells, 4),
+            "",
+            "the new prompt's row is in the grid"
+        );
+        assert!(cursor.caret_in_dock, "{cursor:?}");
+        assert_eq!(line.cursor, 2);
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_completion_list_below_the_cursor_stays_in_the_grid() {
+        // Tab: the list is printed below the command line and the caret goes
+        // back up. The line is the dock's, the list is not part of it.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_grid_session(
+            &format!(
+                "{}git \\r\\nadd  commit\\r\\nswitch\\033[2A\\033[7G",
+                grid_prompt(2)
+            ),
+            wake,
+        );
+        let (cells, cursor, line) = wait_grid_line(&session, "the line was not read", |state| {
+            state.status == DockStatus::Live && state.display_chars > 0
+        });
+        assert_eq!(line.buffer, "git ", "the space before the caret is text");
+        assert_eq!(line.cursor, 4);
+        assert_eq!(row_glyphs(&cells, 2), "", "{cells:?}");
+        assert_eq!(row_glyphs(&cells, 3), "addcommit");
+        assert_eq!(row_glyphs(&cells, 4), "switch");
+        assert!(cursor.caret_in_dock, "{cursor:?}");
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_wrapped_line_is_one_line_and_both_rows_are_the_docks() {
+        // 45 letters after a two-column prompt fill a 40-column row and spill
+        // into the next. The text is one line without a break; the caret on
+        // either row hides both rows.
+        let letters = "a".repeat(45);
+        for (moves, caret) in [("", 45), ("\\033[A", 5)] {
+            let wake = Arc::new(TestWake::default());
+            let session = spawn_grid_session(&format!("{}{letters}{moves}", grid_prompt(2)), wake);
+            let (cells, cursor, line) =
+                wait_grid_line(&session, "the line was not read", |state| {
+                    state.buffer == letters
+                });
+            assert_eq!(line.cursor, caret, "{line:?}");
+            assert_eq!(row_glyphs(&cells, 2), "");
+            assert_eq!(row_glyphs(&cells, 3), "", "the wrap's tail stayed behind");
+            assert!(cursor.caret_in_dock, "{cursor:?}");
+            session.shutdown();
+        }
+    }
+
+    #[test]
+    fn rows_after_the_cursor_of_a_multi_line_command_stay_in_the_grid() {
+        // `echo a⏎b`: with the caret on the last line the dock has both; with
+        // the caret up on the first, the second line is below the caret and
+        // stays where it was drawn.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_grid_session(&format!("{}echo a\\r\\nb", grid_prompt(2)), wake);
+        let (cells, _, line) = wait_grid_line(&session, "the line was not read", |state| {
+            state.buffer == "echo a\nb"
+        });
+        assert_eq!(line.cursor, 8, "{line:?}");
+        assert_eq!(row_glyphs(&cells, 2), "");
+        assert_eq!(row_glyphs(&cells, 3), "");
+        session.shutdown();
+
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_grid_session(
+            &format!("{}echo a\\r\\nb\\033[A\\033[8G", grid_prompt(2)),
+            wake,
+        );
+        let (cells, _, line) = wait_grid_line(&session, "the line was not read", |state| {
+            state.buffer == "echo a"
+        });
+        assert_eq!(row_glyphs(&cells, 2), "");
+        assert_eq!(
+            row_glyphs(&cells, 3),
+            "b",
+            "the line below the caret vanished"
+        );
+        assert_eq!(line.cursor, 5, "the caret is on the `a`: {line:?}");
+        session.shutdown();
+    }
+
+    #[test]
+    fn an_emoji_cluster_reaches_the_dock_whole() {
+        // With clustering on the grid keeps `👍🏽` in one cell (the thumb and its
+        // modifier as a zero-width tail); the line carries both code points
+        // so the dock's own walk makes the one glyph.
+        let wake = Arc::new(TestWake::default());
+        let mut options = test_options(
+            sh(&format!(
+                "printf '{}cmd1{}{}\u{1F44D}\u{1F3FD}'; sleep 5",
+                anchored_prompt(1),
+                ran(1, 0, "out"),
+                grid_prompt(2),
+            )),
+            40,
+        );
+        options.dock = true;
+        options.cluster = true;
+        let session = Session::spawn(options, wake).unwrap();
+        let (_, _, line) = wait_grid_line(&session, "the line was not read", |state| {
+            state.status == DockStatus::Live && state.display_chars > 0
+        });
+        assert_eq!(line.buffer, "\u{1F44D}\u{1F3FD}");
+        assert!(line.cluster);
+        assert_eq!(line.cursor, 2);
         session.shutdown();
     }
 
@@ -23649,6 +23972,55 @@ e\\314\\201.'; sleep 5";
         assert!(reader.join().unwrap() > 0, "the mirror was never read");
         assert!(frames > 0, "no frame was produced during the race");
         assert!(docked > 0, "the frame path never saw the mirror live");
+        assert!(session.reader_alive(), "the reader thread died in the race");
+        session.shutdown();
+    }
+
+    #[test]
+    #[ignore = "runs with make test-race"]
+    fn race_grid_line_publication_and_scanner() {
+        // The frame reads the line from the grid under the `Term` lock and
+        // writes it to the ledger after releasing it, while the reader thread
+        // keeps writing the ledger's `A`, `g`, `B` and `e`. The claim: a
+        // publication never lands over a finished line — once `e` is applied
+        // the grid word is gone and nothing is published until the next `g` —
+        // and the two locks never nest (a nesting hangs here).
+        let wake = Arc::new(TestWake::default());
+        let session = Arc::new(spawn_docked_session(
+            &format!(
+                "while :; do printf '{}ls'; sleep 0.01; \
+                 printf '\\033]8133;e\\007\\033]133;C\\007\\r\\n\
+                 \\033]133;D;0;bt_block=1\\007'; done",
+                grid_prompt(1)
+            ),
+            Arc::clone(&wake),
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let watcher = {
+            let session = Arc::clone(&session);
+            std::thread::spawn(move || {
+                let mut live = 0u64;
+                while Instant::now() < deadline {
+                    let log = lock(&session.shell);
+                    assert!(
+                        !(log.dock_grid && log.holding_end()),
+                        "a line held by `e` is still grid-sourced"
+                    );
+                    live += u64::from(log.dock.status == DockStatus::Live);
+                }
+                live
+            })
+        };
+        let mut frames = 0u64;
+        while Instant::now() < deadline {
+            if frame_if_damaged(&session, |_| ()).is_some() {
+                frames += 1;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(watcher.join().unwrap() > 0, "the line was never published");
+        assert!(frames > 0, "no frame was produced during the race");
         assert!(session.reader_alive(), "the reader thread died in the race");
         session.shutdown();
     }
