@@ -289,6 +289,84 @@ impl<U: EventListener> Handler for ClusterHandler<'_, U> {
     }
 }
 
+/// Where the last `advance` cut a UTF-8 character: how many of its bytes are
+/// still to come. Every caller that feeds one stream through several
+/// `advance`s goes through [`Utf8Seam::feed`].
+///
+/// **Why it exists: vte 0.15 drops a byte at the seam.** A character cut at
+/// the end of one `advance` is completed at the start of the next by copying
+/// up to three bytes into the parser's partial buffer
+/// (`advance_partial_utf8`). When those three bytes hold the start of another
+/// character that is itself cut, the parser prints the first character but
+/// counts every valid byte of the buffer as consumed, so whatever stood
+/// between the two characters is never printed: `· ·` read as `C2` and
+/// `B7 20 C2 B7` loses its space. A full-screen program's row then lands one
+/// column left of where the program believes it is, and stays there until
+/// the program redraws that row. Which reads cut where is down to timing, so
+/// it showed as a shift that came and went.
+///
+/// The cure is on this side: the bytes that complete a cut character go in
+/// one per `advance`, so the copy never reaches past the character itself.
+/// Nothing is held back and every byte is parsed in the same round, so a
+/// journal counting the bytes an `advance` got sees the same count. Inside
+/// an escape sequence the parser keeps no partial character; there a byte
+/// at a time changes nothing either.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Utf8Seam {
+    /// The cut character's bytes still to come; 0 when the last `advance`
+    /// ended on a character boundary.
+    missing: u8,
+}
+
+impl Utf8Seam {
+    /// Hands `bytes` to `advance`: first the bytes completing the character
+    /// the previous call cut, one at a time, then the rest in one slice.
+    pub(crate) fn feed(&mut self, mut bytes: &[u8], mut advance: impl FnMut(&[u8])) {
+        while self.missing > 0
+            && let Some((&byte, rest)) = bytes.split_first()
+        {
+            advance(&bytes[..1]);
+            self.missing = if is_continuation(byte) {
+                self.missing - 1
+            } else {
+                // Not a continuation: the cut character was invalid and this
+                // byte starts afresh — it may open a character of its own.
+                missing_at_end(&bytes[..1])
+            };
+            bytes = rest;
+        }
+        if !bytes.is_empty() {
+            advance(bytes);
+            self.missing = missing_at_end(bytes);
+        }
+    }
+}
+
+/// A UTF-8 continuation byte (`10xxxxxx`).
+fn is_continuation(byte: u8) -> bool {
+    byte & 0xC0 == 0x80
+}
+
+/// How many bytes the character cut at the end of `bytes` still lacks; 0
+/// when `bytes` ends on a boundary or with bytes that open no valid
+/// character (those the parser does not keep waiting on).
+fn missing_at_end(bytes: &[u8]) -> u8 {
+    for (back, &byte) in bytes.iter().rev().take(4).enumerate() {
+        if is_continuation(byte) {
+            continue;
+        }
+        let len: usize = match byte {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => return 0,
+        };
+        // audit: `len ≤ 4`, so the difference fits a `u8`.
+        return len.saturating_sub(back + 1) as u8;
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,5 +633,73 @@ mod tests {
             );
         }
         assert_eq!(rows(&t)[0], "[🇹🇷]|·|[👍🏽]|·");
+    }
+
+    /// `bytes` fed through one parser in the slices `cuts` marks — the way
+    /// the reader gets a stream, a read at a time — across the seam.
+    fn feed_cut(term: &mut Term<VoidListener>, cluster: bool, bytes: &[u8], cuts: &[usize]) {
+        let mut parser: Processor = Processor::new();
+        let mut last_input = false;
+        let mut seam = Utf8Seam::default();
+        let mut at = 0;
+        for &cut in cuts.iter().chain(std::iter::once(&bytes.len())) {
+            seam.feed(&bytes[at..cut], |slice| {
+                parser.advance(
+                    &mut ClusterHandler::new(term, cluster, &mut last_input),
+                    slice,
+                );
+            });
+            at = cut;
+        }
+    }
+
+    /// A read that ends inside `·` (`C2` | `B7 20 C2 B7`) keeps the space
+    /// after it. The parser alone drops it — when that stops being true the
+    /// seam can go.
+    #[test]
+    fn a_character_cut_by_a_read_keeps_the_byte_after_it() {
+        let bytes = "· ·".as_bytes();
+        let mut t = term(10, 1);
+        feed_cut(&mut t, true, bytes, &[1]);
+        assert_eq!(rows(&t)[0], "·| |·");
+
+        let mut bare = term(10, 1);
+        let mut parser: Processor = Processor::new();
+        let mut last_input = false;
+        for slice in [&bytes[..1], &bytes[1..]] {
+            parser.advance(
+                &mut ClusterHandler::new(&mut bare, true, &mut last_input),
+                slice,
+            );
+        }
+        assert_eq!(
+            rows(&bare)[0],
+            "·|·",
+            "vte no longer drops the byte after a cut character: Utf8Seam is not needed"
+        );
+    }
+
+    /// Wherever one read or two cut the stream — inside a two-, three- or
+    /// four-byte character, an escape sequence or an emoji cluster — the
+    /// cells are the ones a single read gives.
+    #[test]
+    fn every_cut_gives_the_cells_of_one_read() {
+        let text = "a·b ğ│é \x1b[31mx🙂y\x1b[m ş─z 👍🏽 ü!\u{301}";
+        let bytes = text.as_bytes();
+        for cluster in [false, true] {
+            let mut whole = term(40, 2);
+            feed(&mut whole, cluster, text);
+            let want = rows(&whole);
+            for i in 1..bytes.len() {
+                let mut t = term(40, 2);
+                feed_cut(&mut t, cluster, bytes, &[i]);
+                assert_eq!(rows(&t), want, "one cut at {i}, cluster {cluster}");
+                for j in i + 1..bytes.len() {
+                    let mut t = term(40, 2);
+                    feed_cut(&mut t, cluster, bytes, &[i, j]);
+                    assert_eq!(rows(&t), want, "cuts at {i} and {j}, cluster {cluster}");
+                }
+            }
+        }
     }
 }

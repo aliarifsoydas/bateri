@@ -69,7 +69,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi::{self, Handler as _, Timeout as _};
 
-use crate::handler::ClusterHandler;
+use crate::handler::{ClusterHandler, Utf8Seam};
 use crate::reader::{MAX_LOCKED_READ, READ_BUFFER_SIZE};
 use crate::session::{GridSize, Osc52, TerminalOptions, history_of_vt, term_config, wipe};
 use crate::settings::{CaretShape, CursorBlink};
@@ -954,6 +954,9 @@ struct Scratch {
     title: TitleSlot,
     parser: ansi::Processor,
     last_input: bool,
+    /// The character the last fed slice cut ([`Utf8Seam`]): the replay
+    /// crosses the reader's seams the way the reader did.
+    seam: Utf8Seam,
     tail: Tail,
     options: TerminalOptions,
     cluster: bool,
@@ -970,11 +973,15 @@ impl Scratch {
         let mut term = Term::new(term_config(base.options), &grid, title.clone());
         let mut parser: ansi::Processor = ansi::Processor::new();
         let mut last_input = false;
+        // The chunks cut wherever `CHUNK` falls, characters included.
+        let mut seam = Utf8Seam::default();
         for chunk in base.vt.chunks(CHUNK) {
-            parser.advance(
-                &mut ClusterHandler::new(&mut term, base.cluster, &mut last_input),
-                chunk,
-            );
+            seam.feed(chunk, |bytes| {
+                parser.advance(
+                    &mut ClusterHandler::new(&mut term, base.cluster, &mut last_input),
+                    bytes,
+                );
+            });
             progress.fetch_add(1, Ordering::AcqRel);
         }
         let mut scratch = Self {
@@ -982,6 +989,7 @@ impl Scratch {
             title,
             parser: ansi::Processor::new(),
             last_input: base.last_input,
+            seam: Utf8Seam::default(),
             tail: Tail::default(),
             options: base.options,
             cluster: base.cluster,
@@ -995,10 +1003,12 @@ impl Scratch {
         if bytes.is_empty() {
             return;
         }
-        self.parser.advance(
-            &mut ClusterHandler::new(&mut self.term, self.cluster, &mut self.last_input),
-            bytes,
-        );
+        self.seam.feed(bytes, |bytes| {
+            self.parser.advance(
+                &mut ClusterHandler::new(&mut self.term, self.cluster, &mut self.last_input),
+                bytes,
+            );
+        });
         self.tail.feed(bytes);
     }
 

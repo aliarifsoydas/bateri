@@ -38,6 +38,18 @@ of every installed copy. A version without a section is not released.
   own background still reach the window's edges. The cost is a column or two
   and sometimes a row fewer in the same window.
 
+### Fixed
+
+- **A full-screen program's row no longer slips one column to the left.**
+  When a program's output arrived split in the middle of a character such as
+  `·`, `ğ` or `│`, the character or space right after it could be lost, so
+  the rest of that row was drawn one column too far left — in htop, a game
+  or a program's own frame, the right border of a single row stepped in, and
+  it stayed that way until the program redrew the row. Text shown in the
+  usual way could lose a letter the same way. It depended on how the output
+  happened to be split, so it came and went with the window's size and the
+  moment.
+
 ## [0.14.0] - 2026-10-12
 
 ### Changed
