@@ -109,7 +109,7 @@ pub(crate) fn remote_hosts_path(home: &std::path::Path) -> std::path::PathBuf {
     home.join("Library/Application Support/bateri/remote-hosts")
 }
 
-/// `bateri ssh-argv [--tty] [--block N] [--instance I] -- <ssh arguments…>`: `Some(exit code)` when
+/// `bateri ssh-argv [--tty] [--block N] [--instance I] [--cwd D] -- <ssh arguments…>`: `Some(exit code)` when
 /// the process was started as the subcommand, `None` otherwise. `main` calls
 /// it before the window-server check — the local zsh's `ssh` function calls
 /// it on every `ssh`, in any session. The body is
@@ -147,7 +147,7 @@ pub fn ssh_argv() -> Option<i32> {
         &ssh_route::SystemSsh,
         &remote_hosts_path(&home),
         &ssh_route::socket_bases(Some(&home), uid),
-        bt_shell_common::ssh_wrap::boot(),
+        &bt_shell_common::ssh_wrap::boot_in,
         bt_shell_common::ssh_wrap::new_nonce().as_deref(),
         tab.as_ref(),
         &mut std::io::stdout().lock(),

@@ -651,8 +651,12 @@ const REMOTE_FILES: [(&str, &str); 8] = [
 /// The payload: [`MAGIC`], `bt_files` (one `bt_put` per [`REMOTE_FILES`]
 /// entry, its content a single-quoted literal (`upload::sq`, the crate's one
 /// quoting rule) — no here-document: bash as
-/// `sh` would write one to `/tmp`), then [`BOOT_SCRIPT`].
-fn payload() -> String {
+/// `sh` would write one to `/tmp`), the starting directory `bt_cwd` when
+/// there is one ([`is_start_dir`]; the same quoting), then [`BOOT_SCRIPT`].
+/// The directory rides here rather than as a word of [`remote_command`]: the
+/// payload is base64 and `eval`ed by `sh`, so any path is one literal, and
+/// the command's positional form ([`unwrap`]) stays as older builds read it.
+fn payload(cwd: Option<&str>) -> String {
     let mut text = format!("{MAGIC}\nbt_files() {{\n");
     for (path, content) in REMOTE_FILES {
         text.push_str(&format!(
@@ -662,6 +666,9 @@ fn payload() -> String {
         ));
     }
     text.push_str("}\n");
+    if let Some(cwd) = cwd.filter(|cwd| is_start_dir(cwd)) {
+        text.push_str(&format!("bt_cwd={}\n", crate::upload::sq(cwd)));
+    }
     text.push_str(BOOT_SCRIPT);
     text
 }
@@ -719,7 +726,33 @@ fn one_liner(payload: &str) -> String {
 /// one-liner carrying the base64 payload. Always [`is_inline`].
 pub fn boot() -> &'static str {
     static BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    BOOT.get_or_init(|| one_liner(&payload()))
+    BOOT.get_or_init(|| one_liner(&payload(None)))
+}
+
+/// [`boot`], starting the login shell in `cwd` when it is one
+/// ([`is_start_dir`]) — the remote folder ⌘T's tab was in, passed once by
+/// the new tab's `ssh` (`--cwd`, [`ssh_argv_main`]). Still [`is_inline`]:
+/// the directory is inside the base64 payload ([`payload`]).
+pub fn boot_in(cwd: Option<&str>) -> std::borrow::Cow<'static, str> {
+    match cwd.filter(|cwd| is_start_dir(cwd)) {
+        Some(cwd) => std::borrow::Cow::Owned(one_liner(&payload(Some(cwd)))),
+        None => std::borrow::Cow::Borrowed(boot()),
+    }
+}
+
+/// The longest starting directory carried: Linux's `PATH_MAX`. A longer one
+/// could not be `cd`ed to in one step anyway.
+const START_DIR_MAX: usize = 4096;
+
+/// Whether `dir` can be the server's starting directory: absolute, `~` or
+/// `~/…` (the forms the dock shows: OSC 7's path or the title's folder),
+/// no control character (a NUL could not even reach the shell's
+/// environment) and at most [`START_DIR_MAX`] bytes. Anything else is not
+/// carried: the session starts at home, as a plain `ssh` does.
+pub fn is_start_dir(dir: &str) -> bool {
+    (dir.starts_with('/') || dir == "~" || dir.starts_with("~/"))
+        && dir.len() <= START_DIR_MAX
+        && !dir.chars().any(char::is_control)
 }
 
 // ─── the bootstrap's proof ───────────────────────────────────────────────
@@ -894,7 +927,7 @@ fn take_up(state_path: &Path, nonce: &str) -> bool {
     up || used
 }
 
-/// `bateri ssh-argv [--tty] [--block N] [--instance I] -- <ssh arguments…>`: the subcommand's body
+/// `bateri ssh-argv [--tty] [--block N] [--instance I] [--cwd D] -- <ssh arguments…>`: the subcommand's body
 /// (`argv` is what follows `ssh-argv`). Writes the wrapped arguments to `out`,
 /// each followed by a NUL, or nothing; the exit code is always zero and every
 /// failure is "nothing" — the caller runs plain `ssh`.
@@ -906,7 +939,12 @@ fn take_up(state_path: &Path, nonce: &str) -> bool {
 /// `--instance I` is the running bateri's instance directory name
 /// (`BATERI_SSH_INSTANCE`), looked for under `roots`
 /// ([`crate::ssh_route::socket_bases`]); without it, or without the
-/// directory, the session is no master ([`Control`]). `settings` is the settings file's launch
+/// directory, the session is no master ([`Control`]). `--cwd D` is the
+/// remote folder the session starts in: a tab opened by ⌘T from a remote
+/// tab passes its source's folder to its first `ssh`, once; `boot` builds the
+/// bootstrap for it ([`boot_in`]), and a `D` that is not [`is_start_dir`]
+/// starts at home. Each flag is optional and they come in this order, so an
+/// older shell's call (no `--cwd`) still wraps. `settings` is the settings file's launch
 /// reading (an unusable file turns the integration off); `state_path` is the
 /// platform's state file. A wrapped connection is recorded as
 /// [`Fact::Touched`] **before** it is printed: if the record fails nothing is
@@ -921,7 +959,7 @@ pub fn ssh_argv_main(
     runner: &dyn SshRunner,
     state_path: &Path,
     roots: &[PathBuf],
-    boot: &str,
+    boot: &dyn Fn(Option<&str>) -> std::borrow::Cow<'static, str>,
     nonce: Option<&str>,
     tab: Option<&PaneUuid>,
     out: &mut impl Write,
@@ -946,12 +984,17 @@ pub fn ssh_argv_main(
         }
         rest => (Vec::new(), rest),
     };
+    let (cwd, rest) = match rest {
+        [flag, cwd, rest @ ..] if flag == "--cwd" => (Some(cwd.as_str()), rest),
+        rest => (None, rest),
+    };
     let Some(("--", args)) = rest.split_first().map(|(head, tail)| (head.as_str(), tail)) else {
         return 0;
     };
     let state = load(state_path);
+    let boot = boot(cwd);
     let Some(wrapped) = decide(
-        args, tty, settings, runner, &state, boot, parent, nonce, tab, &sockets,
+        args, tty, settings, runner, &state, &boot, parent, nonce, tab, &sockets,
     ) else {
         return 0;
     };
@@ -1193,16 +1236,57 @@ mod tests {
     /// binary wrapped. Frozen here: the function's two calls as today's
     /// script makes them and a wrapped argv of an older version (another
     /// version word). **The rule:** a flag or a tail form is added beside
-    /// these, never changed; this fixture goes two versions later.
+    /// these, never changed; this fixture goes two versions later. The
+    /// previous script's `ssh-argv` call is today's without `"${cwd[@]}"`
+    /// (an optional flag, [`ssh_argv_main`]); the subcommand without `--cwd`
+    /// is `the_subcommand_prints_nul_separated_args_or_nothing`.
     #[test]
     fn the_previous_functions_calls_still_parse() {
         let script = include_str!("../../../assets/shell/zsh/bateri.zsh");
         for call in [
-            r#"ssh-argv $tty --block "$__bateri_block" "${instance[@]}" -- "$@""#,
+            r#"ssh-argv $tty --block "$__bateri_block" "${instance[@]}" "${cwd[@]}" -- "$@""#,
             r#"ssh-fell-back --rc $rc "${instance[@]}" -- "${wrapped[@]}""#,
         ] {
             assert!(script.contains(call), "the function's call moved: {call}");
         }
+        // The previous script's `ssh-argv` call, frozen: no `--cwd`.
+        let previous = r#"ssh-argv $tty --block "$__bateri_block" "${instance[@]}" -- "$@""#;
+        assert!(
+            !script.contains(previous),
+            "today's call is not the previous one"
+        );
+        let dir = scratch("previous-call");
+        let path = dir.join("remote-hosts");
+        record(&path, Fact::Posix, "u@h:22", 1, LOCK_PATIENCE).unwrap();
+        let mut out = Vec::new();
+        ssh_argv_main(
+            &words(&[
+                "--tty",
+                "--block",
+                "7",
+                "--instance",
+                "0a1b2c3d",
+                "--",
+                "prod",
+            ]),
+            &Settings::default(),
+            &Gconfig::new(PLAIN),
+            &path,
+            &[],
+            &|cwd| {
+                assert_eq!(cwd, None);
+                BOOT_STUB.into()
+            },
+            Some(NONCE),
+            None,
+            &mut out,
+        );
+        let expected: Vec<u8> = wrap(&words(&["prod"]), BOOT_STUB, Some(7), NONCE, None, None)
+            .iter()
+            .flat_map(|arg| arg.bytes().chain([0]))
+            .collect();
+        assert_eq!(out, expected, "the previous call still wraps");
+        fs::remove_dir_all(&dir).unwrap();
         let older = words(&[
             "-t",
             "-o",
@@ -1710,7 +1794,7 @@ mod tests {
         let path = dir.join("remote-hosts");
         record(&path, Fact::Posix, "u@h:22", 1, LOCK_PATIENCE).unwrap();
         let runner = Gconfig::new(PLAIN);
-        let run = |argv: &[&str], boot: &str| {
+        let run = |argv: &[&str], boot: &'static str| {
             let mut out = Vec::new();
             let code = ssh_argv_main(
                 &words(argv),
@@ -1718,7 +1802,7 @@ mod tests {
                 &runner,
                 &path,
                 &[],
-                boot,
+                &|_| boot.into(),
                 Some(NONCE),
                 None,
                 &mut out,
@@ -1763,6 +1847,67 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// `--cwd` (after `--instance`, before `--`) is handed to the bootstrap's
+    /// builder and only there; without it the builder is asked for none, so
+    /// the previous script's call wraps as it did.
+    #[test]
+    fn the_subcommand_hands_the_starting_directory_to_the_bootstrap() {
+        let dir = scratch("main-cwd");
+        let path = dir.join("remote-hosts");
+        record(&path, Fact::Posix, "u@h:22", 1, LOCK_PATIENCE).unwrap();
+        let runner = Gconfig::new(PLAIN);
+        let run = |argv: &[&str]| {
+            let mut out = Vec::new();
+            ssh_argv_main(
+                &words(argv),
+                &Settings::default(),
+                &runner,
+                &path,
+                &[],
+                &|cwd| cwd.map_or(BOOT_STUB.into(), |cwd| format!("cd {cwd}").into()),
+                Some(NONCE),
+                None,
+                &mut out,
+            );
+            out
+        };
+        let printed = |boot: &str| -> Vec<u8> {
+            wrap(&words(&["prod"]), boot, Some(7), NONCE, None, None)
+                .iter()
+                .flat_map(|arg| arg.bytes().chain([0]))
+                .collect()
+        };
+        assert_eq!(
+            run(&["--tty", "--block", "7", "--cwd", "/srv/app", "--", "prod"]),
+            printed("cd /srv/app")
+        );
+        assert_eq!(
+            run(&["--tty", "--block", "7", "--", "prod"]),
+            printed(BOOT_STUB)
+        );
+        // Out of order it is not a flag: nothing, plain `ssh`.
+        assert!(run(&["--tty", "--cwd", "/srv", "--block", "7", "--", "prod"]).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_starting_directory_is_absolute_or_home_rooted() {
+        for dir in ["/", "/srv/my app", "/home/ömer/proje", "~", "~/src", "/a'b"] {
+            assert!(is_start_dir(dir), "{dir:?}");
+        }
+        let long = format!("/{}", "a".repeat(START_DIR_MAX));
+        for dir in [
+            "", "src", "~user/x", "~x", "-r", "/a\nb", "/a\0b", "/a\x1b]b", &long,
+        ] {
+            assert!(!is_start_dir(dir), "{dir:?}");
+        }
+        // One the server could not be sent builds no other bootstrap.
+        assert_eq!(boot_in(Some("src")), boot());
+        assert_eq!(boot_in(None), boot());
+        assert_ne!(boot_in(Some("/srv")), boot());
+        assert!(is_inline(&boot_in(Some("/a'b \"c\" $d !e \\f"))));
+    }
+
     /// With bateri's instance directory, the session becomes a
     /// master there — unless the user shares connections themselves.
     #[test]
@@ -1782,7 +1927,7 @@ mod tests {
                 &runner,
                 &path,
                 &roots,
-                BOOT_STUB,
+                &|_| BOOT_STUB.into(),
                 Some(NONCE),
                 None,
                 &mut out,
@@ -2197,8 +2342,12 @@ mod tests {
             is_inline(boot),
             "the one-liner breaks a login shell's quoting"
         );
-        assert!(payload().starts_with(&format!("{MAGIC}\n")));
+        assert!(payload(None).starts_with(&format!("{MAGIC}\n")));
         let command = remote_command(boot, Some(u32::MAX), NONCE, None);
+        assert!(command.len() < 64 * 1024, "{} bytes", command.len());
+        // The longest starting directory it carries, too.
+        let deepest = format!("/{}", "a".repeat(START_DIR_MAX - 1));
+        let command = remote_command(&boot_in(Some(&deepest)), Some(u32::MAX), NONCE, None);
         assert!(command.len() < 64 * 1024, "{} bytes", command.len());
         let args = words(&["-p", "2222", "prod"]);
         let runner = Gconfig::new(PLAIN);
@@ -2340,7 +2489,7 @@ mod remote_shells {
         TerminalOptions, Theme,
     };
 
-    use super::{boot, remote_command};
+    use super::{boot, boot_in, remote_command};
     use crate::child::{SilentWake, wait_until};
     use crate::settings::TempRoot;
 
@@ -2805,6 +2954,82 @@ mod remote_shells {
                 "{name}"
             );
             assert_eq!(run(&bad), "id=bateri|unset|unset.", "{name}");
+        }
+    }
+
+    /// The starting directory ([`boot_in`]): every login shell the bootstrap
+    /// `exec`s — the integration's (zsh) and the plain fault's (`sh`) —
+    /// starts in it, with `PWD` as the path was written (a symlink is not
+    /// resolved); `~` is the server's home, and a folder that is not there
+    /// leaves the shell at home. Any name survives the payload's quoting.
+    #[test]
+    fn the_bootstrap_starts_the_shell_in_the_directory() {
+        let sh = which("sh").expect("sh");
+        for name in ["zsh", "sh"] {
+            let root = TempRoot::new(&format!("remote-cwd-{name}"));
+            let home = root.0.join("home");
+            let bin = root.0.join("bin");
+            let odd = home.join("my 'app' \"$x\" !y");
+            let link = root.0.join("link");
+            std::fs::create_dir_all(home.join(".local/share")).expect("home");
+            std::fs::create_dir_all(home.join("src")).expect("src");
+            std::fs::create_dir_all(&odd).expect("odd");
+            std::os::unix::fs::symlink(&odd, &link).expect("link");
+            std::fs::create_dir_all(&bin).expect("bin");
+            let shell = bin.join(name);
+            std::fs::write(
+                &shell,
+                "#!/bin/sh\nprintf 'pwd=%s|%s.' \"$PWD\" \"$(pwd -P)\"\n",
+            )
+            .expect("stand-in");
+            std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .expect("chmod");
+            let real = |path: &Path| path.canonicalize().expect("real").display().to_string();
+            let run = |cwd: Option<&str>| {
+                let out = std::process::Command::new(&sh)
+                    .arg("-c")
+                    .arg(remote_command(&boot_in(cwd), Some(PARENT), NONCE, None))
+                    .env_clear()
+                    .env("HOME", &home)
+                    .env("SHELL", &shell)
+                    .env("XDG_DATA_HOME", home.join(".local/share"))
+                    .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                    .current_dir(&home)
+                    .stdin(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .expect("sh");
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                text[text.find("pwd=").unwrap_or(0)..].to_owned()
+            };
+            let (odd, link) = (odd.display().to_string(), link.display().to_string());
+            assert_eq!(
+                run(Some(&odd)),
+                format!("pwd={odd}|{}.", real(Path::new(&odd))),
+                "{name}"
+            );
+            assert_eq!(
+                run(Some(&link)),
+                format!("pwd={link}|{}.", real(Path::new(&odd))),
+                "{name}: the symlink stays itself"
+            );
+            assert_eq!(
+                run(Some("~/src")),
+                format!("pwd={}/src|{}.", home.display(), real(&home.join("src"))),
+                "{name}"
+            );
+            assert_eq!(
+                run(Some("~")),
+                format!("pwd={}|{}.", home.display(), real(&home)),
+                "{name}"
+            );
+            for cwd in [None, Some("/no/such/folder"), Some("src")] {
+                let text = run(cwd);
+                assert!(
+                    text.ends_with(&format!("|{}.", real(&home))),
+                    "{name} {cwd:?}: {text}"
+                );
+            }
         }
     }
 

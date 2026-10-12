@@ -1227,7 +1227,9 @@ pub(crate) mod tests {
     /// fallback: after a wrapped `ssh` that did not end with 255 it
     /// asks `ssh-fell-back` with the **wrapped** arguments and reruns a
     /// non-empty answer, returning the last `ssh`'s code — 255 asks too
-    /// (the binary decides); inside tmux or screen nothing is wrapped.
+    /// (the binary decides); inside tmux or screen nothing is wrapped. The
+    /// inherited remote folder (`BATERI_SSH_CWD`) goes to the first `ssh`
+    /// only, and out of the environment.
     #[test]
     fn the_wrappers_ssh_function_asks_the_binary() {
         let root = TempRoot::new("ssh-function");
@@ -1292,6 +1294,7 @@ pub(crate) mod tests {
                             bin.join("bateri").display().to_string(),
                         ),
                         ("BATERI_SSH_INSTANCE".to_owned(), "0a1b2c3d".to_owned()),
+                        ("BATERI_SSH_CWD".to_owned(), "/srv/my app".to_owned()),
                     ]),
                     cols: 80,
                     rows: 20,
@@ -1324,19 +1327,20 @@ pub(crate) mod tests {
 
         let session = spawn("PS1='$ '\n");
         session.write(
-            b"ssh x 'y z'; ssh x | cat; echo \"[${BATERI_BIN-unset}${BATERI_SSH_INSTANCE-unset}]\"\n",
+            b"ssh x 'y z'; ssh x | cat; echo \"[${BATERI_BIN-unset}${BATERI_SSH_INSTANCE-unset}${BATERI_SSH_CWD-unset}]\"\n",
         );
         wait_until("the wrapped call did not run", || {
-            shown(&session, "[-t][x][y z][BOOT]") && shown(&session, "[unsetunset]")
+            shown(&session, "[-t][x][y z][BOOT]") && shown(&session, "[unsetunsetunset]")
         });
         let asked = std::fs::read_to_string(&log).expect("the binary was asked");
         // `--block` is the command's own block: the first prompt's; the
         // instance is the masters' directory, out of the environment.
         // The wrapped call that ended with 0 asked the fallback with the
-        // wrapped arguments (nothing came back: no rerun).
+        // wrapped arguments (nothing came back: no rerun). The folder went
+        // with the first call and not the second.
         assert_eq!(
             asked,
-            "ssh-argv --tty --block 1 --instance 0a1b2c3d -- x y z\n\
+            "ssh-argv --tty --block 1 --instance 0a1b2c3d --cwd /srv/my app -- x y z\n\
              ssh-fell-back --rc 0 --instance 0a1b2c3d -- -t x y z BOOT\n\
              ssh-argv --block 1 --instance 0a1b2c3d -- x\n"
         );

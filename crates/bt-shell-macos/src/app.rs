@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use block2::RcBlock;
 use bt_core::{
     AdoptMode, HostMark, InitialInput, KeepRunning, MarkSubject, PaneUuid, ReduceMotion,
-    RestoreWindows, SHUTDOWN_GRACE, SYSTEM_THEME, Scrollbar, Settings, SettingsEdit,
+    RemoteKind, RestoreWindows, SHUTDOWN_GRACE, SYSTEM_THEME, Scrollbar, Settings, SettingsEdit,
     ShellIntegration, Teardown, Theme,
 };
 use bt_gpu::{DisplayLink, MIN_SAMPLES, Renderer, ScrollbarMode, Stats};
@@ -387,6 +387,28 @@ fn initial_line(opening: Opening, remote_line: Option<String>) -> Option<String>
         Opening::Tab | Opening::Split => remote_line,
         Opening::Window | Opening::LocalTab | Opening::Restore => None,
     }
+}
+
+/// The remote folder the new shell's first `ssh` starts in, as the
+/// environment pair the wrapper's `ssh` takes once (`BATERI_SSH_CWD` →
+/// `bateri ssh-argv --cwd`): only beside ⌘T's first input ([`initial_line`])
+/// and only when that input is an `ssh` — mosh is not wrapped, and the
+/// folder would wait for the next, unrelated `ssh`. Only where the wrapper's
+/// `ssh` asks the helper (`BATERI_BIN` in `integration`): elsewhere nothing
+/// takes the variable out of the environment. `dir` is the folder the dock
+/// shows ([`bt_core::Session::remote_link_directory`]); one the server could
+/// not be sent is no folder ([`bt_shell_common::ssh_wrap::is_start_dir`]).
+fn ssh_start_dir(
+    initial: Option<&str>,
+    kind: Option<RemoteKind>,
+    dir: String,
+    integration: &[(String, String)],
+) -> Option<(String, String)> {
+    (initial.is_some()
+        && kind == Some(RemoteKind::Ssh)
+        && bt_shell_common::ssh_wrap::is_start_dir(&dir)
+        && integration.iter().any(|(key, _)| key == "BATERI_BIN"))
+    .then(|| ("BATERI_SSH_CWD".to_owned(), dir))
 }
 
 /// The session directory ([`restore::directory`]) — `None` in a timed run and
@@ -3936,6 +3958,18 @@ impl AppDelegate {
             .and_then(|session| session.working_directory())
             .or_else(child::working_directory);
         let initial = initial_line(opening, session.and_then(|session| session.remote_line()));
+        let integration = self.shell_integration();
+        let env = session
+            .and_then(|session| {
+                ssh_start_dir(
+                    initial.as_deref(),
+                    session.remote_target().map(|(_, target, _)| target.kind),
+                    session.remote_link_directory(),
+                    &integration.0,
+                )
+            })
+            .into_iter()
+            .collect();
         let config = embed::Config {
             id: self.next_id(),
             host: Rc::new(TabHost::new(tab)),
@@ -3948,7 +3982,7 @@ impl AppDelegate {
             replay: None,
             zoom: from.map_or_else(Zoom::default, TerminalPane::zoom),
             masters: self.ivars().masters.clone(),
-            integration: self.shell_integration(),
+            integration,
             reduce_motion: self.reduce_motion(),
             smooth_scroll: self.smooth_scroll(),
             scrollbar: self.scrollbar_mode(),
@@ -3961,7 +3995,7 @@ impl AppDelegate {
                 .clone()
                 .map(|keeper| keeper as Rc<dyn crate::pane::Holder>),
             adopt: None,
-            env: Vec::new(),
+            env,
         };
         (config, theme)
     }
@@ -7231,6 +7265,40 @@ mod tests {
         ] {
             assert_eq!(initial_line(opening, None), None, "{opening:?}");
         }
+    }
+
+    #[test]
+    fn a_new_tab_follows_a_remote_tab_into_its_folder() {
+        let wrapper = [
+            ("ZDOTDIR".to_owned(), "/w".to_owned()),
+            ("BATERI_BIN".to_owned(), "/b".to_owned()),
+        ];
+        let line = Some("ssh -p 2222 prod");
+        let ssh = Some(RemoteKind::Ssh);
+        assert_eq!(
+            ssh_start_dir(line, ssh, "/srv/app".to_owned(), &wrapper),
+            Some(("BATERI_SSH_CWD".to_owned(), "/srv/app".to_owned()))
+        );
+        // The title's folder, as the dock shows it.
+        assert_eq!(
+            ssh_start_dir(line, ssh, "~/src".to_owned(), &wrapper).map(|(_, dir)| dir),
+            Some("~/src".to_owned())
+        );
+        // No first input (⌥⌘T, ⌘N, a local tab), mosh, no folder, a folder the
+        // server could not be sent, no wrapper to take the variable back: none.
+        assert_eq!(ssh_start_dir(None, ssh, "/srv".to_owned(), &wrapper), None);
+        assert_eq!(
+            ssh_start_dir(line, Some(RemoteKind::Mosh), "/srv".to_owned(), &wrapper),
+            None
+        );
+        assert_eq!(ssh_start_dir(line, None, "/srv".to_owned(), &wrapper), None);
+        assert_eq!(ssh_start_dir(line, ssh, String::new(), &wrapper), None);
+        assert_eq!(ssh_start_dir(line, ssh, "/a\0b".to_owned(), &wrapper), None);
+        assert_eq!(
+            ssh_start_dir(line, ssh, "/srv".to_owned(), &wrapper[..1]),
+            None
+        );
+        assert_eq!(ssh_start_dir(line, ssh, "/srv".to_owned(), &[]), None);
     }
 
     #[test]

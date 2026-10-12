@@ -12,6 +12,16 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+### Changed
+
+- **A new tab from an ssh tab opens in the same remote folder.** ⌘T (and
+  the tab bar's `+`, and a split) on a tab connected over ssh already
+  connected the new tab to the same host; it now also lands in the folder
+  that tab was in — the one its dock shows — instead of your home folder
+  there. This works on hosts where bateri's remote integration is on. If the
+  folder is gone by then, the new tab starts at home as before, and a later
+  `ssh` you type in that tab starts at home as usual.
+
 ## [0.13.0] - 2026-10-12
 
 ### Changed

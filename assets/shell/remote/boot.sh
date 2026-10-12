@@ -13,7 +13,8 @@
 # starts with it — a `base64` that ignored `-d` and printed garbage is never
 # `eval`ed. `ssh_wrap` prepends it, together with `bt_files`, the function that
 # writes the integration's files (each one's content as a single-quoted
-# literal, so no here-document — bash as `sh` would put one in `/tmp`).
+# literal, so no here-document — bash as `sh` would put one in `/tmp`), and
+# `bt_cwd`, the starting directory, when the session has one.
 #
 # WHAT IT DOES, IN ORDER:
 #   0. says it runs: `ESC ] 8133 ; i ; up ; {nonce} BEL`, the
@@ -28,6 +29,7 @@
 #      `LC_BATERI_TAB_URL`) is exported for every login shell below
 #      — the decode fallback does not (a known limit: it is a server without
 #      a base64 decoder, and its `AcceptEnv LC_*` still may).
+#      Then, when the payload carries one, it enters the starting directory.
 #   1. prints the motd — sshd does not when it runs a command (`do_login` is
 #      the interactive login's path). A known limit both ways: a server that
 #      turned the motd off for ssh (`PrintMotd no`, no pam_motd) shows it now,
@@ -89,6 +91,24 @@ case ${4-} in
     esac
     ;;
 esac
+
+# 0c. The starting directory: a tab opened by ⌘T from a remote tab carries
+# the folder that tab was in, as `bt_cwd` above this file
+# (`ssh_wrap::payload`) — absolute, `~` or `~/…`. Before every arm, so a
+# plain login shell starts there too. A folder that is not there (or not
+# ours to enter) is no fault: the shell starts at home, as a plain `ssh`
+# does. `PWD` is exported so the login shell keeps the path as the dock
+# showed it — a symlinked folder is not resolved to its target.
+case ${bt_cwd-} in
+  '~') bt_cwd=$HOME ;;
+  '~/'*) bt_cwd=$HOME/${bt_cwd#'~/'} ;;
+  /*) ;;
+  *) bt_cwd= ;;
+esac
+if [ -n "$bt_cwd" ] && cd "$bt_cwd" 2>/dev/null; then
+  export PWD
+fi
+unset bt_cwd
 
 bt_fault() {
   printf '\033]8133;f;%s\007' "$1"

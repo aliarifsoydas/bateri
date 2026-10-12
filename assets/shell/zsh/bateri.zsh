@@ -144,6 +144,11 @@ if (( ! ${+__bateri_bin} )); then
   # session becomes a master there. Same rule: ours, out of the environment.
   __bateri_ssh_instance=${BATERI_SSH_INSTANCE-}
   unset BATERI_SSH_INSTANCE
+  # The remote folder a tab opened by ⌘T from a remote tab starts in: its
+  # first `ssh` takes it (`__bateri_ssh`), once. Same rule: ours, out of the
+  # environment.
+  __bateri_ssh_cwd=${BATERI_SSH_CWD-}
+  unset BATERI_SSH_CWD
 fi
 
 # Attaches the OSC 133 marks to zsh's own hooks.
@@ -279,7 +284,7 @@ __bateri_hooks() {
 
 # Runs the user's `ssh`, wrapped when bateri says so.
 #
-# `bateri ssh-argv [--tty] --block N [--instance I] -- <args…>` prints the wrapped arguments, each
+# `bateri ssh-argv [--tty] --block N [--instance I] [--cwd D] -- <args…>` prints the wrapped arguments, each
 # followed by a NUL, or nothing — and nothing (also a missing binary or any
 # failure) means plain `command ssh "$@"`, today's path. `--tty` only when stdin
 # AND stdout are terminals: under `$(…)` the binary's own stdout is our pipe, so
@@ -290,7 +295,11 @@ __bateri_hooks() {
 # `--block` is this command's block (`__bateri_block`): the server's blocks are
 # marked as its children (`bt_remote=<P>.<S>.<n>`). `--instance`
 # is bateri's socket directory (`__bateri_ssh_instance`): the session becomes a
-# master there and bateri's file jobs ride it.
+# master there and bateri's file jobs ride it. `--cwd` is the remote folder
+# a tab opened by ⌘T from a remote tab inherits (`__bateri_ssh_cwd`): the
+# server's shell starts there. Only the tab's FIRST `ssh` gets it — the one
+# ⌘T typed —, so an `exit` and a new `ssh`, to this host or another, starts
+# at home as a plain one does.
 #
 # THE SILENT FALLBACK: every wrapped `ssh` that ended asks `bateri
 # ssh-fell-back --rc N [--instance I] -- <the wrapped arguments>` — 255 too:
@@ -316,7 +325,9 @@ __bateri_hooks() {
 __bateri_ssh() {
   emulate -L zsh
   local out tty= rc
-  local -a instance
+  local -a instance cwd
+  [[ -n $__bateri_ssh_cwd ]] && cwd=( --cwd "$__bateri_ssh_cwd" )
+  __bateri_ssh_cwd=
   if [[ -n ${TMUX-} || -n ${STY-} ]]; then
     command ssh "$@"
     return
@@ -324,7 +335,7 @@ __bateri_ssh() {
   [[ -t 0 && -t 1 ]] && tty=--tty
   [[ -n $__bateri_ssh_instance ]] && instance=( --instance "$__bateri_ssh_instance" )
   if [[ -x $__bateri_bin ]]; then
-    out=$(command $__bateri_bin ssh-argv $tty --block "$__bateri_block" "${instance[@]}" -- "$@" 2>/dev/null)
+    out=$(command $__bateri_bin ssh-argv $tty --block "$__bateri_block" "${instance[@]}" "${cwd[@]}" -- "$@" 2>/dev/null)
   fi
   if [[ -n $out && $out == *$'\0' ]]; then
     local -a wrapped
