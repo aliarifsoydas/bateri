@@ -12,6 +12,8 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-12
+
 ### Changed
 
 - **A new tab from an ssh tab opens in the same remote folder.** ⌘T (and
