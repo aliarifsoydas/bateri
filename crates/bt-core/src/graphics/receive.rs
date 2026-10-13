@@ -1,18 +1,17 @@
-//! From a command taken out of the stream to a record the parser can apply.
+//! From a command the parser ended to a record that can be applied.
 //!
-//! Two stages, on the reader thread, outside the parser. [`Receiver`] is the
-//! cheap one and runs inside `TappedPty::read`, under the read lease: it
-//! assembles the chunks of a transmission as base64 text and does nothing to
-//! it. [`decode_payload`] is the expensive one (base64, zlib, PNG, and
-//! reading the file or shared memory a command names) and runs where neither
-//! the lease nor the terminal lock is held
-//! ([`Hub::decode_pending`](super::Hub::decode_pending), called by the read
-//! loop between a read and the parse of it): a frame must not wait for an
-//! image to inflate or a disk to answer. Nothing in the first stage touches
-//! a file: the size the cursor's movement is made from is the command's own
-//! (`s=` and `v=`, or the head of a PNG the sequence carries), never the
-//! file's ([`sniff`]). Nothing here panics on a bad payload: every way it can
-//! be wrong is an [`Error`] that becomes the program's answer.
+//! Two stages. [`Receiver`] is the cheap one and runs where the parser ends
+//! the command, under the terminal's lock: it assembles the chunks of a
+//! transmission as base64 text and does nothing to it. [`decode_payload`] is
+//! the expensive one (base64, zlib, PNG, and reading the file or shared memory
+//! a command names) and runs where neither the lease nor the terminal lock is
+//! held ([`Hub::decode_pending`](super::Hub::decode_pending), called by the
+//! read loop while the parser is halted behind the command): a frame must not
+//! wait for an image to inflate or a disk to answer. Nothing in the first
+//! stage touches a file: the size the cursor's movement is made from is the
+//! command's own (`s=` and `v=`, or the head of a PNG the sequence carries),
+//! never the file's ([`sniff`]). Nothing here panics on a bad payload: every
+//! way it can be wrong is an [`Error`] that becomes the program's answer.
 
 use std::io::Cursor;
 use std::time::Instant;
@@ -29,10 +28,11 @@ use super::{
 };
 use crate::shell::decode_base64;
 
-/// How many images' sizes the receiver remembers. A placement of an image
-/// still waiting in the queue is sized from them; a program that keeps more
-/// than this many images at once and places one it sent long ago gets an
-/// image that does not move the cursor.
+/// How many images' sizes the receiver remembers: the sizes a placement is
+/// made from where there is no store to ask (the journal's replay) or the store
+/// does not have the image (its transmission failed). A program that keeps more
+/// than this many images at once and places one it sent long ago gets, in a
+/// replay, an image that does not move the cursor.
 const KNOWN_LIMIT: usize = 256;
 
 /// How much of a transmission's base64 text is read to find a PNG's size.
@@ -44,8 +44,8 @@ const HEAD_COMPRESSED: usize = 4096;
 /// The base64 text of the longest name.
 const NAME_TEXT_LIMIT: usize = NAME_LIMIT.div_ceil(3) * 4;
 
-/// What the reader knows of the terminal when it takes a command out of the
-/// stream: how big the cells are and how far the cursor can go.
+/// What the parser knows of the terminal when a command ends: how big the
+/// cells are and how far the cursor can go.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Env {
     /// A cell's size in pixels.
@@ -63,18 +63,13 @@ pub(crate) struct Decoded {
     pub(crate) pixels: Vec<u8>,
 }
 
-impl Decoded {
-    pub(crate) fn len(&self) -> usize {
-        self.pixels.len()
-    }
-}
-
 /// What a command comes to.
 pub(crate) enum Outcome {
-    /// Apply this when the parser reaches the marker.
+    /// Apply this where the command ended (after the decoding, if it needs
+    /// any).
     Pending(Pending),
-    /// A query's answer. It is not stored and has no place in the stream, so
-    /// it is the reader's to send, now.
+    /// A query's answer. It is not stored and nothing is applied: it is sent,
+    /// now.
     Query(Reply),
 }
 
@@ -89,6 +84,8 @@ struct Known {
 struct Open {
     /// The keys of the first chunk; a chunk after it names none of them.
     command: Command,
+    /// The control data of the first chunk, as it was on the wire.
+    control: Vec<u8>,
     /// The base64 text of the payload so far, chunks joined as they came.
     text: Vec<u8>,
     since: Instant,
@@ -100,7 +97,8 @@ pub(crate) struct Receiver {
     open: Option<Open>,
     /// The sizes of the images sent lately, newest last: placing an image
     /// moves the cursor by its size, which is known here before the image is
-    /// decoded (and while it is still waiting for its marker).
+    /// decoded (and while it is still waiting for the halt behind its command
+    /// to be resolved).
     known: Vec<Known>,
 }
 
@@ -114,11 +112,29 @@ impl Receiver {
         self.open.is_some()
     }
 
+    /// The transmission waiting for its next chunk as the first chunk that
+    /// would start it again: its control data and the head of its text, which
+    /// is all that the movement of the cursor is made from ([`sniff`]). A copy
+    /// of the screen cut between two chunks hands it to the one that goes on,
+    /// whose last chunk then finds the transmission it ends.
+    pub(crate) fn chain(&self) -> Option<Vec<u8>> {
+        let open = self.open.as_ref()?;
+        // Whole groups of four: a chunk's text is, but the last.
+        let head = open.text.len().min(HEAD_COMPRESSED) / 4 * 4;
+        let mut bytes = b"\x1b_G".to_vec();
+        bytes.extend_from_slice(&open.control);
+        bytes.push(b';');
+        bytes.extend_from_slice(&open.text[..head]);
+        bytes.extend_from_slice(b"\x1b\\");
+        Some(bytes)
+    }
+
     /// Takes one command; `out` is called for what it comes to, in order.
-    /// `stored` tells the size of an image the store already holds; `remote`
-    /// whether the pane is in a remote session now, asked only of a command
-    /// that names a file or shared memory object (the name is the server's,
-    /// not this machine's, and is refused unread).
+    /// `stored` tells the size of an image the store already holds (a stream
+    /// with no store has none to tell); `remote` whether the pane is in a
+    /// remote session, asked only of a command that names a file or shared
+    /// memory object (the name is the server's, not this machine's, and is
+    /// refused unread).
     pub(crate) fn receive(
         &mut self,
         apc: Apc,
@@ -173,6 +189,7 @@ impl Receiver {
                 );
                 let mut open = Open {
                     command,
+                    control: apc.control.clone(),
                     text: Vec::new(),
                     since: now,
                 };
@@ -222,11 +239,17 @@ impl Receiver {
     }
 
     /// How placing `command` moves the cursor; the cursor stays when the
-    /// command asks it to or when the image's size is not known.
+    /// command asks it to or when the image's size is not known. No more rows
+    /// than the screen has: past that the screen is already all new, and the
+    /// placement's top is that far above the cursor, no further.
     fn motion(command: &Command, size: Option<(u32, u32)>, env: Env) -> Motion {
         match size {
             Some(size) if !command.still => {
-                Motion::of(&Spec::new(command, size), env.cell, env.columns)
+                let motion = Motion::of(&Spec::new(command, size), env.cell, env.columns);
+                Motion {
+                    rows: motion.rows.min(u32::from(env.lines)),
+                    ..motion
+                }
             }
             _ => Motion::NONE,
         }
@@ -265,10 +288,10 @@ impl Receiver {
     }
 
     /// The transmission is whole. A store waits, undecoded, for the read loop
-    /// to decode it between a read and its parse, and so does a query that
-    /// names a file (it is answered at its marker, in order); a query with its
-    /// pixels in the sequence is answered here and now, so it is decoded now
-    /// — which is why it may only be small.
+    /// to decode it while the parser is halted behind the command, and so does
+    /// a query that names a file (it is answered when the halt is resolved,
+    /// in order); a query with its pixels in the sequence is answered here
+    /// and now, so it is decoded now — which is why it may only be small.
     fn finish(
         &mut self,
         open: Open,
@@ -280,14 +303,23 @@ impl Receiver {
         let (query, echo) = (command.action == Action::Query, command.echo);
         let named = command.medium != Medium::Direct;
         // The server's name, not this machine's: nothing is looked at. (Asked
-        // here, where the command is taken out of the stream, and not only
-        // when it is decoded: the scanner has seen all of the read by then,
-        // and a session that ended in it — its `D`, the next prompt — would no
-        // longer be remote while the name is the server's. The other way, a
-        // session that ended earlier in the same read, a local command is
-        // refused for: the safe side of a limit.)
+        // here, where the command ends, and not only when it is decoded, and
+        // by the reads the command came in as well as by now: the scanner has
+        // seen all of the read by the time the parser gets here, and a session
+        // that ended in it — its `D`, the next prompt — would no longer be
+        // remote while the name is the server's. The other way, a session that
+        // ended earlier in the same read, a local command is refused for: the
+        // safe side of a limit.)
         if named && remote() {
-            out(failure(query, echo, Error::unreadable()));
+            // The cursor moves for the command all the same, by the keys alone
+            // (the replay of the journal cannot know the name was refused, and
+            // moves it so).
+            let motion = if query {
+                Motion::NONE
+            } else {
+                self.placing(&command, &[], env)
+            };
+            out(refusal(query, echo, Error::unreadable(), motion));
             return;
         }
         // What a command that names its pixels carries is a name, whole.
@@ -303,22 +335,10 @@ impl Receiver {
             text
         };
         if !query || named {
-            // The size is read from the head of the text, nothing is decoded.
-            let size = if query { None } else { sniff(&command, &text) };
-            if let Some(size) = size {
-                self.remember(command.echo, size);
-            }
-            // With both sides given in cells the movement does not depend on the
-            // pixels at all: an image whose size is not known (a named PNG with
-            // no `s=`, `v=`) still moves the cursor by the cells it covers. (The
-            // keys against the file's real size: a program that lies in `s=` and
-            // `v=` moves the cursor by the lie — the file is not looked at.)
-            let motion = if command.action != Action::TransmitAndPut {
+            let motion = if query {
                 Motion::NONE
-            } else if size.is_none() && command.columns > 0 && command.rows > 0 {
-                Self::motion(&command, Some((1, 1)), env)
             } else {
-                Self::motion(&command, size, env)
+                self.placing(&command, &text, env)
             };
             out(Outcome::Pending(Pending::Raw {
                 command,
@@ -338,6 +358,27 @@ impl Receiver {
         }));
     }
 
+    /// How a transmission moves the cursor, and the size it makes known. The
+    /// size is read from the head of the text, nothing is decoded.
+    fn placing(&mut self, command: &Command, text: &[u8], env: Env) -> Motion {
+        let size = sniff(command, text);
+        if let Some(size) = size {
+            self.remember(command.echo, size);
+        }
+        // With both sides given in cells the movement does not depend on the
+        // pixels at all: an image whose size is not known (a named PNG with
+        // no `s=`, `v=`) still moves the cursor by the cells it covers. (The
+        // keys against the file's real size: a program that lies in `s=` and
+        // `v=` moves the cursor by the lie — the file is not looked at.)
+        if command.action != Action::TransmitAndPut {
+            Motion::NONE
+        } else if size.is_none() && command.columns > 0 && command.rows > 0 {
+            Self::motion(command, Some((1, 1)), env)
+        } else {
+            Self::motion(command, size, env)
+        }
+    }
+
     fn abandon(&mut self, out: &mut impl FnMut(Outcome), error: Error) {
         if let Some(open) = self.open.take() {
             let query = open.command.action == Action::Query;
@@ -346,14 +387,19 @@ impl Receiver {
     }
 }
 
-/// A failed command's answer: a query's is the reader's, anything else's
-/// waits for its marker like the rest of the stream.
+/// A failed command's answer: a query's is sent as it is, anything else's is
+/// applied like the rest of the commands.
 fn failure(query: bool, echo: Echo, error: Error) -> Outcome {
+    refusal(query, echo, error, Motion::NONE)
+}
+
+/// [`failure`] of a command the cursor moves for all the same.
+fn refusal(query: bool, echo: Echo, error: Error, motion: Motion) -> Outcome {
     let reply = Reply::failed(echo, error);
     if query {
         Outcome::Query(reply)
     } else {
-        Outcome::Pending(Pending::Reply(reply))
+        Outcome::Pending(Pending::Reply { reply, motion })
     }
 }
 

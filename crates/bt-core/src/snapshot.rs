@@ -1132,15 +1132,27 @@ enum Seq {
     DcsIntermediate,
     /// DCS passthrough: CAN, SUB, ESC and the 8-bit ST end it.
     DcsBody,
-    /// SOS/PM/APC and an ignored DCS: only CAN, SUB and ESC end them — not
+    /// SOS/PM and an ignored DCS: only CAN, SUB and ESC end them — not
     /// `0x9c`, which a UTF-8 payload carries as a continuation byte.
     Ignored,
+    /// An application program command (`ESC _`), which the parser hands to the
+    /// handler: like [`Seq::Ignored`], but its `ESC` does not end it by itself.
+    Apc,
+    /// An `ESC` in an application program command: `\` completes it, any other
+    /// byte cancels it and is read as the byte after an `ESC` that starts afresh.
+    ApcEscape,
     Osc,
 }
 
 /// How many bytes of capacity [`Tail`] keeps once a sequence ends — one
 /// large OSC 52 must not pin its size for the session's life.
 const TAIL_KEEP: usize = 4096;
+
+/// The most bytes of an application program command [`Tail`] keeps: what a
+/// graphics command may carry and its control data. The parser behind it
+/// refuses a command past that anyway, and a body that never ends must not
+/// grow the tail without end.
+const APC_KEEP: usize = crate::graphics::PAYLOAD_LIMIT + 4096;
 
 /// The bytes since the parser last stood in its **ground state**: a read
 /// that ended inside a CSI/OSC/DCS or inside one character's UTF-8 left
@@ -1247,7 +1259,8 @@ impl Tail {
                 _ if executed => {}
                 0x20..=0x2f => self.enter(byte, Seq::EscapeIntermediate),
                 0x50 => self.enter(byte, Seq::DcsEntry),
-                0x58 | 0x5e | 0x5f => self.enter(byte, Seq::Ignored),
+                0x58 | 0x5e => self.enter(byte, Seq::Ignored),
+                0x5f => self.enter(byte, Seq::Apc),
                 0x5b => self.enter(byte, Seq::Csi),
                 0x5d => self.enter(byte, Seq::Osc),
                 0x30..=0x7e => self.ground(),
@@ -1289,6 +1302,22 @@ impl Tail {
                 0x1b => self.escape(),
                 _ => self.bytes.push(byte),
             },
+            Seq::Apc => match byte {
+                0x18 | 0x1a => self.ground(),
+                // The command stays open until the next byte says how it ends.
+                0x1b => self.enter(byte, Seq::ApcEscape),
+                _ if self.bytes.len() < APC_KEEP => self.bytes.push(byte),
+                _ => {}
+            },
+            Seq::ApcEscape => {
+                if byte == 0x5c {
+                    self.ground();
+                } else {
+                    // Cancelled; this byte follows an `ESC` that starts afresh.
+                    self.escape();
+                    self.step(byte);
+                }
+            }
             Seq::DcsBody => match byte {
                 0x18 | 0x1a | 0x9c => self.ground(),
                 0x1b => self.escape(),
@@ -2052,6 +2081,73 @@ pub(crate) mod tests {
         assert_eq!(tail_of(b"\x1bPq\x9c"), b"");
         assert_eq!(tail_of("\x1b_Ŝ".as_bytes()), "\x1b_Ŝ".as_bytes());
         assert_eq!(tail_of(b"\x1bP1<q\x9c"), b"\x1bP1<q\x9c");
+    }
+
+    /// Counts the application program commands a parser completes.
+    #[derive(Default)]
+    struct Ends(u32);
+
+    impl alacritty_terminal::vte::ansi::Handler for Ends {
+        fn apc_end(&mut self, cancelled: bool) {
+            if !cancelled {
+                self.0 += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn a_command_cut_anywhere_is_completed_once_by_the_parser_that_gets_its_tail() {
+        // Two commands, a cancelled one and one whose `ESC` is cut from its `\`.
+        let stream: &[u8] =
+            b"a\x1b_Ga=t,i=1;AAAA\x1b\\b\x1b_Gq=2;BB\x18c\x1b_Gm=0;CC\x1b\\\x1b_G;D\x1b[1mx";
+        let ends = |bytes: &[u8]| {
+            let mut parser: Processor = Processor::new();
+            let mut ends = Ends::default();
+            parser.advance(&mut ends, bytes);
+            ends.0
+        };
+        assert_eq!(ends(stream), 2);
+        for cut in 0..=stream.len() {
+            let mut tail = Tail::default();
+            tail.feed(&stream[..cut]);
+            let carried = [tail.bytes(), &stream[cut..]].concat();
+            assert_eq!(
+                ends(&stream[..cut]) + ends(&carried),
+                ends(stream),
+                "cut at {cut}, tail {:?}",
+                String::from_utf8_lossy(tail.bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn the_tail_keeps_a_command_open_past_its_esc_until_the_next_byte() {
+        let tail_of = |bytes: &[u8]| {
+            let mut tail = Tail::default();
+            tail.feed(bytes);
+            tail.bytes().to_vec()
+        };
+        assert_eq!(tail_of(b"\x1b_Ga=t;AA\x1b"), b"\x1b_Ga=t;AA\x1b");
+        assert_eq!(tail_of(b"\x1b_Ga=t;AA\x1b\\"), b"");
+        // Cancelled: the byte after the `ESC` begins a sequence of its own.
+        assert_eq!(tail_of(b"\x1b_Ga=t;AA\x1b[1"), b"\x1b[1");
+        assert_eq!(tail_of(b"\x1b_Ga=t;AA\x1b_Gb"), b"\x1b_Gb");
+        assert_eq!(tail_of(b"\x1b_Ga=t;AA\x1b\x18"), b"");
+        // A command that is not ours is not held open past its `ESC`.
+        assert_eq!(tail_of(b"\x1bXjunk\x1b"), b"\x1b");
+    }
+
+    #[test]
+    fn a_command_that_never_ends_does_not_grow_the_tail_without_end() {
+        let mut tail = Tail::default();
+        tail.feed(b"\x1b_Ga=t;");
+        let chunk = vec![b'A'; 1 << 20];
+        for _ in 0..(APC_KEEP >> 20) + 2 {
+            tail.feed(&chunk);
+        }
+        assert_eq!(tail.bytes().len(), APC_KEEP);
+        tail.feed(b"\x1b\\");
+        assert!(tail.bytes().is_empty());
     }
 
     #[test]

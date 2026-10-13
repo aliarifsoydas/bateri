@@ -86,7 +86,7 @@ use crate::cluster::{ClusterId, Clusters};
 use crate::color::{self, LinearRgba, Theme};
 use crate::commands::{CommandId, CommandState, command_state};
 use crate::dock::{self, Dock, DockBudget, DockCols, DockEdit, DockPoint};
-use crate::graphics::{self, Hub, Intake, Pictures};
+use crate::graphics::{self, Hub, Pictures};
 use crate::grid_input;
 use crate::handler::ClusterHandler;
 use crate::identity::{LC_TERMINAL, PaneUuid, TERM_PROGRAM, TERM_PROGRAM_VERSION};
@@ -2052,8 +2052,8 @@ struct AdapterInner {
     /// land in the shell as typed input, a copy would replace what the user
     /// copied since. `TappedPty` clears it at the master's first read.
     muted: AtomicBool,
-    /// The kitty graphics commands: the queue between the reader's two
-    /// halves and the images of each screen ([`crate::graphics`]).
+    /// The kitty graphics commands: the images of each screen and the record
+    /// a halted parser waits for ([`crate::graphics`]).
     ///
     /// **Leaf lock under `Term`** (`term` → `images`): the parser applies a
     /// command while it holds `Term`, so the reverse order exists nowhere.
@@ -2315,36 +2315,23 @@ impl EventListener for Adapter {
 ///
 /// `EventLoop` ([`crate::reader`]) is generic over the PTY type; the only
 /// thing that interposes on the **byte** path is this wrapper and it **does
-/// not touch the bytes** except one kind of sequence — [`io::Read::read`]
-/// returns exactly what it read from the inner `Pty`, only showing the slice
-/// to the scanner before returning. The exception is a kitty graphics command
-/// (`ESC _ G … ESC \`): it is taken out of the stream, decoded and queued,
-/// and a marker stands in its place ([`graphics::Motion::mark`];
-/// [`crate::graphics`] says why there and not later). A command that shows an
-/// image and moves the cursor (`C=0`) brings that movement with it in the
-/// marker, as numbers — the wrapper that dispatches the marker does the
-/// moving — so everything downstream, a replay included, moves its cursor the
-/// same way. Everything after the separation — the journal, the
-/// tail, the scanner, the parser — sees the stream **without** the command,
-/// so a replay of the journal never has an image payload in it. The second
-/// thing that enters the parser's **call** path is a separate layer
-/// ([`crate::handler::ClusterHandler`]): it sees not the bytes but the
-/// `Handler` calls going to `Term`, i.e. the two do not do each other's job
-/// — except for the marker, which that layer dispatches.
+/// not touch the bytes** — [`io::Read::read`] returns exactly what it read from
+/// the inner `Pty`, only showing the slice to the scanner before returning.
+/// That includes a kitty graphics command (`ESC _ G … ESC \`): it is not taken
+/// out of the stream. The journal, the tail, the scanner and the parser see
+/// it as the program wrote it, and the parser hands it to
+/// [`crate::handler::ClusterHandler`] in its place in the stream
+/// ([`crate::graphics`] says what that buys). The second thing that enters
+/// the parser's **call** path is that layer: it sees not the bytes but the
+/// `Handler` calls going to `Term`, i.e. the two do not do each other's job.
 ///
-/// **The separation is cheap on purpose.** `read` runs under the read lease
-/// (a frame waits for it) and, once the loop has the lock, under that too, so
-/// a command's payload is only assembled here, as base64 text. Decoding it —
-/// base64, inflate, PNG — happens in the read loop between the read and its
-/// parse, with neither the lease nor the lock held
-/// ([`graphics::Hub::decode_pending`]); so does reading the file or shared
-/// memory object a command names, which here is only a name. **No file is
-/// touched in `read`**, which is why the cursor's movement is never made from
-/// what a file holds: the size is the command's own (`s=`, `v=`), or the
-/// cursor stays. **And nothing of a read outlives the loop's turn**: what the
-/// buffer has no room for (a marker is longer than a short command) is the
-/// next thing `read` returns, and the loop does not end its turn before it has
-/// read it ([`graphics::Intake::read`]).
+/// **A read does not look at a command.** What it adds for graphics is one
+/// thing, and only for a read that may carry a command (it has `ESC _`, or it
+/// continues a sequence, or a command is open): whether the pane is in a remote
+/// session now, noted before
+/// the scanner has looked at the read ([`graphics::Hub::note_remote`]). A name
+/// a command carries is the server's in a remote session, and a session that
+/// ends in the same read must not make it this machine's.
 ///
 /// **`Reader = Self` is the core of the decision.** `Pty::reader()` returns
 /// `&mut File`, so borrowing suffices to hand over the reader: **no second fd
@@ -2419,21 +2406,9 @@ struct TappedPty {
     /// on under it, so this copy sometimes runs under the lock too (at most
     /// `MAX_LOCKED_READ` bytes): a copy, no wait, no system call.
     journal: Option<Arc<Journal>>,
-    /// Takes the graphics commands out of what `read_raw` returns.
-    intake: Intake,
 }
 
 impl TappedPty {
-    /// The bytes read but not yet applied by any parser, behind
-    /// [`Self::tail`]'s: the graphics command the separation was in the
-    /// middle of, or the beginning of one it was holding back (no journal,
-    /// tail or scanner has seen them). The handover carries them on; the
-    /// adopting side's reader finishes the command from what the master has
-    /// left.
-    fn undelivered(&self) -> Vec<u8> {
-        self.intake.undelivered()
-    }
-
     /// The bytes since the parser last stood in its ground state — read once
     /// the reader has stopped, so no byte comes after them.
     fn tail(&self) -> &[u8] {
@@ -2441,47 +2416,27 @@ impl TappedPty {
     }
 
     /// The stream the parser reads: the next bytes of the PTY — the carried
-    /// prefix first, then the fd — with every graphics command taken out
-    /// ([`crate::graphics`]) and its marker in its place ([`Intake::read`]).
-    /// No file is touched here.
+    /// prefix first, then the fd.
     fn read_stream(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let adapter = &self.adapter;
-        let size = &adapter.0.size;
-        self.intake.read(
-            buf,
-            Instant::now(),
-            |buf| {
-                if self.prefix_at < self.prefix.len() {
-                    let rest = &self.prefix[self.prefix_at..];
-                    let n = rest.len().min(buf.len());
-                    buf[..n].copy_from_slice(&rest[..n]);
-                    self.prefix_at += n;
-                    if self.prefix_at == self.prefix.len() {
-                        self.prefix = Vec::new();
-                        self.prefix_at = 0;
-                    }
-                    return Ok(n);
-                }
-                if self.muting {
-                    self.muting = false;
-                    adapter.0.muted.store(false, Ordering::Release);
-                }
-                match &mut self.pty {
-                    PtyKind::Spawned(pty) => pty.reader().read(buf),
-                    PtyKind::Adopted(pty) => pty.file().read(buf),
-                }
-            },
-            &adapter.0.graphics,
-            || {
-                let size = *lock(size);
-                graphics::Env {
-                    cell: (size.cell_width, size.cell_height),
-                    columns: size.num_cols,
-                    lines: size.num_lines,
-                }
-            },
-            &mut |bytes| graphics::Sink::reply(adapter, bytes),
-        )
+        if self.prefix_at < self.prefix.len() {
+            let rest = &self.prefix[self.prefix_at..];
+            let n = rest.len().min(buf.len());
+            buf[..n].copy_from_slice(&rest[..n]);
+            self.prefix_at += n;
+            if self.prefix_at == self.prefix.len() {
+                self.prefix = Vec::new();
+                self.prefix_at = 0;
+            }
+            return Ok(n);
+        }
+        if self.muting {
+            self.muting = false;
+            self.adapter.0.muted.store(false, Ordering::Release);
+        }
+        match &mut self.pty {
+            PtyKind::Spawned(pty) => pty.reader().read(buf),
+            PtyKind::Adopted(pty) => pty.file().read(buf),
+        }
     }
 }
 
@@ -2491,7 +2446,19 @@ impl io::Read for TappedPty {
         if let Some(journal) = &self.journal {
             journal.record_bytes(&buf[..read]);
         }
+        // A read that continues a sequence (the `_` of an `ESC` the last read
+        // ended in) may carry the rest of a command as much as one with `ESC _`
+        // in it.
+        let mid_sequence = !self.tail.bytes().is_empty();
         self.tail.feed(&buf[..read]);
+        // Before the scanner: a remote session that ends in this read is
+        // still the one a graphics command in it was written in.
+        let hub = &self.adapter.0.graphics;
+        if (graphics::may_carry_command(&buf[..read]) || mid_sequence || hub.is_open())
+            && hub.in_remote_session()
+        {
+            hub.note_remote();
+        }
         // Only the slice read **in this round** is scanned; `EventLoop` reads
         // accumulating into its buffer (`buf[unprocessed..]`) and scanning from
         // the start would turn the same byte into a marker twice.
@@ -2918,10 +2885,11 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// measurement: a command in flight finishes in the time its bytes take to
 /// arrive, and this is what a client that went quiet in the middle of one
 /// costs the update. A cut inside a command is still not text: the command
-/// so far goes in the handover's tail ([`TappedPty::undelivered`]) and the
-/// adopting side finishes it. The one cut that is not carried is between the
-/// chunks of a transmission: the next chunk, which names no action, reaches
-/// the adopting side as a command of its own and is answered with an error.
+/// so far is in the handover's tail ([`snapshot::Tail`] follows an application
+/// program command like any other sequence) and the adopting side finishes it.
+/// The one cut that is not carried is between the chunks of a transmission:
+/// the next chunk, which names no action, reaches the adopting side as a
+/// command of its own and is answered with an error.
 const COMMAND_GRACE: Duration = Duration::from_millis(500);
 
 /// How long [`Session::freeze`] waits for the reader to stop. The reader is
@@ -5384,7 +5352,6 @@ impl Session {
             prefix_at: 0,
             muting: mute_prefix,
             journal: journal.clone(),
-            intake: Intake::new(),
         };
         adapter.0.muted.store(mute_prefix, Ordering::Release);
         // Asked when a command names a file: a pane in a remote session is
@@ -5425,6 +5392,7 @@ impl Session {
                 replay.unwrap_or_default(),
                 options.cols,
                 options.rows,
+                options.cell_px,
                 options.terminal,
                 options.cluster,
             ));
@@ -11755,7 +11723,11 @@ impl Session {
         let moved = before.1 - term.grid().cursor.point.line.0;
         let reflowed = term.columns() != before.0 || term.mode().contains(TermMode::ALT_SCREEN);
         graphics.resized(&*term, moved, reflowed, cell_px);
-        self.record(JournalSide::Resize { cols, rows });
+        self.record(JournalSide::Resize {
+            cols,
+            rows,
+            cell: cell_px,
+        });
         *prev = size;
         self.send(Msg::Resize(size));
         // A size change is the only path that changes the grid but produces no
@@ -12001,11 +11973,12 @@ impl Session {
     /// **Not journaled:** the session's life ends with it — what
     /// the journal records leads up to this, not past it.
     pub fn freeze(&self) -> io::Result<Frozen> {
-        // A graphics command taken out of the stream but not finished would
-        // be cut by the stop below: its rest, read by the adopting side, would
-        // print as text. The reader goes on while this waits, so one in flight
-        // finishes ([`COMMAND_GRACE`] bounds a client that went quiet in the
-        // middle of one).
+        // A graphics command that has begun but not ended is cut by the stop
+        // below: the adopting side takes it up from the tail and ends it, but a
+        // transmission in chunks loses the chunks before the cut (the next one
+        // names no action there and is answered with an error). The reader goes
+        // on while this waits, so one in flight finishes ([`COMMAND_GRACE`]
+        // bounds a client that went quiet in the middle of one).
         self.adapter.0.graphics.wait_closed(COMMAND_GRACE);
         // Both or neither: a session with a reader but no master copy has
         // nothing to hand over and must stay untouched.
@@ -12047,10 +12020,10 @@ impl Session {
             return Err(io::Error::other("the reader thread ended with a panic"));
         };
         event_loop.stop_sync(&mut state);
-        let mut tail = event_loop.pty_mut().tail().to_vec();
-        // What the separation had read but not delivered goes behind it: no
-        // parser applied it, so the adopting side's must.
-        tail.extend_from_slice(&event_loop.pty_mut().undelivered());
+        // A graphics command still arriving is in it, from its `ESC _` on:
+        // the adopting side's parser takes it up where this one stood and
+        // finishes it from what the master has left.
+        let tail = event_loop.pty_mut().tail().to_vec();
         let mut input = event_loop.unsent(&mut state);
         // A first input still waiting for our first identified `A` goes now,
         // with the keys held behind it, by the reader's own rule: a ready line that finds
@@ -29035,10 +29008,6 @@ e\\314\\201.'; sleep 5";
         journal: Arc<Journal>,
         fifo: File,
         written: u64,
-        /// What the reader's splitter holds of what was written, which it
-        /// would: the end of a read that may be the beginning of a sequence it
-        /// looks at ([`crate::graphics::Splitter`]).
-        splitter: crate::graphics::Splitter,
         _dir: TempDir,
     }
 
@@ -29082,7 +29051,6 @@ e\\314\\201.'; sleep 5";
                 journal,
                 fifo,
                 written: 0,
-                splitter: crate::graphics::Splitter::new(crate::graphics::PAYLOAD_LIMIT),
                 _dir: dir,
             }
         }
@@ -29094,13 +29062,8 @@ e\\314\\201.'; sleep 5";
             self.fifo
                 .write_all(bytes)
                 .expect("the fifo takes the bytes");
-            // A trailing `ESC`, `ESC _`, `ESC [` or `ESC [ ?` and what follows
-            // may begin a sequence the reader looks at, so it holds it until
-            // the next byte says it does not; the next send applies it.
-            self.splitter.feed(bytes, |_| {});
-            let held = self.splitter.held().len() as u64;
             self.written += bytes.len() as u64;
-            let (journal, target) = (Arc::clone(&self.journal), self.written - held);
+            let (journal, target) = (Arc::clone(&self.journal), self.written);
             wait_until(
                 "the loopback's bytes applied",
                 Duration::from_secs(10),
@@ -29718,8 +29681,8 @@ e\\314\\201.'; sleep 5";
         assert!(journal.is_broken());
         assert_eq!(
             journal.sides_written(),
-            3,
-            "three 13-byte records fit in 40 bytes"
+            2,
+            "two 17-byte records fit in 40 bytes"
         );
     }
 
@@ -29909,11 +29872,11 @@ e\\314\\201.'; sleep 5";
     }
 
     #[test]
-    fn an_image_lands_on_the_screen_that_shows_when_its_marker_is_reached() {
+    fn an_image_lands_on_the_screen_that_shows_when_its_command_ends() {
         let wake = Arc::new(TestWake::default());
         // Entering the alternate screen and the image are in one write: the
         // image is the alternate screen's although nothing had applied the
-        // `?1049h` when the command was taken out of the stream.
+        // `?1049h` when the bytes were read.
         let session = spawn_session(
             &format!(
                 "printf '{}M\\033[?1049h{}ALT'; sleep 8",
@@ -29945,10 +29908,9 @@ e\\314\\201.'; sleep 5";
         let wake = Arc::new(TestWake::default());
         // The answers land in the PTY's input, where the line discipline
         // echoes them (`echoctl`), in the order they were written. Both come
-        // from one write: the graphics answer is given where the command is
-        // taken out of the stream, the device attributes' where the parser
-        // reaches them, and a program that asks for both (terminal-browser
-        // does) gives up when the second comes first.
+        // from one write, and both are the parser's, in the order of the
+        // stream; a program that asks for both (terminal-browser does) gives
+        // up when the second comes first.
         let session = spawn_session(
             "stty echo echoctl; printf '\\033_Gi=4207,a=q,t=d,f=24,s=1,v=1;AAAA\\033\\\\\\033[c'; sleep 8",
             wake,
@@ -29996,10 +29958,10 @@ e\\314\\201.'; sleep 5";
 
     #[test]
     fn a_query_that_names_a_file_is_answered_before_the_device_attributes_too() {
-        // The answer to a query about a file waits for its marker, where a
-        // query with its pixels in the sequence is answered at once; the
-        // marker is in the stream where the command was, ahead of the
-        // attributes, so the order the program needs holds either way.
+        // The answer to a query about a file waits for the read of the file,
+        // which is done with the parser halted behind the command; it is given
+        // where the command ended, ahead of the attributes, so the order the
+        // program needs holds either way.
         let file = NamedFile::new("tty-graphics-protocol-session", &[1, 2, 3]);
         let script = format!(
             r#"stty echo echoctl; {}; printf '\033_Gi=4207,a=q,t=t,f=24,s=1,v=1;%s\033\\\033[c' "$name"; sleep 8"#,
@@ -30142,6 +30104,32 @@ e\\314\\201.'; sleep 5";
         assert!(file.0.exists(), "the server's name was read here");
         assert_eq!(session.remote_target(), None, "the `D` ended the session");
         assert_eq!(stored_ids(&session), (vec![], vec![]));
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_name_whose_escape_came_in_the_read_before_is_still_refused() {
+        // The same, with the read cut between the `ESC` and the `_` of the
+        // command: the second read has no `ESC _` in it to look for, and the
+        // session has ended by the time its command is parsed.
+        let file = NamedFile::new("tty-graphics-protocol-session-cut", &[1, 2, 3]);
+        let script = format!(
+            r#"stty echo echoctl; printf '{}'; read _; printf '\033]133;C\007'; {}; read -r _; printf '\033'; sleep 0.5; printf '_Ga=t,t=t,f=24,s=1,v=1,i=22;%s\033\\\033]133;D;0\007{}' "$name"; sleep 8"#,
+            anchored_prompt(1),
+            file.encoded(),
+            anchored_prompt(2),
+        );
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_docked_session(&script, Arc::clone(&wake));
+        session.write(b"\n");
+        assert_eq!(wake.wait_commands(1, Duration::from_secs(5)), 1);
+        let command = session.running_command().expect("running after `C`");
+        assert!(session.set_remote(command, Some(&RemoteTarget::ssh("prod"))));
+        session.write(b"\n");
+        let text = wait_text(&session, "Gi=22;EBADF");
+        assert!(text.contains("EBADF"), "{text:?}");
+        assert!(file.0.exists(), "the server's name was read here");
+        assert_eq!(session.remote_target(), None, "the `D` ended the session");
         session.shutdown();
     }
 
@@ -30518,13 +30506,12 @@ e\\314\\201.'; sleep 5";
     }
 
     #[test]
-    fn a_marker_a_program_wrote_itself_does_nothing() {
+    fn the_sequence_the_graphics_marker_once_was_does_nothing_when_a_program_writes_it() {
         let wake = Arc::new(TestWake::default());
         let session = spawn_session("printf 'a\\033[?8166hb READY'; sleep 8", wake);
         let text = wait_text(&session, "READY");
         assert!(text.contains("abREADY"), "{text:?}");
         assert_eq!(stored_ids(&session), (vec![], vec![]));
-        assert_eq!(session.adapter.0.graphics.waiting_records(), 0);
         session.shutdown();
     }
 
@@ -30549,25 +30536,34 @@ e\\314\\201.'; sleep 5";
     }
 
     #[test]
-    fn a_stream_of_nothing_but_commands_loses_none_of_its_markers() {
-        // Every marker reaches the parser and finds its record, however the
-        // reads cut the stream.
-        let wake = Arc::new(TestWake::default());
-        let session = spawn_session(
-            "chunk=$(printf '\\033_G\\033\\\\%.0s' $(seq 1 500)); i=0; \
-             while [ $i -lt 100 ]; do printf '%s' \"$chunk\"; i=$((i+1)); done; \
-             printf 'READY'; sleep 8",
-            wake,
+    fn a_stream_of_nothing_but_commands_is_parsed_whole_and_leaves_the_journal_whole() {
+        // Fifty thousand of the shortest commands: each is the parser's where
+        // it ends, however the reads cut the stream, and the journal holds the
+        // bytes as they were read, so a flood cannot make it outgrow its gate.
+        let journal = manual_journal(64 << 20, Duration::from_secs(60));
+        let mut options = test_options(
+            sh("chunk=$(printf '\\033_G\\033\\\\%.0s' $(seq 1 500)); i=0; \
+                 while [ $i -lt 100 ]; do printf '%s' \"$chunk\"; i=$((i+1)); done; \
+                 printf 'READY'; sleep 8"),
+            40,
         );
+        options.journal = Some(Arc::clone(&journal));
+        let session = Session::spawn(options, Arc::new(TestWake::default())).unwrap();
         let text = wait_text(&session, "READY");
         assert!(!text.contains("_G"), "{text:?}");
-        assert_eq!(session.adapter.0.graphics.waiting_records(), 0);
         assert!(session.reader_alive());
+        assert!(!journal.is_broken(), "the flood broke the journal");
+        let records = journal.records();
+        assert_eq!(
+            journal.applied_bytes(),
+            records.bytes_at + records.bytes.len() as u64
+        );
+        assert_eq!(records.bytes.len(), 100 * 500 * 5 + "READY".len());
         session.shutdown();
     }
 
     #[test]
-    fn the_journal_records_the_stream_after_the_separation() {
+    fn the_journal_records_the_stream_as_the_program_wrote_it() {
         let journal = manual_journal(64 << 20, Duration::from_secs(60));
         let mut options = test_options(
             sh(&format!(
@@ -30581,13 +30577,9 @@ e\\314\\201.'; sleep 5";
         wait_text(&session, "READY");
         let records = journal.records();
         let bytes = String::from_utf8_lossy(&records.bytes).into_owned();
-        // The marker has no movement, and its command's random id.
+        // The command is in it, whole, between the text around it.
         assert!(
-            bytes.contains("a\x1b[?16384;16384;16384;") && bytes.contains(";8166hb READY"),
-            "{bytes:?}"
-        );
-        assert!(
-            !bytes.contains("_G") && !bytes.contains("AAAAAA"),
+            bytes.contains("a\x1b_Ga=t,f=32,s=1,v=1,i=7;AAAAAA==\x1b\\b READY"),
             "{bytes:?}"
         );
         assert_eq!(
@@ -30646,7 +30638,7 @@ e\\314\\201.'; sleep 5";
     }
 
     #[test]
-    fn a_freeze_carries_the_beginning_of_a_command_it_was_holding() {
+    fn a_freeze_carries_the_beginning_of_a_sequence_it_was_in() {
         for (script, held) in [
             ("printf 'X\\033'; sleep 8", &b"\x1b"[..]),
             ("printf 'X\\033_'; sleep 8", &b"\x1b_"[..]),
@@ -30660,10 +30652,9 @@ e\\314\\201.'; sleep 5";
 
     #[test]
     fn a_command_cut_by_an_update_finishes_on_the_adopting_side() {
-        // The old side holds `ESC _`, hands it over as the prefix and the
-        // new side's reader, given the rest of the command by the master,
-        // takes it out of the stream: the image is the new side's and
-        // nothing prints.
+        // The old side's parser stood in `ESC _`, hands it over as the prefix
+        // and the new side's parser, given the rest of the command by the
+        // master, ends it: the image is the new side's and nothing prints.
         let (_old, new, _alive) = adopt_frozen_with(
             "printf 'P\\033_'; sleep 1; printf 'Ga=t,f=32,s=1,v=1,i=3;AAAAAA==\\033\\\\Q'; sleep 8",
             "P",
@@ -30677,6 +30668,25 @@ e\\314\\201.'; sleep 5";
         let text = wait_text(&new, "Q");
         assert!(text.contains("PQ"), "{text:?}");
         assert_eq!(stored_ids(&new), (vec![3], vec![]));
+    }
+
+    #[test]
+    fn a_command_the_old_side_finished_is_not_run_again_by_the_adopting_side() {
+        // A query is answered once, by the side that read its end; the other
+        // one is cut inside a second command, which is the only thing carried.
+        let old = spawn_session(
+            "stty echo echoctl; printf '\\033_Gi=51,a=q,t=d,f=24,s=1,v=1;AAAA\\033\\\\Z'; sleep 1; \
+             printf '\\033_Ga=t,f=32,s=1,v=1,i=52;AAAA'; sleep 8",
+            Arc::new(TestWake::default()),
+        );
+        let text = wait_text(&old, "Gi=51;OK");
+        assert_eq!(text.matches("Gi=51;OK").count(), 1, "{text:?}");
+        wait_until("the second command opens", Duration::from_secs(8), || {
+            old.adapter.0.graphics.is_open()
+        });
+        let frozen = old.freeze().expect("the session did not freeze");
+        let carried = String::from_utf8_lossy(&frozen.tail).into_owned();
+        assert_eq!(carried, "\x1b_Ga=t,f=32,s=1,v=1,i=52;AAAA");
     }
 
     /// The race's stall: generous, the race must not break the journal.

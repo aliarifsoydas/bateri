@@ -37,7 +37,7 @@
 //! server's, not this machine's, and a program there that names a file would
 //! be asking this machine for it: the hub refuses the command, before
 //! anything is touched, whenever the pane is remote at the point of the stream
-//! where the command is taken out ([`super::Receiver::receive`]) or at the moment
+//! where the command ends ([`super::Receiver::receive`]) or at the moment
 //! the name would be read ([`super::Hub::set_remote_gate`]); the program's own
 //! test (`a=q` with a file of its own) fails and it sends the picture itself.
 //! The probe that finds a session remote runs after the command starts, so

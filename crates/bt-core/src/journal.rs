@@ -33,10 +33,20 @@
 //! record stamped earlier is in the copy, every later one is stamped at
 //! least there. What the parser holds at the cut travels with the base —
 //! the bytes after its last ground state ([`Tail`], replayed after the VT by
-//! a second fresh parser, the handover's order) and the cluster wrapper's
-//! open-cluster bit; inside a synchronized update there is no cut (its
-//! buffer is the parser's, not `Term`'s), the copy gives up and is asked
-//! again after more output.
+//! a second fresh parser, the handover's order), the graphics transmission
+//! that waits for its next chunk (as the chunk that opens it, played before the
+//! tail) and the cluster wrapper's open-cluster bit; inside a synchronized
+//! update there is no cut (its buffer is the parser's, not `Term`'s), the copy
+//! gives up and is asked again after more output.
+//!
+//! **The copy replays the graphics commands too**, with nothing to place and
+//! nobody to answer: a command only moves the cursor, by the cell size the
+//! resize records (and the base) carry. What it cannot know, the live parser
+//! did: a chunk that came after more than half a minute (the live receiver
+//! drops it), the size of an image sent before the base (the live store has
+//! it), and the sizes of the images sent lately (the live receiver keeps them
+//! across a cut, the copy does not). A cursor that differs in such a case is
+//! put right by the next absolute move a program makes.
 //!
 //! **Known limit:** `CSI b` (repeat the preceding character) right after a
 //! cut repeats nothing — the parser's preceding character is private to
@@ -69,6 +79,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi::{self, Handler as _, Timeout as _};
 
+use crate::graphics::Commands;
 use crate::handler::ClusterHandler;
 use crate::reader::{MAX_LOCKED_READ, READ_BUFFER_SIZE};
 use crate::session::{GridSize, Osc52, TerminalOptions, history_of_vt, term_config, wipe};
@@ -79,18 +90,16 @@ use crate::snapshot::{self, Tail};
 /// The journal format's version — the side records' layout and the meaning
 /// of the two streams. Only one build reads what it wrote; a body that
 /// hands the journal to another process writes this beside it.
-pub const JOURNAL_FORMAT: u32 = 1;
+pub const JOURNAL_FORMAT: u32 = 2;
 
 /// The room one `pty_read` may need: it reads up to `READ_BUFFER_SIZE` before
 /// it holds the terminal lock and, holding it, keeps reading into the whole
 /// buffer until `MAX_LOCKED_READ` went through — so less than the sum. The
 /// read gate closes when the byte stream has less free.
 ///
-/// What the stream records is the stream after the graphics commands were
-/// separated from it, where a command is longer than on the wire (a marker
-/// is 38 bytes). Only a read of a great many tiny commands comes to more
-/// than the sum, and the journal that has no room for it breaks, as for any
-/// read the gate let through that does not fit.
+/// What the stream records is what the PTY gave, graphics commands and
+/// their pixels included, byte for byte: a flood of tiny commands is no more
+/// than the reads that carry it, and the sum covers it.
 pub(crate) const GATE_ROOM: usize = READ_BUFFER_SIZE + MAX_LOCKED_READ;
 
 /// How much earlier than the gate the compaction is asked for: one more
@@ -210,11 +219,17 @@ pub(crate) struct Base {
     /// The bytes after the parser's last ground state; replayed after `vt`
     /// by the journal's parser.
     pub(crate) tail: Vec<u8>,
+    /// The graphics transmission that was waiting for its next chunk at the cut,
+    /// as the chunk that starts it ([`Commands::chain`]); empty if none was.
+    pub(crate) chain: Vec<u8>,
     /// The cluster wrapper's open-cluster bit at the cut.
     pub(crate) last_input: bool,
-    /// The grid size and the options `vt` is laid out under.
+    /// The grid size, the cell's size in pixels (what a graphics command's
+    /// movement of the cursor is made from) and the options `vt` is laid out
+    /// under.
     pub(crate) cols: u16,
     pub(crate) rows: u16,
+    pub(crate) cell: (u16, u16),
     pub(crate) options: TerminalOptions,
     pub(crate) cluster: bool,
     pub(crate) at: JournalCut,
@@ -227,15 +242,18 @@ impl Base {
         vt: Vec<u8>,
         cols: u16,
         rows: u16,
+        cell: (u16, u16),
         options: TerminalOptions,
         cluster: bool,
     ) -> Self {
         Self {
             vt,
             tail: Vec::new(),
+            chain: Vec::new(),
             last_input: false,
             cols,
             rows,
+            cell,
             options,
             cluster,
             at: JournalCut::default(),
@@ -249,9 +267,9 @@ impl Base {
     /// The base as another process of this build reads it ([`Base::decode`]):
     ///
     /// ```text
-    /// "BTJB" | JOURNAL_FORMAT u32 | cols u16 | rows u16
+    /// "BTJB" | JOURNAL_FORMAT u32 | cols u16 | rows u16 | cell width u16 | cell height u16
     /// scrollback u32 | osc52 u8 | cursor u8 | blink u8 | cluster u8 | last_input u8
-    /// at: pty u64, side u64 | vt: len u64, bytes | tail: len u64, bytes
+    /// at: pty u64, side u64 | vt: len u64, bytes | tail: len u64, bytes | chain: len u64, bytes
     /// ```
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64 + self.len());
@@ -259,6 +277,8 @@ impl Base {
         out.extend_from_slice(&JOURNAL_FORMAT.to_le_bytes());
         out.extend_from_slice(&self.cols.to_le_bytes());
         out.extend_from_slice(&self.rows.to_le_bytes());
+        out.extend_from_slice(&self.cell.0.to_le_bytes());
+        out.extend_from_slice(&self.cell.1.to_le_bytes());
         let mut options = [0u8; SIDE_MAX];
         // The options' payload is the side record's: one encoding of them.
         let len = Side::Options(self.options).encode(0, &mut options);
@@ -267,7 +287,7 @@ impl Base {
         out.push(u8::from(self.last_input));
         out.extend_from_slice(&self.at.pty.to_le_bytes());
         out.extend_from_slice(&self.at.side.to_le_bytes());
-        for field in [&self.vt, &self.tail] {
+        for field in [&self.vt, &self.tail, &self.chain] {
             out.extend_from_slice(&(field.len() as u64).to_le_bytes());
             out.extend_from_slice(field);
         }
@@ -288,6 +308,10 @@ impl Base {
         }
         let cols = u16::from_le_bytes(take(2)?.try_into().ok()?);
         let rows = u16::from_le_bytes(take(2)?.try_into().ok()?);
+        let cell = (
+            u16::from_le_bytes(take(2)?.try_into().ok()?),
+            u16::from_le_bytes(take(2)?.try_into().ok()?),
+        );
         let mut record = vec![OPTIONS];
         record.extend_from_slice(&[0; 8]);
         record.extend_from_slice(take(7)?);
@@ -309,12 +333,15 @@ impl Base {
         };
         let vt = field()?;
         let tail = field()?;
+        let chain = field()?;
         rest.is_empty().then_some(Base {
             vt,
             tail,
+            chain,
             last_input,
             cols,
             rows,
+            cell,
             options,
             cluster,
             at: JournalCut { pty, side },
@@ -328,8 +355,12 @@ const BASE_MAGIC: [u8; 4] = *b"BTJB";
 /// A change to `Term`'s content that is not a PTY byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
-    /// `Term::resize` to this grid.
-    Resize { cols: u16, rows: u16 },
+    /// `Term::resize` to this grid, the cell being this many pixels.
+    Resize {
+        cols: u16,
+        rows: u16,
+        cell: (u16, u16),
+    },
     /// ⌘K/⌥⌘K: `top` screen rows scrolled into the history (zero for ⌥⌘K),
     /// then the history erased.
     Clear { top: u32 },
@@ -341,8 +372,8 @@ pub(crate) enum Side {
     StopSync,
 }
 
-/// A side record's most bytes: tag, stamp, the options' payload.
-const SIDE_MAX: usize = 1 + 8 + 7;
+/// A side record's most bytes: tag, stamp, the resize's payload.
+const SIDE_MAX: usize = 1 + 8 + 8;
 
 const RESIZE: u8 = 1;
 const CLEAR: u8 = 2;
@@ -355,15 +386,17 @@ impl Side {
     fn encode(self, stamp: u64, out: &mut [u8; SIDE_MAX]) -> usize {
         let mut payload = [0u8; SIDE_MAX - 9];
         let (tag, len) = match self {
-            Self::Resize { cols, rows } => {
+            Self::Resize { cols, rows, cell } => {
                 let [c0, c1] = cols.to_le_bytes();
                 let [r0, r1] = rows.to_le_bytes();
-                payload = [c0, c1, r0, r1, 0, 0, 0];
-                (RESIZE, 4)
+                let [w0, w1] = cell.0.to_le_bytes();
+                let [h0, h1] = cell.1.to_le_bytes();
+                payload = [c0, c1, r0, r1, w0, w1, h0, h1];
+                (RESIZE, 8)
             }
             Self::Clear { top } => {
                 let [t0, t1, t2, t3] = top.to_le_bytes();
-                payload = [t0, t1, t2, t3, 0, 0, 0];
+                payload = [t0, t1, t2, t3, 0, 0, 0, 0];
                 (CLEAR, 4)
             }
             Self::Options(options) => {
@@ -383,16 +416,16 @@ impl Side {
                     CursorBlink::On => 1,
                     CursorBlink::Off => 2,
                 };
-                payload = [s0, s1, s2, s3, osc52, cursor, blink];
+                payload = [s0, s1, s2, s3, osc52, cursor, blink, 0];
                 (OPTIONS, 7)
             }
             Self::CursorStyleReset => (CURSOR_STYLE, 0),
             Self::StopSync => (STOP_SYNC, 0),
         };
         let [b0, b1, b2, b3, b4, b5, b6, b7] = stamp.to_le_bytes();
-        let [p0, p1, p2, p3, p4, p5, p6] = payload;
+        let [p0, p1, p2, p3, p4, p5, p6, p7] = payload;
         *out = [
-            tag, b0, b1, b2, b3, b4, b5, b6, b7, p0, p1, p2, p3, p4, p5, p6,
+            tag, b0, b1, b2, b3, b4, b5, b6, b7, p0, p1, p2, p3, p4, p5, p6, p7,
         ];
         9 + len
     }
@@ -403,7 +436,8 @@ impl Side {
         let tag = *bytes.first()?;
         let stamp = u64::from_le_bytes(bytes.get(1..9)?.try_into().ok()?);
         let len = match tag {
-            RESIZE | CLEAR => 4,
+            RESIZE => 8,
+            CLEAR => 4,
             OPTIONS => 7,
             CURSOR_STYLE | STOP_SYNC => 0,
             _ => return None,
@@ -412,11 +446,12 @@ impl Side {
         payload
             .get_mut(..len)?
             .copy_from_slice(bytes.get(9..9 + len)?);
-        let [p0, p1, p2, p3, p4, p5, p6] = payload;
+        let [p0, p1, p2, p3, p4, p5, p6, p7] = payload;
         let side = match tag {
             RESIZE => Self::Resize {
                 cols: u16::from_le_bytes([p0, p1]),
                 rows: u16::from_le_bytes([p2, p3]),
+                cell: (u16::from_le_bytes([p4, p5]), u16::from_le_bytes([p6, p7])),
             },
             CLEAR => Self::Clear {
                 top: u32::from_le_bytes([p0, p1, p2, p3]),
@@ -955,11 +990,18 @@ impl EventListener for TitleSlot {
 
 /// The scratch `Term` a copy replays into, with the parser state the
 /// journal's bytes continue.
+///
+/// The journal's bytes are the program's, graphics commands in them: the
+/// replay receives them too, with no store to place into and nobody to answer,
+/// so a command here only moves the cursor — by the same numbers the live
+/// parser moved it by, the cell's size being the one the last resize record
+/// (or the base) says.
 struct Scratch {
     term: Term<TitleSlot>,
     title: TitleSlot,
     parser: ansi::Processor,
     last_input: bool,
+    commands: Commands,
     /// DECSET 1016 as the replay has it: `Term` does not keep the mode, the
     /// wrapper does, and the encoder writes it back into the new base's VT.
     pixels: AtomicBool,
@@ -989,18 +1031,40 @@ impl Scratch {
             );
             progress.fetch_add(1, Ordering::AcqRel);
         }
+        let mut commands = Commands::default();
+        commands.set_cell(base.cell);
         let mut scratch = Self {
             term,
             title,
             parser: ansi::Processor::new(),
             pixels,
+            commands,
             last_input: base.last_input,
             tail: Tail::default(),
             options: base.options,
             cluster: base.cluster,
         };
+        // The chunk that opens the transmission the cut fell in the middle of
+        // (a command of its own: it ended before the tail began), then the
+        // tail. The chain is not the tail's: it never was part of what the
+        // parser is in the middle of.
+        scratch.play(&base.chain);
+        scratch.last_input = base.last_input;
         scratch.feed(&base.tail);
         scratch
+    }
+
+    /// Bytes for the parser that the tail does not follow.
+    fn play(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.parser.advance(
+            &mut ClusterHandler::new(&mut self.term, self.cluster, &mut self.last_input)
+                .pixel_mouse(&self.pixels)
+                .commands(&mut self.commands),
+            bytes,
+        );
     }
 
     /// The journal's PTY bytes, as the reader's `advance` gave them.
@@ -1010,7 +1074,8 @@ impl Scratch {
         }
         self.parser.advance(
             &mut ClusterHandler::new(&mut self.term, self.cluster, &mut self.last_input)
-                .pixel_mouse(&self.pixels),
+                .pixel_mouse(&self.pixels)
+                .commands(&mut self.commands),
             bytes,
         );
         self.tail.feed(bytes);
@@ -1019,10 +1084,11 @@ impl Scratch {
     /// A side record, as the live session made it.
     fn apply(&mut self, side: Side) {
         match side {
-            Side::Resize { cols, rows } => {
+            Side::Resize { cols, rows, cell } => {
                 if cols > 0 && rows > 0 {
                     self.term.resize(GridSize::exact(cols, rows));
                 }
+                self.commands.set_cell(cell);
             }
             Side::Clear { top } => wipe(&mut self.term, top as usize),
             Side::Options(options) => {
@@ -1032,7 +1098,8 @@ impl Scratch {
             Side::CursorStyleReset => self.term.set_cursor_style(None),
             Side::StopSync => self.parser.stop_sync(
                 &mut ClusterHandler::new(&mut self.term, self.cluster, &mut self.last_input)
-                    .pixel_mouse(&self.pixels),
+                    .pixel_mouse(&self.pixels)
+                    .commands(&mut self.commands),
             ),
         }
     }
@@ -1060,9 +1127,11 @@ impl Scratch {
         Base {
             vt,
             tail: self.tail.bytes().to_vec(),
+            chain: self.commands.chain().unwrap_or_default(),
             last_input: self.last_input,
             cols,
             rows,
+            cell: self.commands.cell(),
             options: self.options,
             cluster: self.cluster,
             at,
@@ -1285,7 +1354,11 @@ mod tests {
     #[test]
     fn every_side_record_reads_back() {
         let sides = [
-            Side::Resize { cols: 80, rows: 24 },
+            Side::Resize {
+                cols: 80,
+                rows: 24,
+                cell: (10, 20),
+            },
             Side::Clear { top: 7 },
             Side::Clear { top: 0 },
             Side::Options(options()),
@@ -1311,7 +1384,7 @@ mod tests {
             assert_eq!(read.stamp, index as u64 * 1000);
         }
         assert_eq!(back[0].at, 40);
-        assert_eq!(back[1].at, 40 + 13);
+        assert_eq!(back[1].at, 40 + 17, "a resize is 17 bytes");
         // An unknown tag and a cut record do not read back.
         assert!(decode_sides(0, &[99; 9]).is_none());
         assert!(decode_sides(0, &stream[..12]).is_none());
@@ -1319,7 +1392,7 @@ mod tests {
 
     #[test]
     fn a_base_reads_back_and_refuses_damage() {
-        let mut base = Base::birth(b"\x1b[1mvt\r\n".to_vec(), 33, 11, options(), true);
+        let mut base = Base::birth(b"\x1b[1mvt\r\n".to_vec(), 33, 11, (9, 18), options(), true);
         base.tail = b"\x1b[3".to_vec();
         base.last_input = true;
         base.at = JournalCut {
@@ -1333,11 +1406,12 @@ mod tests {
             (
                 back.cols,
                 back.rows,
+                back.cell,
                 back.options,
                 back.cluster,
                 back.last_input
             ),
-            (33, 11, options(), true, true)
+            (33, 11, (9, 18), options(), true, true)
         );
         assert_eq!((back.vt, back.tail, back.at), (base.vt, base.tail, base.at));
         // Cut short, one byte long, another format or a flag that is no bool.
@@ -1349,8 +1423,58 @@ mod tests {
         other[4] ^= 0xff;
         assert!(Base::decode(&other).is_none());
         let mut flag = bytes;
-        flag[4 + 4 + 4 + 7] = 2;
+        flag[4 + 4 + 4 + 4 + 7] = 2;
         assert!(Base::decode(&flag).is_none());
+    }
+
+    /// An image sent in chunks and a copy cut between two of them: the chunks
+    /// after the cut end a transmission the copy that goes on never saw begin,
+    /// and the cursor moves for it as it does where the stream is not cut.
+    #[test]
+    fn a_cut_between_the_chunks_of_an_image_moves_the_cursor_as_no_cut_does() {
+        use crate::graphics::tests::{base64, rgba};
+        let text = base64(&rgba(20, 40, 5));
+        let pieces: Vec<&[u8]> = text.as_bytes().chunks(1024).collect();
+        assert!(pieces.len() >= 3);
+        let mut chunks = Vec::new();
+        for (at, piece) in pieces.iter().enumerate() {
+            let control = match at {
+                0 => "a=T,f=32,s=20,v=40,i=1,m=1",
+                last if last + 1 == pieces.len() => "m=0",
+                _ => "m=1",
+            };
+            chunks.push([&b"\x1b_G"[..], control.as_bytes(), b";", piece, b"\x1b\\"].concat());
+        }
+        let before = b"ab\x1b[3;3H".to_vec();
+        let after = b"cd".to_vec();
+        let birth = Base::birth(Vec::new(), 40, 10, (10, 20), options(), true);
+        let progress = AtomicU64::new(0);
+        let cursor_after = |cut: Option<usize>| {
+            let mut stream = before.clone();
+            stream.extend(chunks.concat());
+            stream.extend_from_slice(&after);
+            let mut scratch = Scratch::new(&birth, &progress);
+            match cut {
+                None => scratch.feed(&stream),
+                Some(at) => {
+                    scratch.feed(&stream[..at]);
+                    let base = scratch.finish(JournalCut::default(), &progress);
+                    scratch = Scratch::new(&base, &progress);
+                    scratch.feed(&stream[at..]);
+                }
+            }
+            scratch.term.grid().cursor.point
+        };
+        let whole = cursor_after(None);
+        // 20 × 40 pixels are two columns and two rows: the cursor is a row
+        // down and two columns across of where it was, and the text goes on.
+        assert_eq!((whole.line.0, whole.column.0), (3, 6));
+        // Every cut: between two commands, inside one, anywhere.
+        let first = before.len();
+        let end = first + chunks.concat().len() + after.len();
+        for at in first..=end {
+            assert_eq!(cursor_after(Some(at)), whole, "cut at {}", at - first);
+        }
     }
 
     /// The crash's rebuild takes every byte recorded — the last read was
@@ -1359,11 +1483,16 @@ mod tests {
     #[test]
     fn a_rebuild_replays_every_byte_and_applies_an_open_update() {
         use crate::snapshot::tests::readable;
-        let base = Base::birth(b"base\r\n".to_vec(), 20, 6, options(), true);
+        let base = Base::birth(b"base\r\n".to_vec(), 20, 6, (10, 20), options(), true);
         let bytes = b"one\r\ntwo\x1b[?2026hsynced\r\n\x1b[1".to_vec();
         let resize_at = 5;
         let mut sides = [0; SIDE_MAX];
-        let len = Side::Resize { cols: 12, rows: 4 }.encode(resize_at, &mut sides);
+        let resize = Side::Resize {
+            cols: 12,
+            rows: 4,
+            cell: (10, 20),
+        };
+        let len = resize.encode(resize_at, &mut sides);
         let records = JournalRecords {
             bytes_at: 0,
             bytes: bytes.clone(),
@@ -1378,7 +1507,7 @@ mod tests {
         let progress = AtomicU64::new(0);
         let mut by_hand = Scratch::new(&base, &progress);
         by_hand.feed(&bytes[..resize_at as usize]);
-        by_hand.apply(Side::Resize { cols: 12, rows: 4 });
+        by_hand.apply(resize);
         by_hand.feed(&bytes[resize_at as usize..]);
         assert!(by_hand.in_sync());
         by_hand.apply(Side::StopSync);

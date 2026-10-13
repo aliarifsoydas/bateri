@@ -352,6 +352,12 @@ impl<T: Timeout> Processor<T> {
     where
         H: Handler,
     {
+        // The handler asked for a halt and has not taken it back: nothing is
+        // taken, a synchronized update's buffer included.
+        if halting && handler.halt_requested() {
+            return 0;
+        }
+
         // What is left of a replay that halted goes before anything new.
         if self.state.sync_state.replay.is_some() && self.resume_replay(handler, halting) {
             return 0;
@@ -2809,6 +2815,19 @@ mod tests {
         handler.resolve();
         assert_eq!(processor.advance_until_halt(&mut handler, &input[8..]), 2);
         assert_eq!(handler.events[3], Event::Text("cd".into()));
+    }
+
+    #[test]
+    fn a_standing_halt_takes_nothing_into_a_synchronized_update_either() {
+        let mut processor = Processor::<TestSyncHandler>::new();
+        let mut handler = Recorder::default();
+        assert_eq!(processor.advance_until_halt(&mut handler, b"\x1b[?2026h"), 8);
+        handler.halt = true;
+        assert_eq!(processor.advance_until_halt(&mut handler, b"abc"), 0);
+        assert_eq!(processor.sync_bytes_count(), 0);
+        handler.halt = false;
+        assert_eq!(processor.advance_until_halt(&mut handler, b"abc"), 3);
+        assert_eq!(processor.sync_bytes_count(), 3);
     }
 
     #[test]

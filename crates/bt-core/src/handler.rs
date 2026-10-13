@@ -27,24 +27,23 @@
 //! other forwarding clears the bit — an intervening `CUP` or SGR closes the
 //! cluster.
 //!
-//! **The graphics marker is dispatched here.** The reader takes a kitty
-//! graphics command out of the byte stream and leaves a marker (a private
-//! mode `set`, [`MARK_MODE`], with the cursor's movement and the command's id
-//! as arguments) in its place; this wrapper catches it before `Term` sees it
-//! and applies the queued command with that id to the screen showing at that
-//! point of the stream, anchoring a placement at the cursor. The arguments
-//! are private modes of their own that come before it in the same sequence
-//! ([`Motion::mark`]); they are held until it arrives, and the wrapper moves
-//! the cursor down, applies the command and moves it right, so the movement
-//! is in the stream — and a replay of the stream, with no command to apply,
-//! moves the cursor the same way. A program can write a marker of its own:
-//! it names no command (the ids are random, and kept from it), so the cursor
-//! moves, as it could with a cursor movement, and nothing else happens (before
-//! graphics the sequence did nothing at all). A
-//! move to or from the alternate screen drops what that screen's
-//! store holds; a clear of the screen (`CSI 2 J`, `CSI 3 J`) and a reset
-//! delete the placements in stream order, before the rows move. Without a
-//! [`Sink`] (a replay, a snapshot) the marker is read and does nothing.
+//! **Graphics commands end here.** The vendored parser hands the body of
+//! `ESC _ … ESC \` over in slices ([`Handler::apc_start`], [`Handler::apc_put`],
+//! [`Handler::apc_end`]); the stream's [`Commands`] (lent to this wrapper, which
+//! is reborn on every `advance`) put a graphics command together, and where
+//! it ends it takes effect, on the screen showing at that point of the stream:
+//! the cursor moves down, the placement is anchored at the cursor, the cursor
+//! moves right ([`Motion`]), and the program is answered. A command that
+//! needs the expensive half (decoding an image, reading the file it names)
+//! cannot have it under `Term`'s lock: the wrapper parks the record in the hub
+//! and asks the parser to halt right behind the command
+//! ([`Handler::halt_requested`]); the read loop lets go of the lock, decodes,
+//! takes the lock back and calls [`ClusterHandler::resume`], which applies the
+//! record. Without a [`Sink`] (the journal's replay) the command only moves
+//! the cursor, by the same numbers, and the parser never halts. A move to or
+//! from the alternate screen drops what that screen's store holds; a clear of
+//! the screen (`CSI 2 J`, `CSI 3 J`) and a reset delete the placements in
+//! stream order, before the rows move.
 //!
 //! **DECSET 1016 is kept here too.** alacritty parses the mode as unknown
 //! and drops it, and `TermMode` has no bit for it; the wrapper keeps the flag
@@ -60,6 +59,7 @@
 //! in `make clippy`; the same place catches a new method arriving in vte.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -75,7 +75,7 @@ use alacritty_terminal::vte::ansi::{
 // `Cargo.toml`.
 use cursor_icon::CursorIcon;
 
-use crate::graphics::{ARG_BASE, MARK_MODE, Motion, Sink, screen_of};
+use crate::graphics::{Commands, Env, Hub, Motion, Outcome, Pending, Sink, screen_of};
 use crate::input::PIXEL_MOUSE_MODE;
 
 /// The `Handler` the parser sees: it borrows `Term` and forwards calls to
@@ -89,21 +89,20 @@ pub(crate) struct ClusterHandler<'a, U: EventListener> {
     cluster: bool,
     /// Whether the last `Handler` call was `input`: is there an open cluster.
     last_input: &'a mut bool,
-    /// The session's graphics commands ([`crate::graphics`]): where the
-    /// marker finds its record and the store follows the screen. `None` for
-    /// every stream that is not the live one (the journal's replay, the
-    /// handover's snapshot): there the marker is read and does nothing.
+    /// The session's graphics ([`crate::graphics`]): the store the commands
+    /// are applied to and where the program is answered. `None` for every
+    /// stream that is not the live one (the journal's replay, the handover's
+    /// snapshot): there a command only moves the cursor.
     graphics: Option<&'a dyn Sink>,
     /// The session's DECSET 1016 flag ([`PIXEL_MOUSE_MODE`]) — where the
     /// mode lands, since `Term` does not keep it. `None` for a stream with
     /// no flag to keep: the mode is read and does nothing, as the graphics
-    /// marker does without a [`Sink`].
+    /// commands do without a [`Sink`].
     pixels: Option<&'a AtomicBool>,
-    /// The last five arguments of a marker seen so far (the cursor's movement
-    /// and the command's id), which the marker itself ([`MARK_MODE`]) turns
-    /// into the movement and the record to apply. A sequence is dispatched
-    /// whole by one `advance`, so they do not outlive this value.
-    marker_args: [u16; 5],
+    /// The stream's graphics commands, between this wrapper's lives
+    /// ([`ClusterHandler::commands`]). `None`: the parser's application
+    /// program commands are let go.
+    commands: Option<&'a mut Commands>,
 }
 
 impl<'a, U: EventListener> ClusterHandler<'a, U> {
@@ -114,13 +113,13 @@ impl<'a, U: EventListener> ClusterHandler<'a, U> {
             last_input,
             graphics: None,
             pixels: None,
-            marker_args: [0; 5],
+            commands: None,
         }
     }
 
-    /// Lets the wrapper apply the graphics commands the stream carries. The
-    /// session's 1016 flag comes with the sink: the live stream keeps it and
-    /// answers its query.
+    /// Lets the wrapper apply the graphics commands the stream carries (it
+    /// needs [`ClusterHandler::commands`] too). The session's 1016 flag comes
+    /// with the sink: the live stream keeps it and answers its query.
     pub(crate) fn graphics(mut self, graphics: Option<&'a dyn Sink>) -> Self {
         self.graphics = graphics;
         self.pixels = graphics.map(|sink| sink.pixel_mouse());
@@ -139,31 +138,89 @@ impl<'a, U: EventListener> ClusterHandler<'a, U> {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
-    /// The graphics marker was dispatched: the queued command with `id` takes
-    /// effect here, on the screen showing at this point of the stream, between
-    /// the two halves of the cursor's `motion` (down first, so that the cursor
-    /// is on the image's last row where the placement is anchored; right
-    /// after). The movement is made whatever the id: a stream with no sink
-    /// moves the cursor all the same, and so does a marker that names no
-    /// command. No more than a screen's worth of rows, as the reader writes.
-    fn graphics_mark(&mut self, motion: Motion, id: u32) {
-        *self.last_input = false;
-        let screen_lines = u32::try_from(self.term.screen_lines()).unwrap_or(u32::MAX);
-        for _ in 0..motion.rows.min(screen_lines) {
-            self.term.linefeed();
+    /// Gives the wrapper the stream's graphics commands to put a command
+    /// together in. They are the owner's of the parser, not the wrapper's: it
+    /// is made anew for every `advance`, and a command is cut by the reads.
+    pub(crate) fn commands(mut self, commands: &'a mut Commands) -> Self {
+        self.commands = Some(commands);
+        self
+    }
+
+    /// The parser was halted behind a command ([`Handler::halt_requested`])
+    /// and what it waited for is done: the record the hub parked takes effect
+    /// here, where the command ended, and the parser may go on.
+    pub(crate) fn resume(&mut self) {
+        if let Some(commands) = self.commands.as_deref_mut() {
+            commands.resume();
         }
+        if let Some(graphics) = self.graphics
+            && let Some(pending) = graphics.hub().take_parked()
+        {
+            self.place(pending);
+        }
+    }
+
+    /// What a command that ended comes to, in the order it came.
+    fn dispatch(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Query(reply) => {
+                if let Some(graphics) = self.graphics
+                    && let Some(bytes) = reply.encode()
+                {
+                    graphics.reply(bytes);
+                }
+            }
+            Outcome::Pending(pending) => match self.graphics {
+                // The decoding is not for the terminal's lock: the record
+                // waits and the parser stops behind the command.
+                Some(graphics) if matches!(pending, Pending::Raw { .. }) => {
+                    graphics.hub().park(pending);
+                    if let Some(commands) = self.commands.as_deref_mut() {
+                        commands.halt();
+                    }
+                }
+                // With no store (a replay) it is the movement alone.
+                _ => self.place(pending),
+            },
+        }
+    }
+
+    /// A record takes effect on the screen showing, between the two halves of
+    /// the cursor's `motion` (down first, so that the cursor is on the
+    /// image's last row where the placement is anchored; right after), and the
+    /// program is answered.
+    fn place(&mut self, pending: Pending) {
+        let motion = pending.motion();
+        self.move_down(motion);
         if let Some(graphics) = self.graphics {
             let (hub, cell) = (graphics.hub(), graphics.cell());
             // The placements already here are brought to the grid as it is
             // now before a new one is anchored in it.
             hub.look(&*self.term, cell);
             let screen = screen_of(&*self.term, cell);
-            let reply = hub.apply(id, &screen);
+            let reply = hub.apply(pending, &screen);
             hub.settle(&*self.term);
             if let Some(reply) = reply {
                 graphics.reply(reply);
             }
         }
+        self.move_across(motion);
+    }
+
+    /// The first half of a command's movement: down to the image's last row.
+    /// No more than a screen's worth of rows, past that the screen is already
+    /// all new.
+    fn move_down(&mut self, motion: Motion) {
+        *self.last_input = false;
+        let screen_lines = u32::try_from(self.term.screen_lines()).unwrap_or(u32::MAX);
+        for _ in 0..motion.rows.min(screen_lines) {
+            self.term.linefeed();
+        }
+    }
+
+    /// The second half: right of the image, or to the start of the next line
+    /// for an image as wide as the screen.
+    fn move_across(&mut self, motion: Motion) {
         if motion.wrap {
             self.term.linefeed();
             self.term.carriage_return();
@@ -173,12 +230,11 @@ impl<'a, U: EventListener> ClusterHandler<'a, U> {
         }
     }
 
-    /// A private mode number in the range of the marker's arguments: kept,
-    /// the oldest forgotten.
-    fn marker_arg(&mut self, value: u16) {
-        *self.last_input = false;
-        self.marker_args.rotate_left(1);
-        self.marker_args[4] = value;
+    /// Tells the hub whether a command is half-received.
+    fn publish_open(&self) {
+        if let (Some(graphics), Some(commands)) = (self.graphics, self.commands.as_deref()) {
+            graphics.hub().set_open(commands.open());
+        }
     }
 
     /// DECSET/DECRST 1016: the pointer reports turn to pixels or back.
@@ -377,20 +433,6 @@ impl<U: EventListener> Handler for ClusterHandler<'_, U> {
     }
 
     fn set_private_mode(&mut self, mode: PrivateMode) {
-        if let PrivateMode::Unknown(number) = mode {
-            if number == MARK_MODE {
-                let (motion, id) = Motion::from_marker(std::mem::take(&mut self.marker_args));
-                return self.graphics_mark(motion, id);
-            }
-            // The marker's arguments are modes of their own that the marker
-            // names after them; a program's own setting of such a number goes
-            // on to `Term` (which knows no such mode) like any other.
-            if let Some(value) = number.checked_sub(ARG_BASE)
-                && value < ARG_BASE
-            {
-                self.marker_arg(value);
-            }
-        }
         if mode == PrivateMode::Unknown(PIXEL_MOUSE_MODE) {
             return self.pixel_mouse_mode(true);
         }
@@ -427,23 +469,56 @@ impl<U: EventListener> Handler for ClusterHandler<'_, U> {
         self.term.reset_state();
     }
 
-    // The parser's application program commands go to `Term`, which ignores them: this
-    // wrapper leaves them alone too until it has a use for them, and so it never halts the
-    // parser.
     fn apc_start(&mut self) {
-        self.term.apc_start();
+        // Like every other sequence, it closes the open cluster.
+        *self.last_input = false;
+        let seen = self
+            .graphics
+            .is_some_and(|graphics| graphics.hub().remote_seen());
+        if let Some(commands) = self.commands.as_deref_mut() {
+            commands.start(seen);
+        }
     }
 
     fn apc_put(&mut self, data: &[u8]) {
-        self.term.apc_put(data);
+        if let Some(commands) = self.commands.as_deref_mut() {
+            commands.put(data);
+            self.publish_open();
+        }
     }
 
     fn apc_end(&mut self, cancelled: bool) {
-        self.term.apc_end(cancelled);
+        *self.last_input = false;
+        let hub = self.graphics.map(|graphics| graphics.hub());
+        let cell = self
+            .graphics
+            .map(|graphics| graphics.cell())
+            .or_else(|| self.commands.as_deref().map(Commands::cell))
+            .unwrap_or_default();
+        let env = Env {
+            cell,
+            columns: u16::try_from(self.term.columns()).unwrap_or(u16::MAX),
+            lines: u16::try_from(self.term.screen_lines()).unwrap_or(u16::MAX),
+        };
+        let Some(commands) = self.commands.as_deref_mut() else {
+            return;
+        };
+        let stored = |echo| hub.and_then(|hub| hub.stored_size(echo));
+        let remote = || hub.is_some_and(Hub::in_remote_session);
+        let seen = hub.is_some_and(Hub::remote_seen);
+        let outcomes = commands.end(cancelled, Instant::now(), env, &stored, (seen, &remote));
+        self.publish_open();
+        for outcome in outcomes {
+            self.dispatch(outcome);
+        }
     }
 
+    /// Whether the parser is to stop right behind the command it just ended,
+    /// for the decoding that cannot be done under `Term`'s lock
+    /// ([`ClusterHandler::resume`]).
+    #[inline(always)]
     fn halt_requested(&self) -> bool {
-        self.term.halt_requested()
+        self.commands.as_deref().is_some_and(Commands::halted)
     }
 
     forward! {
@@ -807,6 +882,19 @@ mod tests {
         let mut t = term(10, 1);
         feed_cut(&mut t, true, "· ·".as_bytes(), &[1]);
         assert_eq!(rows(&t)[0], "·| |·");
+    }
+
+    /// An application program command is a sequence like any other: between
+    /// the two halves of an emoji it closes the cluster, as a cursor movement
+    /// does, whether or not anything is collecting commands.
+    #[test]
+    fn an_application_program_command_between_two_code_points_closes_the_cluster() {
+        let mut joined = term(10, 1);
+        feed(&mut joined, true, "👍🏽");
+        assert_eq!(rows(&joined)[0], "[👍🏽]|·");
+        let mut cut = term(10, 1);
+        feed(&mut cut, true, "👍\x1b_Xnot ours\x1b\\🏽");
+        assert_eq!(rows(&cut)[0], "[👍]|·|[🏽]|·");
     }
 
     /// Wherever one read or two cut the stream — inside a two-, three- or

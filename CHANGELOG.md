@@ -29,7 +29,9 @@ of every installed copy. A version without a section is not released.
   program hands over, and never writes a name a program gave back into its
   answers. In an interactive `ssh` or `mosh` session the names a program
   sends are not read (they would be the server's files), so a program there
-  sends the picture itself.
+  sends the picture itself. A program that asks what the terminal can draw and
+  then for its attributes (terminal-browser does) hears the answers in the
+  order it asked.
   Images do not survive an update or a crash of bateri; the text does, and a
   program that redraws when its window is signalled draws its images again.
 - **bash gets the command blocks and the dock.** When your login shell is

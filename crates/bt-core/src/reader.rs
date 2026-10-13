@@ -19,11 +19,14 @@
 //! - the PTY tokens are `pub(crate)` in alacritty, their values were copied
 //!   here (and are `pub(crate)` here too: an adopted PTY registers on them);
 //! - comments were translated (first to Turkish, later to English);
-//! - an image a read carried (a graphics command) is decoded — and read, when
-//!   the command names a file or shared memory object — between that
-//!   read and its parse, with the terminal's lease and lock **let go**
-//!   ([`crate::graphics::Hub::decode_pending`]) — a frame waits for the
-//!   lease as well as the lock, so decoding under either would hold it back;
+//! - an image a graphics command carries is decoded — and read, when the
+//!   command names a file or shared memory object — with the terminal's lease
+//!   and lock **let go** ([`crate::graphics::Hub::decode_pending`]) — a frame
+//!   waits for the lease as well as the lock, so decoding under either would
+//!   hold it back. The parser stops right behind such a command
+//!   ([`ansi::Processor::advance_until_halt`]), the decoding is done, and the
+//!   parse goes on from the byte after it: the bytes are parsed in order
+//!   whatever the decoding takes, and the journal counts them as they are;
 //! - the update handover: an opt-in read before the first poll
 //!   ([`EventLoop::read_first`], so a carried prefix reaches the parser on
 //!   a quiet PTY) and, on the loop handed back after `join`, the DEC 2026
@@ -41,7 +44,7 @@
 //!
 //! Preserved contracts — `session.rs`'s lock order and shutdown lean on
 //! them: the terminal lease is held for the whole of `pty_read` but for that
-//! one decode (the `term` → `shell` order in the module header, which the
+//! decode (the `term` → `shell` order in the module header, which the
 //! decode does not touch), the locked read is bounded by
 //! [`MAX_LOCKED_READ`], `Wakeup` is sent only if unsynchronized bytes were
 //! processed, and [`EventLoop::spawn`] returns the `(EventLoop, State)` pair
@@ -59,11 +62,11 @@ use std::time::Instant;
 use alacritty_terminal::event::{Event, EventListener, OnResize, WindowSize};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Term;
-use alacritty_terminal::vte::ansi;
+use alacritty_terminal::vte::ansi::{self, Handler as _};
 use alacritty_terminal::{thread, tty};
 use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
-use crate::graphics::{MARKER_LEN, Sink};
+use crate::graphics::{Commands, Hub, Sink};
 use crate::handler::ClusterHandler;
 use crate::journal::{Journal, Side};
 
@@ -99,26 +102,6 @@ pub(crate) enum Msg {
     /// arm, which would apply a synchronized update early and ask for a
     /// frame. Sent only to a loop that has a journal.
     Room,
-}
-
-/// The most bytes of the PTY a turn of the loop takes in while they deliver
-/// nothing ([`EventLoop::read_rounds`]).
-const PARTIAL_TURN: usize = 16 * READ_BUFFER_SIZE;
-
-/// What one `pty_read` came to.
-struct Round {
-    /// Bytes the parser got.
-    processed: usize,
-    /// Bytes of the PTY taken in (more or fewer than were parsed: commands
-    /// become markers).
-    taken: usize,
-}
-
-impl Round {
-    /// Whether the PTY had anything to give.
-    fn progressed(&self) -> bool {
-        self.processed > 0 || self.taken > 0
-    }
 }
 
 /// Sending end of the loop's channel: queues the message and wakes the
@@ -181,6 +164,9 @@ pub(crate) struct State {
     /// `advance`: a cluster split across two `read` chunks (`👍` · `🏽`) is
     /// still unclosed.
     last_input: bool,
+    /// The graphics commands of the stream ([`Commands`]): the wrapper is
+    /// reborn on every `advance`, a command is cut by the reads.
+    commands: Commands,
 }
 
 impl State {
@@ -261,7 +247,7 @@ pub(crate) struct EventLoop<T: tty::EventedPty, U: EventListener> {
     /// the loop runs as alacritty's does.
     journal: Option<Arc<Journal>>,
     /// The session's graphics ([`EventLoop::graphics`]); `None`: none, and
-    /// the marker the stream may carry does nothing.
+    /// the graphics commands the stream may carry only move the cursor.
     graphics: Option<Arc<dyn Sink>>,
 }
 
@@ -315,7 +301,7 @@ where
     }
 
     /// Applies the graphics commands the stream carries ([`crate::graphics`]):
-    /// the parser's wrapper dispatches their markers into `graphics`.
+    /// the parser's wrapper applies them to `graphics` where they end.
     pub(crate) fn graphics(&mut self, graphics: Arc<dyn Sink>) {
         self.graphics = Some(graphics);
     }
@@ -383,24 +369,6 @@ where
         gate.stalled.map(|(since, _)| since + journal.stall())
     }
 
-    /// How many bytes of the PTY the graphics side has taken in so far, if
-    /// there is one: what a carried prefix is measured by.
-    fn raw_taken(&self) -> Option<u64> {
-        self.graphics
-            .as_deref()
-            .map(|graphics| graphics.hub().raw_taken())
-    }
-
-    /// Whether the read side holds stream the buffer had no room for, which
-    /// the turn must read before it ends. It is asked of the loop's graphics
-    /// sink, which a session always attaches; a loop without one ends its turn
-    /// with whatever the read side holds.
-    fn backlog(&self) -> bool {
-        self.graphics
-            .as_deref()
-            .is_some_and(|graphics| graphics.hub().backlog())
-    }
-
     /// The carried prefix's serial reads ([`EventLoop::read_first`]): `left`
     /// counts down as bytes go through and ends at zero when a round reads
     /// nothing or fails. A closed read gate stops the rounds with `left`
@@ -412,70 +380,13 @@ where
             if !self.gate_open() {
                 return;
             }
-            match self.read_round(state, buf, true) {
-                // The prefix is counted in the PTY's bytes, which are not the
-                // bytes the parser got: a command in it grows, and a part of
-                // one delivers nothing at all.
-                Ok(round) if round.progressed() => *left = left.saturating_sub(round.taken),
-                Ok(_) => *left = 0,
+            match self.pty_read(state, buf, true) {
+                Ok(0) => *left = 0,
+                Ok(processed) => *left = left.saturating_sub(processed),
                 Err(err) => {
                     eprintln!("bateri: the first PTY read failed: {err}");
                     *left = 0;
                 }
-            }
-        }
-    }
-
-    /// One [`EventLoop::pty_read`] and what it came to.
-    fn read_round(&mut self, state: &mut State, buf: &mut [u8], serial: bool) -> io::Result<Round> {
-        let before = self.raw_taken();
-        let processed = self.pty_read(state, buf, serial)?;
-        let taken = match (before, self.raw_taken()) {
-            (Some(before), Some(now)) => {
-                usize::try_from(now.saturating_sub(before)).unwrap_or(usize::MAX)
-            }
-            _ => processed,
-        };
-        Ok(Round { processed, taken })
-    }
-
-    /// Reads the PTY: rounds of `pty_read`, for as long as one delivers
-    /// nothing and yet took bytes in. That is a read of part of a command still
-    /// arriving, which is not a PTY with nothing to say — and a poller that
-    /// does not wake for what a round left (a quiet PTY after its last output,
-    /// a carried prefix) would leave it unread. Bounded in bytes taken
-    /// ([`PARTIAL_TURN`]), so that a command that never ends cannot keep the
-    /// loop from its messages; the poller wakes for the rest of a PTY that has
-    /// more. Returns the bytes parsed.
-    fn read_rounds(
-        &mut self,
-        state: &mut State,
-        buf: &mut [u8],
-        serial: bool,
-    ) -> io::Result<usize> {
-        let (mut processed, mut taken) = (0, 0);
-        loop {
-            let round = self.read_round(state, buf, serial)?;
-            processed += round.processed;
-            taken += round.taken;
-            if round.processed > 0 || round.taken == 0 || taken >= PARTIAL_TURN {
-                return Ok(processed);
-            }
-        }
-    }
-
-    /// What is left of the PTY after the child exited: every round until one
-    /// makes no progress, or [`PARTIAL_TURN`] bytes have been taken (a writer
-    /// that outlives the child, holding the other end, never runs dry). (The
-    /// bytes of a big image the child wrote last, in parts, are not one read.)
-    fn drain_remaining(&mut self, state: &mut State, buf: &mut [u8]) {
-        let mut budget = PARTIAL_TURN;
-        while budget > 0 {
-            match self.read_round(state, buf, false) {
-                Ok(round) if round.progressed() => {
-                    budget = budget.saturating_sub(round.taken.max(1));
-                }
-                _ => return,
             }
         }
     }
@@ -502,19 +413,74 @@ where
         &mut self.pty
     }
 
-    /// Applies a pending DEC 2026 buffer to `Term` through the wrapper —
-    /// the timeout arm's body, without the `Wakeup`. Meant for the loop
-    /// handed back after `join` (the handover's freeze): the snapshot
-    /// must see what the application already sent.
+    /// Applies a pending DEC 2026 buffer to `Term` through the wrapper.
+    /// Meant for the loop handed back after `join` (the handover's freeze):
+    /// the snapshot must see what the application already sent. Graphics
+    /// commands in the buffer only move the cursor here, as they do in the
+    /// journal's replay: the images do not cross an update, nothing decodes
+    /// while the freeze holds the terminal, and a query in the buffer gets
+    /// no answer (the one thing an update that is still open at the freeze
+    /// loses).
     pub(crate) fn stop_sync(&mut self, state: &mut State) {
-        state.parser.stop_sync(
-            &mut ClusterHandler::new(
-                &mut *self.terminal.lock(),
-                self.cluster,
-                &mut state.last_input,
-            )
-            .graphics(self.graphics.as_deref()),
-        );
+        if let Some(graphics) = self.graphics.as_deref() {
+            // The cell the movement is made from: the session's, as the
+            // commands of the buffer would have found it.
+            state.commands.set_cell(graphics.cell());
+        }
+        let mut terminal = self.terminal.lock();
+        let mut handler = ClusterHandler::new(&mut terminal, self.cluster, &mut state.last_input)
+            .commands(&mut state.commands);
+        if let Some(graphics) = self.graphics.as_deref() {
+            handler = handler.pixel_mouse(graphics.pixel_mouse());
+        }
+        state.parser.stop_sync(&mut handler);
+    }
+
+    /// The DEC 2026 timeout: the parser's buffer applied, through the wrapper
+    /// and with the terminal locked — but for the decoding of an image in it,
+    /// which is done with the parser halted behind the command, as
+    /// [`EventLoop::pty_read`] does. `journaled` is called in the lock round
+    /// the stop begins in, before any halt: the replay applies the buffer
+    /// after exactly the bytes applied so far.
+    fn stop_timed_out_sync(&self, state: &mut State, journaled: impl FnOnce()) {
+        let fair = &*self.terminal;
+        let mut lease = Some(fair.lease());
+        let mut terminal = None;
+        let mut halted = {
+            let guard = terminal.get_or_insert_with(|| fair.lock_unfair());
+            let mut handler =
+                ClusterHandler::new(&mut **guard, self.cluster, &mut state.last_input)
+                    .graphics(self.graphics.as_deref())
+                    .commands(&mut state.commands);
+            state.parser.stop_sync_until_halt(&mut handler)
+        };
+        journaled();
+        while halted {
+            let Some(graphics) = self.graphics.as_deref() else {
+                break;
+            };
+            settle_halt(graphics.hub(), &mut lease, &mut terminal, || {
+                let lease = fair.lease();
+                (lease, fair.lock_unfair())
+            });
+            let guard = terminal.get_or_insert_with(|| fair.lock_unfair());
+            let mut handler =
+                ClusterHandler::new(&mut **guard, self.cluster, &mut state.last_input)
+                    .graphics(self.graphics.as_deref())
+                    .commands(&mut state.commands);
+            handler.resume();
+            // What is left of the replay (nothing new is given).
+            let _ = state.parser.advance_until_halt(&mut handler, &[]);
+            halted = handler.halt_requested();
+        }
+        // The update is over: what the reads noted of the commands in it has
+        // been taken.
+        if let Some(graphics) = self.graphics.as_deref()
+            && !state.commands.receiving()
+            && state.parser.sync_bytes_count() == 0
+        {
+            graphics.hub().forget_remote();
+        }
     }
 
     /// The input bytes the loop never wrote, in order: the buffer being
@@ -571,7 +537,8 @@ where
         // for the whole read and `TappedPty::read` runs under it —
         // `session.rs`'s `term` → `shell` lock order depends on this. The one
         // time it is let go is to decode an image (below).
-        let mut lease = Some(self.terminal.lease());
+        let fair = &*self.terminal;
+        let mut lease = Some(fair.lease());
         let mut terminal = None;
 
         loop {
@@ -592,63 +559,94 @@ where
                 },
             }
 
-            // An image the read carried is decoded here, **between the read
-            // and its parse**, and with the terminal neither locked nor
-            // leased: a frame waits for the lease as well as the lock, so
-            // inflating or decoding a large image under either would hold
-            // every frame back for as long as it takes. The bytes of this
-            // round wait in `buf`, as they do when the lock is busy; the
-            // markers in them are not dispatched until the records behind
-            // them are decoded, which is also why the order is kept.
-            if let Some(graphics) = self.graphics.as_deref()
-                && graphics.hub().has_undecoded()
-            {
-                terminal = None;
-                drop(lease.take());
-                graphics.hub().decode_pending();
-                lease = Some(self.terminal.lease());
+            // Try to lock the terminal.
+            if terminal.is_none() {
+                terminal = match fair.try_lock_unfair() {
+                    // At the buffer limit, take the lock by waiting — and in
+                    // the serial rounds always, so a read is parsed alone.
+                    None if serial || unprocessed >= buf.len() => Some(fair.lock_unfair()),
+                    None => continue,
+                    locked => locked,
+                };
             }
 
-            // Try to lock the terminal.
-            let terminal = match &mut terminal {
-                Some(terminal) => terminal,
-                None => terminal.insert(match self.terminal.try_lock_unfair() {
-                    // With less room than a marker takes, take the lock by
-                    // waiting — a read of that size is a piece of a command,
-                    // which delivers nothing, so the buffer never fills — and
-                    // in the serial rounds always, so a read is parsed alone.
-                    // (With a little more room than that and the lock busy,
-                    // a piece of an image is still read in pieces of the
-                    // room's size: about 100 reads for 4 KB in a room of 40
-                    // bytes, where it was about 2000.)
-                    None if serial || buf.len().saturating_sub(unprocessed) < MARKER_LEN => {
-                        self.terminal.lock_unfair()
-                    }
-                    None => continue,
-                    Some(terminal) => terminal,
-                }),
-            };
-
             // Parse the incoming bytes — into `Term` through the wrapper.
-            state.parser.advance(
-                &mut ClusterHandler::new(&mut **terminal, self.cluster, &mut state.last_input)
-                    .graphics(self.graphics.as_deref()),
-                &buf[..unprocessed],
+            //
+            // A graphics command that needs decoding halts the parser right
+            // behind it. The decoding is **between** two stretches of the
+            // parse, with the terminal neither locked nor leased: a frame
+            // waits for the lease as well as the lock, so inflating or
+            // decoding a large image under either would hold every frame
+            // back for as long as it takes. The bytes after the command wait
+            // in `buf`, as they do when the lock is busy, and the parse goes
+            // on from them, so the order is the stream's.
+            let mut at = 0;
+            loop {
+                let guard = terminal.get_or_insert_with(|| fair.lock_unfair());
+                let mut handler =
+                    ClusterHandler::new(&mut **guard, self.cluster, &mut state.last_input)
+                        .graphics(self.graphics.as_deref())
+                        .commands(&mut state.commands);
+                let used = state
+                    .parser
+                    .advance_until_halt(&mut handler, &buf[at..unprocessed]);
+                let halted = handler.halt_requested();
+                drop(handler);
+                at += used;
+                // The journal's applied count, under the terminal lock and by
+                // the bytes the parser took — not the bytes read: the reads
+                // before the lock accumulate into one parse. A side record
+                // the main thread writes while the lock is let go is stamped
+                // by it, and its replay finds it before the byte that ends
+                // the command, where the command's effect on the cursor waits
+                // for it: that last byte (`\`) is counted when the effect is
+                // made. (Not inside a synchronized update's replay, where the
+                // bytes the parser took are the update's, long ago.)
+                let held_back =
+                    usize::from(halted && used > 0 && state.parser.sync_bytes_count() == 0);
+                if let Some(journal) = &self.journal {
+                    journal.applied(used - held_back);
+                }
+                if !halted {
+                    break;
+                }
+                if let Some(graphics) = self.graphics.as_deref() {
+                    settle_halt(graphics.hub(), &mut lease, &mut terminal, || {
+                        let lease = fair.lease();
+                        (lease, fair.lock_unfair())
+                    });
+                }
+                // (A request nothing is parked for is taken back all the same.)
+                let guard = terminal.get_or_insert_with(|| fair.lock_unfair());
+                ClusterHandler::new(&mut **guard, self.cluster, &mut state.last_input)
+                    .graphics(self.graphics.as_deref())
+                    .commands(&mut state.commands)
+                    .resume();
+                if let Some(journal) = &self.journal {
+                    journal.applied(held_back);
+                }
+            }
+            debug_assert_eq!(
+                at, unprocessed,
+                "the parser left bytes it was not halted for"
             );
-            // The journal's applied count, under the terminal lock and by the
-            // slice `advance` got — not the bytes read: the reads before the
-            // lock accumulate into one `advance`.
-            if let Some(journal) = &self.journal {
-                journal.applied(unprocessed);
+
+            // The reads are all parsed: what was noted of them for a command
+            // that is still arriving was taken by it. Not while the parser
+            // holds bytes it has not played yet (a synchronized update): the
+            // commands in them are the reads' still.
+            if let Some(graphics) = self.graphics.as_deref()
+                && !state.commands.receiving()
+                && state.parser.sync_bytes_count() == 0
+            {
+                graphics.hub().forget_remote();
             }
 
             processed += unprocessed;
             unprocessed = 0;
 
-            // Do not hold the terminal locked longer than needed — but not
-            // with stream left that the buffer had no room for, which nothing
-            // would read after this turn ([`Intake::read`]).
-            if processed >= MAX_LOCKED_READ && !self.backlog() {
+            // Do not hold the terminal locked longer than needed.
+            if processed >= MAX_LOCKED_READ {
                 break;
             }
         }
@@ -757,21 +755,13 @@ where
                 // this arm.
                 if events.is_empty() && self.rx.peek().is_none() {
                     if sync_due(sync, self.journal.is_some(), Instant::now()) {
-                        let mut terminal = self.terminal.lock();
-                        state.parser.stop_sync(
-                            &mut ClusterHandler::new(
-                                &mut terminal,
-                                self.cluster,
-                                &mut state.last_input,
-                            )
-                            .graphics(self.graphics.as_deref()),
-                        );
-                        // In the same lock round: the replay applies the
-                        // buffer after exactly the bytes applied so far.
-                        if let Some(journal) = &self.journal {
-                            journal.record(Side::StopSync);
-                        }
-                        drop(terminal);
+                        self.stop_timed_out_sync(&mut state, || {
+                            // In the same lock round: the replay applies the
+                            // buffer after exactly the bytes applied so far.
+                            if let Some(journal) = &self.journal {
+                                journal.record(Side::StopSync);
+                            }
+                        });
                         self.event_proxy.send_event(Event::Wakeup);
                         // A compaction that found the update open gave up
                         // until a new side record — this one: ask again, or
@@ -798,7 +788,7 @@ where
                                     self.event_proxy.send_event(Event::ChildExit(status));
                                 }
                                 if self.drain_on_exit {
-                                    self.drain_remaining(&mut state, &mut buf);
+                                    let _ = self.pty_read(&mut state, &mut buf, false);
                                 }
                                 self.terminal.lock().exit();
                                 self.event_proxy.send_event(Event::Wakeup);
@@ -813,7 +803,7 @@ where
                             }
 
                             let read = if event.readable {
-                                let read = self.read_rounds(&mut state, &mut buf, false);
+                                let read = self.pty_read(&mut state, &mut buf, false);
                                 // Outside the lease: the compaction may start a thread.
                                 if let Some(journal) = &self.journal {
                                     Journal::poke(journal);
@@ -874,6 +864,28 @@ where
     }
 }
 
+/// What a halted parser waits for: the terminal and its lease let go, the
+/// parked transmission decoded (and its file read) with neither held, both
+/// taken back. The caller then lets the wrapper apply the record
+/// ([`ClusterHandler::resume`]).
+///
+/// The guards are the caller's and `relock` makes new ones, in the order the
+/// lock order asks (the lease, then the terminal — by waiting: the stream is
+/// in the middle, and nothing else is to be read before it goes on).
+fn settle_halt<L, G>(
+    hub: &Hub,
+    lease: &mut Option<L>,
+    terminal: &mut Option<G>,
+    relock: impl FnOnce() -> (L, G),
+) {
+    *terminal = None;
+    drop(lease.take());
+    hub.decode_pending();
+    let (new_lease, new_terminal) = relock();
+    *lease = Some(new_lease);
+    *terminal = Some(new_terminal);
+}
+
 /// The most events the poller returns in one round (alacritty's number).
 const EVENTS_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
     Some(capacity) => capacity,
@@ -882,6 +894,7 @@ const EVENTS_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
@@ -892,7 +905,7 @@ mod tests {
     use alacritty_terminal::term::test::TermSize;
 
     use super::*;
-    use crate::graphics::{Env, Hub, Intake, Motion};
+    use crate::graphics::Hub;
 
     /// The graphics side of a session, without a session.
     struct TestSink {
@@ -919,12 +932,8 @@ mod tests {
     /// What the scripted PTY gives, a step at a time.
     enum Step {
         Text(&'static str),
-        /// A graphics command taken out already: its record is queued,
-        /// undecoded, and the marker is what the PTY gives.
-        Image,
         /// Bytes as the PTY would give them, graphics commands in them
-        /// included: they go through the read side's own separation
-        /// ([`Intake`]), which is what `TappedPty` runs.
+        /// included: nothing takes them out on the way.
         Wire(Vec<u8>),
     }
 
@@ -934,22 +943,18 @@ mod tests {
         pending: Vec<u8>,
         /// The most bytes a read of it gives (a pipe gives what it has).
         chunk: usize,
-        sink: Arc<TestSink>,
         void: io::Sink,
-        intake: Intake,
         /// How much of the buffer each read of the script was offered.
         offered: Vec<usize>,
     }
 
     impl ScriptedPty {
-        fn new(steps: impl IntoIterator<Item = Step>, sink: &Arc<TestSink>) -> Self {
+        fn new(steps: impl IntoIterator<Item = Step>) -> Self {
             Self {
                 steps: steps.into_iter().collect(),
                 pending: Vec::new(),
                 chunk: usize::MAX,
-                sink: Arc::clone(sink),
                 void: io::sink(),
-                intake: Intake::new(),
                 offered: Vec::new(),
             }
         }
@@ -961,51 +966,21 @@ mod tests {
     }
 
     impl Read for ScriptedPty {
-        /// What `TappedPty::read_stream` does over a script, by the same
-        /// [`Intake::read`]: the stream the bytes of the next step come to
-        /// back in the buffer, `WouldBlock` for a read that only feeds a
-        /// command still arriving.
+        /// A pipe: what the next step has, as much of it as the buffer and the
+        /// chunk take, and `WouldBlock` when the script is through.
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let (steps, pending, chunk, sink, offered) = (
-                &mut self.steps,
-                &mut self.pending,
-                self.chunk,
-                &self.sink,
-                &mut self.offered,
-            );
-            self.intake.read(
-                buf,
-                Instant::now(),
-                |room| {
-                    offered.push(room.len());
-                    if pending.is_empty() {
-                        *pending = match steps.pop_front() {
-                            Some(Step::Text(text)) => text.as_bytes().to_vec(),
-                            Some(Step::Wire(bytes)) => bytes,
-                            // A command taken out already: its record is
-                            // queued, the marker is what the PTY gives.
-                            Some(Step::Image) => {
-                                sink.hub.queue_raw(1, "a=t,f=32,s=1,v=1,i=1", b"AAAAAA==");
-                                let mut marker = Vec::new();
-                                Motion::NONE.mark(4, 1, &mut marker);
-                                marker
-                            }
-                            None => return Err(ErrorKind::WouldBlock.into()),
-                        };
-                    }
-                    let take = pending.len().min(room.len()).min(chunk);
-                    room[..take].copy_from_slice(&pending[..take]);
-                    pending.drain(..take);
-                    Ok(take)
-                },
-                &sink.hub,
-                || Env {
-                    cell: (10, 20),
-                    columns: 20,
-                    lines: 4,
-                },
-                &mut |_| {},
-            )
+            self.offered.push(buf.len());
+            if self.pending.is_empty() {
+                self.pending = match self.steps.pop_front() {
+                    Some(Step::Text(text)) => text.as_bytes().to_vec(),
+                    Some(Step::Wire(bytes)) => bytes,
+                    None => return Err(ErrorKind::WouldBlock.into()),
+                };
+            }
+            let take = self.pending.len().min(buf.len()).min(self.chunk);
+            buf[..take].copy_from_slice(&self.pending[..take]);
+            self.pending.drain(..take);
+            Ok(take)
         }
     }
 
@@ -1054,31 +1029,57 @@ mod tests {
     /// under that lock, nor under the lease a frame also waits for.
     #[test]
     fn an_image_is_decoded_with_neither_the_terminal_lease_nor_its_lock_held() {
-        let sink = Arc::new(TestSink {
-            hub: Hub::new(),
-            pixel_mouse: AtomicBool::new(false),
-        });
-        let terminal = Arc::new(FairMutex::new(Term::new(
-            Config::default(),
-            &TermSize::new(20, 4),
-            VoidListener,
-        )));
-        let pty = ScriptedPty::new(
-            [Step::Text("hello"), Step::Image, Step::Text("world")],
-            &sink,
-        );
-        let mut event_loop =
-            EventLoop::new(Arc::clone(&terminal), VoidListener, pty, false, false).expect("loop");
-        event_loop.graphics(Arc::clone(&sink) as Arc<dyn Sink>);
+        use crate::graphics::tests::wire;
+        let sink = quiet_sink();
+        let image = wire("a=t,f=32,s=1,v=1,i=1", &[0; 4]);
+        let steps = [
+            Step::Text("hello"),
+            Step::Wire(image.clone()),
+            Step::Text("world"),
+        ];
+        let (mut event_loop, terminal) = scripted_loop(ScriptedPty::new(steps), &sink, false);
+        let frame = frame_thread(&terminal, &sink);
 
-        // What a frame does: `lock()`, from another thread, while the image
-        // is being decoded.
+        let mut state = State::default();
+        let mut buf = vec![0; 4096];
+        let processed = event_loop
+            .pty_read(&mut state, &mut buf, true)
+            .expect("read");
+        frame.finish("an image was decoded");
+
+        assert_eq!(processed, 5 + image.len() + 5, "every byte is the parser's");
+        // The order is kept: the text on both sides of the command reached the
+        // grid, and the image it carried is stored.
+        let row = grid_row(&terminal.lock(), 0);
+        assert!(row.starts_with("helloworld"), "{row:?}");
+        assert!(!sink.hub.is_parked());
+        assert_eq!(sink.hub.with_images(|images| images.main().ids()), [1]);
+    }
+
+    /// A frame that wants the terminal while the loop decodes: it asks for the
+    /// lock the moment the decode begins and must get it before the decode ends.
+    struct Frame {
+        free: Arc<AtomicBool>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Frame {
+        fn finish(self, what: &str) {
+            self.thread.join().expect("the frame thread");
+            assert!(
+                self.free.load(Ordering::Acquire),
+                "a frame could not take the terminal while {what}"
+            );
+        }
+    }
+
+    fn frame_thread(terminal: &Arc<FairMutex<Term<VoidListener>>>, sink: &Arc<TestSink>) -> Frame {
         let (go, go_rx) = mpsc::channel::<()>();
         let (got, got_rx) = mpsc::channel::<()>();
-        let frame = {
-            let terminal = Arc::clone(&terminal);
+        let thread = {
+            let terminal = Arc::clone(terminal);
             std::thread::spawn(move || {
-                if go_rx.recv().is_ok() {
+                if go_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
                     drop(terminal.lock());
                     let _ = got.send(());
                 }
@@ -1087,6 +1088,7 @@ mod tests {
         let free = Arc::new(AtomicBool::new(false));
         {
             let free = Arc::clone(&free);
+            // Called just before an image is decoded or a file is opened.
             sink.hub.on_decode(Box::new(move || {
                 let _ = go.send(());
                 free.store(
@@ -1095,31 +1097,7 @@ mod tests {
                 );
             }));
         }
-
-        let mut state = State::default();
-        let mut buf = vec![0; 4096];
-        let processed = event_loop
-            .pty_read(&mut state, &mut buf, true)
-            .expect("read");
-        frame.join().expect("the frame thread");
-
-        assert!(
-            free.load(Ordering::Acquire),
-            "a frame could not take the terminal while an image was decoded"
-        );
-        let mut marker = Vec::new();
-        Motion::NONE.mark(4, 1, &mut marker);
-        assert_eq!(processed, 5 + marker.len() + 5);
-        // The order is kept: the text on both sides of the marker reached the
-        // grid, and the image its marker named is stored.
-        let terminal = terminal.lock();
-        let row: String = (0..terminal.columns())
-            .map(|column| terminal.grid()[Line(0)][Column(column)].c)
-            .collect();
-        assert!(row.starts_with("helloworld"), "{row:?}");
-        drop(terminal);
-        assert!(!sink.hub.has_undecoded());
-        assert_eq!(sink.hub.with_images(|images| images.main().ids()), [1]);
+        Frame { free, thread }
     }
 
     /// A file in the temporary directory for a command to name, removed when
@@ -1238,67 +1216,172 @@ mod tests {
     fn a_file_is_read_with_neither_the_lease_nor_the_lock_held() {
         let png = one_cell_png("bt-reader-png");
         let sink = quiet_sink();
-        let pty = ScriptedPty::new(
-            [
-                Step::Text("hello"),
-                Step::Wire(icat_command(&png)),
-                Step::Text("world"),
-            ],
-            &sink,
-        );
+        let pty = ScriptedPty::new([
+            Step::Text("hello"),
+            Step::Wire(icat_command(&png)),
+            Step::Text("world"),
+        ]);
         let (mut event_loop, terminal) = scripted_loop(pty, &sink, false);
-
-        let (go, go_rx) = mpsc::channel::<()>();
-        let (got, got_rx) = mpsc::channel::<()>();
-        let frame = {
-            let terminal = Arc::clone(&terminal);
-            std::thread::spawn(move || {
-                if go_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
-                    drop(terminal.lock());
-                    let _ = got.send(());
-                }
-            })
-        };
-        let free = Arc::new(AtomicBool::new(false));
-        {
-            let free = Arc::clone(&free);
-            // Called just before the file is opened.
-            sink.hub.on_decode(Box::new(move || {
-                let _ = go.send(());
-                free.store(
-                    got_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
-                    Ordering::Release,
-                );
-            }));
-        }
+        let frame = frame_thread(&terminal, &sink);
 
         let mut state = State::default();
         let mut buf = vec![0; 4096];
         event_loop
-            .read_rounds(&mut state, &mut buf, true)
+            .pty_read(&mut state, &mut buf, true)
             .expect("read");
-        frame.join().expect("the frame thread");
+        frame.finish("a file was read");
 
-        assert!(
-            free.load(Ordering::Acquire),
-            "a frame could not take the terminal while a file was read"
-        );
         // The image is one cell: the cursor goes one column right of the
         // text before it, and the text after it follows.
-        let terminal = terminal.lock();
-        let row = grid_row(&terminal, 0);
+        let row = grid_row(&terminal.lock(), 0);
         assert!(row.starts_with("hello world"), "{row:?}");
-        drop(terminal);
-        assert!(!sink.hub.has_undecoded());
+        assert!(!sink.hub.is_parked());
         assert_eq!(sink.hub.with_images(|images| images.main().ids()), [1]);
     }
 
-    /// 300 of the shortest commands that move the cursor, in a buffer a tenth
-    /// of what they become: the PTY is read by what the room left can hold,
-    /// so one turn takes them all in, in order, and nothing of what it read
-    /// is left anywhere — not in the separation, not in the PTY's script.
+    /// A DEC 2026 update that timed out is applied with the same care: the
+    /// decoding of an image in it is not done under the terminal's lock.
     #[test]
-    fn a_flood_of_short_commands_is_read_to_its_end_and_nothing_is_left() {
+    fn an_image_in_an_update_that_timed_out_is_decoded_with_the_terminal_free() {
+        use crate::graphics::tests::wire;
+        let sink = quiet_sink();
+        let steps = [
+            Step::Wire(b"\x1b[?2026h".to_vec()),
+            Step::Wire(wire("a=T,f=32,s=10,v=20,i=1", &[0; 10 * 20 * 4])),
+            Step::Text("after"),
+        ];
+        let (mut event_loop, terminal) = scripted_loop(ScriptedPty::new(steps), &sink, false);
+        let mut state = State::default();
+        let mut buf = vec![0; 4096];
+        event_loop
+            .pty_read(&mut state, &mut buf, true)
+            .expect("read");
+        // All of it waits in the parser's buffer.
+        assert!(all_text(&terminal.lock()).trim().is_empty());
+        assert!(
+            sink.hub
+                .with_images(|images| images.main().ids())
+                .is_empty()
+        );
+
+        let frame = frame_thread(&terminal, &sink);
+        let mut journaled = false;
+        event_loop.stop_timed_out_sync(&mut state, || journaled = true);
+        frame.finish("the image of a timed out update was decoded");
+
+        assert!(journaled, "the stop is journaled in the round it begins in");
+        assert_eq!(sink.hub.with_images(|images| images.main().ids()), [1]);
+        // One cell across, no row down: the image is a cell big, then the text.
+        let row = grid_row(&terminal.lock(), 0);
+        assert!(row.starts_with(" after"), "{row:?}");
+    }
+
+    /// The handover applies an update that is still open without the images,
+    /// and moves the cursor as the commands in it would have: by the cell size
+    /// the session has, not one the parser never heard of.
+    #[test]
+    fn an_update_open_at_the_freeze_moves_the_cursor_by_the_sessions_cell() {
+        use crate::graphics::tests::wire;
+        let sink = quiet_sink();
+        let steps = [Step::Wire(
+            [
+                b"\x1b[?2026h\x1b[3;6H".to_vec(),
+                // 20 × 40 pixels are two columns by two rows of the sink's cell.
+                wire("a=T,f=32,s=20,v=40,i=1", &[0; 20 * 40 * 4]),
+            ]
+            .concat(),
+        )];
+        let (mut event_loop, terminal) = scripted_loop(ScriptedPty::new(steps), &sink, false);
+        let mut state = State::default();
+        let mut buf = vec![0; 1 << 16];
+        event_loop
+            .pty_read(&mut state, &mut buf, true)
+            .expect("read");
+        event_loop.stop_sync(&mut state);
+        let point = terminal.lock().grid().cursor.point;
+        assert_eq!((point.line.0, point.column.0), (3, 7));
+        assert!(
+            sink.hub
+                .with_images(|images| images.main().ids())
+                .is_empty()
+        );
+    }
+
+    /// A name in an update that is still being written is the reads' still:
+    /// the parser has caught up with them, but not with the commands it holds
+    /// back, and what the reads noted of the pane waits for those.
+    #[test]
+    fn what_the_reads_noted_waits_for_the_commands_an_update_holds_back() {
+        use std::os::unix::ffi::OsStrExt;
+
+        use crate::graphics::tests::wire;
+        let sink = quiet_sink();
+        let file = TempFile::new("tty-graphics-protocol-reader-held", &[0; 4]);
+        let steps = [Step::Wire(b"\x1b[?2026h".to_vec())];
+        let (mut event_loop, _terminal) = scripted_loop(ScriptedPty::new(steps), &sink, false);
+        let mut state = State::default();
+        let mut buf = vec![0; 4096];
+        event_loop
+            .pty_read(&mut state, &mut buf, true)
+            .expect("read");
+        // The next read has a name in it, and noted the pane as remote (a
+        // session that ended in that read is not remote when it is played).
+        let command = wire("a=t,t=t,f=32,s=1,v=1,i=1", file.0.as_os_str().as_bytes());
+        event_loop.pty_mut().steps.push_back(Step::Wire(command));
+        sink.hub.note_remote();
+        event_loop
+            .pty_read(&mut state, &mut buf, true)
+            .expect("read");
+        assert!(
+            sink.hub.remote_seen(),
+            "the update's commands are not played"
+        );
+        event_loop.stop_timed_out_sync(&mut state, || ());
+        assert!(!sink.hub.remote_seen(), "played: nothing is held back");
+        assert!(file.0.exists(), "the name was refused, not read");
+        assert!(
+            sink.hub
+                .with_images(|images| images.main().ids())
+                .is_empty()
+        );
+    }
+
+    /// The journal counts the bytes the parser took before the terminal is let
+    /// go for a decode, but for the last byte of the command: a side record the
+    /// main thread writes in that gap is stamped by them, and its replay finds
+    /// it before the byte that makes the command's effect on the cursor, where
+    /// the live terminal made that effect after it.
+    #[test]
+    fn the_journal_counts_the_bytes_the_parser_took_before_the_terminal_is_let_go() {
+        use crate::graphics::tests::wire;
+        let sink = quiet_sink();
+        let journal = Journal::in_memory();
+        let image = wire("a=t,f=32,s=1,v=1,i=1", &[0; 4]);
+        let steps = [Step::Wire([&b"hello"[..], &image, b"world"].concat())];
+        let (mut event_loop, terminal) = scripted_loop(ScriptedPty::new(steps), &sink, false);
+        event_loop.journal(Arc::clone(&journal));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let (journal, seen) = (Arc::clone(&journal), Arc::clone(&seen));
+            sink.hub.on_decode(Box::new(move || {
+                seen.lock().expect("lock").push(journal.applied_bytes());
+            }));
+        }
+        let mut state = State::default();
+        let mut buf = vec![0; 4096];
+        let processed = event_loop
+            .pty_read(&mut state, &mut buf, true)
+            .expect("read");
+        assert_eq!(*seen.lock().expect("lock"), [5 + image.len() as u64 - 1]);
+        assert_eq!(journal.applied_bytes(), processed as u64);
+        assert!(grid_row(&terminal.lock(), 0).starts_with("helloworld"));
+    }
+
+    /// The shortest commands there are, a great many of them, in a buffer far
+    /// smaller than the stream: each is parsed where it ends, in order, and
+    /// nothing of what was read is left anywhere.
+    #[test]
+    fn a_flood_of_short_commands_is_parsed_to_its_end() {
         use crate::graphics::tests::wire;
         let sink = quiet_sink();
         // The size the placements below are made from, from a command that
@@ -1310,19 +1393,16 @@ mod tests {
             wire_bytes.extend_from_slice(&wire("a=p,i=1", &[]));
         }
         wire_bytes.extend_from_slice(b"END");
-        let pty = ScriptedPty::new([Step::Wire(wire_bytes)], &sink);
+        let total = wire_bytes.len();
+        let pty = ScriptedPty::new([Step::Wire(wire_bytes)]);
         let (mut event_loop, terminal) = scripted_loop(pty, &sink, false);
 
         let mut state = State::default();
-        // A buffer far smaller than what the commands come to: each read of
-        // the script fills it, and the rest of the stream is read before the
-        // script is. The PTY still has bytes when a turn ends, as it does at
-        // the limit of the lock; the poller brings the loop back for them.
         let mut buf = vec![0; 512];
         let mut processed = 0;
         for _ in 0..1000 {
             processed += event_loop
-                .read_rounds(&mut state, &mut buf, true)
+                .pty_read(&mut state, &mut buf, true)
                 .expect("read");
             let pty = event_loop.pty_mut();
             if pty.steps.is_empty() && pty.pending.is_empty() {
@@ -1334,118 +1414,16 @@ mod tests {
             all_text(&terminal.lock()).contains("END"),
             "the text after the commands did not arrive"
         );
-        // 300 markers with their movement are more than the 12 bytes each was.
-        assert!(processed > 300 * 12, "{processed} bytes parsed");
-        let pty = event_loop.pty_mut();
-        assert!(pty.pending.is_empty(), "the PTY has bytes left");
-        assert!(pty.intake.undelivered().is_empty());
-    }
-
-    /// What the buffer has no room for is read in the turn that read the
-    /// rest, also past the limit of the lock: no wake brings the loop back for
-    /// stream that is held in the read side and not in the PTY. (The PTY may
-    /// well have bytes when a turn ends; the poller brings the loop back.)
-    #[test]
-    fn a_turn_reads_the_stream_the_buffer_had_no_room_for_before_it_ends() {
-        let sink = quiet_sink();
-        // 3000 commands of eight bytes become 38 bytes each, more than the
-        // lock's limit, from a buffer of 4096.
-        let mut wire_bytes = b"\x1b_Ga=d\x1b\\".repeat(3000);
-        wire_bytes.extend_from_slice(b"END");
-        let pty = ScriptedPty::new([Step::Wire(wire_bytes)], &sink);
-        let (mut event_loop, terminal) = scripted_loop(pty, &sink, false);
-        let mut state = State::default();
-        let mut buf = vec![0; 4096];
-        let mut processed = 0;
-        for turn in 0..100 {
-            processed += event_loop
-                .pty_read(&mut state, &mut buf, false)
-                .expect("read");
-            assert!(
-                !sink.hub.backlog(),
-                "stream left in the read side, turn {turn}"
-            );
-            if event_loop.pty_mut().pending.is_empty() {
-                break;
-            }
-        }
-        assert_eq!(processed, 3000 * 38 + 3);
-        assert!(all_text(&terminal.lock()).contains("END"));
-    }
-
-    /// A writer that outlives the child, holding the other end of the PTY,
-    /// never lets the drain run dry: it stops at its budget.
-    #[test]
-    fn the_drain_after_a_childs_exit_stops_at_its_budget() {
-        let sink = quiet_sink();
-        let steps = (0..40).map(|_| Step::Wire(vec![b'x'; 1 << 20]));
-        let pty = ScriptedPty::new(steps, &sink);
-        let (mut event_loop, _terminal) = scripted_loop(pty, &sink, true);
-        let mut state = State::default();
-        let mut buf = vec![0; READ_BUFFER_SIZE];
-        event_loop.drain_remaining(&mut state, &mut buf);
-        let left = event_loop.pty_mut().steps.len();
-        assert!(left > 0, "all of it was read");
-        assert!(40 - left >= PARTIAL_TURN / (1 << 20), "{left} steps left");
-    }
-
-    /// A buffer that has a few bytes left, a terminal that is locked, and an
-    /// image coming in a piece: the bytes of its command are not parsed, so
-    /// the buffer would never fill and the loop would read them a few at a
-    /// time until the lock is free. It waits for the lock instead, and the
-    /// whole stream is parsed once it has it.
-    #[test]
-    fn a_nearly_full_buffer_waits_for_a_busy_lock_instead_of_reading_by_the_byte() {
-        use crate::graphics::tests::{rgba, wire};
-        let sink = quiet_sink();
-        let image = wire("a=t,f=32,s=32,v=32,i=1", &rgba(32, 32, 0));
-        let steps = [
-            Step::Wire(vec![b'p'; 61]),
-            Step::Wire(image),
-            Step::Wire(b"END".to_vec()),
-        ];
-        let (mut event_loop, terminal) =
-            scripted_loop(ScriptedPty::new(steps, &sink), &sink, false);
-        // The terminal is locked for a while, as a frame holds it.
-        let (locked, hold) = std::sync::mpsc::channel();
-        let holder = {
-            let terminal = Arc::clone(&terminal);
-            std::thread::spawn(move || {
-                let guard = terminal.lock();
-                locked.send(()).expect("the test is waiting");
-                std::thread::sleep(Duration::from_millis(150));
-                drop(guard);
-            })
-        };
-        hold.recv().expect("the lock was taken");
-        let mut state = State::default();
-        let mut buf = vec![0; 64];
-        for _ in 0..100 {
-            event_loop
-                .pty_read(&mut state, &mut buf, false)
-                .expect("read");
-            let pty = event_loop.pty_mut();
-            if pty.steps.is_empty() && pty.pending.is_empty() {
-                break;
-            }
-        }
-        holder.join().expect("the holder");
-        let reads = event_loop.pty_mut().offered.len();
-        assert!(reads < 200, "{reads} reads of the PTY");
-        let text = all_text(&terminal.lock());
-        assert!(
-            text.starts_with("ppppp") && text.contains("END"),
-            "{text:?}"
-        );
-        assert_eq!(sink.hub.with_images(|images| images.main().ids()), [1]);
+        assert_eq!(processed, total, "every byte the PTY gave is the parser's");
+        assert!(event_loop.pty_mut().pending.is_empty());
     }
 
     /// The promise made for a terminal that has seen no image command: the
     /// read path is what it was before graphics — the parser gets the bytes
     /// the PTY gave, each read is offered the whole buffer, and there is one
     /// read of the PTY for each piece it gave. Every read in this corpus ends
-    /// where the next sequence may begin, and the programs' own markers and
-    /// long mode lists are in it.
+    /// where the next sequence may begin, and sequences that look like
+    /// graphics, and are not, are in it.
     #[test]
     fn a_stream_with_no_command_is_the_parsers_input_byte_for_byte() {
         let long_list = format!(
@@ -1478,37 +1456,45 @@ mod tests {
         ];
         let sink = quiet_sink();
         let steps = pieces.iter().map(|piece| Step::Wire(piece.to_vec()));
-        let mut pty = ScriptedPty::new(steps, &sink);
+        let (mut event_loop, terminal) = scripted_loop(ScriptedPty::new(steps), &sink, false);
+        let mut state = State::default();
         let mut buf = vec![0u8; 4096];
-        let mut parsed = Vec::new();
-        for _ in &pieces {
-            match pty.read(&mut buf) {
-                Ok(read) => parsed.extend_from_slice(&buf[..read]),
-                // A piece that is only the beginning of what the next says.
-                Err(error) => assert_eq!(error.kind(), ErrorKind::WouldBlock),
-            }
-        }
-        assert_eq!(parsed, pieces.concat());
-        assert_eq!(pty.offered, vec![buf.len(); pieces.len()]);
+        let processed = event_loop
+            .pty_read(&mut state, &mut buf, true)
+            .expect("read");
+        assert_eq!(processed, pieces.concat().len());
+        // One read for each piece, and one that found nothing more; each was
+        // offered the whole buffer.
+        let pty = event_loop.pty_mut();
+        assert_eq!(pty.offered, vec![buf.len(); pieces.len() + 1]);
         assert!(pty.steps.is_empty() && pty.pending.is_empty());
+        // And what the parser made of them is what a parser makes of the same
+        // bytes given whole.
+        let mut reference = Term::new(Config::default(), &TermSize::new(20, 4), VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        let mut last_input = false;
+        parser.advance(
+            &mut ClusterHandler::new(&mut reference, false, &mut last_input),
+            &pieces.concat(),
+        );
+        assert_eq!(all_text(&terminal.lock()), all_text(&reference));
     }
 
     /// An image in parts — 4 KB commands, as the protocol asks — delivers
-    /// nothing until its last part, and a read of one part is a read that took
-    /// bytes in, not a PTY with nothing to say. Live, the loop's turn goes on
-    /// to the text behind it.
+    /// nothing until its last part. Live, the loop's turn goes on to the text
+    /// behind it.
     #[test]
     fn a_big_image_in_parts_and_the_text_after_it_are_read_in_one_turn() {
         let sink = quiet_sink();
         let mut wire_bytes = chunked_image(100, 1);
         wire_bytes.extend_from_slice(b"END");
-        let pty = ScriptedPty::new([Step::Wire(wire_bytes)], &sink);
+        let pty = ScriptedPty::new([Step::Wire(wire_bytes)]);
         let (mut event_loop, terminal) = scripted_loop(pty, &sink, false);
 
         let mut state = State::default();
         let mut buf = vec![0; 4096];
         event_loop
-            .read_rounds(&mut state, &mut buf, false)
+            .pty_read(&mut state, &mut buf, false)
             .expect("read");
 
         assert!(all_text(&terminal.lock()).contains("END"));
@@ -1516,16 +1502,15 @@ mod tests {
     }
 
     /// The same image in a handover's prefix: the rounds that read it stop
-    /// when the prefix is through, not at the first round that parsed nothing.
+    /// when the prefix is through.
     #[test]
     fn a_big_image_in_parts_in_a_carried_prefix_is_read_to_its_end() {
         let sink = quiet_sink();
         let mut prefix = chunked_image(100, 1);
         prefix.extend_from_slice(b"END");
         let carried = prefix.len();
-        // A pipe that gives 4 KB a read: the first round takes part of the
-        // image and delivers nothing.
-        let pty = ScriptedPty::new([Step::Wire(prefix)], &sink).chunked(4096);
+        // A pipe that gives 4 KB a read.
+        let pty = ScriptedPty::new([Step::Wire(prefix)]).chunked(4096);
         let (mut event_loop, terminal) = scripted_loop(pty, &sink, false);
         let sender = event_loop.channel();
         event_loop.read_first(carried);
@@ -1543,29 +1528,30 @@ mod tests {
         assert!(seen, "the end of the prefix was left unread");
     }
 
-    /// And the output a child wrote last before it exited: drained to its end,
-    /// whatever the parts it came in.
+    /// And the output a child wrote last before it exited: drained, whatever
+    /// the parts it came in.
     #[test]
     fn a_big_image_in_parts_a_child_wrote_last_is_drained_to_its_end() {
         let sink = quiet_sink();
         let mut wire_bytes = chunked_image(100, 1);
         wire_bytes.extend_from_slice(b"END");
-        let pty = ScriptedPty::new([Step::Wire(wire_bytes)], &sink).chunked(4096);
+        let pty = ScriptedPty::new([Step::Wire(wire_bytes)]).chunked(4096);
         let (mut event_loop, terminal) = scripted_loop(pty, &sink, true);
 
         let mut state = State::default();
         let mut buf = vec![0; READ_BUFFER_SIZE];
-        event_loop.drain_remaining(&mut state, &mut buf);
+        event_loop
+            .pty_read(&mut state, &mut buf, false)
+            .expect("read");
 
         assert!(all_text(&terminal.lock()).contains("END"));
     }
 
-    /// A carried prefix is measured in bytes of the PTY, which are not the
-    /// bytes the parser gets: commands in it grow. The loop's first rounds
-    /// stop when the prefix is through — counted in what was read — and a
-    /// quiet PTY gives nothing to wake the poller for the rest.
+    /// A carried prefix is counted in the bytes the parser gets, which are the
+    /// bytes it was carried in: the loop's first rounds stop when the prefix is
+    /// through, and a quiet PTY gives nothing to wake the poller for the rest.
     #[test]
-    fn a_carried_prefix_is_counted_in_the_bytes_of_the_pty() {
+    fn a_long_carried_prefix_of_commands_is_read_to_its_end() {
         use crate::graphics::tests::wire;
         let sink = quiet_sink();
         let image = TempFile::new("bt-reader-prefix", &vec![3; 30 * 40 * 4]);
@@ -1577,9 +1563,8 @@ mod tests {
         prefix.extend_from_slice(b"END");
         let carried = prefix.len();
         // A pipe that gives a thousand bytes a read: the rounds stop at the
-        // lock's time limit long before the prefix is through, and the stream
-        // is by then well past the prefix's length.
-        let pty = ScriptedPty::new([Step::Wire(prefix)], &sink).chunked(1000);
+        // lock's limit long before the prefix is through.
+        let pty = ScriptedPty::new([Step::Wire(prefix)]).chunked(1000);
         let (mut event_loop, terminal) = scripted_loop(pty, &sink, false);
         let sender = event_loop.channel();
         event_loop.read_first(carried);
