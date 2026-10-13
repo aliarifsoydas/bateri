@@ -1209,7 +1209,7 @@ fn c_int_from(raw: libc::c_long) -> Option<libc::c_int> {
     libc::c_int::try_from(raw).ok().filter(|&fd| fd >= 0)
 }
 
-/// [`bt_core::PtyOps`]'s body: the two syscalls of an adopted PTY.
+/// [`bt_core::PtyOps`]'s body: the syscalls of an adopted PTY.
 pub struct SystemPty;
 
 impl bt_core::PtyOps for SystemPty {
@@ -1251,6 +1251,22 @@ impl bt_core::PtyOps for SystemPty {
         // SAFETY: a signal to a pid whose exit fd says it is still the
         // process we adopted.
         unsafe { libc::kill(pid, libc::SIGHUP) };
+    }
+
+    fn winch(&self, master: std::os::fd::BorrowedFd<'_>) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `master` is open for the call; the result is checked.
+        let group = unsafe { libc::tcgetpgrp(master.as_raw_fd()) };
+        // `-1`: no foreground group (the session has none yet, or the
+        // terminal is gone). Group 0 and 1 are never a program's: `0` would
+        // be our own group and `1` the system's.
+        if group <= 1 {
+            return;
+        }
+        // SAFETY: a signal to the group the kernel names as the PTY's
+        // foreground right now; a group that ended in between is `ESRCH`,
+        // which is the same as nothing to redraw.
+        unsafe { libc::killpg(group, libc::SIGWINCH) };
     }
 }
 
@@ -2465,6 +2481,54 @@ pub(crate) mod tests {
         );
         drop(old);
         let _ = new.shutdown();
+    }
+
+    /// A program that asked for pixel pointer reports (DECSET 1016) is
+    /// still asked after the update: the mode crosses in the handover's VT
+    /// and lands in the adopting session's flag, and one that turned it off
+    /// stays off.
+    #[test]
+    fn the_pixel_mouse_mode_crosses_the_handover() {
+        let (_old, new, ..) = hand_over(
+            "printf '\\033[?1016h\\033[?1000h'; echo ready; while :; do sleep 1; done",
+            "ready",
+            b"",
+        );
+        assert!(new.pixel_mouse(), "the mode did not come across");
+        let (_old, new, ..) = hand_over(
+            "printf '\\033[?1016h\\033[?1016l'; echo ready; while :; do sleep 1; done",
+            "ready",
+            b"",
+        );
+        assert!(!new.pixel_mouse(), "a mode turned off came back on");
+        // The held bytes behind the tail go through the reader, which keeps
+        // the flag from there.
+        let (_old, new, ..) = hand_over(
+            "echo ready; while :; do sleep 1; done",
+            "ready",
+            b"\x1b[?1016h",
+        );
+        wait_until("the held bytes did not turn the mode on", || {
+            new.pixel_mouse()
+        });
+    }
+
+    /// The adopting side asks the foreground program to redraw without
+    /// touching the size: `SIGWINCH` to the PTY's foreground group reaches
+    /// the shell script, and nothing sent it before.
+    #[test]
+    fn winch_reaches_the_foreground_program_of_an_adopted_pane() {
+        let script = "trap 'echo WINCHED' WINCH; echo ready; while :; do sleep 0.05; done";
+        let (_old, new, ..) = hand_over(script, "ready", b"");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !all_text(&new).contains("WINCHED"),
+            "the adoption alone signalled the program"
+        );
+        new.winch();
+        wait_until("the program did not get the signal", || {
+            all_text(&new).contains("WINCHED")
+        });
     }
 
     /// Dropping an adopted session hangs its child up and waits for nothing.

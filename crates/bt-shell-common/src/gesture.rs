@@ -16,6 +16,15 @@
 
 use bt_core::{Click, MouseButton, SelectKind, SelectionPoint};
 
+/// What the motion throttle compares: where the last report went, in the unit it was made in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Notch {
+    /// The visible window's column and row.
+    Cell(u16, u16),
+    /// The pixel in the grid.
+    Pixel(u16, u16),
+}
+
 /// The gesture's state. `Copy`: the view keeps it in a `Cell` and does take-modify-put on every
 /// event — so that `RefCell`'s borrow panic is not put at risk in the middle of a `Session` call.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -42,14 +51,19 @@ pub struct Gesture {
     /// selection is in progress produces both **at the same time**. A bitmask, because three
     /// buttons can be held down at once.
     sent: u8,
-    /// The cell the last motion report went to — the throttle's notch.
+    /// The place the last motion report went to — the throttle's notch.
     ///
-    /// A report must go at most once **per cell**; the comparison runs **before** the `bt-core`
-    /// call, so motion that stays in the same cell never touches the `Term` lock. The measure is
-    /// the **visible window** cell, `half` does not enter — the report is at cell resolution.
+    /// A report must go at most once **per cell** (once per **pixel** while the application has
+    /// DECSET 1016 on: its reports are in pixels, and a cell is too coarse a notch for them); the
+    /// comparison runs **before** the `bt-core` call, so motion that stays in the same place never
+    /// touches the `Term` lock. The cell is the **visible window** cell, `half` does not enter.
     /// Press and release refresh the notch only **when they are reported** ([`Gesture::stamp`]):
     /// the criterion is "this was reported to the application".
-    notch: Option<(u16, u16)>,
+    ///
+    /// The two units are different keys on purpose: when the application flips the mode in the
+    /// middle of a gesture the next motion is "changed" and one report too many goes, which beats
+    /// a pixel read as a cell dropping one.
+    notch: Option<Notch>,
     /// Whether the left button's press was a ⌘-click on a **verified** link
     /// ([`Gesture::pressed_link`]).
     ///
@@ -342,7 +356,16 @@ impl Gesture {
     /// Moves the notch to the fresh cell and tells whether the cell **changed** — `true` on first
     /// sight, `false` on repeat. The half is not read.
     pub fn moved_to(&mut self, cell: SelectionPoint) -> bool {
-        let now = (cell.col, cell.row);
+        self.notch_to(Notch::Cell(cell.col, cell.row))
+    }
+
+    /// [`Gesture::moved_to`] at pixel resolution — the pointer's pixel in the grid, while the
+    /// application's reports are in pixels (DECSET 1016).
+    pub fn moved_to_pixel(&mut self, px: (u16, u16)) -> bool {
+        self.notch_to(Notch::Pixel(px.0, px.1))
+    }
+
+    fn notch_to(&mut self, now: Notch) -> bool {
         self.notch.replace(now) != Some(now)
     }
 
@@ -350,6 +373,11 @@ impl Gesture {
     /// in the same cell does not produce a second report.
     pub fn stamp(&mut self, cell: SelectionPoint) {
         self.moved_to(cell);
+    }
+
+    /// [`Gesture::stamp`] for a report in pixels.
+    pub fn stamp_pixel(&mut self, px: (u16, u16)) {
+        self.moved_to_pixel(px);
     }
 }
 
@@ -732,5 +760,35 @@ mod tests {
         // A reported press's stamp swallows the first motion in the same cell.
         gesture.stamp(cell(9, 9, CellHalf::Left));
         assert!(!gesture.moved_to(cell(9, 9, CellHalf::Right)));
+    }
+
+    #[test]
+    fn pixel_motion_is_throttled_to_one_report_per_pixel() {
+        // With DECSET 1016 on the cell is too coarse a key: a move inside the same cell is a
+        // different pixel and the application wants it.
+        let mut gesture = Gesture::default();
+        assert!(gesture.moved_to_pixel((40, 45)));
+        assert!(!gesture.moved_to_pixel((40, 45)));
+        assert!(gesture.moved_to_pixel((41, 45)));
+        assert!(gesture.moved_to_pixel((41, 46)));
+        // A reported press's stamp swallows the first motion in the same pixel, not the next.
+        gesture.stamp_pixel((7, 7));
+        assert!(!gesture.moved_to_pixel((7, 7)));
+        assert!(gesture.moved_to_pixel((8, 7)));
+    }
+
+    #[test]
+    fn a_cell_and_a_pixel_are_never_the_same_notch() {
+        // The mode flipping mid-gesture: `(3, 7)` the cell and `(3, 7)` the pixel are not the
+        // same place, so the first motion in the new unit goes out.
+        let mut gesture = Gesture::default();
+        let cell = SelectionPoint {
+            col: 3,
+            row: 7,
+            half: CellHalf::Left,
+        };
+        assert!(gesture.moved_to(cell));
+        assert!(gesture.moved_to_pixel((3, 7)));
+        assert!(gesture.moved_to(cell));
     }
 }

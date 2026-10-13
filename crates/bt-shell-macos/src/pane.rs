@@ -3302,6 +3302,7 @@ impl TerminalPane {
         // carried history and the note.
         let adopting = adopt.is_some();
         let mut nudge = false;
+        let mut carried_on = false;
         let mut carried = None;
         let (session, shell_parent) = match adopt {
             Some(adopted) => {
@@ -3313,6 +3314,7 @@ impl TerminalPane {
                     Ok((session, parent)) => {
                         self.ivars().taken_from.replace(taken_from);
                         carried = program;
+                        carried_on = true;
                         (session, parent)
                     }
                     Err((error, history)) => {
@@ -3334,6 +3336,12 @@ impl TerminalPane {
         let session = Arc::new(session);
         if nudge {
             nudge_program(&session);
+        } else if carried_on {
+            // The text came across and the images did not (they are not
+            // carried): a program that redraws on `SIGWINCH` draws them
+            // again. The size is untouched; a nudged program is already
+            // redrawing, through its size.
+            session.winch();
         }
         // The closing sequence reaches the session from here, not through the
         // link, and the keyboard holds its own copy; all three live on the main

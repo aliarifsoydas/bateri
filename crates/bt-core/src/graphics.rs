@@ -632,6 +632,12 @@ pub(crate) trait Sink: Send + Sync {
     /// Writes an answer to the program, the way the terminal's other
     /// answers go.
     fn reply(&self, bytes: Vec<u8>);
+
+    /// The session's DECSET 1016 flag ([`crate::input::PIXEL_MOUSE_MODE`]),
+    /// which the wrapper sets and clears as the stream says. It lives with
+    /// the session rather than in `Term` because alacritty does not know the
+    /// mode; the pointer reports read it.
+    fn pixel_mouse(&self) -> &AtomicBool;
 }
 
 #[cfg(test)]

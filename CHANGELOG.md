@@ -19,8 +19,11 @@ of every installed copy. A version without a section is not released.
   `timg -p kitty`, yazi's previews and terminal-browser. An image sits in the
   cells where the program put it, scrolls with the text around it (and back
   into view when you scroll up), stays under or over the text as the program
-  asked, and goes when the program deletes it or you clear the screen. Images
-  do not survive an update or a crash of bateri; the text does.
+  asked, and goes when the program deletes it or you clear the screen. A
+  program that asks for it also gets the pointer's exact position, not just
+  the cell, so a click on a small button in a page lands on it. Images do not
+  survive an update or a crash of bateri; the text does, and a program that
+  redraws when its window is signalled draws its images again.
 - **bash gets the command blocks and the dock.** When your login shell is
   bash 4.4 or newer, the stripe beside each command, the duration of a long
   one and the directory you are in show, the `ssh` integration reaches

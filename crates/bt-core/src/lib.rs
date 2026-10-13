@@ -4,7 +4,7 @@
 //! `alacritty_terminal` is **encapsulated**: no alacritty type appears in the
 //! `pub` API, the outside sees only `Session`, `Cell`, `UnderlineStyle`, `Cursor`, `Block`,
 //! `Blocks`,
-//! `SelectionPoint`, `SelectKind`, `CellHalf`, `Arrow`, `Wheel`, `ScrollIntent`,
+//! `SelectionPoint`, `Pointer`, `SelectKind`, `CellHalf`, `Arrow`, `Wheel`, `ScrollIntent`,
 //! search's `SearchQuery`, `SearchStatus`, `SearchRun`, `SearchRuns`,
 //! the scroll bar's `ScrollPosition`, `TrackMark`, `TrackBlock`, `TrackMarks`,
 //! the block marks' `BlockHandle`, `BlockInfo` and `BlockReport`,
@@ -95,7 +95,7 @@ pub use search::{
 pub use session::{
     Activity, AdoptMode, Adoption, Block, BlockHandle, BlockInfo, BlockReport, Blocks, Cell,
     CellHalf, Click, Cursor, DirtyFlag, DockKey, Frozen, InitialInput, LinkHit, LinkHover,
-    LinkKind, LinkPoint, LinkSpan, LinkStamp, Osc52, PathCandidate, PtyOps, PtySize,
+    LinkKind, LinkPoint, LinkSpan, LinkStamp, Osc52, PathCandidate, Pointer, PtyOps, PtySize,
     SHUTDOWN_GRACE, ScrollGlide, ScrollIntent, ScrollPosition, SelectKind, SelectionPoint,
     SelectionRun, SelectionRuns, Session, SessionOptions, ShutdownHandle, Teardown,
     TerminalOptions, TrackBlock, TrackMark, TrackMarks, UnderlineStyle, Wheel, load_shell,

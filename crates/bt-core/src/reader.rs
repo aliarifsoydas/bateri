@@ -799,6 +799,7 @@ mod tests {
     /// The graphics side of a session, without a session.
     struct TestSink {
         hub: Hub,
+        pixel_mouse: AtomicBool,
     }
 
     impl Sink for TestSink {
@@ -811,6 +812,10 @@ mod tests {
         }
 
         fn reply(&self, _: Vec<u8>) {}
+
+        fn pixel_mouse(&self) -> &AtomicBool {
+            &self.pixel_mouse
+        }
     }
 
     /// One read of the scripted PTY.
@@ -887,7 +892,10 @@ mod tests {
     /// under that lock, nor under the lease a frame also waits for.
     #[test]
     fn an_image_is_decoded_with_neither_the_terminal_lease_nor_its_lock_held() {
-        let sink = Arc::new(TestSink { hub: Hub::new() });
+        let sink = Arc::new(TestSink {
+            hub: Hub::new(),
+            pixel_mouse: AtomicBool::new(false),
+        });
         let terminal = Arc::new(FairMutex::new(Term::new(
             Config::default(),
             &TermSize::new(20, 4),

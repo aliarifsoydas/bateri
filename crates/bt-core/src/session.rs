@@ -2059,6 +2059,12 @@ struct AdapterInner {
     /// command while it holds `Term`, so the reverse order exists nowhere.
     /// The decoding of an image never takes it; only the applying does.
     graphics: Hub,
+    /// DECSET 1016: the application wants pointer reports in pixels. The
+    /// stream's wrapper writes it ([`crate::handler::ClusterHandler`]; it is
+    /// not in `Term`, alacritty does not know the mode), the mouse methods
+    /// and the shell's throttle read it, and the handover carries it as
+    /// `?1016h` in the VT ([`snapshot::encode_live`]).
+    pixel_mouse: AtomicBool,
 }
 
 impl Adapter {
@@ -2082,6 +2088,7 @@ impl Adapter {
             child_exited: AtomicBool::new(false),
             muted: AtomicBool::new(false),
             graphics: Hub::new(),
+            pixel_mouse: AtomicBool::new(false),
         }))
     }
 
@@ -2127,6 +2134,10 @@ impl graphics::Sink for Adapter {
         if !self.0.muted.load(Ordering::Acquire) {
             self.input(bytes);
         }
+    }
+
+    fn pixel_mouse(&self) -> &AtomicBool {
+        &self.0.pixel_mouse
     }
 }
 
@@ -2556,6 +2567,17 @@ impl io::Read for TappedPty {
                 adapter.reply(program_status::SUPPORT_REPLY.to_owned());
                 return;
             }
+            // `CSI 16 t`, the cell's size in pixels (`CSI 6 ; height ; width t`):
+            // from the size the PTY was told, the one `CSI 14 t`'s answer is
+            // made of. Unknown (zero) is no answer: the program falls back
+            // to its own default, which beats a zero it would divide by.
+            if matches!(event, ScanEvent::CellSizeQuery) {
+                let (width, height) = adapter.cell_px();
+                if width > 0 && height > 0 {
+                    adapter.reply(format!("\x1b[6;{height};{width}t"));
+                }
+                return;
+            }
             let answers = key_gen.load(Ordering::Acquire);
             let outcome = lock(&self.shell).apply_scan_answering(event, answers);
             if outcome.title {
@@ -2806,7 +2828,7 @@ pub struct PtySize {
     pub cell_height: u16,
 }
 
-/// The two syscalls an adopted PTY needs and `bt-core` cannot make — it has
+/// The syscalls an adopted PTY needs and `bt-core` cannot make — it has
 /// no `libc` (the [`Session::remote_login`] precedent: the platform shell
 /// passes the call in). The body is `bt_shell_common::jobs::SystemPty`.
 pub trait PtyOps: Send + Sync {
@@ -2815,6 +2837,10 @@ pub trait PtyOps: Send + Sync {
     /// `SIGHUP` to `pid` **unless** `exit` (the child's exit fd) is already
     /// readable — then the pid may be another process's.
     fn hangup(&self, pid: u32, exit: BorrowedFd<'_>);
+    /// `SIGWINCH` to the PTY's foreground process group, the group the
+    /// kernel names for the master (`TIOCGPGRP`). The size is not touched: a
+    /// program that handles the signal redraws whatever the size did.
+    fn winch(&self, master: BorrowedFd<'_>);
 }
 
 /// What [`Session::freeze`] hands over: everything another
@@ -3073,6 +3099,46 @@ pub struct SelectionPoint {
     pub col: u16,
     pub row: u16,
     pub half: CellHalf,
+}
+
+/// Where the pointer is, for the reports that go to the application: the
+/// cell, and the pixel under the pointer when the host knows it.
+///
+/// The pixel is **physical**, counted from the grid's top-left corner and
+/// 0-based (the report adds the one), clamped into the grid the way the
+/// cell is — the same measure as the cell size the PTY is told
+/// (`TIOCSWINSZ`, `CSI 14 t`, `CSI 16 t`), so `x / cell width` is the cell's
+/// column. A host that only knows the cell passes the [`SelectionPoint`]
+/// itself (`From`): the pixel is then the cell's centre.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Pointer {
+    pub cell: SelectionPoint,
+    /// `(x, y)`; `None` from a host that knows only the cell.
+    pub px: Option<(u16, u16)>,
+}
+
+impl From<SelectionPoint> for Pointer {
+    fn from(cell: SelectionPoint) -> Self {
+        Self { cell, px: None }
+    }
+}
+
+impl Pointer {
+    /// The pixel a report carries: the host's, or the cell's centre.
+    fn pixel(self, cell_px: (u16, u16)) -> (u16, u16) {
+        self.px.unwrap_or_else(|| {
+            (
+                self.cell
+                    .col
+                    .saturating_mul(cell_px.0)
+                    .saturating_add(cell_px.0 / 2),
+                self.cell
+                    .row
+                    .saturating_mul(cell_px.1)
+                    .saturating_add(cell_px.1 / 2),
+            )
+        })
+    }
 }
 
 /// The selection's **step**: letter, word or line — single, double and triple
@@ -5367,8 +5433,11 @@ impl Session {
             let mut parser: ansi::Processor = ansi::Processor::new();
             let mut last_input = false;
             let mut term = term.lock();
+            // The handover's VT carries DECSET 1016 as it carries the other
+            // modes; it lands in the flag the reader keeps from here on.
             parser.advance(
-                &mut ClusterHandler::new(&mut term, options.cluster, &mut last_input),
+                &mut ClusterHandler::new(&mut term, options.cluster, &mut last_input)
+                    .pixel_mouse(&adapter.0.pixel_mouse),
                 bytes,
             );
         }
@@ -7920,12 +7989,14 @@ impl Session {
     /// separate job independent of input.
     ///
     /// **The pointer** (`at`) is the visible window's cell and `half` is not
-    /// read: the report is at cell resolution (SGR-pixel, 1016, out of scope). The
-    /// type is [`SelectionPoint`], because `bt-shell`'s mouse translation already
-    /// gives it and its fields are named — swapping column and row would not
-    /// compile. The cell is lowered to the application's row with
-    /// `display_offset`; if the row is not on the application's screen (the
-    /// window in the history, row `< 0`) no report goes — alacritty's rule.
+    /// read. The report is at cell resolution unless the application turned
+    /// DECSET 1016 on ([`Session::pixel_mouse`]); then it carries the pointer's
+    /// pixel ([`Pointer`]). The cell's type is [`SelectionPoint`], because
+    /// `bt-shell`'s mouse translation already gives it and its fields are named
+    /// — swapping column and row would not compile. The cell is lowered to the
+    /// application's row with `display_offset` (the pixel by that many cell
+    /// heights); if the row is not on the application's screen (the window in
+    /// the history, row `< 0`) no report goes — alacritty's rule.
     ///
     /// **The repeat is clamped**: at most **one page** (the visible row count)
     /// goes to the application in an event. `bt-shell` converts the delta from
@@ -7954,9 +8025,10 @@ impl Session {
         rows: f64,
         lines: i32,
         intent: ScrollIntent,
-        at: SelectionPoint,
+        at: impl Into<Pointer>,
         shift: bool,
     ) -> Wheel {
+        let at = at.into();
         let mut term = self.term.lock();
         let unit = match input::wheel_route(*term.mode(), shift) {
             WheelRoute::Scroll => {
@@ -7978,12 +8050,11 @@ impl Session {
                 input::arrow(arrow, *term.mode()).to_vec()
             }
             WheelRoute::Report(encoding) => {
+                let encoding = encoding.pixel(self.adapter.0.pixel_mouse.load(Ordering::Acquire));
                 let offset = term.grid().display_offset() as i32;
-                let line = viewport_point((at.col, at.row), offset).line;
                 let button = if lines > 0 { WHEEL_UP } else { WHEEL_DOWN };
-                let report = u16::try_from(line.0)
-                    .ok()
-                    .and_then(|row| input::mouse_report(encoding, button, true, at.col, row));
+                let report =
+                    mouse_report_at(encoding, button, at, offset, true, self.adapter.cell_px());
                 let Some(report) = report else {
                     return Wheel::Ignored;
                 };
@@ -7999,6 +8070,15 @@ impl Session {
         }
         self.send(Msg::Input(unit.repeat(count).into()));
         Wheel::Sent
+    }
+
+    /// Whether the application turned DECSET 1016 on, i.e. its pointer
+    /// reports are in pixels ([`Pointer`]). The shell reads it to throttle
+    /// motion by pixel instead of by cell; a lock-free read of the flag
+    /// the stream's wrapper keeps. It says nothing of whether mouse
+    /// reporting itself is on — that is [`Session::mouse_motion`]'s route.
+    pub fn pixel_mouse(&self) -> bool {
+        self.adapter.0.pixel_mouse.load(Ordering::Acquire)
     }
 
     /// Mouse button: press or release. The decision looks at the mode and the
@@ -8058,9 +8138,10 @@ impl Session {
         &self,
         button: MouseButton,
         pressed: bool,
-        at: SelectionPoint,
+        at: impl Into<Pointer>,
         modifiers: MouseModifiers,
     ) -> Click {
+        let at = at.into();
         let term = self.term.lock();
         // Shift is asked **only at the press**: the release's route was locked at
         // the press. The mode is asked at both and `Select` means two different
@@ -8070,11 +8151,13 @@ impl Session {
         let encoding = match input::button_route(*term.mode(), shift) {
             ButtonRoute::Select if pressed => return Click::Select,
             ButtonRoute::Select => return Click::Ignored,
-            ButtonRoute::Report(encoding) => encoding,
+            ButtonRoute::Report(encoding) => {
+                encoding.pixel(self.adapter.0.pixel_mouse.load(Ordering::Acquire))
+            }
         };
         let offset = term.grid().display_offset() as i32;
         let byte = input::button_byte(button, modifiers);
-        let report = mouse_report_at(encoding, byte, at, offset, pressed);
+        let report = mouse_report_at(encoding, byte, at, offset, pressed, self.adapter.cell_px());
         drop(term);
         self.send_report(report)
     }
@@ -8116,16 +8199,18 @@ impl Session {
     pub fn mouse_motion(
         &self,
         button: Option<MouseButton>,
-        at: SelectionPoint,
+        at: impl Into<Pointer>,
         modifiers: MouseModifiers,
     ) -> Click {
+        let at = at.into();
         let term = self.term.lock();
         let Some(encoding) = input::motion_route(*term.mode(), button.is_some()) else {
             return Click::Ignored;
         };
+        let encoding = encoding.pixel(self.adapter.0.pixel_mouse.load(Ordering::Acquire));
         let offset = term.grid().display_offset() as i32;
         let byte = input::motion_byte(button, modifiers);
-        let report = mouse_report_at(encoding, byte, at, offset, true);
+        let report = mouse_report_at(encoding, byte, at, offset, true, self.adapter.cell_px());
         drop(term);
         self.send_report(report)
     }
@@ -8355,7 +8440,8 @@ impl Session {
         // `Term` → the leaf title slot: the order the title events already
         // take (module header).
         let mut term = self.term.lock();
-        snapshot::encode_live(&mut term, &|| lock(title).clone(), &|| ()).0
+        let pixel_mouse = self.pixel_mouse();
+        snapshot::encode_live(&mut term, &|| lock(title).clone(), &|| (), pixel_mouse).0
     }
 
     /// `bt-core`'s own state as a versioned blob — the handover's second half
@@ -11767,6 +11853,23 @@ impl Session {
         }
     }
 
+    /// Tells an adopted PTY's foreground program to redraw: `SIGWINCH`, with
+    /// the size left alone (an adopting process cannot know which pane had
+    /// images, and the images are not carried — a program that redraws on the
+    /// signal draws them again). A session without the master's copy or the
+    /// syscall (a spawned one) does nothing.
+    ///
+    /// **Journal-neutral:** a signal, which the snapshot does not read — no
+    /// side record ([`crate::journal`]).
+    pub fn winch(&self) {
+        if let Some(ops) = &self.ops
+            && let Some(master) = lock(&self.master).as_ref()
+        {
+            use std::os::fd::AsFd;
+            ops.winch(master.as_fd());
+        }
+    }
+
     /// Stops the reader thread and ends the shell child.
     ///
     /// `Msg::Shutdown` → `join` → the returned `(EventLoop, State)` dropping.
@@ -12460,9 +12563,16 @@ fn clear_selection_locked<T>(term: &mut Term<T>) -> bool {
     visible_range(selection.as_ref(), term).is_some()
 }
 
-/// The body of the report: lowers the pointer's cell to the application's row
-/// and builds the bytes. **The caller holds the lock** — `offset` was read
-/// under it; this is pure.
+/// The body of the report: lowers the pointer to the application's screen and
+/// builds the bytes. **The caller holds the lock** — `offset` was read under
+/// it; this is pure.
+///
+/// **The report's own unit decides what is lowered.** A cell report takes the
+/// pointer's cell and a pixel report ([`MouseEncoding::SgrPixels`]) its pixel
+/// — both from the one [`Pointer`], and the pixel's row is lowered by
+/// `offset` cell heights as the cell's is by `offset` rows, so the same
+/// pointer is on the application's screen in one unit exactly when it is in the
+/// other. `cell_px` is the size the PTY was told, the measure the pixel is in.
 ///
 /// `pressed` selects only two things and both are from the same distinction:
 /// the report's format (`M`/`m` in SGR) and **the fate of a coordinate that
@@ -12472,21 +12582,31 @@ fn clear_selection_locked<T>(term: &mut Term<T>) -> bool {
 fn mouse_report_at(
     encoding: MouseEncoding,
     byte: u8,
-    at: SelectionPoint,
+    at: Pointer,
     offset: i32,
     pressed: bool,
+    cell_px: (u16, u16),
 ) -> Option<Vec<u8>> {
-    let line = viewport_point((at.col, at.row), offset).line;
+    let (col, line) = if encoding == MouseEncoding::SgrPixels {
+        let (x, y) = at.pixel(cell_px);
+        let lowered = i32::from(y).saturating_sub(offset.saturating_mul(i32::from(cell_px.1)));
+        (x, lowered)
+    } else {
+        (
+            at.cell.col,
+            viewport_point((at.cell.col, at.cell.row), offset).line.0,
+        )
+    };
     if pressed {
-        let row = u16::try_from(line.0).ok()?;
-        return input::mouse_report(encoding, byte, true, at.col, row);
+        let row = u16::try_from(line).ok()?;
+        return input::mouse_report(encoding, byte, true, col, row);
     }
     // The row can overflow only **negatively** (the window in the scrollback, or
     // the pointer on the fill band): since `display_offset` is not negative
     // there is no overflow above. The encoding's ceiling is clamped separately —
     // both column and row.
-    let row = u16::try_from(line.0.max(0)).unwrap_or(u16::MAX);
-    let (col, row) = (encoding.clamp(at.col), encoding.clamp(row));
+    let row = u16::try_from(line.max(0)).unwrap_or(u16::MAX);
+    let (col, row) = (encoding.clamp(col), encoding.clamp(row));
     input::mouse_report(encoding, byte, false, col, row)
 }
 
@@ -13270,6 +13390,7 @@ mod tests {
             lock(&self.resizes).push((size.cols, size.rows));
         }
         fn hangup(&self, _pid: u32, _exit: BorrowedFd<'_>) {}
+        fn winch(&self, _master: BorrowedFd<'_>) {}
     }
 
     /// Freezes a `/bin/sh` running `script` (after `ready` shows) and adopts
@@ -23597,6 +23718,117 @@ mod tests {
         expect_sent(&motion, &wake, b"\x1b[<35;1;1M");
     }
 
+    /// The pointer a host that knows the pixel passes for a point inside
+    /// cell `(col, row)` — `dx`, `dy` pixels from its corner (the tests' cells
+    /// are 9 × 18).
+    fn pixel_pointer(col: u16, row: u16, dx: u16, dy: u16) -> Pointer {
+        Pointer {
+            cell: at(col, row, CellHalf::Left),
+            px: Some((col * 9 + dx, row * 18 + dy)),
+        }
+    }
+
+    #[test]
+    fn dec_1016_reports_the_pointers_pixel_one_based() {
+        // 1016 alone is enough (xterm's SGR-pixels), and a bare cell from a
+        // host that does not know the pixel reports the cell's centre.
+        let (session, wake) = dump_session(40, "printf '\\033[?1016h\\033[?1000h'", |mode| {
+            mode.contains(TermMode::MOUSE_REPORT_CLICK)
+        });
+        assert!(session.pixel_mouse());
+        let left = MouseButton::Left;
+        let none = MouseModifiers::default();
+        // The centre of cell (4, 2): (4 * 9 + 4, 2 * 18 + 9) = (40, 45), one-based.
+        let centre = pixel_pointer(4, 2, 4, 9);
+        assert_eq!(session.mouse_button(left, true, centre, none), Click::Sent);
+        expect_sent(&session, &wake, b"\x1b[<0;41;46M");
+        assert_eq!(session.mouse_button(left, false, centre, none), Click::Sent);
+        expect_sent(&session, &wake, b"\x1b[<0;41;46m");
+        // Another pixel of the same cell is another report.
+        let corner = pixel_pointer(4, 2, 0, 0);
+        assert_eq!(session.mouse_button(left, true, corner, none), Click::Sent);
+        expect_sent(&session, &wake, b"\x1b[<0;37;37M");
+        // The bare cell: the same bytes as the centre, through another button.
+        let bare = at(4, 2, CellHalf::Right);
+        assert_eq!(
+            session.mouse_button(MouseButton::Right, true, bare, none),
+            Click::Sent
+        );
+        expect_sent(&session, &wake, b"\x1b[<2;41;46M");
+        // The wheel is a report too, in the same unit.
+        assert_eq!(
+            session.scroll_wheel(1.0, 1, ScrollIntent::Lines, centre, false),
+            Wheel::Sent
+        );
+        expect_sent(&session, &wake, b"\x1b[<64;41;46M");
+    }
+
+    #[test]
+    fn dec_1016_motion_reports_every_pixel_and_dec_1016l_goes_back_to_cells() {
+        let (session, wake) = dump_session(
+            40,
+            "printf '\\033[?1003h\\033[?1006h\\033[?1016h'",
+            |mode| mode.contains(TermMode::MOUSE_MOTION | TermMode::SGR_MOUSE),
+        );
+        let none = MouseModifiers::default();
+        // Pixels (37, 37) and (38, 37) are the same cell: pixel resolution
+        // tells them apart.
+        let first = pixel_pointer(4, 2, 1, 1);
+        assert_eq!(session.mouse_motion(None, first, none), Click::Sent);
+        expect_sent(&session, &wake, b"\x1b[<35;38;38M");
+        // 1016 off with 1006 still on: SGR with cells again.
+        let (session, wake) = dump_session(
+            40,
+            "printf '\\033[?1003h\\033[?1006h\\033[?1016h\\033[?1016l'",
+            |mode| mode.contains(TermMode::MOUSE_MOTION | TermMode::SGR_MOUSE),
+        );
+        wait_until("the mode did not close", Duration::from_secs(5), || {
+            !session.pixel_mouse()
+        });
+        assert_eq!(session.mouse_motion(None, first, none), Click::Sent);
+        expect_sent(&session, &wake, b"\x1b[<35;5;3M");
+    }
+
+    #[test]
+    fn a_pixel_report_lowers_its_row_by_the_window_in_the_history() {
+        // The cell's row and the pixel's are lowered together: one cell
+        // height per row of `display_offset`, and a press where either is
+        // off the application's screen is not reported.
+        let pointer = pixel_pointer(4, 2, 4, 9);
+        let lowered = |offset, pressed| {
+            mouse_report_at(
+                MouseEncoding::SgrPixels,
+                0,
+                pointer,
+                offset,
+                pressed,
+                (9, 18),
+            )
+        };
+        assert_eq!(lowered(0, true).unwrap(), b"\x1b[<0;41;46M");
+        // One row down in the history: 45 - 18 = 27, one-based 28.
+        assert_eq!(lowered(1, true).unwrap(), b"\x1b[<0;41;28M");
+        // Two rows: the pixel is inside row 0 of the application's screen,
+        // 45 - 36 = 9; three: the pointer is above it.
+        assert_eq!(lowered(2, true).unwrap(), b"\x1b[<0;41;10M");
+        assert_eq!(lowered(3, true), None);
+        // A release is clamped, not dropped: a button must not stay stuck.
+        assert_eq!(lowered(3, false).unwrap(), b"\x1b[<0;41;1m");
+        // The cell's row lowers the same, so the two units agree on "above".
+        let cells = |offset| mouse_report_at(MouseEncoding::Sgr, 0, pointer, offset, true, (9, 18));
+        assert!(cells(2).is_some() && cells(3).is_none());
+    }
+
+    #[test]
+    fn the_cell_size_report_is_the_size_the_pty_was_told() {
+        // `CSI 16 t` answers `CSI 6 ; height ; width t`, and the text area
+        // `CSI 14 t` gives is that many cells wide and tall: 40 × 10 cells of
+        // 9 × 18 pixels.
+        let (session, wake) = dump_session(40, "printf '\\033[16t\\033[14t'", |_| true);
+        let _ = &session;
+        expect_sent(&session, &wake, b"\x1b[6;18;9t\x1b[4;180;360t");
+    }
+
     #[test]
     fn release_follows_press() {
         // If the press was reported the release is **not dropped**, it is
@@ -28994,6 +29226,8 @@ e\\314\\201.'; sleep 5";
         "\x1b[23t",
         "\x1b]4;3;rgb:11/22/33\x07\x1b]11;rgb:01/02/03\x07",
         "\x1b]8;id=x;https://bateri.dev\x07link\x1b]8;;\x07 after\r\n",
+        "\x1b[?1016h",
+        "\x1b[?1016l",
         "\x1b[5 q",
         "\x1b[2 q\x1b[?12h",
         "\x1b[0 q\x1b[?12l",
@@ -29132,8 +29366,9 @@ e\\314\\201.'; sleep 5";
         );
         let mut parser: ansi::Processor = ansi::Processor::new();
         let mut last_input = false;
+        let copy_pixels = AtomicBool::new(false);
         parser.advance(
-            &mut ClusterHandler::new(&mut copy, true, &mut last_input),
+            &mut ClusterHandler::new(&mut copy, true, &mut last_input).pixel_mouse(&copy_pixels),
             &base.vt,
         );
 
@@ -29142,14 +29377,20 @@ e\\314\\201.'; sleep 5";
         let (live_shown, live_vt, live_probed) = {
             let mut term = lo.session.term.lock();
             let shown = readable(&*term);
-            let (vt, probed) = snapshot::encode_live(&mut *term, &|| lock(slot).clone(), &|| ());
+            let pixels = lo.session.pixel_mouse();
+            let (vt, probed) =
+                snapshot::encode_live(&mut *term, &|| lock(slot).clone(), &|| (), pixels);
             (shown, vt, probed)
         };
         assert_eq!(readable(&copy), live_shown, "seed {seed}");
         assert_eq!(lock(&titles.0).clone(), live_title, "seed {seed}");
         let copy_titles = titles.clone();
-        let (copy_vt, copy_probed) =
-            snapshot::encode_live(&mut copy, &move || lock(&copy_titles.0).clone(), &|| ());
+        let (copy_vt, copy_probed) = snapshot::encode_live(
+            &mut copy,
+            &move || lock(&copy_titles.0).clone(),
+            &|| (),
+            copy_pixels.load(Ordering::Acquire),
+        );
         assert_eq!(
             String::from_utf8_lossy(&copy_vt),
             String::from_utf8_lossy(&live_vt),
@@ -29168,19 +29409,25 @@ e\\314\\201.'; sleep 5";
             titles.clone(),
         );
         let mut last_input = false;
+        let crash_pixels = AtomicBool::new(false);
         for bytes in [&rebuilt.vt, &rebuilt.tail] {
             // A fresh parser for each, the handover's order.
             let mut parser: ansi::Processor = ansi::Processor::new();
             parser.advance(
-                &mut ClusterHandler::new(&mut crash, true, &mut last_input),
+                &mut ClusterHandler::new(&mut crash, true, &mut last_input)
+                    .pixel_mouse(&crash_pixels),
                 bytes,
             );
         }
         assert_eq!(readable(&crash), live_shown, "seed {seed}: the rebuild");
         assert_eq!(lock(&titles.0).clone(), live_title, "seed {seed}");
         let crash_titles = titles.clone();
-        let (crash_vt, crash_probed) =
-            snapshot::encode_live(&mut crash, &move || lock(&crash_titles.0).clone(), &|| ());
+        let (crash_vt, crash_probed) = snapshot::encode_live(
+            &mut crash,
+            &move || lock(&crash_titles.0).clone(),
+            &|| (),
+            crash_pixels.load(Ordering::Acquire),
+        );
         assert_eq!(
             String::from_utf8_lossy(&crash_vt),
             String::from_utf8_lossy(&live_vt),
@@ -29625,8 +29872,9 @@ e\\314\\201.'; sleep 5";
         );
         let live_shown = readable(&*session.term.lock());
         assert_eq!(readable(&copy), live_shown);
-        let (copy_vt, _) = snapshot::encode_live(&mut copy, &|| None, &|| ());
-        let (live_vt, _) = snapshot::encode_live(&mut *session.term.lock(), &|| None, &|| ());
+        let (copy_vt, _) = snapshot::encode_live(&mut copy, &|| None, &|| (), false);
+        let (live_vt, _) =
+            snapshot::encode_live(&mut *session.term.lock(), &|| None, &|| (), false);
         assert_eq!(
             String::from_utf8_lossy(&copy_vt),
             String::from_utf8_lossy(&live_vt)
@@ -30040,8 +30288,9 @@ e\\314\\201.'; sleep 5";
             session.term.lock().grid().cursor.point
         );
         assert_eq!(readable(&copy), readable(&*session.term.lock()));
-        let (copy_vt, _) = snapshot::encode_live(&mut copy, &|| None, &|| ());
-        let (live_vt, _) = snapshot::encode_live(&mut *session.term.lock(), &|| None, &|| ());
+        let (copy_vt, _) = snapshot::encode_live(&mut copy, &|| None, &|| (), false);
+        let (live_vt, _) =
+            snapshot::encode_live(&mut *session.term.lock(), &|| None, &|| (), false);
         assert_eq!(
             String::from_utf8_lossy(&copy_vt),
             String::from_utf8_lossy(&live_vt)

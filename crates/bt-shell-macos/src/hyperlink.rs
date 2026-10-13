@@ -334,7 +334,7 @@ fn spans_contain(spans: &[LinkSpan], in_dock: bool, cell: LinkCell) -> bool {
 /// Mouse point → the link hit test's cell ([`LinkPoint::Screen`]): a **signed**
 /// screen row (negative is the fill band above the origin, `-1` its bottom row —
 /// [`crate::view::cover_of`]'s arithmetic, floor instead of ceiling) and a column.
-/// Pure, the inputs of [`crate::view::point_to_cell`].
+/// Pure, the inputs of [`crate::view::point_to_pointer`].
 ///
 /// `None` outside the grid's columns, in the left padding and below the grid
 /// (the dock band). Above the origin nothing is rejected here: whether a band
@@ -342,7 +342,7 @@ fn spans_contain(spans: &[LinkSpan], in_dock: bool, cell: LinkCell) -> bool {
 /// `Term` lock with the frame's own numbers. **The top fade is a band row too**
 /// here: a link in the text thinning away there underlines on ⌘-hover and
 /// opens on ⌘-click, where the selection takes the fade for the window's edge
-/// ([`crate::view::point_to_cell`]) — the gesture aimed at what the eye sees
+/// ([`crate::view::point_to_pointer`]) — the gesture aimed at what the eye sees
 /// works where it sees it.
 pub(crate) fn link_cell_at(
     view_px: (f64, f64),

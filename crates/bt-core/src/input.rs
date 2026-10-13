@@ -55,12 +55,22 @@ pub(crate) fn arrow(arrow: Arrow, mode: TermMode) -> [u8; 3] {
 pub(crate) const WHEEL_UP: u8 = 64;
 pub(crate) const WHEEL_DOWN: u8 = 65;
 
+/// The DEC private mode that turns mouse reports into pixels (xterm's
+/// SGR-Pixels). alacritty parses it as `PrivateMode::Unknown` and does
+/// nothing, so the stream's wrapper keeps the flag
+/// ([`crate::handler::ClusterHandler`]).
+pub(crate) const PIXEL_MOUSE_MODE: u16 = 1016;
+
 /// Mouse report encoding — the one the application picked with DECSET
-/// 1006/1005.
+/// 1006/1005/1016.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MouseEncoding {
     /// 1006: decimal, unbounded.
     Sgr,
+    /// 1016: [`MouseEncoding::Sgr`]'s bytes with the pointer's **pixel** in
+    /// the grid in place of its cell. Only the coordinates differ, so the
+    /// formatting stays in [`mouse_report`]'s one SGR arm.
+    SgrPixels,
     /// 1005: coordinate is a UTF-8 character, cut off at 2015.
     Utf8,
     /// X10/normal: coordinate is a single byte, cut off at 223.
@@ -82,7 +92,7 @@ impl MouseEncoding {
     /// two-byte UTF-8.
     fn limit(self) -> Option<u16> {
         match self {
-            MouseEncoding::Sgr => None,
+            MouseEncoding::Sgr | MouseEncoding::SgrPixels => None,
             MouseEncoding::Utf8 => Some(2015),
             MouseEncoding::Normal => Some(223),
         }
@@ -98,6 +108,19 @@ impl MouseEncoding {
     /// wrong coordinate is better than that.
     pub(crate) fn clamp(self, pos: u16) -> u16 {
         self.limit().map_or(pos, |limit| pos.min(limit - 1))
+    }
+
+    /// The encoding once DECSET 1016 is taken into account: while the
+    /// application has it on, reports are in pixels whichever of the other
+    /// encodings is on, 1016 alone included (SGR-pixels). The flag wins while
+    /// it is set, as SGR wins over UTF-8 here; xterm and kitty keep one
+    /// last-set encoding instead, which differs only for a program that turns
+    /// 1016 on and then another encoding (terminal-browser turns 1016 on last). The flag
+    /// is not in `TermMode` — alacritty does not know the mode — so the
+    /// routes ([`button_route`], [`motion_route`], [`wheel_route`]) answer
+    /// without it and the caller applies it to the encoding they return.
+    pub(crate) fn pixel(self, on: bool) -> Self {
+        if on { MouseEncoding::SgrPixels } else { self }
     }
 }
 
@@ -644,6 +667,35 @@ mod tests {
             mouse_report(MouseEncoding::Sgr, WHEEL_UP, true, u16::MAX, 2015).unwrap(),
             b"\x1b[<64;65536;2016M"
         );
+    }
+
+    #[test]
+    fn pixel_reports_are_sgr_with_the_pixel_in_place_of_the_cell() {
+        // The bytes are SGR's: only what is handed in differs, and it is
+        // one-based all the same.
+        assert_eq!(
+            mouse_report(MouseEncoding::SgrPixels, WHEEL_UP, true, 40, 45).unwrap(),
+            b"\x1b[<64;41;46M"
+        );
+        assert_eq!(
+            mouse_report(MouseEncoding::SgrPixels, WHEEL_UP, false, 0, 0).unwrap(),
+            b"\x1b[<64;1;1m"
+        );
+        // Neither a ceiling to reject at nor one to clamp to.
+        assert_eq!(MouseEncoding::SgrPixels.clamp(4000), 4000);
+        assert!(mouse_report(MouseEncoding::SgrPixels, WHEEL_UP, true, 4000, 4000).is_some());
+    }
+
+    #[test]
+    fn dec_1016_wins_over_the_other_encodings_and_off_changes_nothing() {
+        for encoding in [
+            MouseEncoding::Sgr,
+            MouseEncoding::Utf8,
+            MouseEncoding::Normal,
+        ] {
+            assert_eq!(encoding.pixel(true), MouseEncoding::SgrPixels);
+            assert_eq!(encoding.pixel(false), encoding);
+        }
     }
 
     #[test]

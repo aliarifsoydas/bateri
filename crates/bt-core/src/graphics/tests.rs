@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::apc::Apc;
@@ -1367,6 +1368,7 @@ mod screenful {
     struct Sinker {
         hub: Hub,
         answers: Mutex<Vec<u8>>,
+        pixel_mouse: AtomicBool,
     }
 
     impl Sink for Sinker {
@@ -1380,6 +1382,10 @@ mod screenful {
 
         fn reply(&self, bytes: Vec<u8>) {
             self.answers.lock().expect("lock").extend(bytes);
+        }
+
+        fn pixel_mouse(&self) -> &AtomicBool {
+            &self.pixel_mouse
         }
     }
 
@@ -1413,6 +1419,7 @@ mod screenful {
                 sink: Sinker {
                     hub: Hub::new(),
                     answers: Mutex::new(Vec::new()),
+                    pixel_mouse: AtomicBool::new(false),
                 },
                 term: Term::new(config, &size(columns, lines), VoidListener),
                 parser: Processor::new(),
@@ -1702,5 +1709,47 @@ mod screenful {
         screen.feed(MARK);
         screen.feed(MARK);
         assert_eq!(screen.placed(), [(1, 2, 2)]);
+    }
+
+    fn answers(screen: &Screenful) -> Vec<u8> {
+        std::mem::take(&mut screen.sink.answers.lock().expect("lock"))
+    }
+
+    #[test]
+    fn the_pixel_mouse_flag_follows_the_stream_and_the_mode_is_answered() {
+        let mut screen = Screenful::new(20, 10, 100);
+        screen.feed(b"\x1b[?1016$p");
+        assert_eq!(answers(&screen), b"\x1b[?1016;2$y", "off: reset");
+        screen.feed(b"\x1b[?1016h");
+        assert!(screen.sink.pixel_mouse.load(Ordering::Acquire));
+        screen.feed(b"\x1b[?1016$p");
+        assert_eq!(answers(&screen), b"\x1b[?1016;1$y", "on: set");
+        screen.feed(b"\x1b[?1016l");
+        assert!(!screen.sink.pixel_mouse.load(Ordering::Acquire));
+        // A reset takes the mode with the rest.
+        screen.feed(b"\x1b[?1016h\x1bc");
+        assert!(!screen.sink.pixel_mouse.load(Ordering::Acquire));
+        // The other mouse modes are alacritty's and do not move it.
+        screen.feed(b"\x1b[?1016h\x1b[?1000h\x1b[?1006h\x1b[?1000l");
+        assert!(screen.sink.pixel_mouse.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_replay_keeps_the_mode_in_its_own_flag_and_answers_nobody() {
+        let flag = AtomicBool::new(false);
+        let mut term = Term::new(Config::default(), &size(20, 10), VoidListener);
+        let mut parser: Processor = Processor::new();
+        let mut last_input = false;
+        parser.advance(
+            &mut ClusterHandler::new(&mut term, true, &mut last_input).pixel_mouse(&flag),
+            b"\x1b[?1016h\x1b[?1016$p",
+        );
+        assert!(flag.load(Ordering::Acquire));
+        // Without a flag to keep the mode is read and does nothing.
+        let mut bare = Term::new(Config::default(), &size(20, 10), VoidListener);
+        parser.advance(
+            &mut ClusterHandler::new(&mut bare, true, &mut last_input),
+            b"\x1b[?1016h",
+        );
     }
 }

@@ -37,12 +37,20 @@
 //! delete the placements in stream order, before the rows move. Without a
 //! [`Sink`] (a replay, a snapshot) the marker is read and does nothing.
 //!
+//! **DECSET 1016 is kept here too.** alacritty parses the mode as unknown
+//! and drops it, and `TermMode` has no bit for it; the wrapper keeps the flag
+//! the pointer reports read ([`ClusterHandler::pixel_mouse`]) and answers
+//! DECRQM for it. A stream with no flag to keep reads the mode and does
+//! nothing.
+//!
 //! **The forwarding list is in one macro and guarded.** Every `Handler`
 //! method has an empty default; a method dropped from the list still
 //! compiles but never reaches `Term`'s implementation, and the symptom is
 //! silent (e.g. an escape sequence is ignored). The
 //! `clippy::missing_trait_methods` above the `impl` turns that omission red
 //! in `make clippy`; the same place catches a new method arriving in vte.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -59,6 +67,7 @@ use alacritty_terminal::vte::ansi::{
 use cursor_icon::CursorIcon;
 
 use crate::graphics::{MARK_MODE, Sink, screen_of};
+use crate::input::PIXEL_MOUSE_MODE;
 
 /// The `Handler` the parser sees: it borrows `Term` and forwards calls to
 /// it. It is reborn **on every `advance` and `stop_sync` call** — one lock
@@ -76,6 +85,11 @@ pub(crate) struct ClusterHandler<'a, U: EventListener> {
     /// every stream that is not the live one (the journal's replay, the
     /// handover's snapshot): there the marker is read and does nothing.
     graphics: Option<&'a dyn Sink>,
+    /// The session's DECSET 1016 flag ([`PIXEL_MOUSE_MODE`]) — where the
+    /// mode lands, since `Term` does not keep it. `None` for a stream with
+    /// no flag to keep: the mode is read and does nothing, as the graphics
+    /// marker does without a [`Sink`].
+    pixels: Option<&'a AtomicBool>,
 }
 
 impl<'a, U: EventListener> ClusterHandler<'a, U> {
@@ -85,12 +99,24 @@ impl<'a, U: EventListener> ClusterHandler<'a, U> {
             cluster,
             last_input,
             graphics: None,
+            pixels: None,
         }
     }
 
-    /// Lets the wrapper apply the graphics commands the stream carries.
+    /// Lets the wrapper apply the graphics commands the stream carries. The
+    /// session's 1016 flag comes with the sink: the live stream keeps it and
+    /// answers its query.
     pub(crate) fn graphics(mut self, graphics: Option<&'a dyn Sink>) -> Self {
         self.graphics = graphics;
+        self.pixels = graphics.map(|sink| sink.pixel_mouse());
+        self
+    }
+
+    /// Lets the wrapper keep DECSET 1016 in `flag` for a stream that has no
+    /// sink: the replays that rebuild a session's `Term` (a handover's VT,
+    /// the journal's scratch copy) carry the mode across with it.
+    pub(crate) fn pixel_mouse(mut self, flag: &'a AtomicBool) -> Self {
+        self.pixels = Some(flag);
         self
     }
 
@@ -115,6 +141,27 @@ impl<'a, U: EventListener> ClusterHandler<'a, U> {
         if let Some(reply) = reply {
             graphics.reply(reply);
         }
+    }
+
+    /// DECSET/DECRST 1016: the pointer reports turn to pixels or back.
+    fn pixel_mouse_mode(&mut self, on: bool) {
+        *self.last_input = false;
+        if let Some(pixels) = self.pixels {
+            pixels.store(on, Ordering::Release);
+        }
+    }
+
+    /// DECRQM for 1016, answered the way alacritty answers the modes it
+    /// knows (`CSI ? Ps ; Pm $ y`: 1 set, 2 reset) — through the sink, so it
+    /// takes the same FIFO as the parser's own replies. A stream without a
+    /// sink is a replay and replies to nobody.
+    fn report_pixel_mouse(&mut self) {
+        *self.last_input = false;
+        let (Some(graphics), Some(pixels)) = (self.graphics, self.pixels) else {
+            return;
+        };
+        let state = if pixels.load(Ordering::Acquire) { 1 } else { 2 };
+        graphics.reply(format!("\x1b[?{PIXEL_MOUSE_MODE};{state}$y").into_bytes());
     }
 
     /// `CSI 2 J` deletes the placements that reach onto the screen, `CSI 3 J`
@@ -295,11 +342,25 @@ impl<U: EventListener> Handler for ClusterHandler<'_, U> {
         if mode == PrivateMode::Unknown(MARK_MODE) {
             return self.graphics_mark();
         }
+        if mode == PrivateMode::Unknown(PIXEL_MOUSE_MODE) {
+            return self.pixel_mouse_mode(true);
+        }
         self.switching_screens(|term| term.set_private_mode(mode));
     }
 
     fn unset_private_mode(&mut self, mode: PrivateMode) {
+        if mode == PrivateMode::Unknown(PIXEL_MOUSE_MODE) {
+            return self.pixel_mouse_mode(false);
+        }
         self.switching_screens(|term| term.unset_private_mode(mode));
+    }
+
+    fn report_private_mode(&mut self, mode: PrivateMode) {
+        if mode == PrivateMode::Unknown(PIXEL_MOUSE_MODE) {
+            return self.report_pixel_mouse();
+        }
+        *self.last_input = false;
+        self.term.report_private_mode(mode);
     }
 
     fn clear_screen(&mut self, mode: ClearMode) {
@@ -310,6 +371,9 @@ impl<U: EventListener> Handler for ClusterHandler<'_, U> {
         *self.last_input = false;
         if let Some(graphics) = self.graphics {
             graphics.hub().reset();
+        }
+        if let Some(pixels) = self.pixels {
+            pixels.store(false, Ordering::Release);
         }
         self.term.reset_state();
     }
@@ -356,7 +420,6 @@ impl<U: EventListener> Handler for ClusterHandler<'_, U> {
         fn set_mode(&mut self, mode: Mode);
         fn unset_mode(&mut self, mode: Mode);
         fn report_mode(&mut self, mode: Mode);
-        fn report_private_mode(&mut self, mode: PrivateMode);
         fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>);
         fn set_keypad_application_mode(&mut self);
         fn unset_keypad_application_mode(&mut self);

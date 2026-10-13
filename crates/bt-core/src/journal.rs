@@ -954,6 +954,9 @@ struct Scratch {
     title: TitleSlot,
     parser: ansi::Processor,
     last_input: bool,
+    /// DECSET 1016 as the replay has it: `Term` does not keep the mode, the
+    /// wrapper does, and the encoder writes it back into the new base's VT.
+    pixels: AtomicBool,
     /// The character the last fed slice cut ([`Utf8Seam`]): the replay
     /// crosses the reader's seams the way the reader did.
     seam: Utf8Seam,
@@ -973,12 +976,14 @@ impl Scratch {
         let mut term = Term::new(term_config(base.options), &grid, title.clone());
         let mut parser: ansi::Processor = ansi::Processor::new();
         let mut last_input = false;
+        let pixels = AtomicBool::new(false);
         // The chunks cut wherever `CHUNK` falls, characters included.
         let mut seam = Utf8Seam::default();
         for chunk in base.vt.chunks(CHUNK) {
             seam.feed(chunk, |bytes| {
                 parser.advance(
-                    &mut ClusterHandler::new(&mut term, base.cluster, &mut last_input),
+                    &mut ClusterHandler::new(&mut term, base.cluster, &mut last_input)
+                        .pixel_mouse(&pixels),
                     bytes,
                 );
             });
@@ -988,6 +993,7 @@ impl Scratch {
             term,
             title,
             parser: ansi::Processor::new(),
+            pixels,
             last_input: base.last_input,
             seam: Utf8Seam::default(),
             tail: Tail::default(),
@@ -1005,7 +1011,8 @@ impl Scratch {
         }
         self.seam.feed(bytes, |bytes| {
             self.parser.advance(
-                &mut ClusterHandler::new(&mut self.term, self.cluster, &mut self.last_input),
+                &mut ClusterHandler::new(&mut self.term, self.cluster, &mut self.last_input)
+                    .pixel_mouse(&self.pixels),
                 bytes,
             );
         });
@@ -1026,11 +1033,10 @@ impl Scratch {
                 self.options = options;
             }
             Side::CursorStyleReset => self.term.set_cursor_style(None),
-            Side::StopSync => self.parser.stop_sync(&mut ClusterHandler::new(
-                &mut self.term,
-                self.cluster,
-                &mut self.last_input,
-            )),
+            Side::StopSync => self.parser.stop_sync(
+                &mut ClusterHandler::new(&mut self.term, self.cluster, &mut self.last_input)
+                    .pixel_mouse(&self.pixels),
+            ),
         }
     }
 
@@ -1045,10 +1051,15 @@ impl Scratch {
         let cols = u16::try_from(self.term.columns()).unwrap_or(u16::MAX);
         let rows = u16::try_from(self.term.screen_lines()).unwrap_or(u16::MAX);
         let slot = self.title.clone();
-        let (vt, _) =
-            snapshot::encode_live(&mut self.term, &move || lock(&slot.0).clone(), &|| {
+        let pixels = self.pixels.load(Ordering::Acquire);
+        let (vt, _) = snapshot::encode_live(
+            &mut self.term,
+            &move || lock(&slot.0).clone(),
+            &|| {
                 progress.fetch_add(1, Ordering::AcqRel);
-            });
+            },
+            pixels,
+        );
         Base {
             vt,
             tail: self.tail.bytes().to_vec(),

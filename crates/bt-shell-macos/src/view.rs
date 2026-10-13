@@ -35,7 +35,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::Arc;
 
 use bt_core::{
-    BlockHandle, CellHalf, Click, MouseButton, MouseModifiers, ScrollIntent, SearchCover,
+    BlockHandle, CellHalf, Click, MouseButton, MouseModifiers, Pointer, ScrollIntent, SearchCover,
     SelectionPoint, Session, Wheel,
 };
 use bt_gpu::{CellMetrics, ContextStrip, ContextTrailing, Origin, ScrollbarLayout};
@@ -67,7 +67,7 @@ use crate::pane::TerminalPane;
 use crate::pointer;
 use crate::quote::{paste_quote, shell_quote};
 
-/// What happens to a point that falls outside the grid - [`point_to_cell`]'s
+/// What happens to a point that falls outside the grid - [`point_to_pointer`]'s
 /// single decision axis.
 ///
 /// The rule is one sentence: **an event that starts a gesture is rejected,
@@ -179,7 +179,12 @@ impl OutOfGrid {
 /// The grid's columns start on the grid's frame ([`CellMetrics::grid_inset`]);
 /// the dock's input block asks the same arithmetic from the ruler
 /// ([`dock_point_to_cell`]).
-pub(crate) fn point_to_cell(
+///
+/// **The pixel**: besides the cell, the pointer's physical pixel in the grid comes out of
+/// the same body (0-based from the grid's top-left, sticking to the grid's edge where the
+/// cell does), for the reports that go to the application - so a report's two units cannot
+/// disagree about where the pointer is.
+pub(crate) fn point_to_pointer(
     view_px: (f64, f64),
     metrics: CellMetrics,
     origin_px: f64,
@@ -187,14 +192,14 @@ pub(crate) fn point_to_cell(
     scale: f64,
     cols: u16,
     rows: u16,
-) -> Option<SelectionPoint> {
+) -> Option<Pointer> {
     let left = metrics.grid_inset().left;
     cell_at(
         view_px, metrics, left, origin_px, outside, scale, cols, rows,
     )
 }
 
-/// [`point_to_cell`] for the dock's input block: its columns start on the
+/// [`point_to_pointer`] for the dock's input block: its columns start on the
 /// dock's left margin ([`CellMetrics::side_left_px`]), where the drawing puts
 /// the dock's cells.
 pub(crate) fn dock_point_to_cell(
@@ -210,10 +215,14 @@ pub(crate) fn dock_point_to_cell(
     cell_at(
         view_px, metrics, left, origin_px, outside, scale, cols, rows,
     )
+    .map(|pointer| pointer.cell)
 }
 
-/// The one body of [`point_to_cell`] and [`dock_point_to_cell`]: `left_px`
-/// is the surface's horizontal start.
+/// The one body of [`point_to_pointer`] and [`dock_point_to_cell`]:
+/// `left_px` is the surface's horizontal start. The
+/// pixel is the floor of the same `x`/`y` the cell comes from (physical,
+/// 0-based from the surface's top-left) and sticks to the surface's edge
+/// where the cell does: a negative to 0, past the far side to its last pixel.
 #[allow(clippy::too_many_arguments)]
 fn cell_at(
     view_px: (f64, f64),
@@ -224,7 +233,7 @@ fn cell_at(
     scale: f64,
     cols: u16,
     rows: u16,
-) -> Option<SelectionPoint> {
+) -> Option<Pointer> {
     if cols == 0 || rows == 0 {
         return None;
     }
@@ -274,10 +283,19 @@ fn cell_at(
     } else {
         (cols - 1, CellHalf::Right)
     };
-    Some(SelectionPoint { col, row, half })
+    // `max` then `min`, not `clamp`: a zero-sized metric would make `clamp`'s
+    // range empty and `clamp` panics on that. NaN comes out as 0 too.
+    let pixel = |at: f64, extent: f64| (at.max(0.0).min(extent - 1.0)) as u16;
+    Some(Pointer {
+        cell: SelectionPoint { col, row, half },
+        px: Some((
+            pixel(x, cell_w * f64::from(cols)),
+            pixel(y, cell_h * f64::from(rows)),
+        )),
+    })
 }
 
-/// The cells the search panel covers - **pure**, with [`point_to_cell`]'s
+/// The cells the search panel covers - **pure**, with [`point_to_pointer`]'s
 /// arithmetic: the panel's bottom edge and left edge in physical pixels (from
 /// the view's top and left), `origin_px` the drawn frame's vertical origin
 /// ([`bt_gpu::Origin`]).
@@ -309,7 +327,7 @@ pub(crate) fn cover_of(
 /// ([`bt_gpu::dock_px`]; the **single** copy `split_into_grid` and the second
 /// viewport use), the input line is below the band's breathing padding - the
 /// padding's source is the gutter ([`CellMetrics::gutter_px`],
-/// `Frame::dock_pos`). The line is given to [`point_to_cell`] with this value
+/// `Frame::dock_pos`). The line is given to [`point_to_pointer`] with this value
 /// as **a one-row grid**: the column and half arithmetic comes from the same
 /// body as the grid's, and so does the press's rejection ("the context line
 /// and the band's padding do nothing") and the drag's clamping ("into the line").
@@ -324,7 +342,7 @@ pub(crate) fn dock_input_top_px(height_px: f64, metrics: CellMetrics, dock_rows:
 /// and discards the truncation remainder, so the information about where in
 /// the cell we are is not there. The source is the **remainder** before the
 /// division (x relative to `cell_w`). For a negative x the remainder is also
-/// negative and falls to the left half - the left edge rule is in [`point_to_cell`].
+/// negative and falls to the left half - the left edge rule is in [`point_to_pointer`].
 ///
 /// **The midpoint is written to the right half** (`>=`): the two halves
 /// partition exactly as `[0, w/2)` and `[w/2, w)` - no x is left without a
@@ -588,7 +606,7 @@ pub(crate) struct ViewIvars {
     /// one; the only thing that diverges is the clamp limit of a click on the
     /// bottom edge. Since geometry snaps the offset anyway the window closes
     /// in one frame. A degenerate size never causes this transition: the
-    /// session rejects it (`Session::resize`) and `point_to_cell` returns
+    /// session rejects it (`Session::resize`) and `point_to_pointer` returns
     /// `None` at zero rows/columns, so both sides go silent at the same place.
     metrics: Cell<Option<(CellMetrics, (u16, u16))>>,
     /// The dock's row count; `0` → the window has no dock (an integration-less
@@ -1092,7 +1110,7 @@ define_class!(
             // as today: the application does not know about the fill anyway, it
             // is a terminal drawing.
             let Some(pointer) =
-                self.window_point_cell(event.locationInWindow(), OutOfGrid::CLAMP)
+                self.window_point_pointer(event.locationInWindow(), OutOfGrid::CLAMP)
             else {
                 return;
             };
@@ -1811,7 +1829,7 @@ impl BateriView {
         }
         // The pointer's cell and the fill rejection's zero, with the
         // rationale in the line arm (`scrollWheel:`).
-        let Some(pointer) = self.window_point_cell(event.locationInWindow(), OutOfGrid::CLAMP)
+        let Some(pointer) = self.window_point_pointer(event.locationInWindow(), OutOfGrid::CLAMP)
         else {
             return;
         };
@@ -2245,8 +2263,10 @@ impl BateriView {
             match self.with_gesture(|g| g.released(button)) {
                 Release::Report => {
                     let clamp = OutOfGrid::CLAMP;
-                    if let Some(cell) = self.window_point_cell(event.locationInWindow(), clamp) {
-                        self.report_button(session, button, false, cell, event);
+                    if let Some(pointer) =
+                        self.window_point_pointer(event.locationInWindow(), clamp)
+                    {
+                        self.report_button(session, button, false, pointer, event);
                     }
                 }
                 // The gesture in the dock ended: if it was a click without a drag the caret goes there.
@@ -2331,7 +2351,8 @@ impl BateriView {
             }
             return;
         }
-        let Some(cell) = self.window_point_cell(event.locationInWindow(), OutOfGrid::Reject) else {
+        let Some(pointer) = self.window_point_pointer(event.locationInWindow(), OutOfGrid::Reject)
+        else {
             // The fill band and the dock are never the application's screen: a
             // right click there is the terminal's, the link menu's.
             if button == MouseButton::Right {
@@ -2339,7 +2360,8 @@ impl BateriView {
             }
             return;
         };
-        let answer = self.report_button(session, button, true, cell, event);
+        let cell = pointer.cell;
+        let answer = self.report_button(session, button, true, pointer, event);
         // Mouse mode off (or Shift, the mode's escape): the right click is the
         // terminal's — the link menu. `pressed` sets no bit for a right
         // `Select`, so the menu swallowing `rightMouseUp:` leaves nothing stale.
@@ -2425,14 +2447,23 @@ impl BateriView {
         session: &Session,
         button: MouseButton,
         pressed: bool,
-        cell: SelectionPoint,
+        pointer: Pointer,
         event: &NSEvent,
     ) -> Click {
-        let answer = session.mouse_button(button, pressed, cell, modifiers(event));
+        let answer = session.mouse_button(button, pressed, pointer, modifiers(event));
         if answer == Click::Sent {
-            self.with_gesture(|g| g.stamp(cell));
+            self.stamp_report(session, pointer);
         }
         answer
+    }
+
+    /// Stamps the throttle's notch with the place a report went to, in the
+    /// unit the application's reports are in ([`Session::pixel_mouse`]).
+    fn stamp_report(&self, session: &Session, pointer: Pointer) {
+        match pointer.px.filter(|_| session.pixel_mouse()) {
+            Some(px) => self.with_gesture(|g| g.stamp_pixel(px)),
+            None => self.with_gesture(|g| g.stamp(pointer.cell)),
+        }
     }
 
     /// Releases the buttons a lost `mouseUp:` left pressed in the application
@@ -2450,11 +2481,11 @@ impl BateriView {
         }
         // The continuation of a gesture, not its start: the coordinate is clamped.
         let clamp = OutOfGrid::CLAMP;
-        let Some(cell) = self.window_point_cell(event.locationInWindow(), clamp) else {
+        let Some(pointer) = self.window_point_pointer(event.locationInWindow(), clamp) else {
             return;
         };
         for button in lost {
-            self.report_button(session, button, false, cell, event);
+            self.report_button(session, button, false, pointer, event);
         }
     }
 
@@ -2465,6 +2496,13 @@ impl BateriView {
     /// if the cell did not change the `Term` lock is never taken. The notch is
     /// written even if no report goes - so that with the mode off too there
     /// remains a single resultless call per cell change, not per pixel.
+    ///
+    /// **While the application has DECSET 1016 on the notch is the pixel**
+    /// ([`Gesture::moved_to_pixel`]): its reports are in pixels and a cell is
+    /// too coarse for them, so every pixel of movement takes the lock - also
+    /// when no mouse reporting is on (a program that leaves 1016 set and
+    /// exits). The view cannot ask the mode, `Term` owns it; the cost is the
+    /// per-event lock alacritty's own mouse path pays anyway.
     ///
     /// The cell's gate depends on the button ([`OutOfGrid`]): a held drag is
     /// the continuation of a started gesture and is clamped, while a buttonless
@@ -2480,20 +2518,26 @@ impl BateriView {
             self.flush_lost_releases(session, event);
             OutOfGrid::Reject
         };
-        let Some(cell) = self.window_point_cell(event.locationInWindow(), outside) else {
+        let Some(pointer) = self.window_point_pointer(event.locationInWindow(), outside) else {
             return;
         };
-        if !self.with_gesture(|g| g.moved_to(cell)) {
+        // The notch is the unit the application's reports are in: a pixel
+        // while it has DECSET 1016 on, the cell otherwise.
+        let moved = match pointer.px.filter(|_| session.pixel_mouse()) {
+            Some(px) => self.with_gesture(|g| g.moved_to_pixel(px)),
+            None => self.with_gesture(|g| g.moved_to(pointer.cell)),
+        };
+        if !moved {
             return;
         }
-        session.mouse_motion(button, cell, modifiers(event));
+        session.mouse_motion(button, pointer, modifiers(event));
     }
 
     /// The session + the end under the event (cell and its half). `None` if
     /// the three (`session`, metrics, grid) are not all present: the
     /// selection's end cannot be moved with half the information. A point
     /// falling on the fill band below the top fade is also `None`
-    /// ([`point_to_cell`]).
+    /// ([`point_to_pointer`]).
     ///
     /// Today its only consumer is the drag; the button events want the session
     /// and the cell separately ([`BateriView::button_event`]), because the
@@ -2520,13 +2564,20 @@ impl BateriView {
     /// and when it falls outside the grid the two want different things
     /// ([`OutOfGrid`]).
     fn window_point_cell(&self, in_window: NSPoint, outside: OutOfGrid) -> Option<SelectionPoint> {
+        self.window_point_pointer(in_window, outside)
+            .map(|pointer| pointer.cell)
+    }
+
+    /// [`Self::window_point_cell`] with the pixel too: what the mouse reports
+    /// to the application are made of (`bt-core`'s [`Pointer`]).
+    fn window_point_pointer(&self, in_window: NSPoint, outside: OutOfGrid) -> Option<Pointer> {
         let (metrics, (cols, rows)) = self.ivars().metrics.get()?;
         let point = self.convertPoint_fromView(in_window, None);
         let scale = self.window()?.backingScaleFactor();
         // The origin is the **drawn** frame's value: without a link (the first
         // window) it is zero and the drawing is stuck to the ceiling, so the two are consistent.
         let origin_px = self.ivars().origin.get().map_or(0.0, Origin::px);
-        point_to_cell(
+        point_to_pointer(
             (point.x, point.y),
             metrics,
             f64::from(origin_px),
@@ -2550,7 +2601,7 @@ impl BateriView {
     ///
     /// A drawn frame with **zero** input rows (a remote session's status bar,
     /// or no band at all while a program reads the keyboard itself) is left
-    /// to [`point_to_cell`]'s rejection of a zero-row grid: no point is the
+    /// to [`point_to_pointer`]'s rejection of a zero-row grid: no point is the
     /// dock's, so a click on the lowered grid's bottom row reaches the grid.
     pub(crate) fn window_point_dock(
         &self,
@@ -2900,7 +2951,22 @@ fn context_span_px(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use objc2_foundation::ns_string;
+
+    /// The cell [`point_to_pointer`] puts a point in; the pixel has its own tests.
+    fn point_to_cell(
+        view_px: (f64, f64),
+        metrics: CellMetrics,
+        origin_px: f64,
+        outside: OutOfGrid,
+        scale: f64,
+        cols: u16,
+        rows: u16,
+    ) -> Option<SelectionPoint> {
+        point_to_pointer(view_px, metrics, origin_px, outside, scale, cols, rows)
+            .map(|pointer| pointer.cell)
+    }
 
     /// The scenes' grid measure; the padding is an **argument**, because two
     /// separate things are asked: the cell arithmetic (padding zero) and the padding itself.
@@ -2935,7 +3001,7 @@ mod tests {
         // With the grid's columns the same click is rejected: the reading
         // the dock must not use.
         assert!(
-            crate::view::point_to_cell(
+            point_to_cell(
                 (x, top + 4.0),
                 cell,
                 top,
@@ -3312,6 +3378,60 @@ mod tests {
         // A bottom overflow only clips the row; the column and half come from x.
         assert_eq!(scene((100.0, 600.0)), Some((22, 32)));
         assert_eq!(scene((100.0, 350.0)), Some((22, 32)));
+    }
+
+    /// The scene's pointer: cell, half and pixel.
+    fn scene_pointer(view_px: (f64, f64)) -> Option<Pointer> {
+        point_to_pointer(view_px, grid(0), 0.0, OutOfGrid::CLAMP, 2.0, 100, 33)
+    }
+
+    #[test]
+    fn the_pixel_is_the_floor_of_the_physical_point_the_cell_comes_from() {
+        // Cell (4, 2) at 9 × 18: its centre is the physical point (40.5, 45),
+        // the view point (20.25, 22.5) at @2x.
+        let pointer = scene_pointer((20.25, 22.5)).expect("inside");
+        assert_eq!((pointer.cell.col, pointer.cell.row), (4, 2));
+        assert_eq!(pointer.px, Some((40, 45)));
+        // A click in the middle of any cell reports `(c·w + w/2, r·h + h/2)`
+        // (integer halves), and the pixel divided by the cell size is the
+        // cell: the two units say the same place.
+        for (col, row) in [(0u16, 0u16), (1, 1), (37, 12), (99, 32)] {
+            let view = (
+                (f64::from(col) * 9.0 + 4.5) / 2.0,
+                (f64::from(row) * 18.0 + 9.0) / 2.0,
+            );
+            let pointer = scene_pointer(view).expect("inside");
+            let (x, y) = pointer.px.expect("a pixel");
+            assert_eq!((x, y), (col * 9 + 4, row * 18 + 9));
+            assert_eq!((x / 9, y / 18), (pointer.cell.col, pointer.cell.row));
+        }
+    }
+
+    #[test]
+    fn the_pixel_sticks_to_the_grids_edge_as_the_cell_does() {
+        // Left and above: a negative saturates to 0. Right and below: the
+        // grid's last pixel, 100 × 9 = 900 across and 33 × 18 = 594 down.
+        assert_eq!(
+            scene_pointer((-10.0, -10.0)).expect("sticks").px,
+            Some((0, 0))
+        );
+        let far = scene_pointer((5000.0, 5000.0)).expect("sticks");
+        assert_eq!(far.px, Some((899, 593)));
+        assert_eq!((far.cell.col, far.cell.row), (99, 32));
+    }
+
+    #[test]
+    fn the_pixel_counts_from_the_grids_left_edge_not_the_views() {
+        // 8 physical pixels of padding at @2x: the view point x = 4.0 is the
+        // grid's first pixel, 8.5 is physical 17 - 8 = 9, the next cell's first.
+        let at = |x: f64| point_to_pointer((x, 9.0), grid(8), 0.0, OutOfGrid::CLAMP, 2.0, 100, 33);
+        assert_eq!(at(4.0).expect("inside").px.map(|px| px.0), Some(0));
+        assert_eq!(at(8.5).expect("inside").px.map(|px| px.0), Some(9));
+        assert_eq!(
+            at(0.0).expect("inside").px.map(|px| px.0),
+            Some(0),
+            "the padding"
+        );
     }
 
     #[test]

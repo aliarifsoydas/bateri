@@ -9,8 +9,9 @@
 //! rule (the three points below) would exist in three copies.
 //!
 //! **The fourth arm is not OSC but CSI** and differs from the others in two
-//! ways: the only sequences it recognizes are `CSI 2 J` and `CSI ? 2004 h`, and
-//! it **has no payload**. What it gives is not a payload but how many times
+//! ways: the only sequences it recognizes are `CSI 2 J`, `CSI ? 2004 h` and
+//! `CSI 16 t` (the cell's size in pixels asked for: an event the reader
+//! answers), and it **has no payload**. What it gives is not a payload but how many times
 //! "clear the screen on purpose" went by ([`Scanner::take_screen_clears`]) and
 //! each time a line editor switched
 //! bracketed paste on — the remote shell's login signal, an event in stream
@@ -2695,7 +2696,7 @@ impl ShellLog {
             // The question was answered by the reader before this lock; the
             // reports are **not** gated by the remote session: a program over ssh
             // reporting its state is the case the protocol is for.
-            ScanEvent::StatusQuery => {}
+            ScanEvent::StatusQuery | ScanEvent::CellSizeQuery => {}
             ScanEvent::Status(report) => {
                 outcome.status = self.program.apply(report, Instant::now());
             }
@@ -3854,6 +3855,11 @@ const ERASE_ALL: u32 = 2;
 /// before `C` (`zle_bracketed_paste`), so its own never counts.
 const BRACKETED_PASTE: u32 = 2004;
 
+/// `CSI 16 t`: the program asks for a cell's size in pixels. `vte` has no arm
+/// for it (the `t` arms are the window ops 14, 18, 22, 23), so the scanner is
+/// where it is seen; the answer is the session's, from the size it told the PTY.
+const CELL_SIZE_REPORT: u32 = 16;
+
 /// Where the scanner is. What has to survive a chunk boundary is **not** the
 /// payload itself but this whole state: "I saw ESC" and "I'm in the middle of the
 /// digits" are also carried between two `read()`s.
@@ -3875,11 +3881,11 @@ enum ScanState {
 
 /// As much of a CSI sequence as concerns us.
 ///
-/// **There is no buffer and there will not be:** the two sequences we recognize
+/// **There is no buffer and there will not be:** the three sequences we recognize
 /// have a single number as their parameter, so there is no payload to collect
 /// either. `vte`'s four CSI states (`advance_csi_entry`, `_param`,
 /// `_intermediate`, `_ignore`) descend to a **single** state for us, because the
-/// question we ask is narrow: "is this sequence `CSI 2 J` or `CSI ? 2004 h`".
+/// question we ask is narrow: "is this sequence `CSI 2 J`, `CSI ? 2004 h` or `CSI 16 t`".
 /// The answer for any sequence with an intermediate byte, a marker other than a
 /// leading `?` or a second parameter is the same — no — and [`Self::simple`]
 /// carries that answer.
@@ -3922,6 +3928,15 @@ impl CsiScan {
             && self.has_digit
             && self.param == ERASE_ALL
             && final_byte == b'J'
+    }
+
+    /// Whether the sequence is `CSI 16 t` — the cell size in pixels asked for.
+    fn is_cell_size_query(&self, final_byte: u8) -> bool {
+        self.simple
+            && !self.private
+            && self.has_digit
+            && self.param == CELL_SIZE_REPORT
+            && final_byte == b't'
     }
 
     /// Whether the sequence is `CSI ? 2004 h` — bracketed paste switched on, the
@@ -4039,6 +4054,10 @@ pub(crate) enum ScanEvent<'a> {
     /// Answered by the reader ([`crate::program_status::SUPPORT_REPLY`]); it touches
     /// no state, so it never takes the ledger's lock.
     StatusQuery,
+    /// `CSI 16 t`: a program asks for the cell's size in pixels. Answered by
+    /// the reader like [`ScanEvent::StatusQuery`] (the size is the session's,
+    /// not the ledger's), so it never takes the ledger's lock.
+    CellSizeQuery,
     /// A program status report ([`crate::program_status::parse`]): owned, because
     /// it is rare — a program reports when its state changes, not per keystroke.
     Status(Report),
@@ -4458,6 +4477,9 @@ impl Scanner {
                 0x40..=0x7e => {
                     if csi.is_paste_on(byte) {
                         on_event(ScanEvent::PasteOn);
+                    }
+                    if csi.is_cell_size_query(byte) {
+                        on_event(ScanEvent::CellSizeQuery);
                     }
                     if csi.is_erase_all(byte) {
                         // **Saturating collection, not wrapping.** The consumer drains the counter on
@@ -8145,6 +8167,7 @@ mod tests {
             | ScanEvent::RemoteUp(_)
             | ScanEvent::RemoteMark(_)
             | ScanEvent::StatusQuery
+            | ScanEvent::CellSizeQuery
             | ScanEvent::Status(_)
             | ScanEvent::Progress(_)
             | ScanEvent::Notify(_) => {}
@@ -10315,6 +10338,39 @@ mod tests {
     }
 
     #[test]
+    fn a_cell_size_question_is_read_across_reads_and_only_that_sequence() {
+        let count = |reads: &[&[u8]]| {
+            let mut scanner = Scanner::new();
+            let mut asked = 0;
+            for read in reads {
+                scanner.feed(read, |event| {
+                    asked += usize::from(matches!(event, ScanEvent::CellSizeQuery));
+                });
+            }
+            asked
+        };
+        assert_eq!(count(&[b"\x1b[16t"]), 1);
+        // The reads may cut it anywhere, and text and other sequences may surround it.
+        assert_eq!(count(&[b"ab\x1b[1", b"6", b"t cd"]), 1);
+        assert_eq!(count(&[b"\x1b[16t\x1b[14t\x1b[16t"]), 2);
+        // Not the question: another number, a private marker, a second
+        // parameter, an intermediate byte, another final byte, a number past
+        // the bound.
+        for other in [
+            &b"\x1b[6t"[..],
+            b"\x1b[160t",
+            b"\x1b[?16t",
+            b"\x1b[16;1t",
+            b"\x1b[16 t",
+            b"\x1b[16h",
+            b"\x1b[t",
+            b"\x1b[99999999999999999999t",
+        ] {
+            assert_eq!(count(&[other]), 0, "{other:?}");
+        }
+    }
+
+    #[test]
     fn program_status_reports_are_read_in_stream_order_and_across_reads() {
         let mut scanner = Scanner::new();
         let mut seen = Vec::new();
@@ -11130,6 +11186,7 @@ mod tests {
                 ScanEvent::RemoteSetup(fault) => format!("setup {}", fault.code()),
                 ScanEvent::RemoteUp(nonce) => format!("up {nonce}"),
                 ScanEvent::StatusQuery => "status?".to_owned(),
+                ScanEvent::CellSizeQuery => "cell size?".to_owned(),
                 ScanEvent::Status(report) => format!("status {report:?}"),
                 ScanEvent::Progress(report) => format!("progress {report:?}"),
                 ScanEvent::Notify(note) => format!("notify {note:?}"),

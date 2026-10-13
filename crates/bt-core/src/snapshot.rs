@@ -49,6 +49,7 @@ use alacritty_terminal::vte::ansi::{
 };
 use std::collections::HashMap;
 
+use crate::input::PIXEL_MOUSE_MODE;
 use crate::session::GridSize;
 use crate::shell::{BlockKey, Stripe};
 
@@ -912,8 +913,11 @@ impl ScreenShot {
 /// 6. the changed palette (OSC 4/10/11/12) and the application's cursor
 ///    style (DECSCUSR);
 /// 7. every mode bit outside `MODES_NOT_WRITTEN`, all resets before all
-///    sets (the mouse modes and encodings exclude one another), and the
-///    active kitty bits when they differ from the stack's top (`CSI = n u`);
+///    sets (the mouse modes and encodings exclude one another), DECSET
+///    1016 when `pixel_mouse` says it is on (`TermMode` has no bit for it:
+///    the caller reads the flag the stream's wrapper keeps; the adopting
+///    side's replay puts it back the same way), and the active kitty bits
+///    when they differ from the stack's top (`CSI = n u`);
 /// 8. the active screen's cursor — **after** the modes: `?6h` homes the
 ///    cursor and under origin mode `CUP` is region-relative — and SI/SO
 ///    last, since it maps what the cursor's rewritten cell writes.
@@ -928,6 +932,7 @@ pub(crate) fn encode_live<T: EventListener>(
     term: &mut Term<T>,
     title: &dyn Fn() -> Option<String>,
     step: &dyn Fn(),
+    pixel_mouse: bool,
 ) -> (Vec<u8>, Probed) {
     let mode = *term.mode();
     let colors: Vec<Option<Rgb>> = (0..=LAST_SETTABLE_COLOR)
@@ -1062,6 +1067,11 @@ pub(crate) fn encode_live<T: EventListener>(
         if mode.contains(bit) {
             out.extend_from_slice(set.as_bytes());
         }
+    }
+    // A fresh terminal has the flag off, so only the on state is written —
+    // an off one would add bytes to every VT for nothing.
+    if pixel_mouse {
+        out.extend_from_slice(format!("\x1b[?{PIXEL_MOUSE_MODE}h").as_bytes());
     }
     let active_keys = alternate
         .as_ref()
@@ -1660,7 +1670,7 @@ pub(crate) mod tests {
 
     fn encode_of(term: &mut Term<Recorder>, recorder: &Recorder) -> (Vec<u8>, Probed) {
         let recorder = recorder.clone();
-        encode_live(term, &move || recorder.title(), &|| ())
+        encode_live(term, &move || recorder.title(), &|| (), false)
     }
 
     /// What `Term` shows of the active screen without a probe.
