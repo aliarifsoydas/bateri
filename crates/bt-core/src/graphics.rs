@@ -71,6 +71,8 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::Term;
 
+use crate::pointer::PointerShapes;
+
 pub(crate) use apc::Collector;
 pub(crate) use place::Motion;
 pub(crate) use place::Screen;
@@ -792,6 +794,17 @@ pub(crate) trait Sink: Send + Sync {
     /// the session rather than in `Term` because alacritty does not know the
     /// mode; the pointer reports read it.
     fn pixel_mouse(&self) -> &AtomicBool;
+
+    /// The session's pointer shapes (OSC 22, [`crate::pointer`]), which the
+    /// wrapper applies the stream's requests, screen moves and resets to.
+    /// Kept with the session for 1016's reason, but no replay carries them:
+    /// a stream without a sink drops the requests (the module says why).
+    fn pointer(&self) -> &PointerShapes;
+
+    /// The shown pointer shape changed: tells the shell, which reads it
+    /// ([`crate::Session::pointer_shape`]). No frame — the pointer is not
+    /// drawn by the renderer.
+    fn pointer_changed(&self);
 }
 
 #[cfg(test)]

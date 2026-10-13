@@ -207,7 +207,8 @@ bt-shell-macos = { path = "crates/bt-shell-macos" }
 # (2026-10-13): vte 0.15.0 drops the byte after a character that a read cut in two and
 # swallows application program commands (`ESC _ … ESC \`) without telling the handler;
 # the fork fixes the first and passes the second on, with a way to halt the parser right
-# after a command. Same name and version, so `alacritty_terminal` resolves to it unchanged; when it
+# after a command. It also hands the pointer shape request (OSC 22) on as written: upstream
+# reads a single name, and kitty's protocol (reset, push/pop, query) is more. Same name and version, so `alacritty_terminal` resolves to it unchanged; when it
 # asks for a newer vte the fork is carried over by hand (`FORK.md` says how), and
 # `make audit` fails if the patch stops applying — cargo only warns, then quietly
 # builds the registry's vte.

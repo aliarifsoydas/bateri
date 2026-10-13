@@ -98,6 +98,7 @@ use crate::input::{
 };
 use crate::journal::{Base, Journal, Side as JournalSide};
 use crate::link;
+use crate::pointer::{PointerShape, PointerShapes};
 use crate::program_status::{self, ProgramActivity};
 use crate::reader::{
     EventLoop, EventLoopSender, Msg, PTY_CHILD_EVENT_TOKEN, PTY_READ_WRITE_TOKEN, State,
@@ -2065,6 +2066,11 @@ struct AdapterInner {
     /// and the shell's throttle read it, and the handover carries it as
     /// `?1016h` in the VT ([`snapshot::encode_live`]).
     pixel_mouse: AtomicBool,
+    /// The pointer shapes the application asked for (OSC 22, [`crate::pointer`]):
+    /// the stream's wrapper keeps them, the shell reads the shown one
+    /// ([`Session::pointer_shape`]). Unlike `pixel_mouse` no replay carries
+    /// them — the module says why.
+    pointer: PointerShapes,
 }
 
 impl Adapter {
@@ -2089,6 +2095,7 @@ impl Adapter {
             muted: AtomicBool::new(false),
             graphics: Hub::new(),
             pixel_mouse: AtomicBool::new(false),
+            pointer: PointerShapes::default(),
         }))
     }
 
@@ -2138,6 +2145,14 @@ impl graphics::Sink for Adapter {
 
     fn pixel_mouse(&self) -> &AtomicBool {
         &self.0.pixel_mouse
+    }
+
+    fn pointer(&self) -> &PointerShapes {
+        &self.0.pointer
+    }
+
+    fn pointer_changed(&self) {
+        self.0.wake.pointer_changed();
     }
 }
 
@@ -2522,6 +2537,10 @@ impl io::Read for TappedPty {
             }
             if outcome.prompt || outcome.ended {
                 wake.phase_edge();
+            }
+            // The shell is back: no program's pointer stays over its prompt.
+            if outcome.prompt && adapter.0.pointer.clear() {
+                wake.pointer_changed();
             }
             if outcome.remote_edge {
                 wake.remote_command_edge();
@@ -8020,6 +8039,13 @@ impl Session {
         self.adapter.0.pixel_mouse.load(Ordering::Acquire)
     }
 
+    /// The pointer shape the application asks for over the grid (OSC 22,
+    /// [`crate::pointer`]); `None` → the pane's own. The shell reads it when
+    /// [`Wake::pointer_changed`] says it changed; a leaf lock.
+    pub fn pointer_shape(&self) -> Option<PointerShape> {
+        self.adapter.0.pointer.shown()
+    }
+
     /// Mouse button: press or release. The decision looks at the mode and the
     /// mode lives in `Term`, i.e. the decision is here — `bt-shell` keeps no mode
     /// and **cannot ask the mode** (`bracketed_paste`'s written rationale: had
@@ -12718,6 +12744,7 @@ mod tests {
         commands: u32,
         /// How many times [`Wake::link_hover_lost`] came.
         hovers_lost: u32,
+        pointers: u32,
         /// How many times [`Wake::remote_up`] came.
         ups: u32,
         /// How many times [`Wake::remote_typed`] came.
@@ -12838,6 +12865,11 @@ mod tests {
 
         fn link_hover_lost(&self) {
             self.state.lock().unwrap().hovers_lost += 1;
+            self.cond.notify_all();
+        }
+
+        fn pointer_changed(&self) {
+            self.state.lock().unwrap().pointers += 1;
             self.cond.notify_all();
         }
 
@@ -24252,6 +24284,33 @@ e\\314\\201.'; sleep 5";
         // The second `C` produced no news: the count stays at two.
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(wake.state.lock().unwrap().commands, 2);
+    }
+
+    #[test]
+    fn the_shells_prompt_takes_the_programs_pointer_away() {
+        // A program on the main screen sets a shape and ends without a reset;
+        // our identified `A`, in a later read, gives the pane its own back.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_session(
+            "printf '\\033]22;pointer\\033\\\\'; sleep 0.5; \
+             printf '\\033]133;A;bt_block=1\\007'; sleep 5",
+            Arc::clone(&wake),
+        );
+        let pointers = |target: u32| {
+            wake.cond
+                .wait_timeout_while(
+                    wake.state.lock().unwrap(),
+                    Duration::from_secs(5),
+                    |state| state.pointers < target,
+                )
+                .unwrap()
+                .0
+                .pointers
+        };
+        assert_eq!(pointers(1), 1);
+        assert_eq!(session.pointer_shape(), Some(PointerShape::Pointer));
+        assert_eq!(pointers(2), 2);
+        assert_eq!(session.pointer_shape(), None);
     }
 
     #[test]

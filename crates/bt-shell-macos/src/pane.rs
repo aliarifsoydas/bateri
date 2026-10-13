@@ -949,6 +949,9 @@ struct ShellWake {
     /// Whether the stale-link news is waiting on the main queue —
     /// `search_pending`'s twin: at most one job.
     link_pending: Arc<AtomicBool>,
+    /// Whether the pointer shape's news is waiting on the main queue —
+    /// `search_pending`'s twin: at most one job.
+    pointer_pending: Arc<AtomicBool>,
     /// Whether the block index's news is waiting on the main queue —
     /// `search_pending`'s twin: at most one job.
     blocks_pending: Arc<AtomicBool>,
@@ -1635,6 +1638,26 @@ impl Wake for ShellWake {
             let mtm = MainThreadMarker::new().expect("the main queue is the main thread");
             if let Some(pane) = lookup(mtm, id) {
                 pane.view().link_lost();
+            }
+        });
+    }
+
+    fn pointer_changed(&self) {
+        // The reader thread, under the `Term` lock or right after the scan:
+        // the shape the program asks for changed. The view redoes its cursor
+        // rectangles on the next main-queue turn — no frame; at most one job
+        // (`search_changed`'s pattern).
+        if self.pointer_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let pending = Arc::clone(&self.pointer_pending);
+        let (id, lookup) = (self.id, self.lookup);
+        DispatchQueue::main().exec_async(move || {
+            pending.swap(false, Ordering::AcqRel);
+            // audit: a block running on the main queue is on the main thread by definition.
+            let mtm = MainThreadMarker::new().expect("the main queue is the main thread");
+            if let Some(pane) = lookup(mtm, id) {
+                pane.view().sync_cursor_rects();
             }
         });
     }
@@ -2517,6 +2540,7 @@ impl TerminalPane {
                 identity_probe: Arc::default(),
                 port_probe: Arc::new(PortProbe::new(ports_on)),
                 link_pending: Arc::default(),
+                pointer_pending: Arc::default(),
                 blocks_pending: Arc::default(),
                 unseen_pending: Arc::default(),
                 up_pending: Arc::default(),

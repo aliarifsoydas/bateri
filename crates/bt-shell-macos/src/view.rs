@@ -35,8 +35,8 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::Arc;
 
 use bt_core::{
-    BlockHandle, CellHalf, Click, MouseButton, MouseModifiers, Pointer, ScrollIntent, SearchCover,
-    SelectionPoint, Session, Wheel,
+    BlockHandle, CellHalf, Click, MouseButton, MouseModifiers, Pointer, PointerShape, ScrollIntent,
+    SearchCover, SelectionPoint, Session, Wheel,
 };
 use bt_gpu::{CellMetrics, ContextStrip, ContextTrailing, Origin, ScrollbarLayout};
 use objc2::rc::Retained;
@@ -628,6 +628,9 @@ pub(crate) struct ViewIvars {
     /// [`BateriView::sync_cursor_rects`] compares): the upload buttons' and the
     /// ⌘-hovered link's, one list.
     cursor_rects: RefCell<Vec<NSRect>>,
+    /// The program's cursor rectangle and shape the last `resetCursorRects`
+    /// set up ([`BateriView::program_cursor`]), compared beside the hands.
+    program_cursor: Cell<Option<(NSRect, PointerShape)>>,
     /// The ⌘-hover and ⌘-click state ([`crate::hyperlink`]).
     link: RefCell<LinkState>,
     /// The drawn frame's vertical origin - the read end of the body the frame
@@ -864,9 +867,11 @@ define_class!(
 
         /// AppKit's call to rebuild the cursor rects: automatically when the
         /// frame changes, with `invalidateCursorRectsForView:` when the
-        /// buttons' place changes ([`BateriView::sync_cursor_rects`]).
+        /// buttons' place or the program's shape changes
+        /// ([`BateriView::sync_cursor_rects`]).
         #[unsafe(method(resetCursorRects))]
         fn reset_cursor_rects(&self) {
+            self.program_cursor_rect();
             self.hand_cursor_rects();
         }
 
@@ -1707,6 +1712,7 @@ impl BateriView {
             dock_cols: Cell::new(0),
             context: Cell::new(ContextStrip::default()),
             cursor_rects: RefCell::new(Vec::new()),
+            program_cursor: Cell::new(None),
             link: RefCell::new(LinkState::default()),
             origin: OnceCell::new(),
             strip_area: RefCell::new(None),
@@ -2736,6 +2742,44 @@ impl BateriView {
         self.ivars().cursor_rects.replace(rects);
     }
 
+    /// The program's pointer shape (OSC 22) over the grid: a cursor rect, for
+    /// [`Self::hand_cursor_rects`]' reason. AppKit sets it when the pointer
+    /// moves into the rectangle or the rects are rebuilt — a shape asked for
+    /// while the pointer stands still shows at its next move.
+    fn program_cursor_rect(&self) {
+        let program = self.program_cursor();
+        if let Some((rect, shape)) = program {
+            self.addCursorRect_cursor(rect, &pointer::cursor(shape));
+        }
+        self.ivars().program_cursor.set(program);
+    }
+
+    /// Where the program's shape shows and which it is: the grid's part of
+    /// the view — above the dock's input block, left of the scroll bar's strip
+    /// while there is a bar, so bateri's own parts keep their cursors — and
+    /// `Session::pointer_shape`. `None` without a shape, and while ⌘ shows a
+    /// link: AppKit leaves overlapping cursor rects undefined, and over a
+    /// link the hand is bateri's (the protocol lets the terminal choose there).
+    fn program_cursor(&self) -> Option<(NSRect, PointerShape)> {
+        let shape = self.session()?.pointer_shape()?;
+        if !self.link_rects().is_empty() {
+            return None;
+        }
+        let scale = self.window()?.backingScaleFactor();
+        let bounds = self.bounds();
+        let mut size = bounds.size;
+        if let Some(origin) = self.origin() {
+            if let Some((top, _)) = origin.dock() {
+                size.height = size.height.min(f64::from(top) / scale);
+            }
+            let bar = origin.scrollbar();
+            if bar.drawable() {
+                size.width = size.width.min(f64::from(bar.strip_x()) / scale);
+            }
+        }
+        Some((NSRect::new(bounds.origin, size), shape))
+    }
+
     /// Every hand-cursor rectangle: the context row's parts, the shown link
     /// and the scroll bar's drawn block marks.
     fn hand_rects(&self) -> Vec<NSRect> {
@@ -2761,14 +2805,18 @@ impl BateriView {
     /// Makes the installed cursor rects refresh if they are stale: buttons
     /// appeared or went away (so the hand does not hang), or the dock's
     /// **drawn** place moved - point size, window size, the band's gliding, the
-    /// alternate screen. The rectangle is read from the last drawn frame and
-    /// AppKit's own triggers (the frame) can run before that frame, so the
-    /// criterion is the geometry itself. The callers are every motion and every
-    /// refresh (`TerminalPane::footer_hover`, `show_transfer`); on the same
-    /// rectangle it is a no-op, i.e. the cursor is not re-evaluated.
+    /// alternate screen — or the program's shape or its rectangle changed. The
+    /// rectangle is read from the last drawn frame and AppKit's own triggers
+    /// (the frame) can run before that frame, so the criterion is the geometry
+    /// itself. The callers are every motion, every refresh
+    /// (`TerminalPane::footer_hover`, `show_transfer`) and the program's new
+    /// shape (`Wake::pointer_changed`); on the same rectangles it is a no-op,
+    /// i.e. the cursor is not re-evaluated.
     pub(crate) fn sync_cursor_rects(&self) {
         let fresh = self.hand_rects();
-        if *self.ivars().cursor_rects.borrow() == fresh {
+        if *self.ivars().cursor_rects.borrow() == fresh
+            && self.ivars().program_cursor.get() == self.program_cursor()
+        {
             return;
         }
         if let Some(window) = self.window() {

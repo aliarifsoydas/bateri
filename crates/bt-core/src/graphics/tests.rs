@@ -1422,6 +1422,7 @@ mod screenful {
 
     use super::*;
     use crate::handler::ClusterHandler;
+    use crate::pointer::{PointerShape, PointerShapes};
 
     const CELL: (u16, u16) = (10, 20);
 
@@ -1445,6 +1446,9 @@ mod screenful {
         hub: Hub,
         told: Told,
         pixel_mouse: AtomicBool,
+        pointer: PointerShapes,
+        /// How many times the shown pointer shape changed.
+        pointer_changes: AtomicUsize,
     }
 
     impl Sink for Sinker {
@@ -1462,6 +1466,14 @@ mod screenful {
 
         fn pixel_mouse(&self) -> &AtomicBool {
             &self.pixel_mouse
+        }
+
+        fn pointer(&self) -> &PointerShapes {
+            &self.pointer
+        }
+
+        fn pointer_changed(&self) {
+            self.pointer_changes.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1495,6 +1507,8 @@ mod screenful {
                     hub: Hub::new(),
                     told: told.clone(),
                     pixel_mouse: AtomicBool::new(false),
+                    pointer: PointerShapes::default(),
+                    pointer_changes: AtomicUsize::new(0),
                 },
                 term: Term::new(config, &size(columns, lines), told),
                 parser: Processor::new(),
@@ -1974,6 +1988,35 @@ mod screenful {
         // The other mouse modes are alacritty's and do not move it.
         screen.feed(b"\x1b[?1016h\x1b[?1000h\x1b[?1006h\x1b[?1000l");
         assert!(screen.sink.pixel_mouse.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn the_pointer_shape_follows_the_stream_one_stack_per_screen() {
+        let mut screen = Screenful::new(20, 10, 100);
+        let shown = |screen: &Screenful| screen.sink.pointer.shown();
+        screen.feed(b"\x1b]22;pointer\x1b\\");
+        assert_eq!(shown(&screen), Some(PointerShape::Pointer));
+        // The alternate screen keeps a stack of its own…
+        screen.feed(b"\x1b[?1049h");
+        assert_eq!(shown(&screen), None);
+        screen.feed(b"\x1b]22;>text\x1b\\\x1b]22;?__current__,wait\x07");
+        assert_eq!(shown(&screen), Some(PointerShape::Text));
+        assert_eq!(
+            screen.told(),
+            b"\x1b]22;text,1\x07",
+            "answered in stream order"
+        );
+        // …and leaving it brings the main screen's back.
+        screen.feed(b"\x1b[?1049l");
+        assert_eq!(shown(&screen), Some(PointerShape::Pointer));
+        // A reset empties both.
+        screen.feed(b"\x1bc\x1b[?1049h");
+        assert_eq!(shown(&screen), None);
+        assert_eq!(
+            screen.sink.pointer_changes.load(Ordering::Relaxed),
+            5,
+            "told once per change: pointer, none, text, pointer, none"
+        );
     }
 
     #[test]

@@ -34,6 +34,14 @@ of every installed copy. A version without a section is not released.
   order it asked.
   Images do not survive an update or a crash of bateri; the text does, and a
   program that redraws when its window is signalled draws its images again.
+- **Programs can change the mouse pointer.** A program that asks for a
+  pointer shape (OSC 22) gets it while the pointer is over its text: the hand
+  over a link in terminal-browser, a text beam over a field, a crosshair, a
+  resize arrow. The shape belongs to the screen the program drew it on, so
+  the arrow comes back when a full-screen program exits, and again when your
+  shell's prompt returns after a program left a shape behind. The dock, the
+  scroll bar and a link under ⌘ keep their own pointers. A shape a program
+  asks for while the mouse is still shows as soon as the mouse moves.
 - **bash gets the command blocks and the dock.** When your login shell is
   bash 4.4 or newer, the stripe beside each command, the duration of a long
   one and the directory you are in show, the `ssh` integration reaches

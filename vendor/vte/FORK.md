@@ -46,6 +46,14 @@ below. Upstream's code keeps upstream's formatting, and the workspace's `fmt` an
   halt. Tests: the `apc_*`, `sos_and_pm_are_dropped` tests in `lib.rs` and the
   `*halt*` tests in `ansi.rs` (every one- and two-way cut of streams with commands, with
   and without a synchronized update, the 2 MiB overflow, a timed-out update).
+- **The pointer shape request (OSC 22) reaches the handler as written.** Upstream reads
+  the payload as one CSS name and drops anything else, so kitty's protocol (an empty
+  request resets the shape, `>` and `<` push and pop, `?` queries, a comma-separated list)
+  never got through. `ansi::Handler::set_pointer_shape(request, terminator)` now gets the
+  payload (empty for `OSC 22 ST` too) and the terminator a reply takes; its default body
+  is upstream's reading, so `alacritty_terminal` behaves as before. Tests:
+  `pointer_shape_request_reaches_the_handler_as_written` and
+  `pointer_shape_name_is_set_by_default` in `ansi.rs`.
 
 ## When `alacritty_terminal` asks for a newer `vte`
 

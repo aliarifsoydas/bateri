@@ -896,6 +896,8 @@ const EVENTS_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
 mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::pointer::PointerShapes;
     use std::time::Duration;
 
     use alacritty_terminal::event::VoidListener;
@@ -911,6 +913,7 @@ mod tests {
     struct TestSink {
         hub: Hub,
         pixel_mouse: AtomicBool,
+        pointer: PointerShapes,
     }
 
     impl Sink for TestSink {
@@ -927,6 +930,12 @@ mod tests {
         fn pixel_mouse(&self) -> &AtomicBool {
             &self.pixel_mouse
         }
+
+        fn pointer(&self) -> &PointerShapes {
+            &self.pointer
+        }
+
+        fn pointer_changed(&self) {}
     }
 
     /// What the scripted PTY gives, a step at a time.
@@ -1204,6 +1213,7 @@ mod tests {
         Arc::new(TestSink {
             hub: Hub::new(),
             pixel_mouse: AtomicBool::new(false),
+            pointer: PointerShapes::default(),
         })
     }
 

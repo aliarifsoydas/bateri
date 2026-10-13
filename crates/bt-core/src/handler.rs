@@ -51,6 +51,11 @@
 //! DECRQM for it. A stream with no flag to keep reads the mode and does
 //! nothing.
 //!
+//! **So is OSC 22, the pointer's shape** ([`crate::pointer`]): the fork hands
+//! the request over as written, the shapes are the session's ([`Sink`]), one
+//! stack per screen, so a move to or from the alternate screen and a reset
+//! change the shape shown. A stream without a sink drops the request.
+//!
 //! **The forwarding list is in one macro and guarded.** Every `Handler`
 //! method has an empty default; a method dropped from the list still
 //! compiles but never reaches `Term`'s implementation, and the symptom is
@@ -284,6 +289,9 @@ impl<'a, U: EventListener> ClusterHandler<'a, U> {
             && self.on_alternate_screen() != before
         {
             graphics.hub().drop_alt();
+            if graphics.pointer().show(!before) {
+                graphics.pointer_changed();
+            }
         }
     }
 
@@ -466,7 +474,33 @@ impl<U: EventListener> Handler for ClusterHandler<'_, U> {
         if let Some(pixels) = self.pixels {
             pixels.store(false, Ordering::Release);
         }
+        if let Some(graphics) = self.graphics
+            && graphics.pointer().clear()
+        {
+            graphics.pointer_changed();
+        }
         self.term.reset_state();
+    }
+
+    /// OSC 22 ([`crate::pointer`]): the request goes to the current screen's
+    /// stack, a query is answered the way the terminal's other answers go and
+    /// the shell hears of a new shape. Without a sink (a replay) it is read
+    /// and dropped.
+    fn set_pointer_shape(&mut self, request: &[u8], terminator: &str) {
+        *self.last_input = false;
+        let Some(graphics) = self.graphics else {
+            return;
+        };
+        let (reply, changed) =
+            graphics
+                .pointer()
+                .request(self.on_alternate_screen(), request, terminator);
+        if let Some(reply) = reply {
+            graphics.reply(reply);
+        }
+        if changed {
+            graphics.pointer_changed();
+        }
     }
 
     fn apc_start(&mut self) {

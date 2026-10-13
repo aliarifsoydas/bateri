@@ -196,6 +196,21 @@ pub trait Wake: Send + Sync + 'static {
     /// queue.
     fn link_hover_lost(&self);
 
+    /// The pointer shape the application asks for
+    /// ([`crate::Session::pointer_shape`]) changed: an OSC 22 request, a move
+    /// to or from the alternate screen, a reset or the shell's prompt. The
+    /// receiver redoes the pane's cursor rectangles — **no frame**: the
+    /// renderer does not draw the pointer, and a `wake` here would count as
+    /// content under the idle gate.
+    ///
+    /// **Edge-triggered and payload-free** (the precedent is
+    /// [`Wake::title_changed`]): it comes only when the shown shape changed,
+    /// and the receiver reads the shape itself. It arrives on the reader
+    /// thread, under the `Term` lock or (the prompt) right after the scan;
+    /// the three prohibitions above apply. The implementor posts **at most
+    /// one** job to its queue.
+    fn pointer_changed(&self);
+
     /// The scroll bar's block marks are wanted
     /// ([`crate::Session::set_block_marks`]) and the history moved since the
     /// block index last looked — output, a clear, a resize. The receiver

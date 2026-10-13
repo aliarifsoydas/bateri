@@ -858,6 +858,18 @@ pub trait Handler {
     /// Set mouse cursor icon.
     fn set_mouse_cursor_icon(&mut self, _: CursorIcon) {}
 
+    /// Set the mouse pointer's shape (OSC 22) from the request as the program wrote
+    /// it: an optional operation (`=`, `>`, `<`, `?`) and a comma-separated list of
+    /// names, possibly empty. `terminator` is the one a reply takes. By default a
+    /// single name is read and set, as upstream reads the sequence.
+    fn set_pointer_shape(&mut self, request: &[u8], _terminator: &str) {
+        let shape = String::from_utf8_lossy(request);
+        match CursorIcon::from_str(&shape) {
+            Ok(cursor_icon) => self.set_mouse_cursor_icon(cursor_icon),
+            Err(_) => debug!("[osc 22] unrecognized cursor icon shape: {shape:?}"),
+        }
+    }
+
     /// Report current keyboard mode.
     fn report_keyboard_mode(&mut self) {}
 
@@ -1646,12 +1658,9 @@ where
             },
 
             // Set mouse cursor shape.
-            b"22" if params.len() == 2 => {
-                let shape = String::from_utf8_lossy(params[1]);
-                match CursorIcon::from_str(&shape) {
-                    Ok(cursor_icon) => self.handler.set_mouse_cursor_icon(cursor_icon),
-                    Err(_) => debug!("[osc 22] unrecognized cursor icon shape: {shape:?}"),
-                }
+            b"22" if params.len() <= 2 => {
+                let request = params.get(1).copied().unwrap_or_default();
+                self.handler.set_pointer_shape(request, terminator);
             },
 
             // Set cursor style.
@@ -2239,6 +2248,7 @@ mod tests {
         identity_reported: bool,
         color: Option<Rgb>,
         reset_colors: Vec<usize>,
+        cursor_icon: Option<CursorIcon>,
     }
 
     impl Handler for MockHandler {
@@ -2270,6 +2280,10 @@ mod tests {
         fn reset_color(&mut self, index: usize) {
             self.reset_colors.push(index)
         }
+
+        fn set_mouse_cursor_icon(&mut self, cursor_icon: CursorIcon) {
+            self.cursor_icon = Some(cursor_icon);
+        }
     }
 
     impl Default for MockHandler {
@@ -2281,8 +2295,48 @@ mod tests {
                 identity_reported: false,
                 color: None,
                 reset_colors: Vec::new(),
+                cursor_icon: None,
             }
         }
+    }
+
+    /// The pointer shape requests (OSC 22) as they arrive, with their terminators.
+    #[derive(Default)]
+    struct PointerRequests(Vec<(Vec<u8>, String)>);
+
+    impl Handler for PointerRequests {
+        fn set_pointer_shape(&mut self, request: &[u8], terminator: &str) {
+            self.0.push((request.to_vec(), terminator.to_owned()));
+        }
+    }
+
+    #[test]
+    fn pointer_shape_request_reaches_the_handler_as_written() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = PointerRequests::default();
+
+        parser.advance(&mut handler, b"\x1b]22;\x1b\\\x1b]22;>pointer,text\x07\x1b]22\x07");
+
+        let requests: Vec<_> =
+            handler.0.iter().map(|(request, end)| (request.as_slice(), end.as_str())).collect();
+        assert_eq!(requests, [
+            (&b""[..], "\x1b\\"),
+            (&b">pointer,text"[..], "\x07"),
+            (&b""[..], "\x07"),
+        ]);
+    }
+
+    #[test]
+    fn pointer_shape_name_is_set_by_default() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, b"\x1b]22;pointer\x1b\\");
+        assert_eq!(handler.cursor_icon, Some(CursorIcon::Pointer));
+
+        // An empty request, or a list, is not one name: upstream's reading leaves it.
+        parser.advance(&mut handler, b"\x1b]22;\x1b\\\x1b]22;>text\x1b\\");
+        assert_eq!(handler.cursor_icon, Some(CursorIcon::Pointer));
     }
 
     #[test]

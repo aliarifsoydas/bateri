@@ -62,6 +62,7 @@ mod input;
 mod journal;
 mod link;
 mod notify;
+mod pointer;
 mod program_status;
 mod reader;
 mod search;
@@ -90,6 +91,7 @@ pub use journal::{
     rebuild as journal_rebuild,
 };
 pub use notify::Notification;
+pub use pointer::PointerShape;
 pub use program_status::{ProgramActivity, ProgramRecord, State as ProgramState};
 pub use search::{
     SearchCover, SearchDirection, SearchQuery, SearchReport, SearchRun, SearchRuns, SearchStatus,
