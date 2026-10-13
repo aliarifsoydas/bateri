@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 alacritty_terminal = { workspace = true }
 cursor-icon = { workspace = true }
+libc = { workspace = true }
 miniz_oxide = { workspace = true }
 png = { workspace = true }
 polling = { workspace = true }

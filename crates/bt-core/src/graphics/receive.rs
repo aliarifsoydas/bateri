@@ -3,12 +3,16 @@
 //! Two stages, on the reader thread, outside the parser. [`Receiver`] is the
 //! cheap one and runs inside `TappedPty::read`, under the read lease: it
 //! assembles the chunks of a transmission as base64 text and does nothing to
-//! it. [`decode_payload`] is the expensive one (base64, zlib, PNG) and runs
-//! where neither the lease nor the terminal lock is held
+//! it. [`decode_payload`] is the expensive one (base64, zlib, PNG, and
+//! reading the file or shared memory a command names) and runs where neither
+//! the lease nor the terminal lock is held
 //! ([`Hub::decode_pending`](super::Hub::decode_pending), called by the read
 //! loop between a read and the parse of it): a frame must not wait for an
-//! image to inflate. Nothing here panics on a bad payload: every way it can
-//! be wrong is an [`Error`] that becomes the program's answer.
+//! image to inflate or a disk to answer. The one read of a named file that
+//! cannot wait is the first bytes of a PNG, which say how far the cursor
+//! moves ([`sniff`]): a few hundred bytes of a regular file, opened without
+//! blocking. Nothing here panics on a bad payload: every way it can be wrong
+//! is an [`Error`] that becomes the program's answer.
 
 use std::io::Cursor;
 use std::time::Instant;
@@ -18,9 +22,10 @@ use miniz_oxide::inflate::{TINFLStatus, decompress_to_vec_zlib_with_limit};
 use super::apc::Apc;
 use super::command::{self, Action, Command, Format, Medium};
 use super::place::{Motion, Spec};
+use super::source;
 use super::{
-    Echo, Error, MAX_DIMENSION, OPEN_TIMEOUT, Pending, QUERY_LIMIT, QUOTA_BYTES, Reply,
-    TRANSMISSION_LIMIT,
+    Echo, Error, FILE_LIMIT, MAX_DIMENSION, NAME_LIMIT, OPEN_TIMEOUT, Pending, QUERY_LIMIT,
+    QUOTA_BYTES, Reply, TRANSMISSION_LIMIT,
 };
 use crate::shell::decode_base64;
 
@@ -35,6 +40,9 @@ const KNOWN_LIMIT: usize = 256;
 /// its compressed stream, which is longer than the text it holds.
 const HEAD_PLAIN: usize = 64;
 const HEAD_COMPRESSED: usize = 4096;
+
+/// The base64 text of the longest name.
+const NAME_TEXT_LIMIT: usize = NAME_LIMIT.div_ceil(3) * 4;
 
 /// What the reader knows of the terminal when it takes a command out of the
 /// stream: how big the cells are and how far the cursor can go.
@@ -140,7 +148,7 @@ impl Receiver {
             }
         };
         if self.open.is_some() && !command.explicit_action {
-            self.chunk(command, apc, env, &mut out);
+            self.chunk(command, apc, now, env, &mut out);
             return;
         }
         // A command that names its action ends a transmission in progress.
@@ -153,17 +161,12 @@ impl Receiver {
                 out(Outcome::Pending(Pending::Put { command, motion }));
             }
             Action::Transmit | Action::TransmitAndPut | Action::Query => {
-                if command.medium == Medium::Indirect {
-                    let error = Error::invalid("files and shared memory are not supported");
-                    out(failure(
-                        command.action == Action::Query,
-                        command.echo,
-                        error,
-                    ));
-                    return;
-                }
-                let (query, echo, last) =
-                    (command.action == Action::Query, command.echo, !command.more);
+                // A name is whole in its command: `m=` chunks pixels.
+                let (query, echo, last) = (
+                    command.action == Action::Query,
+                    command.echo,
+                    !command.more || command.medium != Medium::Direct,
+                );
                 let mut open = Open {
                     command,
                     text: Vec::new(),
@@ -225,10 +228,20 @@ impl Receiver {
         }
     }
 
-    fn chunk(&mut self, command: Command, apc: Apc, env: Env, out: &mut impl FnMut(Outcome)) {
+    fn chunk(
+        &mut self,
+        command: Command,
+        apc: Apc,
+        now: Instant,
+        env: Env,
+        out: &mut impl FnMut(Outcome),
+    ) {
         let Some(mut open) = self.open.take() else {
             return;
         };
+        // The wait is for the next chunk: a big image that keeps coming, slowly,
+        // is not one that stopped.
+        open.since = now;
         // A late `q=` still counts: the last word on how much to hear.
         if command.echo.quiet != 0 {
             open.command.echo.quiet = command.echo.quiet;
@@ -247,13 +260,29 @@ impl Receiver {
     }
 
     /// The transmission is whole. A store waits, undecoded, for the read loop
-    /// to decode it between a read and its parse; a query is answered here
-    /// and now, so it is decoded now — which is why it may only be small.
+    /// to decode it between a read and its parse, and so does a query that
+    /// names a file (it is answered at its marker, in order); a query with its
+    /// pixels in the sequence is answered here and now, so it is decoded now
+    /// — which is why it may only be small.
     fn finish(&mut self, open: Open, env: Env, out: &mut impl FnMut(Outcome)) {
         let Open { command, text, .. } = open;
-        if command.action != Action::Query {
+        let (query, echo) = (command.action == Action::Query, command.echo);
+        let named = command.medium != Medium::Direct;
+        // What a command that names its pixels carries is a name, whole.
+        let text = if named {
+            match source::name(&text) {
+                Ok(name) => name,
+                Err(error) => {
+                    out(failure(query, echo, error));
+                    return;
+                }
+            }
+        } else {
+            text
+        };
+        if !query || named {
             // The size is read from the head of the text, nothing is decoded.
-            let size = sniff(&command, &text);
+            let size = if query { None } else { sniff(&command, &text) };
             if let Some(size) = size {
                 self.remember(command.echo, size);
             }
@@ -269,7 +298,6 @@ impl Receiver {
             }));
             return;
         }
-        let echo = command.echo;
         let decoded = if text.len() > QUERY_LIMIT {
             Err(Error::too_big("a query carries a few bytes of image"))
         } else {
@@ -306,6 +334,9 @@ impl Open {
         if apc.overflowed {
             return Err(Error::too_big("the payload of one command is too large"));
         }
+        if self.command.medium != Medium::Direct && apc.payload.len() > NAME_TEXT_LIMIT {
+            return Err(Error::invalid("the file name is too long"));
+        }
         if self.text.len() + apc.payload.len() > TRANSMISSION_LIMIT {
             return Err(Error::too_big("the image data is too large"));
         }
@@ -314,10 +345,12 @@ impl Open {
     }
 }
 
-/// The pixel size a transmission's text holds, read without decoding the
-/// image: a raw payload's is in its keys, a PNG's is in its first bytes
-/// (`IHDR`), after inflating the head of the stream when it is compressed.
-/// `None` when it cannot be told, and the cursor then stays.
+/// The pixel size a transmission holds, read without decoding the image: a
+/// raw payload's is in its keys, a PNG's is in its first bytes (`IHDR`),
+/// after inflating the head of the stream when it is compressed. `text` is
+/// the payload's base64, or the name of the file it is in (a PNG in shared
+/// memory is not looked into). `None` when it cannot be told, and the cursor
+/// then stays.
 fn sniff(command: &Command, text: &[u8]) -> Option<(u32, u32)> {
     if command.format != Format::Png {
         let (width, height) = (command.width, command.height);
@@ -328,9 +361,14 @@ fn sniff(command: &Command, text: &[u8]) -> Option<(u32, u32)> {
     } else {
         HEAD_PLAIN
     };
-    let head = text.get(..take.min(text.len()))?;
-    let mut bytes = Vec::with_capacity(head.len() / 4 * 3 + 3);
-    decode_base64(head, &mut bytes)?;
+    let mut bytes = if command.medium == Medium::Direct {
+        let head = text.get(..take.min(text.len()))?;
+        let mut bytes = Vec::with_capacity(head.len() / 4 * 3 + 3);
+        decode_base64(head, &mut bytes)?;
+        bytes
+    } else {
+        source::peek(command, text, take / 4 * 3)?
+    };
     if command.zlib {
         bytes = match decompress_to_vec_zlib_with_limit(&bytes, PNG_HEAD) {
             Ok(inflated) => inflated,
@@ -357,12 +395,19 @@ fn png_size(head: &[u8]) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
-/// The image a transmission's base64 text holds, as RGBA.
+/// The image a transmission holds, as RGBA: `text` is its base64 or, for a
+/// command that names a file or shared memory object, the name.
 pub(crate) fn decode_payload(command: &Command, text: Vec<u8>) -> Result<Decoded, Error> {
     // The dimensions first: an image that will be refused is refused before
-    // any of its text is decoded.
+    // any of its text is decoded, or any file is touched.
     if let Some(per_pixel) = command.format.bytes_per_pixel() {
         raw_size(command, per_pixel)?;
+    }
+    if command.medium != Medium::Direct {
+        let bytes = source::load(command, &text, read_limit(command)?)?;
+        // Whatever is wrong with what was read, the program is told the same
+        // thing: a corrupt file and a missing one must not be told apart.
+        return decode(command, bytes).map_err(|_| Error::unreadable());
     }
     let mut bytes = Vec::with_capacity(text.len() / 4 * 3 + 3);
     if decode_base64(&text, &mut bytes).is_none() {
@@ -370,6 +415,24 @@ pub(crate) fn decode_payload(command: &Command, text: Vec<u8>) -> Result<Decoded
     }
     drop(text);
     decode(command, bytes)
+}
+
+/// How many bytes of a file or shared memory object are read: all a raw
+/// image of the given size can have, or, where the size is not known from the
+/// keys (a PNG, compressed data), as much as a transmission may add up to.
+/// A query that names a file reads what a transmission would: it asks whether
+/// this one can be shown.
+fn read_limit(command: &Command) -> Result<usize, Error> {
+    match command.format.bytes_per_pixel() {
+        Some(per_pixel) if !command.zlib => {
+            let size = raw_size(command, per_pixel)?;
+            if size > FILE_LIMIT {
+                return Err(Error::too_big("the image data is too large"));
+            }
+            Ok(size)
+        }
+        _ => Ok(FILE_LIMIT),
+    }
 }
 
 /// The pixels a payload holds, as RGBA.
@@ -392,7 +455,7 @@ fn decode(command: &Command, bytes: Vec<u8>) -> Result<Decoded, Error> {
     };
     match (command.format, expected) {
         (Format::Png, _) => decode_png(&bytes),
-        (_, Some(expected)) => decode_raw(command, &bytes, expected),
+        (_, Some(expected)) => decode_raw(command, bytes, expected),
         // `expected` exists exactly for the raw formats.
         _ => Err(Error::invalid("unknown pixel format")),
     }
@@ -426,7 +489,7 @@ fn check_dimensions(width: u32, height: u32) -> Result<(), Error> {
     Ok(())
 }
 
-fn decode_raw(command: &Command, bytes: &[u8], expected: usize) -> Result<Decoded, Error> {
+fn decode_raw(command: &Command, bytes: Vec<u8>, expected: usize) -> Result<Decoded, Error> {
     if bytes.len() < expected {
         return Err(Error::short(format!(
             "insufficient image data: {} < {expected}",
@@ -448,7 +511,7 @@ fn decode_raw(command: &Command, bytes: &[u8], expected: usize) -> Result<Decode
             }
             pixels
         }
-        _ => bytes.to_vec(),
+        _ => bytes,
     };
     Ok(Decoded {
         width: command.width,

@@ -365,7 +365,8 @@ impl Pictures {
         &self.band
     }
 
-    pub(crate) fn clear(&mut self) {
+    /// Empties both lists and keeps their buffers.
+    pub fn clear(&mut self) {
         self.grid.clear();
         self.band.clear();
     }

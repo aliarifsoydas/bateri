@@ -51,8 +51,13 @@ impl Format {
 pub(crate) enum Medium {
     /// `d` (the default): in the escape sequence itself.
     Direct,
-    /// `f`, `t`, `s`: a file, a temporary file or shared memory.
-    Indirect,
+    /// `f`: a file the payload names.
+    File,
+    /// `t`: a temporary file the payload names, deleted once it is read.
+    Temp,
+    /// `s`: a POSIX shared memory object the payload names, removed once it
+    /// is read.
+    Shared,
 }
 
 /// What a delete (`a=d`) matches, by the lower-case form of `d=`.
@@ -99,6 +104,10 @@ pub(crate) struct Command {
     /// `s=`, `v=`: the pixel dimensions of a raw payload.
     pub(crate) width: u32,
     pub(crate) height: u32,
+    /// `S=`, `O=`: how many bytes to read from a file or shared memory
+    /// object (0 is "to its end") and where in it they begin.
+    pub(crate) data_size: u32,
+    pub(crate) data_offset: u32,
     /// `m=1`: more chunks follow.
     pub(crate) more: bool,
     /// The scope of a delete and whether the data goes too (`d=` in upper case).
@@ -142,6 +151,8 @@ fn parse(control: &[u8], echo: Echo) -> Result<Command, Error> {
         zlib: false,
         width: 0,
         height: 0,
+        data_size: 0,
+        data_offset: 0,
         more: false,
         scope: Scope::Visible,
         free: false,
@@ -188,7 +199,9 @@ fn parse(control: &[u8], echo: Echo) -> Result<Command, Error> {
             b't' => {
                 command.medium = match letter(value)? {
                     b'd' => Medium::Direct,
-                    b'f' | b't' | b's' => Medium::Indirect,
+                    b'f' => Medium::File,
+                    b't' => Medium::Temp,
+                    b's' => Medium::Shared,
                     _ => return Err(Error::invalid("unknown transmission medium")),
                 };
             }
@@ -198,6 +211,8 @@ fn parse(control: &[u8], echo: Echo) -> Result<Command, Error> {
             },
             b's' => command.width = number(value)?,
             b'v' => command.height = number(value)?,
+            b'S' => command.data_size = number(value)?,
+            b'O' => command.data_offset = number(value)?,
             b'm' => {
                 command.more = match number(value)? {
                     0 => false,
@@ -424,9 +439,24 @@ mod tests {
     }
 
     #[test]
-    fn a_file_medium_is_known_but_not_direct() {
-        for medium in ["f", "t", "s"] {
-            assert_eq!(parsed(&format!("t={medium}")).medium, Medium::Indirect);
+    fn the_three_indirect_media_are_told_apart() {
+        for (letter, medium) in [
+            ("f", Medium::File),
+            ("t", Medium::Temp),
+            ("s", Medium::Shared),
+        ] {
+            assert_eq!(parsed(&format!("t={letter}")).medium, medium);
         }
+        assert_eq!(parsed("t=d").medium, Medium::Direct);
+    }
+
+    #[test]
+    fn a_file_read_has_a_size_and_an_offset() {
+        let command = parsed("t=f,S=300,O=16");
+        assert_eq!((command.data_size, command.data_offset), (300, 16));
+        let command = parsed("t=f");
+        assert_eq!((command.data_size, command.data_offset), (0, 0));
+        let (_, error) = failed("i=4,S=-1");
+        assert_eq!(error.code(), "EINVAL");
     }
 }

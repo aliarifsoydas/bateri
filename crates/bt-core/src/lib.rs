@@ -25,7 +25,9 @@
 //! surface of the settings model and the theme file; the theme's colors are
 //! `0xRRGGBB`, not alacritty's `Rgb`.
 //!
-//! What the boundary carries is a **decision**, not pixels: `Cursor` gives the
+//! What the boundary carries is a **decision**, not pixels (the one exception
+//! is a kitty graphics image, whose RGBA pixels are the thing itself and cross
+//! as `Picture`s): `Cursor` gives the
 //! cursor's position and the color of the text left under its block ("the text
 //! under the cursor must stay readable" is a terminal semantic), and the
 //! drawing side knows which pixels will take that color — **the decision is
@@ -39,8 +41,9 @@
 //!
 //! Contract: this crate sees no macOS-specific library — no `objc2*`,
 //! `core-text`, `metal` — and stays buildable on Linux; the Vulkan gate is
-//! built on top of this separation. The Unix PTY (`libc`, `rustix`) is allowed
-//! and does not close that gate.
+//! //! built on top of this separation. The Unix PTY and the POSIX calls it
+//! brings (`libc`, `rustix`: the PTY, shared memory objects, opening a file
+//! without blocking) are allowed and do not close that gate.
 //!
 //! The audit is `make audit` (`Makefile`, runs in every `make check`) and is a
 //! proxy at the dependency level; the real gate is building with

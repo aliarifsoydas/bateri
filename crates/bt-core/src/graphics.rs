@@ -9,9 +9,11 @@
 //!   `TappedPty::read`, before the parser, and only separates: it takes
 //!   `ESC _ G … ESC \` out of the bytes, joins the chunks of a transmission
 //!   as base64 text and queues that, undecoded, as a [`Pending::Raw`] record.
-//!   In the stream it leaves [`MARK`] in the command's place. (A query is the
-//!   exception: its answer is due at once, so it is decoded there, and it may
-//!   only be small — [`QUERY_LIMIT`].)
+//!   In the stream it leaves [`MARK`] in the command's place. (A query whose
+//!   pixels are in the sequence is the exception: its answer is due at once, so
+//!   it is decoded there, and it may only be small — [`QUERY_LIMIT`]. One that
+//!   names a file or shared memory object is not: it is read with the rest and
+//!   answered at its marker.)
 //! - **The decoding** ([`Hub::decode_pending`]) is the expensive part —
 //!   base64, zlib, PNG. The read loop does it between a read and the parse of
 //!   it, with the terminal's lease and lock both let go, because a frame
@@ -32,6 +34,13 @@
 //! this. How placements keep their lines while the content scrolls is
 //! [`follow`]'s, and what the frame draws is [`Pictures`].
 //!
+//! **Where the pixels come from** is the command's `t=`. In the escape
+//! sequence itself (`d`) they travel as the payload. A file (`f`), a
+//! temporary file (`t`) or a shared memory object (`s`) is named by the payload
+//! instead, and [`source`] reads it — where the decoding is, never in the
+//! read — under rules that treat the name as what it is: text any program, and
+//! anything a program prints, can write.
+//!
 //! Nothing here draws. The store holds decoded pixels and placements per
 //! screen ([`Images`]); the frame hands them over as [`Picture`]s.
 
@@ -40,6 +49,7 @@ mod command;
 mod follow;
 mod place;
 mod receive;
+mod source;
 mod store;
 
 use std::collections::VecDeque;
@@ -57,7 +67,7 @@ pub use place::{Picture, PictureLayer, Pictures};
 pub(crate) use receive::{Env, Outcome, Receiver};
 pub(crate) use store::{Window, screen_of};
 
-use command::Command;
+use command::{Action, Command};
 use receive::Decoded;
 use store::Images;
 
@@ -88,9 +98,18 @@ pub(crate) const PAYLOAD_LIMIT: usize = 64 * 1024 * 1024;
 /// program compresses (`o=z`) or sends a PNG.
 pub(crate) const TRANSMISSION_LIMIT: usize = 192 * 1024 * 1024;
 
+/// The most bytes read from a file or shared memory object, where the image
+/// is not raw pixels of a known size: the decoded size of
+/// [`TRANSMISSION_LIMIT`] worth of base64, so the three media cost the same
+/// memory.
+pub(crate) const FILE_LIMIT: usize = TRANSMISSION_LIMIT / 4 * 3;
+
+/// The longest file or shared memory name, kitty's limit.
+pub(crate) const NAME_LIMIT: usize = 2048;
+
 /// The most base64 text a query (`a=q`) may carry. A query is answered the
 /// moment it is read, so it is decoded there and then, in the read path; real
-/// ones are a pixel.
+/// ones are a pixel. A query that names a file reads at most the same.
 pub(crate) const QUERY_LIMIT: usize = 64 * 1024;
 
 /// How long a chunked transmission may wait for its next chunk before it is
@@ -171,6 +190,16 @@ impl Error {
         Self::new("ENOSPC", message)
     }
 
+    /// A file or shared memory object that could not be read, for whatever
+    /// reason: kitty's own words. One answer for all of them, and none of it
+    /// the program's: a refusal that says why would tell a program that
+    /// only prints text which files this machine has and how big they are,
+    /// and an answer that repeats a name would write the program's text
+    /// into the PTY's input.
+    pub(crate) fn unreadable() -> Self {
+        Self::new("EBADF", "Failed to read image file")
+    }
+
     #[cfg(test)]
     pub(crate) fn code(&self) -> &'static str {
         self.code
@@ -239,10 +268,12 @@ impl Reply {
 
 /// A command waiting for the parser to reach its marker.
 pub(crate) enum Pending {
-    /// A transmission whose base64 text has not been decoded yet:
-    /// [`Hub::decode_pending`] turns it into a `Store` or a `Reply`. The
-    /// `motion` is what the reader wrote around the marker if the command
-    /// shows the image (`a=T`).
+    /// A transmission that has not been decoded yet: [`Hub::decode_pending`]
+    /// turns it into a `Store` or a `Reply`. `text` is the payload as it
+    /// came — base64 pixels — or, when the command names a file or shared
+    /// memory object (`t=f/t/s`), the name, which is read then. The `motion`
+    /// is what the reader wrote around the marker if the command shows the
+    /// image (`a=T`).
     Raw {
         command: Command,
         text: Vec<u8>,
@@ -402,6 +433,9 @@ impl Hub {
     fn decoded(&self, command: Command, text: Vec<u8>, motion: Motion, held: usize) -> Pending {
         let echo = command.echo;
         match receive::decode_payload(&command, text) {
+            // A query that names a file is a transmission that is not kept:
+            // it only waits here, for its marker, to be answered in order.
+            Ok(_) if command.action == Action::Query => Pending::Reply(Reply::ok(echo)),
             Ok(decoded) if held.saturating_add(decoded.len()) > self.waiting => {
                 Pending::Reply(Reply::failed(
                     echo,

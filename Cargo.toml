@@ -122,7 +122,12 @@ cursor-icon = { version = "1.2", default-features = false }
 # The last resort of the watchdog thread: `write(2, …)` + `_exit(70)`, both
 # async-signal-safe (`bt-shell-macos::bekci`). NOT a new crate — it was already in the
 # graph (alacritty opens the PTY with it) and the version does not move; in `Cargo.lock`
-# only an edge is added to `bt-shell-macos`'s dependency list.
+# only an edge is added to `bt-shell-macos`'s dependency list. The same edge is
+# in `bt-core`'s list for the kitty graphics protocol's shared memory
+# (`graphics::source`: `shm_open`, `shm_unlink` and, on macOS, `mmap`, none of
+# which std offers) and for opening a named file without blocking on a pipe
+# (`O_NONBLOCK`, `O_NOFOLLOW`). The Unix PTY's `libc` is the one the layer
+# contract allows `bt-core` (`lib.rs`); no version moves.
 libc = "0.2"
 # To be able to implement `EventedReadWrite` (`bt-core::session`'s `TappedPty`):
 # the trait's three registration methods pass `Poller`, `Event` and `PollMode` in

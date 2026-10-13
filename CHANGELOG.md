@@ -21,9 +21,14 @@ of every installed copy. A version without a section is not released.
   into view when you scroll up), stays under or over the text as the program
   asked, and goes when the program deletes it or you clear the screen. A
   program that asks for it also gets the pointer's exact position, not just
-  the cell, so a click on a small button in a page lands on it. Images do not
-  survive an update or a crash of bateri; the text does, and a program that
-  redraws when its window is signalled draws its images again.
+  the cell, so a click on a small button in a page lands on it. A program
+  can hand a picture over through a file or shared memory, so big images and
+  pages that redraw often need not pass through the terminal's input; bateri
+  reads only ordinary files (never `/dev`, `/proc` or `/sys`), deletes only a
+  temporary file named for the purpose, removes the shared memory object the
+  program hands over, and never writes a name a program gave back into its
+  answers. Images do not survive an update or a crash of bateri; the text does, and a
+  program that redraws when its window is signalled draws its images again.
 - **bash gets the command blocks and the dock.** When your login shell is
   bash 4.4 or newer, the stripe beside each command, the duration of a long
   one and the directory you are in show, the `ssh` integration reaches

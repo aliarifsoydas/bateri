@@ -2337,7 +2337,10 @@ impl EventListener for Adapter {
 /// a command's payload is only assembled here, as base64 text. Decoding it —
 /// base64, inflate, PNG — happens in the read loop between the read and its
 /// parse, with neither the lease nor the lock held
-/// ([`graphics::Hub::decode_pending`]).
+/// ([`graphics::Hub::decode_pending`]); so does reading the file or shared
+/// memory object a command names, which here is only a name. The one touch
+/// of a file in `read` is the first bytes of a named PNG, to know how far
+/// the cursor moves (`graphics::source::peek`).
 ///
 /// **`Reader = Self` is the core of the decision.** `Pty::reader()` returns
 /// `&mut File`, so borrowing suffices to hand over the reader: **no second fd
@@ -29965,6 +29968,70 @@ e\\314\\201.'; sleep 5";
         let attributes = text.find("[?6c").expect("the attributes");
         assert!(graphics < attributes, "{text:?}");
         assert_eq!(stored_ids(&session), (vec![], vec![]));
+        session.shutdown();
+    }
+
+    /// A file in the temporary directory for a graphics command to name,
+    /// removed when the guard goes if the terminal has not taken it.
+    struct NamedFile(std::path::PathBuf);
+
+    impl NamedFile {
+        fn new(stem: &str, bytes: &[u8]) -> Self {
+            let path = std::env::temp_dir().join(format!("{stem}-{}", std::process::id()));
+            std::fs::write(&path, bytes).expect("a file to name");
+            Self(path)
+        }
+
+        /// A shell command that puts the file's name, in base64, in `$name`.
+        fn encoded(&self) -> String {
+            format!(
+                "name=$(printf %s '{}' | base64 | tr -d '\\n')",
+                self.0.display()
+            )
+        }
+    }
+
+    impl Drop for NamedFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_query_that_names_a_file_is_answered_before_the_device_attributes_too() {
+        // The answer to a query about a file waits for its marker, where a
+        // query with its pixels in the sequence is answered at once; the
+        // marker is in the stream where the command was, ahead of the
+        // attributes, so the order the program needs holds either way.
+        let file = NamedFile::new("tty-graphics-protocol-session", &[1, 2, 3]);
+        let script = format!(
+            r#"stty echo echoctl; {}; printf '\033_Gi=4207,a=q,t=t,f=24,s=1,v=1;%s\033\\\033[c' "$name"; sleep 8"#,
+            file.encoded()
+        );
+        let session = spawn_session(&script, Arc::new(TestWake::default()));
+        let text = wait_text(&session, "[?6c");
+        let graphics = text
+            .find("^[_Gi=4207;OK^[\\")
+            .unwrap_or_else(|| panic!("no graphics answer in {text:?}"));
+        let attributes = text.find("[?6c").expect("the attributes");
+        assert!(graphics < attributes, "{text:?}");
+        assert!(!file.0.exists(), "the query took the temporary file");
+        assert_eq!(stored_ids(&session), (vec![], vec![]));
+        session.shutdown();
+    }
+
+    #[test]
+    fn an_image_in_a_file_is_stored_and_the_file_is_left_alone() {
+        let file = NamedFile::new("bt-session-image", &[9, 8, 7, 6]);
+        let script = format!(
+            r#"stty -echo; {}; printf '\033_Ga=t,t=f,f=32,s=1,v=1,i=6;%s\033\\READY' "$name"; sleep 8"#,
+            file.encoded()
+        );
+        let session = spawn_session(&script, Arc::new(TestWake::default()));
+        let text = wait_text(&session, "READY");
+        assert!(!text.contains("Ga="), "{text:?}");
+        assert_eq!(stored_ids(&session), (vec![6], vec![]));
+        assert!(file.0.exists());
         session.shutdown();
     }
 

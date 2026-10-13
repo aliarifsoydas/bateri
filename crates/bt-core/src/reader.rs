@@ -19,7 +19,8 @@
 //! - the PTY tokens are `pub(crate)` in alacritty, their values were copied
 //!   here (and are `pub(crate)` here too: an adopted PTY registers on them);
 //! - comments were translated (first to Turkish, later to English);
-//! - an image a read carried (a graphics command) is decoded between that
+//! - an image a read carried (a graphics command) is decoded — and read, when
+//!   the command names a file or shared memory object — between that
 //!   read and its parse, with the terminal's lease and lock **let go**
 //!   ([`crate::graphics::Hub::decode_pending`]) — a frame waits for the
 //!   lease as well as the lock, so decoding under either would hold it back;

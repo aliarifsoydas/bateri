@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::apc::Apc;
@@ -376,6 +379,32 @@ fn nothing_is_applied_until_the_last_chunk_and_the_flag_says_so() {
     rig.run_at(&[ESC_G, b"m=0;AA==", ST].concat(), &mut now, &mut stream);
     assert!(!rig.receiver.is_open());
     assert_eq!(rig.main_ids(), [1]);
+}
+
+#[test]
+fn a_transmission_that_keeps_coming_is_not_one_that_waited_too_long() {
+    // Every chunk is inside the wait of the one before it, though the whole
+    // is far longer than the wait (a big image over a slow link).
+    let mut rig = Rig::new();
+    let mut stream = Vec::new();
+    let mut now = Instant::now();
+    let step = OPEN_TIMEOUT - Duration::from_secs(1);
+    rig.run_at(
+        &[ESC_G, b"a=t,f=32,s=1,v=1,i=6,m=1;AAAA", ST].concat(),
+        &mut now,
+        &mut stream,
+    );
+    now += step;
+    rig.run_at(&[ESC_G, b"m=1;AAAA", ST].concat(), &mut now, &mut stream);
+    now += step;
+    // 4 + 4 + 0 characters is 6 bytes, and a pixel is 4: the last chunk
+    // finishes it with the right size.
+    let (_, answers) = rig.run_at(&[ESC_G, b"m=0;", ST].concat(), &mut now, &mut stream);
+    assert!(
+        !error_of(&answers).contains("in time"),
+        "{}",
+        error_of(&answers)
+    );
 }
 
 #[test]
@@ -1752,4 +1781,453 @@ mod screenful {
             b"\x1b[?1016h",
         );
     }
+}
+
+// ─── files and shared memory ────────────────────────────────────────────
+
+/// The whole answer to a command whose file or object could not be used: the
+/// same words whatever the reason.
+fn unreadable(id: u32) -> Vec<u8> {
+    format!("\x1b_Gi={id};EBADF:Failed to read image file\x1b\\").into_bytes()
+}
+
+fn unique(stem: &str) -> String {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    format!(
+        "{stem}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// A file for a test to name; it is removed when the guard goes.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn in_dir(dir: &Path, stem: &str, bytes: &[u8]) -> Self {
+        let path = dir.join(unique(stem));
+        std::fs::write(&path, bytes).expect("a scratch file");
+        Self(path)
+    }
+
+    /// In the temporary directory, where a program leaves what it sends.
+    fn temp(stem: &str, bytes: &[u8]) -> Self {
+        Self::in_dir(&std::env::temp_dir(), stem, bytes)
+    }
+
+    /// A file that is in no temporary directory.
+    fn elsewhere(stem: &str, bytes: &[u8]) -> Self {
+        Self::in_dir(Path::new(env!("CARGO_MANIFEST_DIR")), stem, bytes)
+    }
+
+    fn name(&self) -> &[u8] {
+        self.0.as_os_str().as_bytes()
+    }
+
+    fn exists(&self) -> bool {
+        std::fs::symlink_metadata(&self.0).is_ok()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A shared memory object holding `bytes`, made the way a program that sends
+/// pixels this way makes one. Removed when the guard goes, if it is still
+/// there.
+struct Object(String);
+
+impl Object {
+    fn new(bytes: &[u8]) -> Self {
+        let name = format!("/{}", unique("bt-gfx"));
+        let c_name = CString::new(name.as_str()).expect("a name");
+        // SAFETY: `c_name` is NUL-terminated and outlives the calls; the
+        // object is created, sized, written through a mapping of exactly
+        // its size and closed here, and the mapping is released before the
+        // function returns.
+        unsafe {
+            let fd = libc::shm_open(
+                c_name.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                0o600,
+            );
+            assert!(fd >= 0, "shm_open: {}", std::io::Error::last_os_error());
+            assert_eq!(libc::ftruncate(fd, bytes.len() as libc::off_t), 0);
+            let map = libc::mmap(
+                std::ptr::null_mut(),
+                bytes.len(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            assert_ne!(map, libc::MAP_FAILED, "mmap");
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), map.cast::<u8>(), bytes.len());
+            libc::munmap(map, bytes.len());
+            libc::close(fd);
+        }
+        Self(name)
+    }
+
+    fn name(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    fn exists(&self) -> bool {
+        let c_name = CString::new(self.0.as_str()).expect("a name");
+        // SAFETY: a read-only open of a NUL-terminated name, closed at once.
+        unsafe {
+            let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0);
+            if fd >= 0 {
+                libc::close(fd);
+            }
+            fd >= 0
+        }
+    }
+}
+
+impl Drop for Object {
+    fn drop(&mut self) {
+        let c_name = CString::new(self.0.as_str()).expect("a name");
+        // SAFETY: a NUL-terminated name.
+        unsafe { libc::shm_unlink(c_name.as_ptr()) };
+    }
+}
+
+#[test]
+fn a_file_is_read_where_it_lies_and_left_there() {
+    let pixels = rgba(2, 1, 9);
+    let file = Scratch::temp("bt-image", &pixels);
+    let mut rig = Rig::new();
+    let (stream, answers) = rig.run(&wire("a=t,t=f,f=32,s=2,v=1,i=7", file.name()));
+    assert_eq!(stream, MARK);
+    assert_eq!(answers, ok(7));
+    assert_eq!(rig.pixels(7), Some(pixels));
+    assert!(file.exists(), "t=f does not delete");
+}
+
+#[test]
+fn a_temporary_file_is_read_and_deleted() {
+    let pixels = rgba(2, 1, 4);
+    let file = Scratch::temp("tty-graphics-protocol-image", &pixels);
+    let mut rig = Rig::new();
+    let (_, answers) = rig.run(&wire("a=t,t=t,f=32,s=2,v=1,i=7", file.name()));
+    assert_eq!(answers, ok(7));
+    assert_eq!(rig.pixels(7), Some(pixels));
+    assert!(!file.exists(), "t=t deletes once it is read");
+}
+
+#[test]
+fn rgb_zlib_and_png_come_out_of_a_file_as_they_do_out_of_the_stream() {
+    let mut rig = Rig::new();
+    let rgb = Scratch::temp("bt-image", &[10, 20, 30, 40, 50, 60]);
+    rig.run(&wire("a=t,t=f,f=24,s=2,v=1,i=1", rgb.name()));
+    assert_eq!(rig.pixels(1), Some(vec![10, 20, 30, 255, 40, 50, 60, 255]));
+    let packed = Scratch::temp("bt-image", &zlib(&rgba(8, 8, 1)));
+    rig.run(&wire("a=t,t=f,f=32,o=z,s=8,v=8,i=2", packed.name()));
+    assert_eq!(rig.pixels(2), Some(rgba(8, 8, 1)));
+    let png = png_file(
+        2,
+        2,
+        png::ColorType::Rgba,
+        png::BitDepth::Eight,
+        None,
+        None,
+        &rgba(2, 2, 5),
+    );
+    let file = Scratch::temp("bt-image", &png);
+    rig.run(&wire("a=t,t=f,f=100,i=3", file.name()));
+    assert_eq!(rig.pixels(3), Some(rgba(2, 2, 5)));
+}
+
+#[test]
+fn a_png_in_a_file_is_sized_from_its_header_like_one_in_the_stream() {
+    let png = png_file(
+        30,
+        40,
+        png::ColorType::Rgba,
+        png::BitDepth::Eight,
+        None,
+        None,
+        &rgba(30, 40, 3),
+    );
+    let around = [b"\x1bD".as_slice(), MARK, b"\x1b[3C"].concat();
+    for (name, medium) in [("bt-image", "f"), ("tty-graphics-protocol-image", "t")] {
+        let file = Scratch::temp(name, &png);
+        let mut rig = Rig::new();
+        let (stream, _) = rig.run(&wire(&format!("a=T,t={medium},f=100,i=1"), file.name()));
+        assert_eq!(stream, around, "t={medium}");
+        assert_eq!(placed(&rig), [(1, -1, 0)], "t={medium}");
+    }
+    // Compressed, and with the PNG not at the start of the file.
+    let mut padded = vec![0; 16];
+    padded.extend_from_slice(&zlib(&png));
+    let file = Scratch::temp("bt-image", &padded);
+    let mut rig = Rig::new();
+    let (stream, _) = rig.run(&wire("a=T,t=f,f=100,o=z,O=16,i=1", file.name()));
+    assert_eq!(stream, around);
+}
+
+#[test]
+fn a_file_is_not_touched_while_the_stream_is_read_only_when_it_is_decoded() {
+    let file = Scratch::temp("tty-graphics-protocol-image", &rgba(1, 1, 2));
+    let mut rig = Rig::new();
+    queue_only(&mut rig, &wire("a=t,t=t,f=32,s=1,v=1,i=3", file.name()));
+    assert!(rig.hub.has_undecoded());
+    assert!(file.exists(), "nothing is read or deleted in the read");
+    rig.hub.decode_pending();
+    assert!(!rig.hub.has_undecoded());
+    assert!(!file.exists(), "the decode read it");
+    let answers = rig.hub.apply_next(&rig.screen()).unwrap_or_default();
+    assert_eq!(answers, ok(3));
+}
+
+#[test]
+fn part_of_a_file_is_read_by_size_and_offset() {
+    let pixels = rgba(2, 1, 7);
+    let mut bytes = vec![0xee; 16];
+    bytes.extend_from_slice(&pixels);
+    bytes.extend_from_slice(&[0xdd; 5]);
+    let file = Scratch::temp("bt-image", &bytes);
+    let mut rig = Rig::new();
+    rig.run(&wire("a=t,t=f,f=32,s=2,v=1,O=16,S=8,i=1", file.name()));
+    assert_eq!(rig.pixels(1), Some(pixels.clone()));
+    // Without a size the read goes to the end, and a raw image takes only
+    // what its dimensions call for: the five bytes after it are not read.
+    rig.run(&wire("a=t,t=f,f=32,s=2,v=1,O=16,i=2", file.name()));
+    assert_eq!(rig.pixels(2), Some(pixels));
+    // Too little is the same answer as no file at all, with no number in it.
+    for control in [
+        "a=t,t=f,f=32,s=2,v=1,O=16,S=4,i=3",
+        "a=t,t=f,f=32,s=2,v=1,O=1000,i=3",
+        "a=t,t=f,f=32,s=40,v=40,i=3",
+    ] {
+        let (_, answers) = rig.run(&wire(control, file.name()));
+        assert_eq!(answers, unreadable(3), "{control}");
+    }
+}
+
+#[test]
+fn a_temporary_file_that_may_not_be_taken_is_refused_and_left_alone() {
+    let pixels = rgba(1, 1, 1);
+    let mut rig = Rig::new();
+    let control = "a=t,t=t,f=32,s=1,v=1,i=5";
+    // In the temporary directory but not named for the protocol.
+    let plain = Scratch::temp("bt-image", &pixels);
+    // Named for it but in a directory that is not a temporary one.
+    let away = Scratch::elsewhere("tty-graphics-protocol-image", &pixels);
+    // Named for it, in the temporary directory, but a link to a file that
+    // is neither.
+    let target = Scratch::elsewhere("bt-image", &pixels);
+    let link = Scratch(std::env::temp_dir().join(unique("tty-graphics-protocol-link")));
+    std::os::unix::fs::symlink(&target.0, &link.0).expect("a link");
+    for file in [&plain, &away, &link] {
+        let (_, answers) = rig.run(&wire(control, file.name()));
+        assert_eq!(answers, unreadable(5), "{:?}", file.0);
+        assert!(file.exists(), "{:?} was touched", file.0);
+    }
+    assert!(target.exists());
+    assert!(rig.main_ids().is_empty());
+    // The same file, asked for as an ordinary file, is read; the temporary
+    // directory is no reason to refuse it.
+    let (_, answers) = rig.run(&wire("a=t,t=f,f=32,s=1,v=1,i=5", plain.name()));
+    assert_eq!(answers, ok(5));
+}
+
+#[test]
+fn a_file_the_protocol_may_not_name_is_refused_before_it_is_opened() {
+    let mut rig = Rig::new();
+    let names: [&[u8]; 7] = [
+        b"/dev/null",
+        b"/dev/zero",
+        b"/dev/stdin",
+        b"/proc/self/status",
+        b"/sys/kernel",
+        b"relative/image.png",
+        b"~/image.png",
+    ];
+    for name in names {
+        let (_, answers) = rig.run(&wire("a=t,t=f,f=32,s=1,v=1,i=1", name));
+        assert_eq!(answers, unreadable(1), "{}", String::from_utf8_lossy(name));
+    }
+    // A pipe is no file: opening it for reading would wait for a writer.
+    let fifo = std::env::temp_dir().join(unique("bt-fifo"));
+    let c_path = CString::new(fifo.as_os_str().as_bytes()).expect("a path");
+    // SAFETY: a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let (_, answers) = rig.run(&wire(
+        "a=t,t=f,f=32,s=1,v=1,i=1",
+        fifo.as_os_str().as_bytes(),
+    ));
+    let _ = std::fs::remove_file(&fifo);
+    assert_eq!(answers, unreadable(1));
+    // A directory is no file either.
+    let (_, answers) = rig.run(&wire(
+        "a=t,t=f,f=32,s=1,v=1,i=1",
+        std::env::temp_dir().as_os_str().as_bytes(),
+    ));
+    assert_eq!(answers, unreadable(1));
+    assert!(rig.main_ids().is_empty());
+}
+
+#[test]
+fn what_is_in_an_answer_is_never_the_programs_own_text() {
+    // An answer is written into the PTY's input: a name repeated in it would
+    // be typed into whatever reads that.
+    let mut rig = Rig::new();
+    let (_, answers) = rig.run(&wire(
+        "a=t,t=f,f=32,s=1,v=1,i=1",
+        b"/nonexistent/evil\n; touch pwned",
+    ));
+    assert_eq!(answers, unreadable(1));
+    let text = error_of(&answers);
+    assert!(
+        !text.contains("evil") && !text.contains("pwned"),
+        "{text:?}"
+    );
+}
+
+#[test]
+fn a_name_that_cannot_be_one_is_refused_where_it_is_read() {
+    let mut rig = Rig::new();
+    let long = vec![b'a'; NAME_LIMIT + 1];
+    let names: [&[u8]; 3] = [b"", b"/tmp/a\0b", &long];
+    for name in names {
+        let (_, answers) = rig.run(&wire("a=t,t=f,f=32,s=1,v=1,i=1", name));
+        let text = error_of(&answers);
+        assert!(text.starts_with("\x1b_Gi=1;EINVAL:"), "{text:?}");
+    }
+    let (_, answers) = rig.run(b"\x1b_Ga=t,t=f,f=32,s=1,v=1,i=1;not base64!\x1b\\");
+    assert!(error_of(&answers).contains("EINVAL"));
+    // A name past what the splitter keeps is cut and refused, not read.
+    let (_, answers) = rig.run(&wire(
+        "a=t,t=f,f=32,s=1,v=1,i=1",
+        &vec![b'a'; NAME_LIMIT * 3],
+    ));
+    assert!(error_of(&answers).contains("EINVAL"));
+    assert!(rig.main_ids().is_empty());
+}
+
+#[test]
+fn a_name_is_whole_in_its_command_and_m_does_not_wait_for_more() {
+    let file = Scratch::temp("bt-image", &rgba(1, 1, 3));
+    let mut rig = Rig::new();
+    let (_, answers) = rig.run(&wire("a=t,t=f,f=32,s=1,v=1,m=1,i=2", file.name()));
+    assert_eq!(answers, ok(2));
+    assert!(!rig.receiver.is_open());
+}
+
+#[test]
+fn an_image_too_big_to_read_is_refused_without_touching_its_file() {
+    let file = Scratch::temp("tty-graphics-protocol-image", &[0; 16]);
+    let mut rig = Rig::new();
+    // 320 MB of pixels fits the quota but not a transmission.
+    let (_, answers) = rig.run(&wire("a=t,t=t,f=32,s=10000,v=8000,i=1", file.name()));
+    assert!(
+        error_of(&answers).starts_with("\x1b_Gi=1;EFBIG:"),
+        "{answers:?}"
+    );
+    assert!(file.exists(), "refused before the file was looked at");
+}
+
+#[test]
+fn shared_memory_is_read_and_removed() {
+    let pixels = rgba(2, 1, 6);
+    let object = Object::new(&pixels);
+    let mut rig = Rig::new();
+    let (stream, answers) = rig.run(&wire("a=t,t=s,f=32,s=2,v=1,i=4", object.name()));
+    assert_eq!(stream, MARK);
+    assert_eq!(answers, ok(4));
+    assert_eq!(rig.pixels(4), Some(pixels));
+    assert!(!object.exists(), "t=s removes the object once it is read");
+}
+
+#[test]
+fn shared_memory_is_read_from_an_offset_far_past_a_page() {
+    // Further in than any page is long, and not on a page boundary.
+    let at = 16384 + 24;
+    let pixels = rgba(2, 1, 8);
+    let mut bytes = vec![0xaa; at];
+    bytes.extend_from_slice(&pixels);
+    let object = Object::new(&bytes);
+    let mut rig = Rig::new();
+    let control = format!("a=t,t=s,f=32,s=2,v=1,O={at},S=8,i=1");
+    let (_, answers) = rig.run(&wire(&control, object.name()));
+    assert_eq!(answers, ok(1));
+    assert_eq!(rig.pixels(1), Some(pixels));
+}
+
+#[test]
+fn an_object_that_cannot_be_used_is_removed_all_the_same() {
+    // More pixels than the object has: even where an object is rounded up to
+    // a page, 200 × 200 of them are more than one.
+    let object = Object::new(&[1, 2, 3]);
+    let mut rig = Rig::new();
+    let (_, answers) = rig.run(&wire("a=t,t=s,f=32,s=200,v=200,i=1", object.name()));
+    assert_eq!(answers, unreadable(1));
+    assert!(!object.exists(), "the program handed it over");
+    // One that is not there, and names that are not names of objects.
+    for name in [&b"/bt-gfx-none"[..], b"no-slash", b"/a/b", b"/", b"/.."] {
+        let (_, answers) = rig.run(&wire("a=t,t=s,f=32,s=2,v=1,i=1", name));
+        assert_eq!(answers, unreadable(1), "{}", String::from_utf8_lossy(name));
+    }
+    assert!(rig.main_ids().is_empty());
+}
+
+#[test]
+fn a_query_that_names_its_pixels_is_answered_at_its_marker_and_keeps_nothing() {
+    let mut rig = Rig::new();
+    let plain = Scratch::temp("bt-image", &[1, 2, 3]);
+    let (stream, answers) = rig.run(&wire("i=9,a=q,t=f,f=24,s=1,v=1", plain.name()));
+    assert_eq!(stream, MARK, "it waits for its place in the stream");
+    assert_eq!(answers, ok(9));
+    assert!(plain.exists());
+    let temp = Scratch::temp("tty-graphics-protocol-image", &[1, 2, 3]);
+    let (_, answers) = rig.run(&wire("i=9,a=q,t=t,f=24,s=1,v=1", temp.name()));
+    assert_eq!(answers, ok(9));
+    assert!(!temp.exists(), "a query takes a temporary file too");
+    let object = Object::new(&[1, 2, 3]);
+    let (_, answers) = rig.run(&wire("i=9,a=q,t=s,f=24,s=1,v=1", object.name()));
+    assert_eq!(answers, ok(9));
+    assert!(!object.exists());
+    // What a terminal that cannot read it says, for the program to fall back.
+    let (_, answers) = rig.run(&wire("i=9,a=q,t=f,f=24,s=1,v=1", b"/nonexistent/x"));
+    assert_eq!(answers, unreadable(9));
+    assert!(rig.queries.is_empty(), "none of these was answered early");
+    assert!(rig.main_ids().is_empty(), "a query stores nothing");
+}
+
+#[test]
+fn a_query_that_names_a_file_asks_about_the_whole_of_it() {
+    // A query does not have a size of its own: it asks whether this image can
+    // be shown, however big it is.
+    let file = Scratch::temp("bt-image", &rgba(200, 200, 1));
+    let mut rig = Rig::new();
+    let (_, answers) = rig.run(&wire("i=2,a=q,t=f,f=32,s=200,v=200", file.name()));
+    assert_eq!(answers, ok(2));
+    assert!(rig.main_ids().is_empty());
+}
+
+#[test]
+fn whatever_is_wrong_with_a_named_file_is_one_answer() {
+    // Missing, corrupt, short, the wrong format: told apart, they would say
+    // which files exist and what is in them.
+    let junk = Scratch::temp("bt-image", b"not an image at all, not even close");
+    let short = Scratch::temp("bt-image", &[1, 2, 3]);
+    let mut rig = Rig::new();
+    let cases = [
+        ("a=t,t=f,f=32,s=2,v=1,i=1", b"/nonexistent/file".as_slice()),
+        ("a=t,t=f,f=100,i=1", junk.name()),
+        ("a=t,t=f,f=32,o=z,s=2,v=1,i=1", junk.name()),
+        ("a=t,t=f,f=32,s=2,v=1,i=1", short.name()),
+        ("a=t,t=f,f=24,s=100,v=100,i=1", short.name()),
+    ];
+    for (control, name) in cases {
+        let (_, answers) = rig.run(&wire(control, name));
+        assert_eq!(answers, unreadable(1), "{control}");
+    }
+    assert!(rig.main_ids().is_empty());
 }

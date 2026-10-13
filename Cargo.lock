@@ -145,6 +145,7 @@ version = "0.14.0"
 dependencies = [
  "alacritty_terminal",
  "cursor-icon",
+ "libc",
  "miniz_oxide 0.8.9",
  "png",
  "polling",

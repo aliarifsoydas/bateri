@@ -1652,7 +1652,7 @@ impl Frame {
         self.dock_clusters.clear();
         // The pictures are restated by every content frame too: one that does
         // not (a screen without any) must not keep the last frame's.
-        self.pictures = Pictures::default();
+        self.pictures.clear();
         // The effects too: in a frame with no dock (alternate screen) the
         // previous frame's ghost must not hang on.
         self.dock_ghosts.clear();
