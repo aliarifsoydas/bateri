@@ -1420,22 +1420,40 @@ does nothing either and the terminal works as it is.
     previewing and the `search:` field under it;
   - `fish --no-config` reads no `vendor_conf.d`, so it gets no marks and no
     dock — the line you type stays in the grid.
-- **bash** (4.4 or newer) gets the command blocks, the stripe, the duration
-  counter, the working directory and the `ssh` integration. The dock does not
-  open for bash yet: the line you type stays in the grid and your prompt shows
-  as it is. bateri starts bash as a login shell in POSIX mode with `ENV` naming
-  its own file; that file leaves POSIX mode and reads your login files itself,
-  in bash's order (`/etc/profile`, then the first of `~/.bash_profile`,
+- **bash** (4.4 or newer) gets the same: the command blocks, the stripe, the
+  duration counter, the working directory, the `ssh` integration and the dock.
+  bateri starts bash as a login shell in POSIX mode with `ENV` naming its own
+  file; that file leaves POSIX mode and reads your login files itself, in
+  bash's order (`/etc/profile`, then the first of `~/.bash_profile`,
   `~/.bash_login` and `~/.profile`), so `logout` and `~/.bash_logout` work,
   your history stays in `~/.bash_history`, and nothing is written to your
   bash files. Its hooks are put in after your files have run, so a prompt
   theme that rewrites `PS1` or `PROMPT_COMMAND` at startup does not take them
   away; one that is re-sourced later in the session (`source ~/.bashrc` typed
   by hand) can, and the marks stop until the next tab.
+  bash does not hand the terminal its line, so the dock reads the line bash
+  *draws* — what you type, in the colors your terminal uses — and bateri
+  draws the prompt: your `PS1` and `PS2` are not shown (see [Getting your
+  prompt back](#getting-your-prompt-back)), and a theme that sets `PS1` again
+  at every prompt is taken back at the next one. A `ssh` function or alias of
+  your own is left alone. What differs from zsh:
+  - clicking in the dock moves the caret there, and selecting text and then
+    typing or pressing delete replaces or removes it, as in zsh;
+  - bash has no suggestions, so the dock shows only what you typed;
+  - a command that continues on a second line (an open quote, a trailing
+    `\`) shows all its lines in the dock, but the dock does not edit it:
+    a click does nothing there and the keys go to bash as you type them;
+  - in vi mode (`set -o vi`) a click in the dock moves the caret in both
+    modes, but deleting a selection works only in insert mode;
+  - the completion list (Tab) is drawn by bash on the grid, above the dock;
+    while Ctrl-R searches the history the dock shows bash's own search line
+    with its first two characters cut off, and goes back to your line when the
+    search ends;
+  - Ctrl-C leaves the line you had typed on the grid with `^C` after it, as
+    bash does in any terminal.
   **macOS's own `/bin/bash` is version 3.2 and is left exactly as it is** —
-  no marks, no change in how it starts. To have them, install a newer bash
-  (for example `brew install bash`) and make it your login shell. A `ssh`
-  function or alias of your own is left alone.
+  no marks, no dock, no change in how it starts. To have them, install a newer
+  bash (for example `brew install bash`) and make it your login shell.
 - **`"blocks"`** — the same setup, but **the input line stays yours**: the
   dock does not open, the line you type stays in the grid, and your prompt
   (p10k, starship, a `PS1` or `fish_prompt` you wrote by hand) shows as it is.
@@ -1496,8 +1514,8 @@ and the whole file becomes unreadable (the title bar says so).
 Since the default is `"auto"`, anyone with a prompt set up **cannot see it**
 after updating: `"auto"` hands the prompt over to the terminal and moves the
 line you type into the dock. In fish that is `fish_prompt`,
-`fish_right_prompt` and `fish_mode_prompt` all three. The way back is a single
-line:
+`fish_right_prompt` and `fish_mode_prompt` all three; in bash it is `PS1` and
+`PS2`. The way back is a single line:
 
 ```toml
 [shell]
@@ -1519,8 +1537,9 @@ screen (yours in the grid, the dock's at the bottom) and the cursor jumped
 between them. Since saying "the prompt should be mine" already means "the line
 should stay in the grid", the key was retired.
 
-The handover happens in **zsh** and **fish**. bash, the far side of SSH and an
-`integration = "off"` session already show your prompt as it is.
+The handover happens in **zsh**, **fish** and **bash** 4.4 or newer. An older
+bash, the far side of SSH and an `integration = "off"` session already show
+your prompt as it is.
 
 #### Listening ports
 

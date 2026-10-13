@@ -15,7 +15,7 @@ glides instead of jumping, and an idle window draws nothing at all.
 - **Command blocks.** Each prompt and its output form a block, marked in the
   gutter with a chevron colored by how the command ended. Commands that run
   longer than a second show their duration.
-- **Input dock.** In zsh and fish, the line you are editing moves to a dock at the
+- **Input dock.** In zsh, fish and bash 4.4 or newer, the line you are editing moves to a dock at the
   bottom of the window with your current directory and git branch beneath it.
   It wraps, grows for multi-line input, supports mouse selection and editing,
   and animates typing and deleting (configurable, or off).

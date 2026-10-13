@@ -3004,6 +3004,10 @@ struct DockEditLine {
     /// Whether the line is from the mirror (`true`) or from the pending
     /// command's prediction. ⇧←/⇧→ only on the mirror: the selection is built against the mirror's text.
     fresh: bool,
+    /// Whether the line was read from the grid ([`ShellLog::dock_grid`]) rather than mirrored.
+    /// There is no mirror to wait for and none to refresh, so no prediction is made for a
+    /// command and a paste is followed by no refresh.
+    grid: bool,
     /// The clusters to the caret's left and right, `[start, end)` in `BUFFER` —
     /// only when clustering is on and it has more than one code point: ⌫/← walks the left one,
     /// ⌦/→ the right one, whole. If the caret is **inside** a cluster (ZLE can put it there)
@@ -8810,6 +8814,11 @@ impl Session {
     ///   ([`ShellLog::dock_editable`]) — in a shell without the binding the
     ///   trailing BEL becomes `send-break` and the line dies (measured).
     ///
+    /// A line read from the grid (a shell that does not mirror it) is the one
+    /// exception to the second and third conditions: it has no keymap to ask about
+    /// and no answer to wait for, and the shell's `w` is the gate — the widget
+    /// refuses a stale `L` itself.
+    ///
     /// While the gate is closed **no command goes**: the selection can still be
     /// copied, the keys go the current way and remove the selection.
     pub fn can_edit_dock(&self) -> bool {
@@ -8870,10 +8879,25 @@ impl Session {
         let generation = self.key_gen.load(Ordering::Acquire);
         let log = lock(&self.shell);
         let input = log.suppressed_input()?;
-        if !(log.dock_editable && input.insert_keymap) {
+        // A line read from the grid has no keymap and no answer to wait for to ask about, so
+        // `w` alone opens the gate there (the shell's widget is bound in every keymap it has
+        // and refuses a stale `L` itself): `answers` moves only when the text does, and a key
+        // that changes nothing (a right arrow at the end of the line) would shut the
+        // freshness gate for good. The line must have been published, though, and it must be
+        // one the shell is editing: a line break in it means the earlier lines are an unfinished
+        // command's (the shell edits only the last), so no `L` the terminal could send would
+        // match and the key would be taken for an edit that never happens.
+        let open = if input.grid {
+            log.grid_open()
+                && log.dock.status == DockStatus::Live
+                && !log.dock.buffer.contains('\n')
+        } else {
+            input.insert_keymap
+        };
+        if !(log.dock_editable && open) {
             return None;
         }
-        let fresh = input.answers == generation;
+        let fresh = input.grid || input.answers == generation;
         let (buffer, caret, selection) = if fresh {
             (
                 log.dock.buffer.as_str(),
@@ -8895,7 +8919,13 @@ impl Session {
         // clustered and tear plain keys from ZLE's bindings (plugins like
         // autopair). In the rest of the row the typing effects and ZLE's own
         // deletion as they are.
-        let emoji = log.dock.cluster && {
+        //
+        // Not on a line read from the grid: a key that goes by command takes its caret from
+        // the last frame, and with no prediction in between a second key that comes before the
+        // next frame would delete from the place the first one has left (← then ⌫ over an
+        // emoji). The keys go to the shell as typed, which moves its own caret first.
+        let clusters = log.dock.cluster && !input.grid;
+        let emoji = clusters && {
             let mut found = false;
             crate::cluster::Walk::new().run(buffer.chars(), |c| {
                 found |= c.end - c.start > 1 && c.width > 1;
@@ -8903,7 +8933,7 @@ impl Session {
             found
         };
         let span = |index: Option<usize>| {
-            let index = index.filter(|_| log.dock.cluster)?;
+            let index = index.filter(|_| clusters)?;
             dock::cluster_span(buffer.chars(), index, true)
                 .filter(|(start, end)| emoji || end - start > 1)
         };
@@ -8914,6 +8944,7 @@ impl Session {
             shift: dock::prebuffer_chars(&log.dock),
             selection,
             fresh,
+            grid: input.grid,
             before: span(caret.checked_sub(1)),
             after: span(Some(caret)),
         })
@@ -8934,6 +8965,10 @@ impl Session {
         let Some(generation) = self.send_input(|_| bytes) else {
             return;
         };
+        // The grid shows the result at the next frame; there is nothing to predict.
+        if line.grid {
+            return;
+        }
         let buffer = line
             .buffer
             .chars()
@@ -11391,7 +11426,8 @@ impl Session {
     /// **The gate is exact**, not loose: in `vicmd` the sequence is not bound and
     /// its bytes would be a command, in a shell without the binding BEL is `send-break`.
     fn paste_refreshes(&self, bytes: &[u8]) -> bool {
-        bytes.iter().any(|b| matches!(b, b'\n' | b'\r')) && self.dock_edit_line().is_some()
+        bytes.iter().any(|b| matches!(b, b'\n' | b'\r'))
+            && self.dock_edit_line().is_some_and(|line| !line.grid)
     }
 
     fn can_be_typed(&self, bytes: &[u8]) -> bool {
@@ -15312,6 +15348,153 @@ mod tests {
         click_dock_at(&session, 4);
         assert_eq!(session.key_gen.load(Ordering::Acquire), generation);
         assert!(std::fs::read(&sent).is_ok_and(|bytes| bytes.is_empty()));
+        session.shutdown();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A grid-sourced dock whose shell also bound the editing widget (`8133;w`, as the bash
+    /// script prints it after the grid source's word): the line `line` (`git sta` unless it
+    /// says otherwise), the caret after it, and a child that dumps the first `count` bytes it
+    /// is sent into `sent` (raw, no echo).
+    fn spawn_editable_grid_session(count: usize, sent: &std::path::Path) -> Session {
+        spawn_editable_grid_line_session("git sta", count, sent)
+    }
+
+    fn spawn_editable_grid_line_session(
+        line: &str,
+        count: usize,
+        sent: &std::path::Path,
+    ) -> Session {
+        let mut options = test_options(
+            sh(&format!(
+                "stty raw -echo; printf '{}cmd1{}\\033]133;A;bt_block=2\\007{}\
+                 \\033]8133;w\\007{line}'; dd bs=1 count={count} of={} 2>/dev/null; sleep 5",
+                anchored_prompt(1),
+                ran(1, 0, "out"),
+                grid_repaint(2),
+                sent.display(),
+            )),
+            40,
+        );
+        options.dock = true;
+        options.cluster = true;
+        Session::spawn(options, Arc::new(TestWake::default())).unwrap()
+    }
+
+    #[test]
+    fn a_grid_dock_edits_through_the_widget_the_shell_announced() {
+        // A shell that reads its line from the grid and bound the widget (`g` and `w`) is
+        // edited like a mirrored one: a click moves the caret (`d;I;I;L`), a selection is
+        // deleted (`d;S;E;L`) — without the keymap and the freshness gates, which a grid
+        // line has no way to answer: the line never says `answers`, and a click that
+        // changes nothing would shut a freshness gate for good.
+        let home = empty_home("grid-edit");
+        let sent = home.join("sent");
+        let session = spawn_editable_grid_session(45, &sent);
+        wait_grid_line(&session, "the line was not read", |state| {
+            state.status == DockStatus::Live && state.buffer == "git sta"
+        });
+        wait_until(
+            "the child did not start reading",
+            Duration::from_secs(5),
+            || sent.exists(),
+        );
+        assert!(session.can_edit_dock(), "`w` alone opens the gate");
+        let generation = session.key_gen.load(Ordering::Acquire);
+
+        // The caret is where it already is: nothing is sent.
+        click_dock_at(&session, 7);
+        assert_eq!(session.key_gen.load(Ordering::Acquire), generation);
+        assert!(std::fs::read(&sent).is_ok_and(|bytes| bytes.is_empty()));
+
+        let sent_len = || std::fs::read(&sent).map_or(0, |bytes| bytes.len());
+        click_dock_at(&session, 4);
+        wait_until("the click was not sent", Duration::from_secs(5), || {
+            sent_len() == 15
+        });
+        assert_eq!(session.key_gen.load(Ordering::Acquire), generation + 1);
+        // No prediction: the grid shows the result at the next frame.
+        assert!(lock(&session.shell).dock_pending.is_none());
+
+        // The shell never answered (the child only reads), so a freshness gate would be shut
+        // by now; this one is not.
+        assert!(session.can_edit_dock());
+        click_dock_at(&session, 1);
+        wait_until(
+            "the second click was not sent",
+            Duration::from_secs(5),
+            || sent_len() == 30,
+        );
+
+        // A selection is deleted by the key, and `L` is the line's length in characters.
+        draw_dock(&session);
+        select_dock(&session, 1, 3);
+        assert!(session.dock_key(DockKey::Backspace));
+        wait_until("the deletion was not sent", Duration::from_secs(5), || {
+            sent_len() == 45
+        });
+        assert_eq!(
+            std::fs::read(&sent).unwrap(),
+            b"\x1b[8133~d;4;4;7\x07\x1b[8133~d;1;1;7\x07\x1b[8133~d;1;3;7\x07"
+        );
+        assert!(lock(&session.shell).dock_pending.is_none());
+        session.shutdown();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_grid_dock_does_not_edit_an_unfinished_command() {
+        // The lines before the last are not the line the shell edits, so no `L` would match:
+        // the gate stays shut and the keys go to the shell as typed, instead of being taken
+        // for edits that never happen.
+        let home = empty_home("grid-edit-multi");
+        let sent = home.join("sent");
+        let session = spawn_editable_grid_line_session("one\\r\\ntwo", 15, &sent);
+        wait_grid_line(&session, "the line was not read", |state| {
+            state.status == DockStatus::Live && state.buffer == "one\ntwo"
+        });
+        assert!(!session.can_edit_dock());
+        select_dock(&session, 0, 2);
+        assert!(!session.dock_delete_selection());
+        assert!(!session.dock_key(DockKey::Backspace));
+        click_dock_at(&session, 1);
+        assert!(std::fs::read(&sent).is_ok_and(|bytes| bytes.is_empty()));
+        session.shutdown();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_grid_dock_leaves_the_keys_over_an_emoji_to_the_shell() {
+        // A key that goes by command takes its caret from the last frame; with no prediction a
+        // second key that comes before the next frame would delete from where the first has
+        // left. So a line read from the grid never walks a cluster by command: ⌫ over an emoji
+        // is the shell's own.
+        let home = empty_home("grid-edit-emoji");
+        let sent = home.join("sent");
+        let session = spawn_editable_grid_line_session("ab\u{1F44D}\u{1F3FD}", 15, &sent);
+        wait_grid_line(&session, "the line was not read", |state| {
+            state.status == DockStatus::Live && state.buffer == "ab\u{1F44D}\u{1F3FD}"
+        });
+        assert!(lock(&session.shell).dock.cluster, "the line has a cluster");
+        assert!(session.can_edit_dock());
+        assert!(!session.dock_key(DockKey::Backspace));
+        assert!(!session.dock_key(DockKey::Left));
+        assert!(std::fs::read(&sent).is_ok_and(|bytes| bytes.is_empty()));
+        session.shutdown();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_grid_dock_without_the_widget_keeps_the_edit_gate_shut() {
+        // `g` without `w`: a shell that draws the line but bound nothing (fish) is never sent
+        // the sequence, whatever the dock holds — its trailing BEL would be `send-break` there.
+        let home = empty_home("grid-no-widget");
+        let sent = home.join("sent");
+        let session = spawn_clickable_grid_session(false, 15, &sent);
+        wait_grid_line(&session, "the line was not read", |state| {
+            state.status == DockStatus::Live && state.buffer == "git sta"
+        });
+        assert!(!session.can_edit_dock());
         session.shutdown();
         let _ = std::fs::remove_dir_all(&home);
     }

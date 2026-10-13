@@ -14,14 +14,18 @@ of every installed copy. A version without a section is not released.
 
 ### Added
 
-- **bash gets the command blocks.** When your login shell is bash 4.4 or newer,
-  the stripe beside each command, the duration of a long one and the
-  directory you are in now show, and the `ssh` integration reaches servers
-  from bash too. Your prompt and your typing stay where they are; the dock
-  for bash comes later. bateri starts bash as a login shell, so `logout`,
-  `~/.bash_logout` and your history work as before, and nothing is written to
-  your bash files. macOS's own `/bin/bash` is version 3.2 and stays exactly as
-  it was; install a newer one (for example `brew install bash`) to get this.
+- **bash gets the command blocks and the dock.** When your login shell is
+  bash 4.4 or newer, the stripe beside each command, the duration of a long
+  one and the directory you are in show, the `ssh` integration reaches
+  servers from bash too, and the line you type moves to the dock at the
+  bottom of the window while bateri draws the prompt, as it does for zsh and
+  fish. Clicking in the dock moves the caret there, and selecting text and
+  typing over it replaces it. To keep your own `PS1`, set `[shell]
+  integration = "blocks"`: the blocks stay and the dock goes. bateri starts
+  bash as a login shell, so `logout`, `~/.bash_logout` and your history work
+  as before, and nothing is written to your bash files. macOS's own
+  `/bin/bash` is version 3.2 and stays exactly as it was; install a newer one
+  (for example `brew install bash`) to get this.
 - **fish gets the dock.** When fish is your login shell, the line you type
   now moves to the dock at the bottom of the window, in fish's own colors with
   its gray suggestion, and bateri draws the prompt, as it does for zsh. The

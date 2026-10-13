@@ -2661,7 +2661,7 @@ pub(crate) mod tests {
     /// The line the dock shows, as the frame reads it from the grid and publishes it. The frame
     /// is what publishes, so every look is a frame; `blocks` is the caller's so the scratch the
     /// frame fills lives as long as the test does.
-    fn fish_dock(session: &Session, blocks: &std::cell::RefCell<Blocks>) -> DockState {
+    fn read_dock(session: &Session, blocks: &std::cell::RefCell<Blocks>) -> DockState {
         screen(session, &mut blocks.borrow_mut());
         let mut state = DockState::default();
         session.dock_state(&mut state);
@@ -2716,10 +2716,10 @@ pub(crate) mod tests {
         // 1.
         session.write(b"echo su");
         wait_until("the dock did not show the typed line", || {
-            let dock = fish_dock(&session, &blocks);
+            let dock = read_dock(&session, &blocks);
             dock.status == DockStatus::Live && dock.buffer == "echo su"
         });
-        let dock = fish_dock(&session, &blocks);
+        let dock = read_dock(&session, &blocks);
         assert_eq!(dock.postdisplay, "garcane", "the suggestion: {dock:?}");
         assert_eq!(
             dock.cursor, 7,
@@ -2745,7 +2745,7 @@ pub(crate) mod tests {
         );
         session.write("x".repeat(100).as_bytes());
         wait_until("the dock did not show the wrapped line", || {
-            let dock = fish_dock(&session, &blocks);
+            let dock = read_dock(&session, &blocks);
             dock.status == DockStatus::Live
                 && dock.buffer.ends_with("xxxxxxxxxx")
                 && dock.buffer.len() == 107
@@ -2760,7 +2760,7 @@ pub(crate) mod tests {
         for cols in [50, 80] {
             let _ = session.resize(cols, 20, (9, 18));
             wait_until("the dock lost the line in a resize", || {
-                let dock = fish_dock(&session, &blocks);
+                let dock = read_dock(&session, &blocks);
                 dock.status == DockStatus::Live && dock.buffer.len() == 107
             });
             let drawn = rows().join("\n");
@@ -2772,7 +2772,7 @@ pub(crate) mod tests {
         // Back to what was typed first: erase the x's.
         session.write("\u{8}".repeat(100).as_bytes());
         wait_until("the dock did not show the shortened line", || {
-            fish_dock(&session, &blocks).buffer == "echo su"
+            read_dock(&session, &blocks).buffer == "echo su"
         });
 
         // 3.
@@ -2793,7 +2793,7 @@ pub(crate) mod tests {
             now.as_slice()
         );
         wait_until("the next prompt was not a dock", || {
-            let dock = fish_dock(&session, &blocks);
+            let dock = read_dock(&session, &blocks);
             dock.status == DockStatus::Live && dock.buffer.is_empty()
         });
         session.shutdown();
@@ -2801,7 +2801,7 @@ pub(crate) mod tests {
 
     /// One frame and one drawing of the dock, as the window does: the drawing is what leaves
     /// the dock's last drawn window behind, and a click in the dock is resolved against it.
-    fn draw_fish_dock(session: &Session, blocks: &std::cell::RefCell<Blocks>) {
+    fn draw_dock(session: &Session, blocks: &std::cell::RefCell<Blocks>) {
         let cursor = session.frame(
             |_| (),
             |_| (),
@@ -2834,8 +2834,8 @@ pub(crate) mod tests {
 
     /// A click in the dock the way the window ends one: press on the character's left half,
     /// release without a drag.
-    fn click_fish_dock(session: &Session, blocks: &std::cell::RefCell<Blocks>, index: u16) {
-        draw_fish_dock(session, blocks);
+    fn click_dock(session: &Session, blocks: &std::cell::RefCell<Blocks>, index: u16) {
+        draw_dock(session, blocks);
         session.dock_select(
             bt_core::SelectKind::Simple,
             bt_core::SelectionPoint {
@@ -2860,11 +2860,11 @@ pub(crate) mod tests {
         let root = TempRoot::new("fish-click");
         let session = spawn_fish_dock(&fish, &root);
         let blocks = std::cell::RefCell::new(Blocks::default());
-        let caret = || fish_dock(&session, &blocks).cursor;
+        let caret = || read_dock(&session, &blocks).cursor;
 
         session.write(b"echo hello world");
         wait_until("the dock did not show the typed line", || {
-            let dock = fish_dock(&session, &blocks);
+            let dock = read_dock(&session, &blocks);
             dock.status == DockStatus::Live && dock.buffer == "echo hello world"
         });
         wait_until("the caret was not at the end", || caret() == 16);
@@ -2876,7 +2876,7 @@ pub(crate) mod tests {
                 "fish {:?} takes no clicks: checking that none is sent",
                 fish.version
             );
-            click_fish_dock(&session, &blocks, 5);
+            click_dock(&session, &blocks, 5);
             std::thread::sleep(std::time::Duration::from_millis(500));
             assert_eq!(
                 caret(),
@@ -2890,23 +2890,23 @@ pub(crate) mod tests {
         // The middle of the line, then its start, then a place back to the right: fish's caret
         // lands on the character clicked, which the dock shows as the caret's index.
         for index in [5u16, 0, 11] {
-            click_fish_dock(&session, &blocks, index);
+            click_dock(&session, &blocks, index);
             wait_until("the caret did not follow the click", || {
                 caret() == usize::from(index)
             });
         }
 
         // Past the last character: the end of the line, however the click is aimed at it.
-        click_fish_dock(&session, &blocks, 16);
+        click_dock(&session, &blocks, 16);
         wait_until("a click at the end did not reach the end", || caret() == 16);
-        click_fish_dock(&session, &blocks, 40);
+        click_dock(&session, &blocks, 40);
         wait_until("a click past the line did not reach the end", || {
             caret() == 16
         });
 
         // The caret moved while the text did not: the line is still typed text, not a
         // new line.
-        let dock = fish_dock(&session, &blocks);
+        let dock = read_dock(&session, &blocks);
         assert_eq!(dock.buffer, "echo hello world", "{dock:?}");
 
         // With a suggestion after the typed text: a click on the suggestion is a click at the
@@ -2916,23 +2916,23 @@ pub(crate) mod tests {
             session
                 .shell_state()
                 .is_some_and(|state| state.phase == ShellPhase::Input && state.last_exit == Some(0))
-                && fish_dock(&session, &blocks).buffer.is_empty()
+                && read_dock(&session, &blocks).buffer.is_empty()
         });
         session.write(b"echo he");
         wait_until("the dock did not show the suggestion", || {
-            let dock = fish_dock(&session, &blocks);
+            let dock = read_dock(&session, &blocks);
             dock.buffer == "echo he" && dock.postdisplay == "llo world"
         });
-        click_fish_dock(&session, &blocks, 2);
+        click_dock(&session, &blocks, 2);
         wait_until("the caret did not move into the typed text", || {
             caret() == 2
         });
-        click_fish_dock(&session, &blocks, 12);
+        click_dock(&session, &blocks, 12);
         wait_until(
             "a click on the suggestion did not reach the end of the text",
             || caret() == 7,
         );
-        let dock = fish_dock(&session, &blocks);
+        let dock = read_dock(&session, &blocks);
         assert_eq!(dock.buffer, "echo he", "the suggestion was taken: {dock:?}");
         session.shutdown();
     }
@@ -2956,13 +2956,13 @@ pub(crate) mod tests {
         });
         session.write(b"xy");
         wait_until("the dock did not show the typed line", || {
-            let dock = fish_dock(&session, &blocks);
+            let dock = read_dock(&session, &blocks);
             dock.status == DockStatus::Live && dock.buffer == "xy"
         });
         wait_until("the job's notice was not on the grid", || {
             shown(&session, "has ended")
         });
-        let dock = fish_dock(&session, &blocks);
+        let dock = read_dock(&session, &blocks);
         assert_eq!(
             (dock.status, dock.buffer.as_str()),
             (DockStatus::Live, "xy"),
@@ -3002,7 +3002,7 @@ pub(crate) mod tests {
         });
         let blocks = std::cell::RefCell::new(Blocks::default());
         wait_until("the next prompt was not a dock", || {
-            let dock = fish_dock(&session, &blocks);
+            let dock = read_dock(&session, &blocks);
             dock.status == DockStatus::Live && dock.buffer.is_empty()
         });
         let rows = screen(&session, &mut blocks.borrow_mut());
@@ -3041,7 +3041,7 @@ pub(crate) mod tests {
             shown(&session, "FISHPROMPTXY> echo hi")
         });
         let blocks = std::cell::RefCell::new(Blocks::default());
-        let dock = fish_dock(&session, &blocks);
+        let dock = read_dock(&session, &blocks);
         assert_ne!(dock.status, DockStatus::Live, "{dock:?}");
         assert!(dock.buffer.is_empty(), "{dock:?}");
         session.shutdown();
@@ -3289,6 +3289,20 @@ pub(crate) mod tests {
     /// `HOME` is the test's own: bash writes its history there, and the user's real files are
     /// never read. `extra` is the rest of the contract (`BATERI_ENV`, `BATERI_BIN`, …).
     fn spawn_bash(bash: &Bash, home: &Path, extra: &[(&str, String)]) -> Session {
+        spawn_bash_with(bash, home, extra, false)
+    }
+
+    /// [`spawn_bash`] with the dock: `BATERI_DOCK` is not sent, which is what `"auto"` does.
+    fn spawn_bash_dock(bash: &Bash, home: &Path, extra: &[(&str, String)]) -> Session {
+        spawn_bash_with(bash, home, extra, true)
+    }
+
+    fn spawn_bash_with(
+        bash: &Bash,
+        home: &Path,
+        extra: &[(&str, String)],
+        with_dock: bool,
+    ) -> Session {
         let wrapper = bash_wrapper_dir().expect("bash wrapper not found");
         let mut env = HashMap::from([
             ("HOME".to_owned(), home.display().to_string()),
@@ -3296,8 +3310,10 @@ pub(crate) mod tests {
                 "ENV".to_owned(),
                 wrapper.join("bateri.bash").display().to_string(),
             ),
-            ("BATERI_DOCK".to_owned(), "off".to_owned()),
         ]);
+        if !with_dock {
+            env.insert("BATERI_DOCK".to_owned(), "off".to_owned());
+        }
         for (key, value) in extra {
             env.insert((*key).to_owned(), value.clone());
         }
@@ -3521,8 +3537,9 @@ pub(crate) mod tests {
     #[test]
     fn a_users_prompt_command_keeps_running_in_every_form() {
         // Ours go around the user's, in whatever form it is: a string, one that ends in a
-        // comment (the joiner is a newline, not `;`), and — bash 5.1 and newer — an array,
-        // whose other elements stay.
+        // comment (the joiner is a newline, not `;`), an array (bash 5.1 and newer keep its
+        // other elements; before, only the first one runs and ours must still be there), and a
+        // shell with `set -u`.
         let Some(bash) = bash() else { return };
         let mut forms = vec![
             ("string", "PROMPT_COMMAND='touch \"$HOME/ran_one\"'\n"),
@@ -3531,13 +3548,14 @@ pub(crate) mod tests {
                 "PROMPT_COMMAND='touch \"$HOME/ran_one\" # a trailing comment'\n",
             ),
             ("none", "unset PROMPT_COMMAND\n"),
+            // Under `set -u` the attribute query of an unset variable is an error.
+            ("nounset", "unset PROMPT_COMMAND\nset -u\n"),
         ];
-        if bash.version >= BashVersion::new(5, 1) {
-            forms.push((
-                "array",
-                "PROMPT_COMMAND=('touch \"$HOME/ran_one\"' 'touch \"$HOME/ran_two\"')\n",
-            ));
-        }
+        // Before 5.1 only the array's first element runs, and ours must still be there.
+        forms.push((
+            "array",
+            "PROMPT_COMMAND=('touch \"$HOME/ran_one\"' 'touch \"$HOME/ran_two\"')\n",
+        ));
         for (name, profile) in forms {
             let root = TempRoot::new(&format!("bash-pc-{name}"));
             let home = root.0.join("home");
@@ -3550,12 +3568,12 @@ pub(crate) mod tests {
                     .shell_state()
                     .is_some_and(|state| state.last_exit == Some(0))
             });
-            if name != "none" {
+            if name != "none" && name != "nounset" {
                 wait_until(&format!("{name}: the user's hook did not run"), || {
                     home.join("ran_one").is_file()
                 });
             }
-            if name == "array" {
+            if name == "array" && bash.version >= BashVersion::new(5, 1) {
                 wait_until("array: the second element did not run", || {
                     home.join("ran_two").is_file()
                 });
@@ -3725,6 +3743,335 @@ pub(crate) mod tests {
             !shown(&session, "kind=function"),
             "ssh was wrapped without the binary"
         );
+        session.shutdown();
+    }
+
+    /// A bash session with the dock and a prompt the user's files write: `PS1` set once and
+    /// rewritten by a `PROMPT_COMMAND` of the kind a prompt theme installs. Both strings are
+    /// unique, so that a claim "it is not drawn" cannot be fooled by other text.
+    fn spawn_bash_dock_with_a_theme(bash: &Bash, root: &TempRoot) -> Session {
+        let home = root.0.join("home");
+        write_home_file(
+            &home,
+            ".bash_profile",
+            "PS1='USERPS1XY> '\nPROMPT_COMMAND='PS1=\"THEMEXY> \"'\n",
+        );
+        let session = spawn_bash_dock(bash, &home, &[]);
+        at_the_prompt(&session);
+        session
+    }
+
+    #[test]
+    fn the_bash_dock_shows_the_line_readline_draws() {
+        // The real test of the bash dock: a real bash draws the prompt the script gave it and
+        // the terminal reads the line back from the grid. In one round:
+        //
+        // 1. Neither the user's prompt nor the one their theme writes at every prompt is drawn:
+        //    the prompt is the terminal's, and the typed line is in the dock with the caret
+        //    after it.
+        // 2. The grid does not show the line a second time — a line that wraps included, and
+        //    after a resize that repaints the prompt.
+        // 3. After Enter the command is a block on the grid and the next prompt is a dock again.
+        // 4. A line cancelled with Ctrl-C stays on the grid as bash leaves it (readline echoes
+        //    `^C`, it does not erase the line as zsh does) and the next prompt is a dock again.
+        let Some(bash) = bash() else { return };
+        let root = TempRoot::new("bash-dock");
+        let session = spawn_bash_dock_with_a_theme(&bash, &root);
+        let blocks = std::cell::RefCell::new(Blocks::default());
+        let rows = || screen(&session, &mut blocks.borrow_mut());
+
+        wait_until("the first prompt was not a dock", || {
+            let dock = read_dock(&session, &blocks);
+            dock.status == DockStatus::Live && dock.buffer.is_empty()
+        });
+        // 1.
+        session.write(b"echo su");
+        wait_until("the dock did not show the typed line", || {
+            let dock = read_dock(&session, &blocks);
+            dock.status == DockStatus::Live && dock.buffer == "echo su"
+        });
+        let dock = read_dock(&session, &blocks);
+        assert_eq!(dock.cursor, 7, "the caret is after the line: {dock:?}");
+        assert!(
+            dock.postdisplay.is_empty(),
+            "bash has no suggestion: {dock:?}"
+        );
+        let drawn = rows().join("\n");
+        assert!(
+            !drawn.contains("USERPS1XY") && !drawn.contains("THEMEXY"),
+            "the user's prompt was drawn on the grid:\n{drawn}"
+        );
+        // 2.
+        assert!(
+            !drawn.contains("echo su"),
+            "the typed line was drawn on the grid too:\n{drawn}"
+        );
+        session.write("x".repeat(100).as_bytes());
+        wait_until("the dock did not show the wrapped line", || {
+            let dock = read_dock(&session, &blocks);
+            dock.status == DockStatus::Live
+                && dock.buffer.ends_with("xxxxxxxxxx")
+                && dock.buffer.len() == 107
+        });
+        for cols in [50, 80] {
+            let _ = session.resize(cols, 20, (9, 18));
+            wait_until("the dock lost the line in a resize", || {
+                let dock = read_dock(&session, &blocks);
+                dock.status == DockStatus::Live && dock.buffer.len() == 107
+            });
+            let drawn = rows().join("\n");
+            assert!(
+                !drawn.contains("xxxxxxxxxx") && !drawn.contains("THEMEXY"),
+                "the line was drawn on the grid at {cols} columns:\n{drawn}"
+            );
+        }
+        session.write("\u{8}".repeat(100).as_bytes());
+        wait_until("the dock did not show the shortened line", || {
+            read_dock(&session, &blocks).buffer == "echo su"
+        });
+
+        // 3.
+        session.write(b"\n");
+        wait_until("the command did not finish", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.phase == ShellPhase::Input && state.last_exit == Some(0))
+                && rows().iter().filter(|row| row.contains("echo su")).count() == 1
+                && rows().iter().any(|row| row == "su")
+        });
+        let mut now = Blocks::default();
+        screen(&session, &mut now);
+        assert_eq!(
+            now.as_slice().len(),
+            1,
+            "the command's anchor was not on the grid: {:?}",
+            now.as_slice()
+        );
+        wait_until("the next prompt was not a dock", || {
+            let dock = read_dock(&session, &blocks);
+            dock.status == DockStatus::Live && dock.buffer.is_empty()
+        });
+
+        // 4.
+        session.write(b"abc");
+        wait_until("the dock did not show the line to cancel", || {
+            read_dock(&session, &blocks).buffer == "abc"
+        });
+        session.write(b"\x03");
+        wait_until("the prompt after the cancelled line was not a dock", || {
+            let dock = read_dock(&session, &blocks);
+            dock.status == DockStatus::Live
+                && dock.buffer.is_empty()
+                && rows().iter().any(|row| row.contains("abc^C"))
+        });
+        session.write(b"echo after\n");
+        wait_until("the command after the cancelled line did not run", || {
+            rows().iter().any(|row| row == "after")
+        });
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_bash_dock_is_edited_by_clicks_and_selections() {
+        // The widget end to end: the terminal's edit command goes to a real readline, which
+        // moves its caret or deletes a range, and the dock reads the result back from the grid.
+        // The line has a letter of two bytes, so that a unit mistake (bytes for characters)
+        // moves the caret to the wrong place.
+        let Some(bash) = bash() else { return };
+        let root = TempRoot::new("bash-dock-edit");
+        let session = spawn_bash_dock_with_a_theme(&bash, &root);
+        let blocks = std::cell::RefCell::new(Blocks::default());
+        let rows = || screen(&session, &mut blocks.borrow_mut());
+        let dock = || read_dock(&session, &blocks);
+        let caret = || dock().cursor;
+
+        // A command first, so that `$?` has a value to lose.
+        session.write(b"false\n");
+        wait_until("the first command did not finish", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.phase == ShellPhase::Input && state.last_exit == Some(1))
+        });
+        session.write("echo \"rc=$?\" ğüş end".as_bytes());
+        wait_until("the dock did not show the typed line", || {
+            let dock = dock();
+            dock.status == DockStatus::Live && dock.buffer == "echo \"rc=$?\" ğüş end"
+        });
+        let len = dock().buffer.chars().count();
+        assert_eq!(caret(), len);
+        // The widget is bound: a click moves the caret to the character clicked, in characters.
+        for index in [3usize, 14, 0, 15] {
+            click_dock(&session, &blocks, index as u16);
+            wait_until("the caret did not follow the click", || caret() == index);
+        }
+        assert_eq!(dock().buffer, "echo \"rc=$?\" ğüş end", "the click edited");
+        let drawn = rows().join("\n");
+        assert!(
+            !drawn.contains("ğüş") && !drawn.contains("THEMEXY"),
+            "the widget's redraw left the line or the theme's prompt on the grid:\n{drawn}"
+        );
+
+        // Typing goes where the caret is.
+        session.write(b"Z");
+        wait_until("the typed character did not land at the caret", || {
+            dock().buffer == "echo \"rc=$?\" ğüZş end"
+        });
+        // A selection is deleted by the key, and the caret lands where it started.
+        draw_dock(&session, &blocks);
+        let point = |index: u16| bt_core::SelectionPoint {
+            col: bt_core::DOCK_TEXT_COL + index,
+            row: 0,
+            half: bt_core::CellHalf::Left,
+        };
+        session.dock_select(bt_core::SelectKind::Simple, point(1));
+        session.dock_drag(point(5));
+        assert!(
+            session.dock_key(bt_core::DockKey::Backspace),
+            "the gate was shut"
+        );
+        wait_until("the selection was not deleted", || {
+            dock().buffer == "e\"rc=$?\" ğüZş end"
+        });
+        wait_until("the caret did not land at the selection's start", || {
+            caret() == 1
+        });
+        // Typing over a selection replaces it.
+        draw_dock(&session, &blocks);
+        session.dock_select(bt_core::SelectKind::Simple, point(0));
+        session.dock_drag(point(1));
+        // The window deletes the selection first and then types by the usual path.
+        assert!(session.dock_delete_selection(), "the gate was shut");
+        session.write(b"X");
+        wait_until("the selection was not replaced", || {
+            dock().buffer == "X\"rc=$?\" ğüZş end"
+        });
+
+        // A payload that is stale (`L` is not the line's length), a refresh and a corrupt one
+        // change nothing.
+        let before = dock();
+        for payload in [
+            &b"\x1b[8133~d;0;0;3\x07"[..],
+            b"\x1b[8133~r\x07",
+            b"\x1b[8133~d;x;1;2\x07",
+        ] {
+            session.write(payload);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let after = dock();
+        assert_eq!(
+            (after.buffer.as_str(), after.cursor),
+            (before.buffer.as_str(), before.cursor),
+            "a payload the widget should refuse changed the line"
+        );
+        // And the line still runs with the status of the command before it (the widget
+        // hands `$?` back).
+        session.write(b"\x01\x0b");
+        session.write(b"echo \"rc=$?\"\n");
+        wait_until("the command did not run", || {
+            rows().iter().any(|row| row == "rc=1")
+        });
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_bash_widget_only_follows_clicks_in_vi_command_mode() {
+        // A deletion the terminal sends is followed by the key the user pressed, and in vi's
+        // command mode that key is a command: it would run on a line that had changed under
+        // it. There the widget moves the caret and leaves the text alone. (An unbound sequence
+        // would be worse: `8133~` is a count and a case toggle.)
+        let Some(bash) = bash() else { return };
+        let root = TempRoot::new("bash-dock-vi");
+        let home = root.0.join("home");
+        write_home_file(&home, ".bash_profile", "set -o vi\n");
+        let session = spawn_bash_dock(&bash, &home, &[]);
+        at_the_prompt(&session);
+        let blocks = std::cell::RefCell::new(Blocks::default());
+        let dock = || read_dock(&session, &blocks);
+
+        session.write(b"echo Hello World");
+        wait_until("the dock did not show the typed line", || {
+            dock().buffer == "echo Hello World"
+        });
+        // Insert mode: a selection is deleted.
+        draw_dock(&session, &blocks);
+        let point = |index: u16| bt_core::SelectionPoint {
+            col: bt_core::DOCK_TEXT_COL + index,
+            row: 0,
+            half: bt_core::CellHalf::Left,
+        };
+        session.dock_select(bt_core::SelectKind::Simple, point(10));
+        session.dock_drag(point(16));
+        assert!(session.dock_delete_selection());
+        wait_until("insert mode did not delete", || {
+            dock().buffer == "echo Hello"
+        });
+
+        // Command mode (Escape, then readline waits out its key sequence timeout).
+        session.write(b"\x1b");
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        click_dock(&session, &blocks, 2);
+        wait_until("the caret did not follow the click", || dock().cursor == 2);
+        draw_dock(&session, &blocks);
+        session.dock_select(bt_core::SelectKind::Simple, point(0));
+        session.dock_drag(point(4));
+        assert!(session.dock_delete_selection());
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        assert_eq!(
+            dock().buffer,
+            "echo Hello",
+            "command mode deleted a selection"
+        );
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_bash_marks_do_not_depend_on_promptvars() {
+        // `PS0`'s flag is a parameter expansion, and a user may turn `promptvars` off: the text
+        // must not be printed before every command, and the block still closes.
+        let Some(bash) = bash() else { return };
+        let root = TempRoot::new("bash-promptvars");
+        let home = root.0.join("home");
+        write_home_file(&home, ".bash_profile", "PS1='$ '\nshopt -u promptvars\n");
+        let session = spawn_bash(&bash, &home, &[]);
+        at_the_prompt(&session);
+        session.write(b"echo ran\n");
+        wait_until("the command did not finish", || {
+            shown(&session, "ran")
+                && session.shell_state().is_some_and(|state| {
+                    state.phase == ShellPhase::Input && state.last_exit == Some(0)
+                })
+        });
+        let rows = screen(&session, &mut Blocks::default());
+        assert!(
+            !rows.iter().any(|row| row.contains("__bateri")),
+            "the flag was printed: {rows:?}"
+        );
+        let mut blocks = Blocks::default();
+        screen(&session, &mut blocks);
+        assert_eq!(blocks.as_slice().len(), 1, "{:?}", blocks.as_slice());
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_bash_blocks_setting_keeps_the_prompt_and_opens_no_dock() {
+        // `BATERI_DOCK=off`: the user's prompt is drawn with the marks around it, the line stays
+        // on the grid and the widget is never bound (no `w`, nothing to answer a click).
+        let Some(bash) = bash() else { return };
+        let root = TempRoot::new("bash-blocks");
+        let home = root.0.join("home");
+        write_home_file(&home, ".bash_profile", "PS1='USERPS1XY> '\n");
+        let session = spawn_bash(&bash, &home, &[]);
+        at_the_prompt(&session);
+        let blocks = std::cell::RefCell::new(Blocks::default());
+        session.write(b"echo su");
+        wait_until("the line was not drawn on the grid", || {
+            screen(&session, &mut blocks.borrow_mut())
+                .iter()
+                .any(|row| row.contains("USERPS1XY> echo su"))
+        });
+        assert_eq!(read_dock(&session, &blocks).status, DockStatus::Idle);
+        assert!(!session.can_edit_dock());
+        session.write(b"\x03");
         session.shutdown();
     }
 }

@@ -3371,7 +3371,7 @@ impl ShellLog {
     /// moment: the shell said `g` at this prompt, the line is still being
     /// written, and the dock has an input row at all — a remote session or a
     /// program reading the keyboard itself has none.
-    fn grid_open(&self) -> bool {
+    pub(crate) fn grid_open(&self) -> bool {
         self.dock_grid
             && self.end_since.is_none()
             && self.context.remote.is_none()

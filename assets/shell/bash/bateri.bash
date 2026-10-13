@@ -18,8 +18,9 @@
 #   ENV              this file; the user's own value comes back below.
 #   BATERI_ENV       the user's `ENV`, if there was one. It is put back and never read: a
 #                    login bash does not read `ENV`.
-#   BATERI_DOCK      `off`: there is no dock in this session. This wrapper has no dock arm
-#                    yet, so the prompt is always the user's, with the marks around it.
+#   BATERI_DOCK      `off`: there is no dock in this session (`integration = "blocks"`), so the
+#                    prompt is the user's, with the marks around it. Absent: the terminal draws
+#                    the prompt and shows the line in its dock (`__bateri_prompt`).
 #   BATERI_BIN, BATERI_SSH_INSTANCE, BATERI_SSH_CWD
 #                    the `ssh` function's inputs, as in the zsh wrapper.
 # The last four are ours, so they are taken out of the environment too (children have no use
@@ -38,6 +39,11 @@ fi
 __bateri_bin=${BATERI_BIN-}
 __bateri_ssh_instance=${BATERI_SSH_INSTANCE-}
 __bateri_ssh_cwd=${BATERI_SSH_CWD-}
+if [ "${BATERI_DOCK-}" = off ]; then
+  __bateri_dock=0
+else
+  __bateri_dock=1
+fi
 unset BATERI_BIN BATERI_SSH_INSTANCE BATERI_SSH_CWD BATERI_DOCK
 
 # POSIX mode's default history file is `~/.sh_history`, set before any startup file is read.
@@ -78,6 +84,43 @@ __bateri_percent() {
   REPLY=$out
 }
 
+# Base64 of `$1`'s bytes into `REPLY`, without padding (the terminal reads both). No fork: the
+# branch name goes through this at every prompt, after the one `git` already costs.
+__bateri_b64() {
+  local LC_ALL=C s=$1 out= i n a b c v
+  local t=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/
+  for (( i = 0; i < ${#s}; i += 3 )); do
+    n=$(( ${#s} - i ))
+    printf -v a '%d' "'${s:i:1}"
+    v=$(( (a & 255) << 16 ))
+    if (( n > 1 )); then
+      printf -v b '%d' "'${s:i+1:1}"
+      v=$(( v | ((b & 255) << 8) ))
+    fi
+    if (( n > 2 )); then
+      printf -v c '%d' "'${s:i+2:1}"
+      v=$(( v | (c & 255) ))
+    fi
+    out+=${t:(v >> 18) & 63:1}${t:(v >> 12) & 63:1}
+    (( n > 1 )) && out+=${t:(v >> 6) & 63:1}
+    (( n > 2 )) && out+=${t:v & 63:1}
+  done
+  REPLY=$out
+}
+
+# Sends the git branch through the dock's channel; empty outside a repository, which deletes
+# the previous directory's branch. One `git` in the usual case, per prompt.
+__bateri_branch() {
+  local REPLY ref
+  ref=$(command git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  # `HEAD` is the answer of a detached HEAD, not a branch name: the short SHA.
+  if [[ $ref == HEAD ]]; then
+    ref=$(command git rev-parse --short HEAD 2>/dev/null)
+  fi
+  __bateri_b64 "$ref"
+  printf '\033]8133;b;%s\007' "$REPLY"
+}
+
 # Reports the working directory with OSC 7, per prompt.
 #
 # THE AUTHORITY IS EMPTY (`file:///…`), not `file://$HOSTNAME…`: the terminal's gate counts a
@@ -97,9 +140,38 @@ __bateri_cwd() {
 # start (`C`). `PS0` is expanded in this shell, and an arithmetic subscript is how it sets the
 # "a command ran" flag without printing (`${…[…]-}`: empty even under `set -u`); an empty line
 # reads no command and prints no `PS0`, so it closes no block — zsh's `preexec` rule.
+#
+# WITH A DOCK the line is handed back to the grid first (`8133;e`). Enter has already moved the
+# caret down a row by the time `PS0` is printed — bash writes the newline, the bracketed-paste
+# end and then `PS0` in separate writes (measured) — and until `e` arrives the dock would show
+# the new, empty row.
+#
+# `PS0` is built at every prompt (`__bateri_ps0`), because that subscript is a parameter
+# expansion and a user may turn `promptvars` off: the text would then be printed as it is
+# before every command. Without it the flag cannot be set from `PS0`, so every prompt counts as
+# one that ran a command: an empty line or a cancelled one closes a block it did not run.
 __bateri_block=0
 __bateri_ran=0
-PS0='${__bateri_none[__bateri_ran=1]-}\e]8;;\a\e]133;C\a'"${PS0-}"
+__bateri_ps0_user=${PS0-}
+__bateri_ps0=
+if (( __bateri_dock )); then
+  __bateri_ps0_marks='\e]8133;e\a\e]8;;\a\e]133;C\a'
+else
+  __bateri_ps0_marks='\e]8;;\a\e]133;C\a'
+fi
+__bateri_ps0() {
+  # A `PS0` that is not the one left last time is a new text of the user's.
+  if [[ ${PS0-} != "$__bateri_ps0" ]]; then
+    __bateri_ps0_user=${PS0-}
+  fi
+  if shopt -q promptvars; then
+    PS0='${__bateri_none[__bateri_ran=1]-}'$__bateri_ps0_marks$__bateri_ps0_user
+  else
+    __bateri_ran=1
+    PS0=$__bateri_ps0_marks$__bateri_ps0_user
+  fi
+  __bateri_ps0=$PS0
+}
 
 # Before the prompt: the finished command's `D`, the next prompt's `A`, the directory. The
 # status of the command that ran is kept: a `PROMPT_COMMAND` after ours may read `$?`.
@@ -116,16 +188,112 @@ __bateri_precmd() {
   __bateri_block=$(( __bateri_block + 1 ))
   printf '\033]133;A;bt_block=%s\007' "$__bateri_block"
   __bateri_cwd
+  (( __bateri_dock )) && __bateri_branch
   return $status
 }
 
-# The user's prompt with the anchor in front and the end mark behind.
+# The terminal's edit command (`CSI 8133 ~ d;S;E;L BEL`): delete the characters `[S, E)` of the
+# line and put the caret at `S`, if the line is `L` characters long. A click in the dock is
+# `S == E`; typing or deleting over a selection is `S < E`. `r;…` (the refresh a paste sends a
+# shell that mirrors its line) is not ours to answer.
 #
-# The anchor is an id-carrying OSC 8 link laid over the prompt's cells, and it lives IN `PS1`:
-# readline draws the prompt again without running `PROMPT_COMMAND` (Ctrl-L, a resize), and a
-# mark printed from a hook would be missing from that copy. It is a prefix: OSC 8 does not
-# nest, so a prompt link of the user's replaces ours for the cells after it (a known limit, a
-# stripe missing, not a wrong one).
+# SILENT IN EVERY CASE: a corrupt payload, an `L` that does not match the line (the terminal
+# read it from the grid a moment ago and the user has typed since) or numbers out of range
+# return without touching the line. The wrong direction is "no edit happened".
+#
+# The payload follows the sequence in the same write, so it is already waiting to be read; the
+# limit only bounds how long a corrupt wire (a payload whose BEL never comes) can freeze the
+# line. Not a measured number, a feel threshold.
+#
+# CHARACTERS: the payload counts them and `${#READLINE_LINE}` does too, in a UTF-8 locale. So
+# does `READLINE_POINT` from bash 5.0; bash 4.4 counts bytes there, so the character index is
+# turned into a byte offset first (`LC_ALL=C` makes `${#…}` count bytes).
+#
+# `$?` is handed back: the widget runs between a prompt and the command the user has not typed
+# yet, and the command's own status is what `$?` should still say.
+#
+# `$1` is `move` where the line is not being typed into (vi's command mode): a click is
+# followed there, a deletion is not, because the key that comes after the terminal's deletion
+# would be a command and run on the line the terminal had already changed. The terminal does not
+# know the keymap, so the widget has to.
+#
+# A payload that does not end in its BEL (a corrupt wire, a stall) leaves the line alone, but
+# the bytes already on the way are read by readline as keys; the same is true of the zsh widget.
+__bateri_dock_edit() {
+  local status=$? ch= payload= head
+  local -i only_move=0
+  [[ ${1-} == move ]] && only_move=1
+  local re='^d;([0-9]{1,9});([0-9]{1,9});([0-9]{1,9})$'
+  while IFS= read -r -n1 -t 0.5 ch; do
+    [[ $ch == $'\a' ]] && break
+    payload+=$ch
+    # A real payload is four short numbers: reading without a limit would swallow the line.
+    (( ${#payload} > 64 )) && break
+  done
+  if [[ $ch == $'\a' && $payload =~ $re ]]; then
+    local -i start=10#${BASH_REMATCH[1]} end=10#${BASH_REMATCH[2]} len=10#${BASH_REMATCH[3]}
+    if (( len == ${#READLINE_LINE} && start <= end && end <= len && (start == end || !only_move) )); then
+      head=${READLINE_LINE:0:start}
+      if (( start < end )); then
+        READLINE_LINE=$head${READLINE_LINE:end}
+      fi
+      if (( BASH_VERSINFO[0] < 5 )); then
+        local LC_ALL=C
+        READLINE_POINT=${#head}
+      else
+        READLINE_POINT=$start
+      fi
+    fi
+  fi
+  return $status
+}
+
+# Binds the widget, in every keymap, and says whether it is bound.
+#
+# AT EVERY PROMPT, because a binding is not persistent: `bind -f ~/.inputrc`, `set -o vi` and a
+# theme's setup can each replace the keymaps. The cost is three builtins, no fork. The sequence
+# is one no keyboard produces, so the user's own bindings are not touched. Every keymap is bound
+# because an unbound sequence is typed: in vi's command mode `8133~` would be a count and a
+# case toggle. There the widget only follows clicks (`move`, see `__bateri_dock_edit`).
+__bateri_dock_arm() {
+  local map how
+  for map in emacs vi-insert vi-command; do
+    how=
+    [[ $map == vi-command ]] && how=' move'
+    bind -m "$map" -x '"\e[8133~": __bateri_dock_edit'"$how" 2> /dev/null || return 1
+  done
+}
+
+# The prompt: with a dock, nothing of the user's; without, theirs with the anchor in front and
+# the end mark behind.
+#
+# WITH A DOCK the prompt is the terminal's, and what bash draws is a contract (`grid_input.rs`):
+#
+#   anchor, two real spaces, `g`, [`w`], `B`
+#
+# - The anchor is the block's id-carrying OSC 8 link, laid over the cells and left open until
+#   `PS0`, so every cell readline draws for the line carries the block's id: the terminal reads
+#   the line from the cells with that id, shows it in the dock and keeps it off the grid.
+# - The two spaces are real width, so the line starts at the third column, readline knows the
+#   prompt's width, wraps and places the caret right.
+# - `g` says "this prompt's line is read from the grid", `w` that the edit widget is bound right
+#   now (a click in the dock moves the caret, typing over a selection deletes it). Both are in
+#   `PS1` rather than printed from a hook: readline draws the prompt again without running
+#   `PROMPT_COMMAND` (Ctrl-L, a resize, the return of a widget), and a mark printed from a hook
+#   would be missing from that copy. The terminal forgets both at every `A`, which is why
+#   they come after it.
+# - `PS2` is empty: the lines of an unfinished command stay under the same open link, so they
+#   go to the dock with the first one, and an empty continuation prompt puts no `> ` between
+#   them. The dock does not edit such a command: the earlier lines are not the line readline is
+#   editing, so no length the terminal could send would match, and the terminal closes the
+#   edit gate for a line with a line break in it (the keys go to readline as they are typed).
+#
+# The prompt is rebuilt at every prompt, from nothing: a theme that rewrites `PS1` is taken
+# back at the next one (`integration = "blocks"` gives the user's prompt back).
+#
+# WITHOUT A DOCK the anchor is a prefix: OSC 8 does not nest, so a prompt link of the user's
+# replaces ours for the cells after it (a known limit, a stripe missing, not a wrong one). It
+# lives IN `PS1` for the reason above.
 #
 # The id is written into the string each time, so the string is rebuilt at every prompt from
 # the user's own text (`__bateri_user_ps1`). A `PS1` that is not the one left last time is a
@@ -139,6 +307,14 @@ __bateri_user_ps1=
 __bateri_ps1=
 __bateri_prompt() {
   local status=$?
+  __bateri_ps0
+  if (( __bateri_dock )); then
+    local ready=
+    __bateri_dock_arm && ready='\[\e]8133;w\a\]'
+    PS1='\[\e]8;;bateri://block/'$__bateri_block'\a\]  \[\e]8133;g\a\]'$ready'\[\e]133;B\a\]'
+    PS2=
+    return $status
+  fi
   if [[ $PS1 != "$__bateri_ps1" ]]; then
     __bateri_user_ps1=$PS1
   fi
@@ -148,9 +324,12 @@ __bateri_prompt() {
 }
 
 # First in `PROMPT_COMMAND`, so `$?` is still the command's when it runs; the prompt last.
-# A bash 5.1 array keeps its other elements. A string uses newlines as the joiner: the user's
-# value may end in a comment or a `;`.
-if [[ ${PROMPT_COMMAND@a} == *a* ]]; then
+# A bash 5.1 array keeps its other elements; before 5.1 only the array's first element runs, so
+# there the first element is taken as a string like any other value. A string uses newlines as
+# the joiner: the user's value may end in a comment or a `;`. `-v` first: under `set -u` the
+# attribute query of an unset variable is an error, and it would end this setup.
+if [[ -v PROMPT_COMMAND && ${PROMPT_COMMAND@a} == *a* ]] \
+  && (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 501 )); then
   PROMPT_COMMAND=(__bateri_precmd "${PROMPT_COMMAND[@]}" __bateri_prompt)
 else
   __bateri_nl=$'\n'
