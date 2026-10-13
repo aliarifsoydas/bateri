@@ -31,8 +31,10 @@
 //! graphics command out of the byte stream and leaves a marker (a private
 //! mode `set`, [`crate::graphics::MARK`]) in its place; this wrapper catches
 //! it before `Term` sees it and applies the oldest queued command to the
-//! screen showing at that point of the stream. A move to or from the
-//! alternate screen drops what that screen's store holds. Without a
+//! screen showing at that point of the stream, anchoring a placement at the
+//! cursor. A move to or from the alternate screen drops what that screen's
+//! store holds; a clear of the screen (`CSI 2 J`, `CSI 3 J`) and a reset
+//! delete the placements in stream order, before the rows move. Without a
 //! [`Sink`] (a replay, a snapshot) the marker is read and does nothing.
 //!
 //! **The forwarding list is in one macro and guarded.** Every `Handler`
@@ -56,7 +58,7 @@ use alacritty_terminal::vte::ansi::{
 // `Cargo.toml`.
 use cursor_icon::CursorIcon;
 
-use crate::graphics::{MARK_MODE, Sink};
+use crate::graphics::{MARK_MODE, Sink, screen_of};
 
 /// The `Handler` the parser sees: it borrows `Term` and forwards calls to
 /// it. It is reborn **on every `advance` and `stop_sync` call** — one lock
@@ -103,9 +105,32 @@ impl<'a, U: EventListener> ClusterHandler<'a, U> {
         let Some(graphics) = self.graphics else {
             return;
         };
-        if let Some(reply) = graphics.hub().apply_next(self.on_alternate_screen()) {
+        let (hub, cell) = (graphics.hub(), graphics.cell());
+        // The placements already here are brought to the grid as it is now
+        // before a new one is anchored in it.
+        hub.look(&*self.term, cell);
+        let screen = screen_of(&*self.term, cell);
+        let reply = hub.apply_next(&screen);
+        hub.settle(&*self.term);
+        if let Some(reply) = reply {
             graphics.reply(reply);
         }
+    }
+
+    /// `CSI 2 J` deletes the placements that reach onto the screen, `CSI 3 J`
+    /// all of them; the rows are cleared right after, so the lines the
+    /// placements were anchored to are still the grid's.
+    fn clearing_screen(&mut self, mode: ClearMode) {
+        *self.last_input = false;
+        if let Some(graphics) = self.graphics
+            && matches!(mode, ClearMode::All | ClearMode::Saved)
+        {
+            let (hub, cell) = (graphics.hub(), graphics.cell());
+            hub.look(&*self.term, cell);
+            let screen = screen_of(&*self.term, cell);
+            hub.clear_screen(&screen, matches!(mode, ClearMode::Saved));
+        }
+        self.term.clear_screen(mode);
     }
 
     /// Runs a private mode change and drops the alternate screen's images
@@ -277,6 +302,18 @@ impl<U: EventListener> Handler for ClusterHandler<'_, U> {
         self.switching_screens(|term| term.unset_private_mode(mode));
     }
 
+    fn clear_screen(&mut self, mode: ClearMode) {
+        self.clearing_screen(mode);
+    }
+
+    fn reset_state(&mut self) {
+        *self.last_input = false;
+        if let Some(graphics) = self.graphics {
+            graphics.hub().reset();
+        }
+        self.term.reset_state();
+    }
+
     forward! {
         fn set_title(&mut self, title: Option<String>);
         fn set_cursor_style(&mut self, style: Option<CursorStyle>);
@@ -312,10 +349,8 @@ impl<U: EventListener> Handler for ClusterHandler<'_, U> {
         fn save_cursor_position(&mut self);
         fn restore_cursor_position(&mut self);
         fn clear_line(&mut self, mode: LineClearMode);
-        fn clear_screen(&mut self, mode: ClearMode);
         fn clear_tabs(&mut self, mode: TabulationClearMode);
         fn set_tabs(&mut self, interval: u16);
-        fn reset_state(&mut self);
         fn reverse_index(&mut self);
         fn terminal_attribute(&mut self, attr: Attr);
         fn set_mode(&mut self, mode: Mode);

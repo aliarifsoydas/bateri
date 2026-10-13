@@ -5743,6 +5743,7 @@ mod tests {
             &mut bt_core::SearchRuns::default(),
             &mut bt_core::TrackMarks::default(),
             &mut bt_core::Clusters::default(),
+            &mut bt_core::Pictures::default(),
             bt_core::ScrollGlide::default(),
             bt_core::DockBudget {
                 share: 0.5,

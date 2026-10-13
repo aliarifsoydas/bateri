@@ -806,6 +806,10 @@ mod tests {
             &self.hub
         }
 
+        fn cell(&self) -> (u16, u16) {
+            (10, 20)
+        }
+
         fn reply(&self, _: Vec<u8>) {}
     }
 

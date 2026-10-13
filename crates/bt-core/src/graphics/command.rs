@@ -66,9 +66,21 @@ pub(crate) enum Scope {
     Number,
     /// `r`: the images whose id is in `x..=y`.
     Range,
-    /// `c`, `p`, `q`, `x`, `y`, `z`, `f`: placements by where they are or what
-    /// they are. They only ever remove placements.
-    Placements,
+    /// `c`: the placements that cover the cursor's cell.
+    Cursor,
+    /// `p`: the placements that cover the cell `x=`, `y=` (1-based).
+    Cell,
+    /// `q`: the placements that cover the cell `x=`, `y=` and have the
+    /// z-index `z=`.
+    CellZ,
+    /// `x`: the placements that cover the column `x=` (1-based).
+    Column,
+    /// `y`: the placements that cover the row `y=` (1-based).
+    Row,
+    /// `z`: the placements with the z-index `z=`.
+    Z,
+    /// `f`: animation frames, which are not supported: nothing matches.
+    Frames,
 }
 
 /// One parsed command. Everything is the raw wire value except where a
@@ -92,9 +104,23 @@ pub(crate) struct Command {
     /// The scope of a delete and whether the data goes too (`d=` in upper case).
     pub(crate) scope: Scope,
     pub(crate) free: bool,
-    /// `x=`, `y=`: a delete's range.
+    /// `x=`, `y=`: a delete's range or cell, and a placement's source offset
+    /// in pixels.
     pub(crate) x: u32,
     pub(crate) y: u32,
+    /// `w=`, `h=`: a placement's source size in pixels; 0 is "to the edge".
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    /// `X=`, `Y=`: where in its first cell the placement starts, pixels.
+    pub(crate) cell_x: u32,
+    pub(crate) cell_y: u32,
+    /// `c=`, `r=`: the cells the placement covers; 0 is "work it out".
+    pub(crate) columns: u32,
+    pub(crate) rows: u32,
+    /// `z=`: which layer the placement is drawn in.
+    pub(crate) z: i32,
+    /// `C=1`: placing leaves the cursor where it is.
+    pub(crate) still: bool,
 }
 
 impl Command {
@@ -121,6 +147,14 @@ fn parse(control: &[u8], echo: Echo) -> Result<Command, Error> {
         free: false,
         x: 0,
         y: 0,
+        w: 0,
+        h: 0,
+        cell_x: 0,
+        cell_y: 0,
+        columns: 0,
+        rows: 0,
+        z: 0,
+        still: false,
     };
     if echo.id != 0 && echo.number != 0 {
         return Err(Error::invalid(
@@ -179,14 +213,35 @@ fn parse(control: &[u8], echo: Echo) -> Result<Command, Error> {
                     b'i' => Scope::Id,
                     b'n' => Scope::Number,
                     b'r' => Scope::Range,
-                    b'c' | b'p' | b'q' | b'x' | b'y' | b'z' | b'f' => Scope::Placements,
+                    b'c' => Scope::Cursor,
+                    b'p' => Scope::Cell,
+                    b'q' => Scope::CellZ,
+                    b'x' => Scope::Column,
+                    b'y' => Scope::Row,
+                    b'z' => Scope::Z,
+                    b'f' => Scope::Frames,
                     _ => return Err(Error::invalid("unknown delete specifier")),
                 };
             }
             b'x' => command.x = number(value)?,
             b'y' => command.y = number(value)?,
-            // `i`, `I`, `p` and `q` are the echo's; the rest are placement
-            // keys no command here reads yet.
+            b'w' => command.w = number(value)?,
+            b'h' => command.h = number(value)?,
+            b'X' => command.cell_x = number(value)?,
+            b'Y' => command.cell_y = number(value)?,
+            b'c' => command.columns = number(value)?,
+            b'r' => command.rows = number(value)?,
+            b'z' => command.z = signed(value)?,
+            b'C' => command.still = number(value)? == 1,
+            // Two ways of placing an image that this terminal does not do:
+            // refusing is better than drawing it in the wrong place.
+            b'U' if number(value)? != 0 => {
+                return Err(Error::invalid("unicode placeholders are not supported"));
+            }
+            b'P' | b'Q' if number(value)? != 0 => {
+                return Err(Error::invalid("relative placement is not supported"));
+            }
+            // `i`, `I`, `p` and `q` are the echo's; the rest is not read.
             _ => {}
         }
     }
@@ -212,6 +267,18 @@ pub(super) fn is_query(control: &[u8]) -> bool {
 /// A decimal `u32`: digits only, so `+1`, ` 1` and `1.0` are not numbers.
 pub(super) fn number(value: &[u8]) -> Result<u32, Error> {
     if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return Err(Error::invalid("a number was expected"));
+    }
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(|| Error::invalid("a number is out of range"))
+}
+
+/// A decimal `i32`, as `z=` writes it: an optional minus sign and digits.
+pub(super) fn signed(value: &[u8]) -> Result<i32, Error> {
+    let digits = value.strip_prefix(b"-").unwrap_or(value);
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return Err(Error::invalid("a number was expected"));
     }
     std::str::from_utf8(value)
@@ -270,6 +337,34 @@ mod tests {
     }
 
     #[test]
+    fn a_placement_reads_its_geometry_and_its_signed_layer() {
+        let command = parsed("a=p,i=3,p=2,x=4,y=5,w=6,h=7,X=8,Y=9,c=10,r=11,z=-12,C=1");
+        assert_eq!(command.action, Action::Put);
+        assert_eq!((command.x, command.y, command.w, command.h), (4, 5, 6, 7));
+        assert_eq!((command.cell_x, command.cell_y), (8, 9));
+        assert_eq!((command.columns, command.rows), (10, 11));
+        assert_eq!(command.z, -12);
+        assert!(command.still);
+        assert_eq!(parsed("z=2147483647").z, i32::MAX);
+        assert!(!parsed("a=p,C=0").still);
+        for control in ["i=4,z=2147483648", "i=4,z=-", "i=4,z=+1", "i=4,z=1-"] {
+            let (echo, error) = failed(control);
+            assert_eq!(echo.id, 4, "{control}");
+            assert_eq!(error.code(), "EINVAL", "{control}");
+        }
+    }
+
+    #[test]
+    fn placements_this_terminal_cannot_do_are_refused_by_name() {
+        for (control, word) in [("a=p,i=1,U=1", "unicode"), ("a=T,i=1,P=2,Q=3", "relative")] {
+            let (echo, error) = failed(control);
+            assert_eq!(echo.id, 1);
+            assert!(error.message().contains(word), "{control}");
+        }
+        assert_eq!(parsed("a=p,i=1,U=0,P=0,Q=0,H=4").action, Action::Put);
+    }
+
+    #[test]
     fn unknown_keys_and_pairs_without_a_value_are_skipped() {
         let command = parsed("a=t,Z=9,junk,,i=5");
         assert_eq!(command.echo.id, 5);
@@ -285,7 +380,13 @@ mod tests {
         let range = parsed("a=d,d=R,x=2,y=9");
         assert_eq!((range.scope, range.x, range.y), (Scope::Range, 2, 9));
         assert_eq!(parsed("a=d").scope, Scope::Visible);
-        assert_eq!(parsed("a=d,d=Z").scope, Scope::Placements);
+        assert_eq!(parsed("a=d,d=Z").scope, Scope::Z);
+        assert_eq!(parsed("a=d,d=c").scope, Scope::Cursor);
+        assert_eq!(parsed("a=d,d=P").scope, Scope::Cell);
+        assert_eq!(parsed("a=d,d=q").scope, Scope::CellZ);
+        assert_eq!(parsed("a=d,d=X").scope, Scope::Column);
+        assert_eq!(parsed("a=d,d=y").scope, Scope::Row);
+        assert_eq!(parsed("a=d,d=F").scope, Scope::Frames);
     }
 
     #[test]

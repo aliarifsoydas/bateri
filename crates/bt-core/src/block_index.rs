@@ -291,7 +291,7 @@ impl BlockIndex {
 /// A row's text, folded — the probe row's check ([`Seen::text`]): a row the
 /// ring reused was cleared and written anew, so its text tells it from the
 /// row that stood there. Every cell's character and its combining marks.
-fn row_text<T>(term: &Term<T>, line: Line) -> u64 {
+pub(crate) fn row_text<T>(term: &Term<T>, line: Line) -> u64 {
     let mut hasher = DefaultHasher::new();
     for cell in &term.grid()[line] {
         cell.c.hash(&mut hasher);

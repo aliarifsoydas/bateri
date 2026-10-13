@@ -86,7 +86,7 @@ use crate::cluster::{ClusterId, Clusters};
 use crate::color::{self, LinearRgba, Theme};
 use crate::commands::{CommandId, CommandState, command_state};
 use crate::dock::{self, Dock, DockBudget, DockCols, DockEdit, DockPoint};
-use crate::graphics::{self, Hub, Piece, Receiver, Splitter};
+use crate::graphics::{self, Hub, Pictures, Piece, Receiver, Splitter};
 use crate::grid_input;
 use crate::handler::ClusterHandler;
 use crate::identity::{LC_TERMINAL, PaneUuid, TERM_PROGRAM, TERM_PROGRAM_VERSION};
@@ -2119,6 +2119,10 @@ impl graphics::Sink for Adapter {
         &self.0.graphics
     }
 
+    fn cell(&self) -> (u16, u16) {
+        self.cell_px()
+    }
+
     fn reply(&self, bytes: Vec<u8>) {
         if !self.0.muted.load(Ordering::Acquire) {
             self.input(bytes);
@@ -2127,6 +2131,12 @@ impl graphics::Sink for Adapter {
 }
 
 impl Adapter {
+    /// A cell's size in pixels, as the PTY was last told.
+    fn cell_px(&self) -> (u16, u16) {
+        let size = *lock(&self.0.size);
+        (size.cell_width, size.cell_height)
+    }
+
     /// Puts bytes on the loop's write queue — the answer to the application's
     /// question ([`Self::reply`]) and the session's first input go through here.
     fn input(&self, bytes: Vec<u8>) {
@@ -2299,7 +2309,11 @@ impl EventListener for Adapter {
 /// to the scanner before returning. The exception is a kitty graphics command
 /// (`ESC _ G … ESC \`): it is taken out of the stream, decoded and queued,
 /// and [`graphics::MARK`] stands in its place ([`crate::graphics`] says why
-/// there and not later). Everything after the separation — the journal, the
+/// there and not later). A command that shows an image and moves the cursor
+/// (`C=0`) brings that movement with it as ordinary escape sequences around
+/// the marker — the rows before it, the columns after it ([`graphics::Motion`]
+/// says why the marker is between them) — so everything downstream moves its
+/// cursor the same way. Everything after the separation — the journal, the
 /// tail, the scanner, the parser — sees the stream **without** the command,
 /// so a replay of the journal never has an image payload in it. The second
 /// thing that enters the parser's **call** path is a separate layer
@@ -2456,15 +2470,27 @@ impl TappedPty {
             return Ok(read);
         }
         let hub = &self.adapter.0.graphics;
+        let size = *lock(&self.adapter.0.size);
+        let env = graphics::Env {
+            cell: (size.cell_width, size.cell_height),
+            columns: size.num_cols,
+            lines: size.num_lines,
+        };
+        let stored = |echo| hub.stored_size(echo);
         let out = self.spill.begin();
         let receiver = &mut self.receiver;
         self.splitter.feed(&buf[..read], |piece| match piece {
             Piece::Bytes(bytes) => out.extend_from_slice(bytes),
-            Piece::Command(apc) => receiver.receive(apc, Instant::now(), |outcome| {
+            Piece::Command(apc) => receiver.receive(apc, Instant::now(), env, &stored, |outcome| {
                 match outcome {
                     graphics::Outcome::Pending(pending) => {
+                        // The cursor's movement is written around the marker:
+                        // the rows before it, the columns after it.
+                        let motion = pending.motion();
+                        motion.lead(env.lines, out);
                         hub.queue(pending);
                         out.extend_from_slice(graphics::MARK);
+                        motion.trail(out);
                     }
                     // A query's answer is not sent yet: the program is told,
                     // as before, that the terminal does not draw.
@@ -5488,6 +5514,14 @@ impl Session {
     /// The runs are in the grid's screen rows, the suppressed input row excluded
     /// — the fill band cannot be selected, the dock's selection is separate.
     ///
+    /// **`pictures` takes the images placed on the screen** ([`Pictures`]):
+    /// those that reach into the grid's rows and into the fill band's, each
+    /// list in drawing order, emptied and refilled every frame. Their rows
+    /// are the surface's own (the band's are fill-local, like `fill_sink`'s).
+    /// The placements are brought to the grid as it is now under this same
+    /// lock ([`crate::graphics`] says how), and only while the screen has
+    /// any, so a frame with no image does no work for them.
+    ///
     /// **`glide` is the glide amount the frame path delivers in this frame**:
     /// in the same `Term` lock, applied before the scan starts and it
     /// **does not wake** — the animation's frame request cannot pass through
@@ -5536,6 +5570,7 @@ impl Session {
         search: &mut SearchRuns,
         marks: &mut TrackMarks,
         clusters: &mut Clusters,
+        pictures: &mut Pictures,
         glide: ScrollGlide,
         budget: DockBudget,
     ) -> Cursor {
@@ -6777,6 +6812,29 @@ impl Session {
                 fill_sink(drawn);
             }
         }
+
+        // **The images of the placements, last of the grid's reads** and
+        // still under the `Term` lock: a placement's line is the grid's, and
+        // the look that brings it to the grid as it is now needs the rows.
+        // The grid's window is the lines the screen shows; the band's is the
+        // channel above it, in the fill-local rows its cells use.
+        pictures.clear();
+        let channel_rows = i32::from(channel);
+        self.adapter.0.graphics.pictures(
+            &term,
+            self.adapter.cell_px(),
+            graphics::Window {
+                first: -offset,
+                last: rows - 1 - offset,
+                shift: offset,
+            },
+            (channel > 0 && !alt_screen).then_some(graphics::Window {
+                first: -offset - channel_rows,
+                last: -offset - 1,
+                shift: offset + channel_rows,
+            }),
+            pictures,
+        );
 
         // The input band's rows for a given need: a closure because a grid-sourced
         // line is published after the `Term` lock is released and the need —
@@ -8397,7 +8455,16 @@ impl Session {
                 ClearKind::ToStart => protected_top(&term, input_block),
                 ClearKind::Scrollback => 0,
             };
+            // The placements are brought to the grid as it is before the
+            // rows move, and follow the rows after: what shows on none of the
+            // kept lines goes, the rest moves up with them.
+            let cell = self.adapter.cell_px();
+            self.adapter.0.graphics.look(&*term, cell);
             wipe(&mut term, top);
+            self.adapter
+                .0
+                .graphics
+                .wiped(&*term, i32::try_from(top).unwrap_or(i32::MAX), cell);
             // The resolved effect, not the command: the replay has no shell
             // ledger to find the kept block with.
             self.record(JournalSide::Clear {
@@ -11611,7 +11678,18 @@ impl Session {
         if same_size(*prev, size) {
             return false;
         }
+        // The placements move with the content: alacritty keeps the content's
+        // distance to the cursor's line through a change of height, so that
+        // distance is what they keep. A change of width reflowed the rows
+        // (and the alternate screen's program redraws on its own), and no
+        // line says where a placement went then.
+        let graphics = &self.adapter.0.graphics;
+        graphics.look(&*term, cell_px);
+        let before = (term.columns(), term.grid().cursor.point.line.0);
         term.resize(grid);
+        let moved = before.1 - term.grid().cursor.point.line.0;
+        let reflowed = term.columns() != before.0 || term.mode().contains(TermMode::ALT_SCREEN);
+        graphics.resized(&*term, moved, reflowed, cell_px);
         self.record(JournalSide::Resize { cols, rows });
         *prev = size;
         self.send(Msg::Resize(size));
@@ -12471,6 +12549,7 @@ mod tests {
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 ScrollGlide::default(),
                 BUDGET,
             )
@@ -12492,6 +12571,7 @@ mod tests {
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 ScrollGlide::default(),
                 BUDGET,
             );
@@ -12515,6 +12595,7 @@ mod tests {
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 ScrollGlide::default(),
                 BUDGET,
             );
@@ -12852,6 +12933,7 @@ mod tests {
                     &mut SearchRuns::default(),
                     &mut TrackMarks::default(),
                     &mut Clusters::default(),
+                    &mut Pictures::default(),
                     ScrollGlide::default(),
                     BUDGET,
                 );
@@ -13359,6 +13441,7 @@ mod tests {
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 ScrollGlide::default(),
                 BUDGET,
             );
@@ -13550,6 +13633,7 @@ mod tests {
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 ScrollGlide::default(),
                 DockBudget { share, cols: 80 },
             );
@@ -13750,6 +13834,7 @@ mod tests {
                     &mut SearchRuns::default(),
                     &mut TrackMarks::default(),
                     &mut Clusters::default(),
+                    &mut Pictures::default(),
                     ScrollGlide::default(),
                     BUDGET,
                 );
@@ -13865,6 +13950,7 @@ mod tests {
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 ScrollGlide::default(),
                 BUDGET,
             );
@@ -13922,6 +14008,7 @@ mod tests {
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 ScrollGlide::default(),
                 BUDGET,
             );
@@ -13969,6 +14056,7 @@ mod tests {
                     &mut SearchRuns::default(),
                     &mut TrackMarks::default(),
                     &mut Clusters::default(),
+                    &mut Pictures::default(),
                     ScrollGlide::default(),
                     BUDGET,
                 )
@@ -13997,6 +14085,7 @@ mod tests {
                     &mut SearchRuns::default(),
                     &mut TrackMarks::default(),
                     &mut Clusters::default(),
+                    &mut Pictures::default(),
                     ScrollGlide::default(),
                     BUDGET,
                 )
@@ -14079,6 +14168,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14128,6 +14218,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14149,6 +14240,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14186,6 +14278,7 @@ mod tests {
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 ScrollGlide::default(),
                 BUDGET,
             );
@@ -14200,6 +14293,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14246,6 +14340,7 @@ mod tests {
                         &mut SearchRuns::default(),
                         &mut TrackMarks::default(),
                         &mut Clusters::default(),
+                        &mut Pictures::default(),
                         ScrollGlide::default(),
                         BUDGET,
                     )
@@ -14260,6 +14355,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14307,6 +14403,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14337,6 +14434,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14373,6 +14471,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14401,6 +14500,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14440,6 +14540,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14473,6 +14574,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14519,6 +14621,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14594,6 +14697,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14638,6 +14742,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14685,6 +14790,7 @@ mod tests {
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 ScrollGlide::default(),
                 BUDGET,
             );
@@ -14727,6 +14833,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14779,6 +14886,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14832,6 +14940,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14883,6 +14992,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14941,6 +15051,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -14968,6 +15079,7 @@ mod tests {
                     &mut SearchRuns::default(),
                     &mut TrackMarks::default(),
                     &mut Clusters::default(),
+                    &mut Pictures::default(),
                     ScrollGlide::default(),
                     BUDGET,
                 );
@@ -14988,6 +15100,7 @@ mod tests {
                         &mut SearchRuns::default(),
                         &mut TrackMarks::default(),
                         &mut Clusters::default(),
+                        &mut Pictures::default(),
                         ScrollGlide::default(),
                         BUDGET,
                     )
@@ -15003,6 +15116,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -15064,6 +15178,7 @@ mod tests {
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 ScrollGlide::default(),
                 BUDGET,
             );
@@ -15778,6 +15893,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -15820,6 +15936,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -15837,6 +15954,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -15968,6 +16086,7 @@ mod tests {
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 ScrollGlide::default(),
                 budget,
             );
@@ -16352,6 +16471,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -16373,6 +16493,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -16392,6 +16513,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -16499,6 +16621,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -16531,6 +16654,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -18412,6 +18536,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -19300,6 +19425,7 @@ mod tests {
                     &mut SearchRuns::default(),
                     &mut TrackMarks::default(),
                     &mut Clusters::default(),
+                    &mut Pictures::default(),
                     ScrollGlide::default(),
                     DockBudget { share, cols: 40 },
                 )
@@ -19372,6 +19498,7 @@ mod tests {
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 ScrollGlide::default(),
                 DockBudget { share: 0.5, cols },
             );
@@ -20153,6 +20280,7 @@ mod tests {
                 &mut search,
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 ScrollGlide::default(),
                 BUDGET,
             );
@@ -20383,6 +20511,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         )
@@ -20969,6 +21098,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -21001,6 +21131,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -21312,6 +21443,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -21385,6 +21517,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -21428,6 +21561,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -22275,6 +22409,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             stale,
             BUDGET,
         );
@@ -22294,6 +22429,7 @@ mod tests {
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             live,
             BUDGET,
         );
@@ -22387,6 +22523,7 @@ mod tests {
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 glide,
                 BUDGET,
             );
@@ -23622,6 +23759,7 @@ e\\314\\201.'; sleep 5";
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut clusters,
+                &mut Pictures::default(),
                 ScrollGlide::default(),
                 BUDGET,
             );
@@ -24826,6 +24964,7 @@ e\\314\\201.'; sleep 5";
             &mut runs,
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -25165,6 +25304,7 @@ e\\314\\201.'; sleep 5";
             &mut runs,
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -25714,6 +25854,7 @@ e\\314\\201.'; sleep 5";
                 &mut SearchRuns::default(),
                 &mut TrackMarks::default(),
                 &mut Clusters::default(),
+                &mut Pictures::default(),
                 glide,
                 BUDGET,
             );
@@ -25995,6 +26136,7 @@ e\\314\\201.'; sleep 5";
             &mut SearchRuns::default(),
             marks,
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -26071,6 +26213,7 @@ e\\314\\201.'; sleep 5";
             &mut SearchRuns::default(),
             &mut marks,
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -26909,6 +27052,7 @@ e\\314\\201.'; sleep 5";
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -27272,6 +27416,7 @@ e\\314\\201.'; sleep 5";
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -27968,6 +28113,7 @@ e\\314\\201.'; sleep 5";
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -28090,6 +28236,7 @@ e\\314\\201.'; sleep 5";
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -28251,6 +28398,7 @@ e\\314\\201.'; sleep 5";
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -28603,6 +28751,7 @@ e\\314\\201.'; sleep 5";
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -28620,6 +28769,7 @@ e\\314\\201.'; sleep 5";
             &mut SearchRuns::default(),
             &mut TrackMarks::default(),
             &mut Clusters::default(),
+            &mut Pictures::default(),
             ScrollGlide::default(),
             BUDGET,
         );
@@ -29680,6 +29830,207 @@ e\\314\\201.'; sleep 5";
             "the terminal was held while decoding"
         );
         assert_eq!(stored_ids(&session), (vec![2], vec![]));
+        session.shutdown();
+    }
+
+    /// A one-pixel image stretched over `c` × `r` cells, as `printf` writes
+    /// it; `more` is more keys, with their comma.
+    fn printf_cells(id: u32, c: u32, r: u32, more: &str) -> String {
+        format!("\\033_Ga=T,f=32,s=1,v=1,i={id},c={c},r={r}{more};AAAAAA==\\033\\\\")
+    }
+
+    /// One frame's cells, pictures and cursor.
+    fn picture_frame(session: &Session) -> (Vec<Cell>, Pictures, Cursor) {
+        let (mut cells, mut pictures) = (Vec::new(), Pictures::default());
+        let cursor = session.frame(
+            |cell| cells.push(cell),
+            |_| (),
+            &mut Blocks::default(),
+            &mut SelectionRuns::default(),
+            &mut SearchRuns::default(),
+            &mut TrackMarks::default(),
+            &mut Clusters::default(),
+            &mut pictures,
+            ScrollGlide::default(),
+            BUDGET,
+        );
+        (cells, pictures, cursor)
+    }
+
+    /// Every placement of the main screen, as (image id, line, column), as
+    /// the frame leaves them.
+    fn placed_lines(session: &Session) -> Vec<(u32, i32, u16)> {
+        picture_frame(session);
+        session
+            .adapter
+            .0
+            .graphics
+            .with_images(|images| images.main().placed())
+    }
+
+    #[test]
+    fn a_placed_image_is_in_the_frame_where_the_cursor_was_and_the_cursor_goes_after_it() {
+        let session = spawn_session(
+            &format!(
+                "stty -echo; printf '\\033[3;5H{}READY'; sleep 8",
+                printf_cells(1, 2, 2, "")
+            ),
+            Arc::new(TestWake::default()),
+        );
+        wait_text(&session, "READY");
+        let (cells, pictures, _) = picture_frame(&session);
+        let [picture] = pictures.grid() else {
+            panic!("one picture, got {:?}", pictures.grid().len());
+        };
+        // Line 2, column 4: the top of a two-row image whose last row is 3.
+        assert_eq!((picture.row, picture.col), (2, 4));
+        // The window's cells are 9 × 18 pixels.
+        assert_eq!((picture.width, picture.height), (18, 36));
+        assert_eq!((picture.size, picture.z), ((1, 1), 0));
+        assert_eq!(picture.pixels.as_slice(), &[0, 0, 0, 0]);
+        assert!(pictures.band().is_empty());
+        // The text goes on at the cell after the image, on its last row.
+        let ready = cells.iter().find(|cell| cell.ch == Some('R')).expect("R");
+        assert_eq!((ready.row, ready.col), (3, 6));
+        session.shutdown();
+    }
+
+    #[test]
+    fn an_image_in_the_history_is_in_the_fill_bands_pictures() {
+        // The image is on line 0, fourteen lines of output push it five
+        // lines into the history; clearing the screen from its top (`CSI H`,
+        // `CSI J`, not `CSI 2 J`) leaves the history to fill the blank above
+        // the text. The band is the dock window's: one without a dock has none.
+        let session = spawn_docked_session(
+            &format!(
+                "stty -echo; printf '{}'; i=0; while [ $i -lt 14 ]; do echo line$i; i=$((i+1)); done; \
+                 printf '\\033[H\\033[JREADY'; sleep 8",
+                printf_cells(1, 2, 2, ",C=1")
+            ),
+            Arc::new(TestWake::default()),
+        );
+        wait_text(&session, "READY");
+        let (_, pictures, cursor) = picture_frame(&session);
+        assert_eq!(cursor.fill, 5, "the whole history fills the blank");
+        assert!(pictures.grid().is_empty(), "{:?}", pictures.grid());
+        let [picture] = pictures.band() else {
+            panic!("one picture, got {:?}", pictures.band().len());
+        };
+        // Lines -5 and -4 are the band's rows 0 and 1.
+        assert_eq!((picture.row, picture.col), (0, 0));
+        session.shutdown();
+    }
+
+    #[test]
+    fn resizing_keeps_a_placements_distance_to_the_cursor_and_a_new_width_takes_it() {
+        let session = spawn_session(
+            &format!(
+                "stty -echo; printf '\\033[6;1H{}\\033[10;1HREADY'; sleep 8",
+                printf_cells(1, 2, 2, ",C=1")
+            ),
+            Arc::new(TestWake::default()),
+        );
+        wait_text(&session, "READY");
+        assert_eq!(placed_lines(&session), [(1, 5, 0)]);
+        // The cursor is on the last line: two lines less pushes two rows into
+        // the history, and the cursor and the image go up with them.
+        assert!(session.resize(40, 8, (9, 18)));
+        assert_eq!(placed_lines(&session), [(1, 3, 0)]);
+        assert!(session.resize(40, 10, (9, 18)));
+        assert_eq!(placed_lines(&session), [(1, 5, 0)]);
+        // Narrower: the rows were reflowed, and no line says where it went.
+        assert!(session.resize(30, 10, (9, 18)));
+        assert_eq!(placed_lines(&session), []);
+        session.shutdown();
+    }
+
+    #[test]
+    fn clearing_to_start_keeps_the_placements_on_the_kept_lines_and_moves_them_up() {
+        let session = spawn_session(
+            &format!(
+                "stty -echo; printf '\\033[8;1H{}\\033[10;1H{}READY'; sleep 8",
+                printf_cells(1, 2, 2, ",C=1"),
+                printf_cells(2, 1, 1, ",C=1")
+            ),
+            Arc::new(TestWake::default()),
+        );
+        wait_text(&session, "READY");
+        assert_eq!(placed_lines(&session), [(1, 7, 0), (2, 9, 0)]);
+        // The kept block is the cursor's line, 9: the first image is wholly
+        // above it, the second is on it and goes to the top.
+        assert!(session.clear_to_start());
+        assert_eq!(placed_lines(&session), [(2, 0, 0)]);
+        session.shutdown();
+    }
+
+    #[test]
+    fn clearing_the_scrollback_takes_the_placements_in_it_and_leaves_the_screens() {
+        let session = spawn_session(
+            &format!(
+                "stty -echo; printf '{}'; i=0; while [ $i -lt 14 ]; do echo line$i; i=$((i+1)); done; \
+                 printf '\\033[10;1H{}READY'; sleep 8",
+                printf_cells(1, 2, 2, ",C=1"),
+                printf_cells(2, 1, 1, ",C=1")
+            ),
+            Arc::new(TestWake::default()),
+        );
+        wait_text(&session, "READY");
+        assert_eq!(placed_lines(&session), [(1, -5, 0), (2, 9, 0)]);
+        assert!(session.clear_scrollback());
+        assert_eq!(placed_lines(&session), [(2, 9, 0)]);
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_journals_copy_of_the_screen_has_the_cursor_where_the_image_left_it() {
+        let journal = manual_journal(64 << 20, Duration::from_secs(60));
+        let mut options = test_options(
+            sh(&format!(
+                "stty -echo; printf 'a\\033[3;5H{}\\033[9;1H{}READY'; sleep 8",
+                printf_cells(1, 2, 3, ""),
+                printf_cells(2, 40, 2, "")
+            )),
+            40,
+        );
+        options.journal = Some(Arc::clone(&journal));
+        let session = Session::spawn(options, Arc::new(TestWake::default())).unwrap();
+        wait_text(&session, "READY");
+        let mut last = journal.applied_bytes();
+        wait_until("the reader settles", Duration::from_secs(10), || {
+            std::thread::sleep(Duration::from_millis(200));
+            let now = journal.applied_bytes();
+            std::mem::replace(&mut last, now) == now
+        });
+        if let Some(cut) = journal.compact() {
+            journal.release(cut);
+        }
+        let base = journal.base().expect("seeded");
+        assert_eq!(base.at.pty, journal.applied_bytes());
+        let mut copy = Term::new(
+            term_config(base.options),
+            &GridSize::for_spawn(base.cols, base.rows),
+            VoidListener,
+        );
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        let mut last_input = false;
+        parser.advance(
+            &mut ClusterHandler::new(&mut copy, true, &mut last_input),
+            &base.vt,
+        );
+        // The second image is as wide as the screen and two rows tall from
+        // line 8: the screen scrolled once, and the cursor ended at the start
+        // of the line after it.
+        assert_eq!(
+            copy.grid().cursor.point,
+            session.term.lock().grid().cursor.point
+        );
+        assert_eq!(readable(&copy), readable(&*session.term.lock()));
+        let (copy_vt, _) = snapshot::encode_live(&mut copy, &|| None, &|| ());
+        let (live_vt, _) = snapshot::encode_live(&mut *session.term.lock(), &|| None, &|| ());
+        assert_eq!(
+            String::from_utf8_lossy(&copy_vt),
+            String::from_utf8_lossy(&live_vt)
+        );
         session.shutdown();
     }
 

@@ -1303,6 +1303,8 @@ impl Core {
             &mut self.search.borrow_mut(),
             &mut self.marks.borrow_mut(),
             &mut clusters,
+            // No picture is drawn yet: the list is asked for and dropped.
+            &mut bt_core::Pictures::default(),
             // The share **does not wake**: this tick draws the frame anyway
             // (`Session::frame`). If its generation changed it drops there.
             glide,

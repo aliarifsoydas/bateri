@@ -24,11 +24,21 @@
 //!   frame. A marker with no record (a program wrote the bytes itself, or
 //!   the stream is being replayed) does nothing.
 //!
-//! Nothing here draws. The store holds decoded pixels per screen
-//! ([`Images`]); placing them on the grid and drawing them come after.
+//! **Placing** is the parser's side too. A placement is anchored to the
+//! cursor's grid line at its marker; when the command moves the cursor
+//! (`C=0`, the default) the reader writes that movement into the stream
+//! beside the marker as ordinary escape sequences ([`Motion`]), so the
+//! journal's copy of the screen moves its cursor the same way without any of
+//! this. How placements keep their lines while the content scrolls is
+//! [`follow`]'s, and what the frame draws is [`Pictures`].
+//!
+//! Nothing here draws. The store holds decoded pixels and placements per
+//! screen ([`Images`]); the frame hands them over as [`Picture`]s.
 
 mod apc;
 mod command;
+mod follow;
+mod place;
 mod receive;
 mod store;
 
@@ -37,8 +47,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::term::Term;
+
 pub(crate) use apc::{Piece, Splitter};
-pub(crate) use receive::{Outcome, Receiver};
+pub(crate) use place::Motion;
+pub(crate) use place::Screen;
+pub use place::{Picture, Pictures};
+pub(crate) use receive::{Env, Outcome, Receiver};
+pub(crate) use store::{Window, screen_of};
 
 use command::Command;
 use receive::Decoded;
@@ -144,6 +161,11 @@ impl Error {
         Self::new("EFBIG", message)
     }
 
+    /// A command that names an image there is none of.
+    pub(crate) fn missing(message: impl Into<String>) -> Self {
+        Self::new("ENOENT", message)
+    }
+
     /// An image that cannot be kept.
     pub(crate) fn no_space(message: impl Into<String>) -> Self {
         Self::new("ENOSPC", message)
@@ -218,10 +240,22 @@ impl Reply {
 /// A command waiting for the parser to reach its marker.
 pub(crate) enum Pending {
     /// A transmission whose base64 text has not been decoded yet:
-    /// [`Hub::decode_pending`] turns it into a `Store` or a `Reply`.
-    Raw { command: Command, text: Vec<u8> },
-    /// Keep a decoded image.
-    Store { command: Command, decoded: Decoded },
+    /// [`Hub::decode_pending`] turns it into a `Store` or a `Reply`. The
+    /// `motion` is what the reader wrote around the marker if the command
+    /// shows the image (`a=T`).
+    Raw {
+        command: Command,
+        text: Vec<u8>,
+        motion: Motion,
+    },
+    /// Keep a decoded image (and show it, for `a=T`).
+    Store {
+        command: Command,
+        decoded: Decoded,
+        motion: Motion,
+    },
+    /// Show a stored image (`a=p`).
+    Put { command: Command, motion: Motion },
     /// Remove placements and, for the upper-case forms, image data.
     Delete(Command),
     /// An answer that has to wait its turn in the stream: the command
@@ -268,7 +302,17 @@ impl Pending {
         match self {
             Self::Raw { text, .. } => text.len(),
             Self::Store { decoded, .. } => decoded.len(),
-            Self::Delete(_) | Self::Reply(_) => 0,
+            Self::Put { .. } | Self::Delete(_) | Self::Reply(_) => 0,
+        }
+    }
+
+    /// How the reader moved the cursor around this record's marker.
+    pub(crate) fn motion(&self) -> Motion {
+        match self {
+            Self::Raw { motion, .. } | Self::Store { motion, .. } | Self::Put { motion, .. } => {
+                *motion
+            }
+            Self::Delete(_) | Self::Reply(_) => Motion::NONE,
         }
     }
 }
@@ -300,7 +344,7 @@ impl Hub {
     pub(crate) fn queue(&self, pending: Pending) {
         let mut inbox = lock(&self.inbox);
         let pending = match pending {
-            Pending::Raw { command, text }
+            Pending::Raw { command, text, .. }
                 if inbox.bytes.saturating_add(text.len()) > self.waiting =>
             {
                 Pending::Reply(Reply::failed(
@@ -338,21 +382,24 @@ impl Hub {
             if let Some(hook) = lock(&self.decoding).as_ref() {
                 hook();
             }
-            let Pending::Raw { command, text } =
-                std::mem::replace(slot, Pending::Reply(Reply::ok(Echo::default())))
+            let Pending::Raw {
+                command,
+                text,
+                motion,
+            } = std::mem::replace(slot, Pending::Reply(Reply::ok(Echo::default())))
             else {
                 continue;
             };
             *bytes -= text.len();
             self.undecoded.fetch_sub(1, Ordering::AcqRel);
-            *slot = self.decoded(command, text, *bytes);
+            *slot = self.decoded(command, text, motion, *bytes);
             *bytes += slot.weight();
         }
     }
 
     /// The record a transmission comes to once its text is decoded; `held`
     /// is what the queue holds besides it.
-    fn decoded(&self, command: Command, text: Vec<u8>, held: usize) -> Pending {
+    fn decoded(&self, command: Command, text: Vec<u8>, motion: Motion, held: usize) -> Pending {
         let echo = command.echo;
         match receive::decode_payload(&command, text) {
             Ok(decoded) if held.saturating_add(decoded.len()) > self.waiting => {
@@ -361,15 +408,19 @@ impl Hub {
                     Error::no_space("too many images are waiting to be shown"),
                 ))
             }
-            Ok(decoded) => Pending::Store { command, decoded },
+            Ok(decoded) => Pending::Store {
+                command,
+                decoded,
+                motion,
+            },
             Err(error) => Pending::Reply(Reply::failed(echo, error)),
         }
     }
 
-    /// Applies the oldest record to the screen that is showing now (`alt`:
-    /// the alternate one) and returns the bytes to answer with, if any.
-    /// `None` and nothing applied when no record is waiting.
-    pub(crate) fn apply_next(&self, alt: bool) -> Option<Vec<u8>> {
+    /// Applies the oldest record to the screen that is showing now and
+    /// returns the bytes to answer with, if any. `None` and nothing applied
+    /// when no record is waiting.
+    pub(crate) fn apply_next(&self, screen: &Screen) -> Option<Vec<u8>> {
         let pending = {
             let mut inbox = lock(&self.inbox);
             let pending = inbox.queue.pop_front()?;
@@ -380,23 +431,104 @@ impl Hub {
             // The read loop decodes before it parses, so this is a net under
             // it, not a path: the command is not lost if something else drove
             // the parser.
-            Pending::Raw { command, text } => {
+            Pending::Raw {
+                command,
+                text,
+                motion,
+            } => {
                 self.undecoded.fetch_sub(1, Ordering::AcqRel);
-                self.decoded(command, text, 0)
+                self.decoded(command, text, motion, 0)
             }
             other => other,
         };
         match pending {
-            Pending::Store { command, decoded } => {
-                lock(&self.images).store(alt, &command, decoded).encode()
+            Pending::Store {
+                command,
+                decoded,
+                motion,
+            } => lock(&self.images)
+                .store(screen, &command, decoded, motion)
+                .encode(),
+            Pending::Put { command, motion } => {
+                lock(&self.images).put(screen, &command, motion).encode()
             }
             Pending::Delete(command) => {
-                lock(&self.images).delete(alt, &command);
+                lock(&self.images).delete(screen, &command);
                 None
             }
             Pending::Reply(reply) => reply.encode(),
             Pending::Raw { .. } => None,
         }
+    }
+
+    /// Brings the placements of the screen showing to its grid as it is now.
+    /// Called before anything reads or changes them, with the `Term` lock
+    /// held.
+    pub(crate) fn look<T>(&self, term: &Term<T>, cell: (u16, u16)) {
+        lock(&self.images).look(term, cell);
+    }
+
+    /// Takes the look of the screen showing as it is now, after something
+    /// that knew where the placements went changed them.
+    pub(crate) fn settle<T>(&self, term: &Term<T>) {
+        lock(&self.images).settle(term);
+    }
+
+    /// `CSI 2 J` (`everything`: `CSI 3 J`): the placements on the screen
+    /// showing go.
+    pub(crate) fn clear_screen(&self, screen: &Screen, everything: bool) {
+        lock(&self.images).clear_screen(screen, everything);
+    }
+
+    /// The terminal was reset (`RIS`): nothing is kept on either screen.
+    pub(crate) fn reset(&self) {
+        lock(&self.images).reset();
+    }
+
+    /// The main screen's top is grid line `top` now and the history above it
+    /// is gone (⌘K and ⌥⌘K). `term` is the main screen's: those cannot run on
+    /// the alternate one.
+    pub(crate) fn wiped<T>(&self, term: &Term<T>, top: i32, cell: (u16, u16)) {
+        let mut images = lock(&self.images);
+        images.wiped(top, cell);
+        images.settle_main(term);
+    }
+
+    /// The grid was resized. `moved`: how many lines up the content went
+    /// with the cursor (down when negative); `reflowed`: the width changed or
+    /// the main screen is not the one showing, and no line says where a
+    /// placement went.
+    pub(crate) fn resized<T>(&self, term: &Term<T>, moved: i32, reflowed: bool, cell: (u16, u16)) {
+        let mut images = lock(&self.images);
+        images.resized(moved, reflowed, cell);
+        images.settle_main(term);
+    }
+
+    /// The size of a stored image on either screen.
+    pub(crate) fn stored_size(&self, echo: Echo) -> Option<(u32, u32)> {
+        lock(&self.images).size_of(echo)
+    }
+
+    /// Fills `out` with the pictures of the placements the frame draws: those
+    /// that reach into the grid's `grid` lines and the fill band's `band`.
+    pub(crate) fn pictures<T>(
+        &self,
+        term: &Term<T>,
+        cell: (u16, u16),
+        grid: Window,
+        band: Option<Window>,
+        out: &mut Pictures,
+    ) {
+        let mut images = lock(&self.images);
+        let alt = term
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
+        if !images.shows(alt) {
+            return;
+        }
+        images.look(term, cell);
+        let columns = u16::try_from(term.columns()).unwrap_or(u16::MAX);
+        images.collect(alt, cell, columns, grid, band, out);
     }
 
     /// The alternate screen was entered or left: what it showed goes.
@@ -426,6 +558,7 @@ impl Hub {
         self.queue(Pending::Raw {
             command,
             text: text.to_vec(),
+            motion: Motion::NONE,
         });
     }
 
@@ -492,6 +625,9 @@ impl Spill {
 /// What the parser's side needs from the session it runs in.
 pub(crate) trait Sink: Send + Sync {
     fn hub(&self) -> &Hub;
+
+    /// A cell's size in pixels.
+    fn cell(&self) -> (u16, u16);
 
     /// Writes an answer to the program, the way the terminal's other
     /// answers go.

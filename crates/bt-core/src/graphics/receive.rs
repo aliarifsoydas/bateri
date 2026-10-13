@@ -17,11 +17,35 @@ use miniz_oxide::inflate::{TINFLStatus, decompress_to_vec_zlib_with_limit};
 
 use super::apc::Apc;
 use super::command::{self, Action, Command, Format, Medium};
+use super::place::{Motion, Spec};
 use super::{
     Echo, Error, MAX_DIMENSION, OPEN_TIMEOUT, Pending, QUERY_LIMIT, QUOTA_BYTES, Reply,
     TRANSMISSION_LIMIT,
 };
 use crate::shell::decode_base64;
+
+/// How many images' sizes the receiver remembers. A placement of an image
+/// still waiting in the queue is sized from them; a program that keeps more
+/// than this many images at once and places one it sent long ago gets an
+/// image that does not move the cursor.
+const KNOWN_LIMIT: usize = 256;
+
+/// How much of a transmission's base64 text is read to find a PNG's size.
+/// The size is 24 bytes into the file; a compressed file needs the head of
+/// its compressed stream, which is longer than the text it holds.
+const HEAD_PLAIN: usize = 64;
+const HEAD_COMPRESSED: usize = 4096;
+
+/// What the reader knows of the terminal when it takes a command out of the
+/// stream: how big the cells are and how far the cursor can go.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Env {
+    /// A cell's size in pixels.
+    pub(crate) cell: (u16, u16),
+    /// The screen's size in cells.
+    pub(crate) columns: u16,
+    pub(crate) lines: u16,
+}
 
 /// A decoded image: straight (non-premultiplied) RGBA, 8 bits a channel,
 /// whatever the payload's format was.
@@ -46,6 +70,13 @@ pub(crate) enum Outcome {
     Query(#[allow(dead_code, reason = "the reader does not send it yet")] Reply),
 }
 
+/// The size of an image the receiver has seen go by.
+struct Known {
+    id: u32,
+    number: u32,
+    size: (u32, u32),
+}
+
 /// A chunked transmission in progress.
 struct Open {
     /// The keys of the first chunk; a chunk after it names none of them.
@@ -59,6 +90,10 @@ struct Open {
 #[derive(Default)]
 pub(crate) struct Receiver {
     open: Option<Open>,
+    /// The sizes of the images sent lately, newest last: placing an image
+    /// moves the cursor by its size, which is known here before the image is
+    /// decoded (and while it is still waiting for its marker).
+    known: Vec<Known>,
 }
 
 impl Receiver {
@@ -72,7 +107,15 @@ impl Receiver {
     }
 
     /// Takes one command; `out` is called for what it comes to, in order.
-    pub(crate) fn receive(&mut self, apc: Apc, now: Instant, mut out: impl FnMut(Outcome)) {
+    /// `stored` tells the size of an image the store already holds.
+    pub(crate) fn receive(
+        &mut self,
+        apc: Apc,
+        now: Instant,
+        env: Env,
+        stored: &dyn Fn(Echo) -> Option<(u32, u32)>,
+        mut out: impl FnMut(Outcome),
+    ) {
         if let Some(open) = &self.open
             && now.saturating_duration_since(open.since) > OPEN_TIMEOUT
         {
@@ -97,15 +140,18 @@ impl Receiver {
             }
         };
         if self.open.is_some() && !command.explicit_action {
-            self.chunk(command, apc, &mut out);
+            self.chunk(command, apc, env, &mut out);
             return;
         }
         // A command that names its action ends a transmission in progress.
         self.open = None;
         match command.action {
             Action::Delete => out(Outcome::Pending(Pending::Delete(command))),
-            // Placing a stored image is not implemented yet.
-            Action::Put => {}
+            Action::Put => {
+                let size = self.size_of(command.echo).or_else(|| stored(command.echo));
+                let motion = Self::motion(&command, size, env);
+                out(Outcome::Pending(Pending::Put { command, motion }));
+            }
             Action::Transmit | Action::TransmitAndPut | Action::Query => {
                 if command.medium == Medium::Indirect {
                     let error = Error::invalid("files and shared memory are not supported");
@@ -128,7 +174,7 @@ impl Receiver {
                     return;
                 }
                 if last {
-                    finish(open, &mut out);
+                    self.finish(open, env, &mut out);
                 } else {
                     self.open = Some(open);
                 }
@@ -136,7 +182,50 @@ impl Receiver {
         }
     }
 
-    fn chunk(&mut self, command: Command, apc: Apc, out: &mut impl FnMut(Outcome)) {
+    /// The size of an image sent lately, by id or else by number.
+    fn size_of(&self, echo: Echo) -> Option<(u32, u32)> {
+        self.known
+            .iter()
+            .rev()
+            .find(|known| {
+                if echo.id != 0 {
+                    known.id == echo.id
+                } else {
+                    echo.number != 0 && known.number == echo.number
+                }
+            })
+            .map(|known| known.size)
+    }
+
+    fn remember(&mut self, echo: Echo, size: (u32, u32)) {
+        if echo.id == 0 && echo.number == 0 {
+            return;
+        }
+        if echo.id != 0 {
+            self.known.retain(|known| known.id != echo.id);
+        }
+        if self.known.len() >= KNOWN_LIMIT {
+            self.known.remove(0);
+        }
+        self.known.push(Known {
+            id: echo.id,
+            number: echo.number,
+            size,
+        });
+    }
+
+    /// How placing `command` moves the cursor; the cursor stays when the
+    /// command asks it to or when the image's size is not known.
+    fn motion(command: &Command, size: Option<(u32, u32)>, env: Env) -> Motion {
+        match size {
+            Some(size) if !command.still => {
+                Motion::of(&Spec::new(command, size), env.cell, env.columns)
+            }
+            _ => Motion::NONE,
+        }
+    }
+
+    fn chunk(&mut self, command: Command, apc: Apc, env: Env, out: &mut impl FnMut(Outcome)) {
         let Some(mut open) = self.open.take() else {
             return;
         };
@@ -151,10 +240,45 @@ impl Receiver {
             return;
         }
         if last {
-            finish(open, out);
+            self.finish(open, env, out);
         } else {
             self.open = Some(open);
         }
+    }
+
+    /// The transmission is whole. A store waits, undecoded, for the read loop
+    /// to decode it between a read and its parse; a query is answered here
+    /// and now, so it is decoded now — which is why it may only be small.
+    fn finish(&mut self, open: Open, env: Env, out: &mut impl FnMut(Outcome)) {
+        let Open { command, text, .. } = open;
+        if command.action != Action::Query {
+            // The size is read from the head of the text, nothing is decoded.
+            let size = sniff(&command, &text);
+            if let Some(size) = size {
+                self.remember(command.echo, size);
+            }
+            let motion = if command.action == Action::TransmitAndPut {
+                Self::motion(&command, size, env)
+            } else {
+                Motion::NONE
+            };
+            out(Outcome::Pending(Pending::Raw {
+                command,
+                text,
+                motion,
+            }));
+            return;
+        }
+        let echo = command.echo;
+        let decoded = if text.len() > QUERY_LIMIT {
+            Err(Error::too_big("a query carries a few bytes of image"))
+        } else {
+            decode_payload(&command, text)
+        };
+        out(Outcome::Query(match decoded {
+            Ok(_) => Reply::ok(echo),
+            Err(error) => Reply::failed(echo, error),
+        }));
     }
 
     fn abandon(&mut self, out: &mut impl FnMut(Outcome), error: Error) {
@@ -190,25 +314,47 @@ impl Open {
     }
 }
 
-/// The transmission is whole. A store waits, undecoded, for the read loop
-/// to decode it between a read and its parse; a query is answered here and
-/// now, so it is decoded now — which is why it may only be small.
-fn finish(open: Open, out: &mut impl FnMut(Outcome)) {
-    let Open { command, text, .. } = open;
-    if command.action != Action::Query {
-        out(Outcome::Pending(Pending::Raw { command, text }));
-        return;
+/// The pixel size a transmission's text holds, read without decoding the
+/// image: a raw payload's is in its keys, a PNG's is in its first bytes
+/// (`IHDR`), after inflating the head of the stream when it is compressed.
+/// `None` when it cannot be told, and the cursor then stays.
+fn sniff(command: &Command, text: &[u8]) -> Option<(u32, u32)> {
+    if command.format != Format::Png {
+        let (width, height) = (command.width, command.height);
+        return (width > 0 && height > 0).then_some((width, height));
     }
-    let echo = command.echo;
-    let decoded = if text.len() > QUERY_LIMIT {
-        Err(Error::too_big("a query carries a few bytes of image"))
+    let take = if command.zlib {
+        HEAD_COMPRESSED
     } else {
-        decode_payload(&command, text)
+        HEAD_PLAIN
     };
-    out(Outcome::Query(match decoded {
-        Ok(_) => Reply::ok(echo),
-        Err(error) => Reply::failed(echo, error),
-    }));
+    let head = text.get(..take.min(text.len()))?;
+    let mut bytes = Vec::with_capacity(head.len() / 4 * 3 + 3);
+    decode_base64(head, &mut bytes)?;
+    if command.zlib {
+        bytes = match decompress_to_vec_zlib_with_limit(&bytes, PNG_HEAD) {
+            Ok(inflated) => inflated,
+            // Stopped at the limit, or short of input: what came out is the
+            // head of the file either way.
+            Err(error) => error.output,
+        };
+    }
+    png_size(&bytes)
+}
+
+/// The signature, the first chunk's length and name, and its width and height.
+const PNG_HEAD: usize = 24;
+
+fn png_size(head: &[u8]) -> Option<(u32, u32)> {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if head.len() < PNG_HEAD || !head.starts_with(SIGNATURE) || head.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(head.get(at..at + 4)?.try_into().ok()?))
+    };
+    let (width, height) = (word(16)?, word(20)?);
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 /// The image a transmission's base64 text holds, as RGBA.
