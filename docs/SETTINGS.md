@@ -1705,10 +1705,11 @@ command line of a program running as root, so a script run with `sudo`
 
 #### Remote shell integration
 
-While `integration = true`, a plain `ssh` typed in the local zsh also sets up
-shell integration on the server: the directory (OSC 7) and then command blocks
-work remotely too. On the server, bateri only writes a few small files under
-`~/.local/share/bateri/shell/`; it does not touch the server's rc files.
+While `integration = true`, a plain `ssh` typed in the local zsh or fish also
+sets up shell integration on the server: the directory (OSC 7) and then
+command blocks work remotely too. On the server, bateri only writes a few
+small files under `~/.local/share/bateri/shell/`; it does not touch the
+server's rc files.
 
 - **On which host**: the value of the first matching entry in `hosts` that
   carries `integration`; if there is no such entry and the host's mark is
