@@ -256,12 +256,32 @@ struct SyncState<T: Timeout> {
 
     /// Bytes read during the synchronized update.
     buffer: Vec<u8>,
+
+    /// The replay of `buffer` that halted before it was done, if one did.
+    replay: Option<Replay>,
 }
 
 impl<T: Timeout> Default for SyncState<T> {
     fn default() -> Self {
-        Self { buffer: Vec::with_capacity(SYNC_BUFFER_SIZE), timeout: Default::default() }
+        Self {
+            buffer: Vec::with_capacity(SYNC_BUFFER_SIZE),
+            timeout: Default::default(),
+            replay: None,
+        }
     }
+}
+
+/// A replay of the synchronized bytes that the handler halted, and what is left of it.
+///
+/// The bytes stay in the sync buffer, which nothing touches until the replay is over.
+#[derive(Debug, Clone, Copy)]
+struct Replay {
+    /// How many bytes of the buffer the parser has been given.
+    done: usize,
+
+    /// Where a newer synchronized update starts in the buffer, if one does: the replay
+    /// ends there and the buffer keeps the rest. See [`Processor::stop_sync_internal`].
+    bsu_offset: Option<usize>,
 }
 
 /// The processor wraps a `crate::Parser` to ultimately call methods on a
@@ -294,21 +314,68 @@ impl<T: Timeout> Processor<T> {
     }
 
     /// Process a new byte from the PTY.
+    ///
+    /// Never stops for [`Handler::halt_requested`]: use [`Self::advance_until_halt`] for that.
     #[inline]
     pub fn advance<H>(&mut self, handler: &mut H, bytes: &[u8])
     where
         H: Handler,
     {
+        let processed = self.advance_inner(handler, bytes, false);
+        debug_assert_eq!(processed, bytes.len());
+    }
+
+    /// Process a new byte from the PTY, stopping when the handler asks for it.
+    ///
+    /// This is [`Self::advance`] that returns right after the byte that made
+    /// [`Handler::halt_requested`] true, with the number of bytes it was given: the caller
+    /// does what the handler wanted done, then calls this again with the rest of `bytes`.
+    /// A call with the handler still halted returns 0 (the handler owns the request and
+    /// takes it back, the processor never does).
+    ///
+    /// The request is not tied to the return value: the last byte of `bytes` can be the
+    /// one that made it. Check [`Handler::halt_requested`] after every call, and keep
+    /// calling until it is false and `bytes` is used up. That includes an empty `bytes`,
+    /// because a halt inside a synchronized update halts its replay and what is left of
+    /// the replay goes on in the next call, before any new byte.
+    #[inline]
+    #[must_use = "Returned value should be used to process the remaining bytes"]
+    pub fn advance_until_halt<H>(&mut self, handler: &mut H, bytes: &[u8]) -> usize
+    where
+        H: Handler,
+    {
+        self.advance_inner(handler, bytes, true)
+    }
+
+    #[inline]
+    fn advance_inner<H>(&mut self, handler: &mut H, bytes: &[u8], halting: bool) -> usize
+    where
+        H: Handler,
+    {
+        // What is left of a replay that halted goes before anything new.
+        if self.state.sync_state.replay.is_some() && self.resume_replay(handler, halting) {
+            return 0;
+        }
+
         let mut processed = 0;
         while processed != bytes.len() {
             if self.state.sync_state.timeout.pending_timeout() {
-                processed += self.advance_sync(handler, &bytes[processed..]);
+                let (used, halted) = self.advance_sync(handler, &bytes[processed..], halting);
+                processed += used;
+                if halted {
+                    break;
+                }
             } else {
-                let mut performer = Performer::new(&mut self.state, handler);
+                let mut performer = Performer::new(&mut self.state, handler, true, halting);
                 processed +=
                     self.parser.advance_until_terminated(&mut performer, &bytes[processed..]);
+                if halting && handler.halt_requested() {
+                    break;
+                }
             }
         }
+
+        processed
     }
 
     /// End a synchronized update.
@@ -316,7 +383,38 @@ impl<T: Timeout> Processor<T> {
     where
         H: Handler,
     {
-        self.stop_sync_internal(handler, None);
+        self.stop_sync_inner(handler, false);
+    }
+
+    /// End a synchronized update, stopping when the handler asks for it.
+    ///
+    /// Returns whether it stopped. If it did the update is not over: do what the handler
+    /// wanted done and call [`Self::advance_until_halt`] (an empty slice will do) until
+    /// the handler no longer asks, which carries the replay to its end. See there for the
+    /// rest of the contract.
+    pub fn stop_sync_until_halt<H>(&mut self, handler: &mut H) -> bool
+    where
+        H: Handler,
+    {
+        self.stop_sync_inner(handler, true)
+    }
+
+    fn stop_sync_inner<H>(&mut self, handler: &mut H, halting: bool) -> bool
+    where
+        H: Handler,
+    {
+        // A replay that halted ends first. If it was of an update that a newer one
+        // followed, that one is still pending and is what the stop is for.
+        if self.state.sync_state.replay.is_some() {
+            if self.resume_replay(handler, halting) {
+                return true;
+            }
+            if !self.state.sync_state.timeout.pending_timeout() {
+                return false;
+            }
+        }
+
+        self.stop_sync_internal(handler, None, halting)
     }
 
     /// End a synchronized update.
@@ -324,21 +422,51 @@ impl<T: Timeout> Processor<T> {
     /// The `bsu_offset` parameter should be passed if the sync buffer contains
     /// a new BSU escape that is not part of the current synchronized
     /// update.
-    fn stop_sync_internal<H>(&mut self, handler: &mut H, bsu_offset: Option<usize>)
+    ///
+    /// Returns whether the handler halted the replay of the update.
+    fn stop_sync_internal<H>(
+        &mut self,
+        handler: &mut H,
+        bsu_offset: Option<usize>,
+        halting: bool,
+    ) -> bool
     where
         H: Handler,
     {
+        self.state.sync_state.replay = Some(Replay { done: 0, bsu_offset });
+        self.resume_replay(handler, halting)
+    }
+
+    /// Process the synchronized bytes of a replay that has not run yet or halted.
+    ///
+    /// Returns whether it halted. When it did, `replay` says where it stands.
+    fn resume_replay<H>(&mut self, handler: &mut H, halting: bool) -> bool
+    where
+        H: Handler,
+    {
+        let Some(replay) = self.state.sync_state.replay else { return false };
+
         // Process all synchronized bytes.
         //
-        // NOTE: We do not use `advance_until_terminated` here since BSU sequences are
-        // processed automatically during the synchronized update.
+        // NOTE: BSU sequences are processed automatically during the synchronized update,
+        // so the performer does not stop for them here.
         let buffer = mem::take(&mut self.state.sync_state.buffer);
-        let offset = bsu_offset.unwrap_or(buffer.len());
-        let mut performer = Performer::new(&mut self.state, handler);
-        self.parser.advance(&mut performer, &buffer[..offset]);
+        let end = replay.bsu_offset.unwrap_or(buffer.len());
+        let mut performer = Performer::new(&mut self.state, handler, false, halting);
+        let done = replay.done
+            + self.parser.advance_until_terminated(&mut performer, &buffer[replay.done..end]);
         self.state.sync_state.buffer = buffer;
 
-        match bsu_offset {
+        // Not even the last byte is let through: whatever the handler wants done goes before
+        // the update is reported over.
+        if halting && handler.halt_requested() {
+            self.state.sync_state.replay = Some(Replay { done, ..replay });
+            return true;
+        }
+        debug_assert_eq!(done, end);
+
+        self.state.sync_state.replay = None;
+        match replay.bsu_offset {
             // Just clear processed bytes if there is a new BSU.
             //
             // NOTE: We do not need to re-process for a new ESU since the `advance_sync`
@@ -355,6 +483,8 @@ impl<T: Timeout> Processor<T> {
                 self.state.sync_state.buffer.clear();
             },
         }
+
+        false
     }
 
     /// Number of bytes in the synchronization buffer.
@@ -365,29 +495,36 @@ impl<T: Timeout> Processor<T> {
 
     /// Process a new byte during a synchronized update.
     ///
-    /// Returns the number of bytes processed.
+    /// Returns the number of bytes processed and whether the handler halted. A halt inside
+    /// the replay of the update that this ends leaves the new bytes unprocessed when they
+    /// are not part of it (the buffer overflowed), and consumed when they are.
     #[cold]
-    fn advance_sync<H>(&mut self, handler: &mut H, bytes: &[u8]) -> usize
+    fn advance_sync<H>(&mut self, handler: &mut H, bytes: &[u8], halting: bool) -> (usize, bool)
     where
         H: Handler,
     {
         // Advance sync parser or stop sync if we'd exceed the maximum buffer size.
         if self.state.sync_state.buffer.len() + bytes.len() >= SYNC_BUFFER_SIZE - 1 {
             // Terminate the synchronized update.
-            self.stop_sync_internal(handler, None);
+            if self.stop_sync_internal(handler, None, halting) {
+                return (0, true);
+            }
 
             // Just parse the bytes normally.
-            let mut performer = Performer::new(&mut self.state, handler);
-            self.parser.advance_until_terminated(&mut performer, bytes)
+            let mut performer = Performer::new(&mut self.state, handler, true, halting);
+            let used = self.parser.advance_until_terminated(&mut performer, bytes);
+            (used, halting && handler.halt_requested())
         } else {
             self.state.sync_state.buffer.extend(bytes);
-            self.advance_sync_csi(handler, bytes.len());
-            bytes.len()
+            let halted = self.advance_sync_csi(handler, bytes.len(), halting);
+            (bytes.len(), halted)
         }
     }
 
     /// Handle BSU/ESU CSI sequences during synchronized update.
-    fn advance_sync_csi<H>(&mut self, handler: &mut H, new_bytes: usize)
+    ///
+    /// Returns whether the handler halted the replay of an update that ended.
+    fn advance_sync_csi<H>(&mut self, handler: &mut H, new_bytes: usize, halting: bool) -> bool
     where
         H: Handler,
     {
@@ -411,10 +548,11 @@ impl<T: Timeout> Processor<T> {
                 self.state.sync_state.timeout.set_timeout(SYNC_UPDATE_TIMEOUT);
                 bsu_offset = Some(offset);
             } else if escape == ESU_CSI {
-                self.stop_sync_internal(handler, bsu_offset);
-                break;
+                return self.stop_sync_internal(handler, bsu_offset, halting);
             }
         }
+
+        false
     }
 }
 
@@ -426,15 +564,26 @@ struct Performer<'a, H: Handler, T: Timeout> {
     state: &'a mut ProcessorState<T>,
     handler: &'a mut H,
 
-    /// Whether the parser should be prematurely terminated.
+    /// Whether a BSU was parsed, which terminates the parser if `sync_stops` says so.
     terminated: bool,
+
+    /// Whether the parser stops after a BSU (the bytes after it are the update's).
+    sync_stops: bool,
+
+    /// Whether the parser stops when the handler asks for it ([`Handler::halt_requested`]).
+    halting: bool,
 }
 
 impl<'a, H: Handler + 'a, T: Timeout> Performer<'a, H, T> {
     /// Create a performer.
     #[inline]
-    pub fn new<'b>(state: &'b mut ProcessorState<T>, handler: &'b mut H) -> Performer<'b, H, T> {
-        Performer { state, handler, terminated: Default::default() }
+    pub fn new<'b>(
+        state: &'b mut ProcessorState<T>,
+        handler: &'b mut H,
+        sync_stops: bool,
+        halting: bool,
+    ) -> Performer<'b, H, T> {
+        Performer { state, handler, terminated: Default::default(), sync_stops, halting }
     }
 }
 
@@ -729,6 +878,29 @@ pub trait Handler {
 
     // Set SCP control.
     fn set_scp(&mut self, _char_path: ScpCharPath, _update_mode: ScpUpdateMode) {}
+
+    /// An application program command (`ESC _ … ESC \`) begins.
+    ///
+    /// See [`crate::Perform::apc_start`] for the sequence of calls that follows.
+    fn apc_start(&mut self) {}
+
+    /// A piece of the body of the command begun by [`Handler::apc_start`].
+    fn apc_put(&mut self, _data: &[u8]) {}
+
+    /// The command ended; `cancelled` is `false` when `ESC \` completed it.
+    fn apc_end(&mut self, _cancelled: bool) {}
+
+    /// Whether the handler wants [`Processor::advance_until_halt`] to return.
+    ///
+    /// Asked after every byte the parser reads, so it is a flag read and nothing more.
+    /// What the handler wants done in the pause (work it should not do while the caller
+    /// holds a lock, say) is its own business, and so is taking the request back:
+    /// while it stays true the processor takes no more bytes. [`Processor::advance`] never
+    /// asks.
+    #[inline(always)]
+    fn halt_requested(&self) -> bool {
+        false
+    }
 }
 
 bitflags! {
@@ -1326,6 +1498,21 @@ where
     }
 
     #[inline]
+    fn apc_start(&mut self) {
+        self.handler.apc_start();
+    }
+
+    #[inline]
+    fn apc_put(&mut self, data: &[u8]) {
+        self.handler.apc_put(data);
+    }
+
+    #[inline]
+    fn apc_end(&mut self, cancelled: bool) {
+        self.handler.apc_end(cancelled);
+    }
+
+    #[inline]
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
 
@@ -1823,7 +2010,7 @@ where
 
     #[inline]
     fn terminated(&self) -> bool {
-        self.terminated
+        (self.sync_stops && self.terminated) || (self.halting && self.handler.halt_requested())
     }
 }
 
@@ -2435,6 +2622,365 @@ mod tests {
         parser.advance(&mut handler, b"\x1b[?2026l");
         assert_eq!(parser.state.sync_state.timeout.is_sync, 0);
         assert_eq!(handler.attr.take(), Some(Attr::Underline));
+    }
+
+    /// What a handler was told, in order. Text is merged so a long run is one entry.
+    #[derive(Debug, PartialEq, Eq, Clone)]
+    enum Event {
+        Text(String),
+        Apc(Vec<u8>),
+        Cancelled(Vec<u8>),
+        Mode(bool, u16),
+        Resolved,
+    }
+
+    /// A handler that asks to be halted after every complete application program command,
+    /// the way one with work to do away from the caller's lock would.
+    #[derive(Default)]
+    struct Recorder {
+        events: Vec<Event>,
+        body: Option<Vec<u8>>,
+        halt: bool,
+        halts: usize,
+    }
+
+    impl Recorder {
+        /// The events without the marks of the caller's pauses.
+        fn told(&self) -> Vec<Event> {
+            self.events.iter().filter(|event| **event != Event::Resolved).cloned().collect()
+        }
+
+        fn resolve(&mut self) {
+            assert!(self.halt);
+            self.halt = false;
+            self.halts += 1;
+            self.events.push(Event::Resolved);
+        }
+    }
+
+    impl Handler for Recorder {
+        fn input(&mut self, c: char) {
+            match self.events.last_mut() {
+                Some(Event::Text(text)) => text.push(c),
+                _ => self.events.push(Event::Text(c.to_string())),
+            }
+        }
+
+        fn set_private_mode(&mut self, mode: PrivateMode) {
+            self.events.push(Event::Mode(true, mode.raw()));
+        }
+
+        fn unset_private_mode(&mut self, mode: PrivateMode) {
+            self.events.push(Event::Mode(false, mode.raw()));
+        }
+
+        fn apc_start(&mut self) {
+            assert!(self.body.replace(Vec::new()).is_none());
+        }
+
+        fn apc_put(&mut self, data: &[u8]) {
+            assert!(!data.is_empty());
+            self.body.as_mut().unwrap().extend_from_slice(data);
+        }
+
+        fn apc_end(&mut self, cancelled: bool) {
+            let body = self.body.take().unwrap();
+            if cancelled {
+                self.events.push(Event::Cancelled(body));
+            } else {
+                self.events.push(Event::Apc(body));
+                self.halt = true;
+            }
+        }
+
+        fn halt_requested(&self) -> bool {
+            self.halt
+        }
+    }
+
+    /// `bytes` through `advance_until_halt` the way a caller must: whenever the handler
+    /// halted, resolve and call again, with an empty slice if nothing is left.
+    fn drive(
+        processor: &mut Processor<TestSyncHandler>,
+        handler: &mut Recorder,
+        mut bytes: &[u8],
+    ) {
+        for _ in 0..1000 {
+            let used = processor.advance_until_halt(handler, bytes);
+            bytes = &bytes[used..];
+            if handler.halt {
+                handler.resolve();
+            } else if bytes.is_empty() {
+                return;
+            } else {
+                panic!("stopped with {} bytes left and nothing asked for it", bytes.len());
+            }
+        }
+        panic!("no progress");
+    }
+
+    /// `input` in the reads `cuts` marks, halting at every command.
+    fn halting_in_reads(input: &[u8], cuts: &[usize]) -> Recorder {
+        let mut processor = Processor::<TestSyncHandler>::new();
+        let mut handler = Recorder::default();
+        let mut start = 0;
+        for end in cuts.iter().copied().chain(iter::once(input.len())) {
+            drive(&mut processor, &mut handler, &input[start..end]);
+            start = end;
+        }
+        handler
+    }
+
+    /// The text and commands of `events` in order. Where in a synchronized update's bytes the
+    /// modes are reported depends on the reads (a read that ends with the end of an update
+    /// ends it, one that goes on is replayed along with the rest), so they are left out.
+    fn commands_and_text(events: &[Event]) -> Vec<Event> {
+        let mut kept: Vec<Event> = Vec::new();
+        for event in events {
+            match (kept.last_mut(), event) {
+                (_, Event::Mode(..) | Event::Resolved) => (),
+                (Some(Event::Text(text)), Event::Text(more)) => text.push_str(more),
+                (_, event) => kept.push(event.clone()),
+            }
+        }
+        kept
+    }
+
+    fn told_by_advance(input: &[u8]) -> Vec<Event> {
+        let mut processor = Processor::<TestSyncHandler>::new();
+        let mut handler = Recorder::default();
+        processor.advance(&mut handler, input);
+        commands_and_text(&handler.events)
+    }
+
+    /// Whatever the reads, a halting caller is told what `advance` tells, and every command
+    /// is followed by exactly one pause before anything that came after it.
+    fn assert_same_in_every_read(input: &[u8]) {
+        let whole = told_by_advance(input);
+        let commands = whole.iter().filter(|event| matches!(event, Event::Apc(_))).count();
+
+        let check = |cuts: &[usize]| {
+            let handler = halting_in_reads(input, cuts);
+            assert_eq!(commands_and_text(&handler.events), whole, "cut at {cuts:?}");
+            assert_eq!(handler.halts, commands, "cut at {cuts:?}");
+            for (at, event) in handler.events.iter().enumerate() {
+                if let Event::Apc(_) = event {
+                    assert_eq!(
+                        handler.events.get(at + 1),
+                        Some(&Event::Resolved),
+                        "cut at {cuts:?}"
+                    );
+                }
+            }
+        };
+        for first in 0..=input.len() {
+            for second in first..=input.len() {
+                check(&[first, second]);
+            }
+        }
+    }
+
+    #[test]
+    fn apc_reaches_the_handler() {
+        let mut handler = Recorder::default();
+        Processor::<TestSyncHandler>::new().advance(&mut handler, b"a\x1b_Gi=1;AAAA\x1b\\b");
+        assert_eq!(handler.told(), [
+            Event::Text("a".into()),
+            Event::Apc(b"Gi=1;AAAA".to_vec()),
+            Event::Text("b".into()),
+        ]);
+    }
+
+    #[test]
+    fn a_halt_returns_right_after_the_command() {
+        let mut processor = Processor::<TestSyncHandler>::new();
+        let mut handler = Recorder::default();
+        let input = b"ab\x1b_Gx\x1b\\cd";
+
+        // `\` is the 8th byte: the halt is after it, not at the `ESC` that began the end.
+        assert_eq!(processor.advance_until_halt(&mut handler, input), 8);
+        assert!(handler.halt);
+        assert_eq!(handler.events, [Event::Text("ab".into()), Event::Apc(b"Gx".to_vec())]);
+
+        // While it stays asked for, no byte is taken.
+        assert_eq!(processor.advance_until_halt(&mut handler, &input[8..]), 0);
+        assert_eq!(handler.events.len(), 2);
+
+        handler.resolve();
+        assert_eq!(processor.advance_until_halt(&mut handler, &input[8..]), 2);
+        assert_eq!(handler.events[3], Event::Text("cd".into()));
+    }
+
+    #[test]
+    fn a_halt_on_the_last_byte_is_reported() {
+        let mut processor = Processor::<TestSyncHandler>::new();
+        let mut handler = Recorder::default();
+        let input = b"a\x1b_Gx\x1b\\";
+
+        assert_eq!(processor.advance_until_halt(&mut handler, input), input.len());
+        assert!(handler.halt);
+    }
+
+    #[test]
+    fn advance_does_not_stop_for_a_halt() {
+        let mut processor = Processor::<TestSyncHandler>::new();
+        let mut handler = Recorder::default();
+        processor.advance(&mut handler, b"\x1b_Gx\x1b\\ab\x1b_Gy\x1b\\cd");
+        assert_eq!(handler.told(), [
+            Event::Apc(b"Gx".to_vec()),
+            Event::Text("ab".into()),
+            Event::Apc(b"Gy".to_vec()),
+            Event::Text("cd".into()),
+        ]);
+    }
+
+    #[test]
+    fn commands_and_halts_do_not_depend_on_the_reads() {
+        // Text on both sides, a body with controls, `DEL`, UTF-8 and a cancelled command in
+        // front of a complete one.
+        assert_same_in_every_read(
+            "ab\x1b_G\u{0}\u{7}\u{7f}é€;QQ\x1b\\\x1b[1mc\x1b_Gcut\x18d\x1b_Gx\x1b[0m\x1b_Gok\x1b\\e"
+                .as_bytes(),
+        );
+    }
+
+    #[test]
+    fn commands_and_halts_inside_a_synchronized_update_wait_for_its_end() {
+        let input = b"a\x1b[?2026hb\x1b_Gx\x1b\\c\x1b_Gy\x1b\\d\x1b[?2026le\x1b_Gz\x1b\\f";
+        assert_same_in_every_read(input);
+
+        // Nothing of the update reaches the handler before its end; then in order, with
+        // a pause after each command.
+        let mut processor = Processor::<TestSyncHandler>::new();
+        let mut handler = Recorder::default();
+        let end = input.windows(8).position(|window| window == ESU_CSI).unwrap();
+        drive(&mut processor, &mut handler, &input[..end]);
+        assert_eq!(handler.told(), [Event::Text("a".into()), Event::Mode(true, 2026)]);
+
+        drive(&mut processor, &mut handler, &input[end..]);
+        assert_eq!(handler.told(), [
+            Event::Text("a".into()),
+            Event::Mode(true, 2026),
+            Event::Text("b".into()),
+            Event::Apc(b"Gx".to_vec()),
+            Event::Text("c".into()),
+            Event::Apc(b"Gy".to_vec()),
+            Event::Text("d".into()),
+            Event::Mode(false, 2026),
+            Event::Text("e".into()),
+            Event::Apc(b"Gz".to_vec()),
+            Event::Text("f".into()),
+            Event::Mode(false, 2026),
+        ]);
+        assert_eq!(handler.halts, 3);
+        assert_eq!(processor.sync_bytes_count(), 0);
+    }
+
+    #[test]
+    fn a_halted_replay_keeps_the_update_that_follows_it() {
+        // The first update ends and a second begins in the same bytes: the replay is of the
+        // first and halts in it, the second must still be pending afterwards.
+        let input = b"\x1b[?2026ha\x1b_Gx\x1b\\\x1b[?2026l\x1b[?2026hb\x1b_Gy\x1b\\";
+        assert_same_in_every_read(input);
+
+        let mut processor = Processor::<TestSyncHandler>::new();
+        let mut handler = Recorder::default();
+        drive(&mut processor, &mut handler, input);
+        assert!(processor.state.sync_state.timeout.pending_timeout());
+        assert!(processor.state.sync_state.replay.is_none());
+        assert_eq!(handler.halts, 1);
+
+        drive(&mut processor, &mut handler, b"\x1b[?2026l");
+        assert!(!processor.state.sync_state.timeout.pending_timeout());
+        assert_eq!(handler.halts, 2);
+        assert_eq!(handler.told().last(), Some(&Event::Mode(false, 2026)));
+    }
+
+    #[test]
+    fn a_full_sync_buffer_keeps_the_order_of_the_commands() {
+        // The update is buffered with a command in it, then one read overflows the buffer: the
+        // command is replayed first, and the halt in the replay leaves the read that
+        // overflowed it unread until the replay is over.
+        let first = b"\x1b[?2026hx\x1b_Gx\x1b\\y";
+        let mut second = vec![b'a'; SYNC_BUFFER_SIZE];
+        second.extend(b"\x1b_Gz\x1b\\z");
+
+        let mut processor = Processor::<TestSyncHandler>::new();
+        let mut handler = Recorder::default();
+        drive(&mut processor, &mut handler, first);
+        assert_eq!(handler.told(), [Event::Mode(true, 2026)]);
+        drive(&mut processor, &mut handler, &second);
+
+        let mut plain_processor = Processor::<TestSyncHandler>::new();
+        let mut plain = Recorder::default();
+        plain_processor.advance(&mut plain, first);
+        plain_processor.advance(&mut plain, &second);
+
+        assert_eq!(handler.told(), plain.told());
+        assert_eq!(handler.told(), [
+            Event::Mode(true, 2026),
+            Event::Text("x".into()),
+            Event::Apc(b"Gx".to_vec()),
+            Event::Text("y".into()),
+            Event::Mode(false, 2026),
+            Event::Text("a".repeat(SYNC_BUFFER_SIZE)),
+            Event::Apc(b"Gz".to_vec()),
+            Event::Text("z".into()),
+        ]);
+        assert_eq!(handler.halts, 2);
+        assert!(!processor.state.sync_state.timeout.pending_timeout());
+    }
+
+    #[test]
+    fn a_timed_out_update_halts_and_ends_when_resolved() {
+        let mut processor = Processor::<TestSyncHandler>::new();
+        let mut handler = Recorder::default();
+
+        drive(&mut processor, &mut handler, b"\x1b[?2026ha\x1b_Gx\x1b\\b");
+        assert_eq!(handler.told(), [Event::Mode(true, 2026)]);
+
+        assert!(processor.stop_sync_until_halt(&mut handler));
+        assert_eq!(handler.told(), [
+            Event::Mode(true, 2026),
+            Event::Text("a".into()),
+            Event::Apc(b"Gx".to_vec()),
+        ]);
+        assert!(processor.state.sync_state.timeout.pending_timeout());
+
+        // Asking again with the request still open takes no step either.
+        assert!(processor.stop_sync_until_halt(&mut handler));
+        assert_eq!(handler.events.len(), 3);
+
+        handler.resolve();
+        drive(&mut processor, &mut handler, &[]);
+        assert_eq!(handler.told().last(), Some(&Event::Mode(false, 2026)));
+        assert_eq!(handler.told()[handler.told().len() - 2], Event::Text("b".into()));
+        assert!(!processor.state.sync_state.timeout.pending_timeout());
+        assert_eq!(processor.sync_bytes_count(), 0);
+    }
+
+    #[test]
+    fn a_halt_on_the_last_byte_of_a_replay_ends_the_update_when_resolved() {
+        let mut processor = Processor::<TestSyncHandler>::new();
+        let mut handler = Recorder::default();
+
+        drive(&mut processor, &mut handler, b"\x1b[?2026ha\x1b_Gx\x1b\\");
+        assert_eq!(processor.sync_bytes_count(), 7);
+
+        // The replay is at its end, but the update is not reported over before the pause.
+        assert!(processor.stop_sync_until_halt(&mut handler));
+        assert_eq!(handler.told(), [
+            Event::Mode(true, 2026),
+            Event::Text("a".into()),
+            Event::Apc(b"Gx".to_vec()),
+        ]);
+        assert!(processor.state.sync_state.timeout.pending_timeout());
+
+        handler.resolve();
+        assert!(!processor.stop_sync_until_halt(&mut handler));
+        assert_eq!(handler.told().last(), Some(&Event::Mode(false, 2026)));
+        assert!(!processor.state.sync_state.timeout.pending_timeout());
+        assert_eq!(processor.sync_bytes_count(), 0);
     }
 
     #[test]

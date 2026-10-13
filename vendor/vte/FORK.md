@@ -24,6 +24,29 @@ below. Upstream's code keeps upstream's formatting, and the workspace's `fmt` an
   `utf8_cut_anywhere_dispatches_what_the_whole_does` (every one- and two-way cut of a
   text mixing one- to four-byte characters, ASCII and an escape sequence).
 
+- **Application program commands reach the handler.** Upstream parses `ESC _ … ESC \`
+  into a state that throws every byte away. `Perform` and `ansi::Handler` now get
+  `apc_start`, `apc_put(&[u8])` and `apc_end(cancelled)`, empty by default, so
+  `alacritty_terminal` compiles unchanged. The body arrives as the slices the reads made
+  (found with `memchr`, never buffered here: the handler decides how much it keeps);
+  bytes are not interpreted, only `ESC`, `CAN` and `SUB` end it. `ESC \` completes the
+  command (`cancelled` is `false`); `CAN`, `SUB` and an `ESC` followed by anything else
+  cancel it, and that byte is then parsed as the one after an `ESC` that starts afresh.
+  SOS and PM (`ESC X`, `ESC ^`) are still dropped. Unlike DCS, `0x9C` is no terminator:
+  the state machine takes no 8-bit controls and a UTF-8 body may hold the byte.
+- **The parser can halt right after a command.** `Handler::halt_requested` (false by
+  default) is asked after every byte; while it is true `Processor::advance_until_halt`
+  returns the number of bytes it took, and `Processor::advance` (unchanged) never asks.
+  The handler owns the request: it is raised in `apc_end` and the caller takes it back
+  after doing what it wanted outside the parser (decoding an image without the terminal's
+  lock). A halted processor takes no byte until then. A synchronized update's replay
+  halts too: its remaining bytes wait in the sync buffer (`Replay`) and the next call
+  resumes them before any new byte, empty slice included, and the update is reported over
+  only after the last pause. `Processor::stop_sync_until_halt` is `stop_sync` that can
+  halt. Tests: the `apc_*`, `sos_and_pm_are_dropped` tests in `lib.rs` and the
+  `*halt*` tests in `ansi.rs` (every one- and two-way cut of streams with commands, with
+  and without a synchronized update, the 2 MiB overflow, a timed-out update).
+
 ## When `alacritty_terminal` asks for a newer `vte`
 
 `make audit` goes red (cargo only warns that the patch is unused, then builds the

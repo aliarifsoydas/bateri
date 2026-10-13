@@ -427,6 +427,25 @@ impl<U: EventListener> Handler for ClusterHandler<'_, U> {
         self.term.reset_state();
     }
 
+    // The parser's application program commands go to `Term`, which ignores them: this
+    // wrapper leaves them alone too until it has a use for them, and so it never halts the
+    // parser.
+    fn apc_start(&mut self) {
+        self.term.apc_start();
+    }
+
+    fn apc_put(&mut self, data: &[u8]) {
+        self.term.apc_put(data);
+    }
+
+    fn apc_end(&mut self, cancelled: bool) {
+        self.term.apc_end(cancelled);
+    }
+
+    fn halt_requested(&self) -> bool {
+        self.term.halt_requested()
+    }
+
     forward! {
         fn set_title(&mut self, title: Option<String>);
         fn set_cursor_style(&mut self, style: Option<CursorStyle>);

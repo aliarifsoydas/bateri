@@ -204,8 +204,10 @@ bt-shell-macos = { path = "crates/bt-shell-macos" }
 
 # `vte`, the parser inside `alacritty_terminal`, is a fork kept in `vendor/vte`: upstream
 # 0.15.0 plus the changes listed in its `FORK.md`. User-approved dependency decision
-# (2026-10-13): vte 0.15.0 drops the byte after a character that a read cut in two.
-# Same name and version, so `alacritty_terminal` resolves to it unchanged; when it
+# (2026-10-13): vte 0.15.0 drops the byte after a character that a read cut in two and
+# swallows application program commands (`ESC _ … ESC \`) without telling the handler;
+# the fork fixes the first and passes the second on, with a way to halt the parser right
+# after a command. Same name and version, so `alacritty_terminal` resolves to it unchanged; when it
 # asks for a newer vte the fork is carried over by hand (`FORK.md` says how), and
 # `make audit` fails if the patch stops applying — cargo only warns, then quietly
 # builds the registry's vte.

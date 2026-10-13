@@ -22,6 +22,9 @@
 //! * UTF-8 Support for Input
 //! * OSC Strings can be terminated by 0x07
 //! * Only supports 7-bit codes
+//! * Application program commands (`ESC _ … ESC \`) are passed on in pieces, see
+//!   [`Perform::apc_start`]; the state machine drops the other two string types
+//!   (SOS and PM)
 //!
 //! [`Parser`]: struct.Parser.html
 //! [`Perform`]: trait.Perform.html
@@ -117,6 +120,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         while i != bytes.len() {
             match self.state {
                 State::Ground => i += self.advance_ground(performer, &bytes[i..]),
+                State::ApcString => i += self.advance_apc(performer, &bytes[i..]),
                 _ => {
                     // Inlining it results in worse codegen.
                     let byte = bytes[i];
@@ -152,6 +156,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         while i != bytes.len() && !performer.terminated() {
             match self.state {
                 State::Ground => i += self.advance_ground(performer, &bytes[i..]),
+                State::ApcString => i += self.advance_apc(performer, &bytes[i..]),
                 _ => {
                     // Inlining it results in worse codegen.
                     let byte = bytes[i];
@@ -180,6 +185,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
             State::OscString => self.advance_osc_string(performer, byte),
             State::SosPmApcString => self.anywhere(performer, byte),
+            State::ApcString => {
+                // The loops hand this state whole slices; a single byte is the same slice.
+                self.advance_apc(performer, core::slice::from_ref(&byte));
+            },
+            State::ApcEscape => self.advance_apc_escape(performer, byte),
             State::Ground => unreachable!(),
         }
     }
@@ -374,7 +384,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.osc_num_params = 0;
                 self.state = State::OscString
             },
-            0x5E..=0x5F => self.state = State::SosPmApcString,
+            0x5E => self.state = State::SosPmApcString,
+            0x5F => {
+                performer.apc_start();
+                self.state = State::ApcString
+            },
             0x60..=0x7E => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
@@ -446,6 +460,55 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.state = State::Escape
             },
             _ => (),
+        }
+    }
+
+    /// Advance the parser inside an application program command.
+    ///
+    /// Like the ground state this one is left only through bytes found by a search, so the
+    /// body goes to the performer in one piece: everything up to the next `ESC`, `CAN` or
+    /// `SUB`. `ESC` does not end the command by itself, the byte after it says how it ends
+    /// (see [`Self::advance_apc_escape`]); `CAN` and `SUB` cancel it.
+    #[inline]
+    fn advance_apc<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        match memchr::memchr3(0x18, 0x1A, 0x1B, bytes) {
+            None => {
+                performer.apc_put(bytes);
+                bytes.len()
+            },
+            Some(end) => {
+                if end != 0 {
+                    performer.apc_put(&bytes[..end]);
+                }
+
+                if bytes[end] == 0x1B {
+                    self.state = State::ApcEscape;
+                } else {
+                    performer.apc_end(true);
+                    performer.execute(bytes[end]);
+                    self.state = State::Ground;
+                }
+
+                end + 1
+            },
+        }
+    }
+
+    /// Advance the parser after an `ESC` inside an application program command.
+    ///
+    /// `ESC \` (the string terminator) completes the command. Any other byte cancels it and
+    /// is handled as the byte after an `ESC` that starts afresh, so `ESC _` right after a
+    /// command that never ended begins the next one.
+    #[inline]
+    fn advance_apc_escape<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        if byte == 0x5C {
+            performer.apc_end(false);
+            self.state = State::Ground;
+        } else {
+            performer.apc_end(true);
+            self.reset_params();
+            self.state = State::Escape;
+            self.advance_esc(performer, byte);
         }
     }
 
@@ -746,6 +809,8 @@ enum State {
     EscapeIntermediate,
     OscString,
     SosPmApcString,
+    ApcString,
+    ApcEscape,
     #[default]
     Ground,
 }
@@ -789,6 +854,28 @@ pub trait Perform {
     /// The previously selected handler should be notified that the DCS has
     /// terminated.
     fn unhook(&mut self) {}
+
+    /// An application program command (`ESC _ … ESC \`) begins.
+    ///
+    /// Its body follows in [`Self::apc_put`], its end in [`Self::apc_end`]. The two other
+    /// string types that look the same (`ESC X` and `ESC ^`) are dropped without a call.
+    fn apc_start(&mut self) {}
+
+    /// A piece of the body of the command begun by [`Self::apc_start`].
+    ///
+    /// The pieces are never empty and as long as the reads that carried them allow: the
+    /// parser holds nothing back, so a command has as many pieces as reads cut it, and
+    /// bounding its size is the performer's business. The bytes are not interpreted:
+    /// controls, `DEL` and bytes above `0x7F` come as they are, only `ESC`, `CAN` and
+    /// `SUB` end the body.
+    fn apc_put(&mut self, _data: &[u8]) {}
+
+    /// The command begun by [`Self::apc_start`] ended.
+    ///
+    /// `cancelled` tells how: `false` for `ESC \` (the command is complete), `true` for `CAN`,
+    /// `SUB` or an `ESC` followed by any other byte, which the terminal must treat as if
+    /// the command had never been sent.
+    fn apc_end(&mut self, _cancelled: bool) {}
 
     /// Dispatch an operating system command.
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
@@ -859,6 +946,9 @@ mod tests {
         Print(char),
         Execute(u8),
         DcsUnhook,
+        ApcStart,
+        ApcPut(Vec<u8>),
+        ApcEnd(bool),
     }
 
     impl Perform for Dispatcher {
@@ -898,6 +988,19 @@ mod tests {
 
         fn execute(&mut self, byte: u8) {
             self.dispatched.push(Sequence::Execute(byte));
+        }
+
+        fn apc_start(&mut self) {
+            self.dispatched.push(Sequence::ApcStart);
+        }
+
+        fn apc_put(&mut self, data: &[u8]) {
+            assert!(!data.is_empty());
+            self.dispatched.push(Sequence::ApcPut(data.to_vec()));
+        }
+
+        fn apc_end(&mut self, cancelled: bool) {
+            self.dispatched.push(Sequence::ApcEnd(cancelled));
         }
     }
 
@@ -1600,5 +1703,150 @@ mod tests {
         assert_eq!(dispatcher.dispatched.len(), 2);
         assert_eq!(dispatcher.dispatched[0], Sequence::Execute(0x18));
         assert_eq!(dispatcher.dispatched[1], Sequence::Execute(0x1A));
+    }
+    /// `dispatched` with the pieces of a body joined: how many there are depends on the reads.
+    fn with_bodies_joined(dispatched: Vec<Sequence>) -> Vec<Sequence> {
+        let mut joined: Vec<Sequence> = Vec::new();
+        for sequence in dispatched {
+            match (joined.last_mut(), sequence) {
+                (Some(Sequence::ApcPut(body)), Sequence::ApcPut(more)) => body.extend(more),
+                (_, sequence) => joined.push(sequence),
+            }
+        }
+        joined
+    }
+
+    #[test]
+    fn apc_is_passed_on_between_its_start_and_end() {
+        let dispatched = dispatched_in_reads(b"a\x1b_Gi=1;AAAA\x1b\\b", &[]);
+
+        assert_eq!(dispatched, [
+            Sequence::Print('a'),
+            Sequence::ApcStart,
+            Sequence::ApcPut(b"Gi=1;AAAA".to_vec()),
+            Sequence::ApcEnd(false),
+            Sequence::Print('b'),
+        ]);
+    }
+
+    #[test]
+    fn an_empty_apc_has_no_body() {
+        assert_eq!(dispatched_in_reads(b"\x1b_\x1b\\", &[]), [
+            Sequence::ApcStart,
+            Sequence::ApcEnd(false),
+        ]);
+    }
+
+    #[test]
+    fn apc_body_comes_in_the_pieces_the_reads_make() {
+        const INPUT: &[u8] = b"\x1b_Gabcdef\x1b\\";
+
+        // One read: one piece. Cut in the body: a piece for each read that has any of it.
+        assert_eq!(dispatched_in_reads(INPUT, &[]).len(), 3);
+        assert_eq!(dispatched_in_reads(INPUT, &[5, 8]), [
+            Sequence::ApcStart,
+            Sequence::ApcPut(b"Gab".to_vec()),
+            Sequence::ApcPut(b"cde".to_vec()),
+            Sequence::ApcPut(b"f".to_vec()),
+            Sequence::ApcEnd(false),
+        ]);
+        // A read that ends on the opening and one that starts on the end bring no empty piece.
+        assert_eq!(dispatched_in_reads(INPUT, &[2, 3, 9, 10]).len(), 4);
+    }
+
+    #[test]
+    fn apc_body_is_not_interpreted() {
+        // Controls other than the three that end it, `DEL`, UTF-8 and bytes that are not.
+        const BODY: &[u8] = b"\x00\x07\x0a\x1f\x7f\x80\x9c\xc3\xa9\xff[1m";
+        let mut input = b"\x1b_".to_vec();
+        input.extend(BODY);
+        input.extend(b"\x1b\\");
+
+        assert_eq!(dispatched_in_reads(&input, &[]), [
+            Sequence::ApcStart,
+            Sequence::ApcPut(BODY.to_vec()),
+            Sequence::ApcEnd(false),
+        ]);
+    }
+
+    #[test]
+    fn apc_cancelled_by_can_and_sub() {
+        for cancel in [0x18u8, 0x1A] {
+            let input = [b"\x1b_Gx".as_slice(), &[cancel], b"y"].concat();
+            assert_eq!(dispatched_in_reads(&input, &[]), [
+                Sequence::ApcStart,
+                Sequence::ApcPut(b"Gx".to_vec()),
+                Sequence::ApcEnd(true),
+                Sequence::Execute(cancel),
+                Sequence::Print('y'),
+            ]);
+        }
+    }
+
+    #[test]
+    fn apc_cancelled_by_an_escape_that_starts_something_else() {
+        // The byte after the `ESC` is handled as if the command had not been there.
+        assert_eq!(dispatched_in_reads(b"\x1b_Gx\x1b[1mz", &[]), [
+            Sequence::ApcStart,
+            Sequence::ApcPut(b"Gx".to_vec()),
+            Sequence::ApcEnd(true),
+            Sequence::Csi(vec![vec![1]], Vec::new(), false, 'm'),
+            Sequence::Print('z'),
+        ]);
+        assert_eq!(dispatched_in_reads(b"\x1b_Gx\x1b_Gy\x1b\\", &[]), [
+            Sequence::ApcStart,
+            Sequence::ApcPut(b"Gx".to_vec()),
+            Sequence::ApcEnd(true),
+            Sequence::ApcStart,
+            Sequence::ApcPut(b"Gy".to_vec()),
+            Sequence::ApcEnd(false),
+        ]);
+        assert_eq!(dispatched_in_reads(b"\x1b_Gx\x1b\x1b\\", &[]), [
+            Sequence::ApcStart,
+            Sequence::ApcPut(b"Gx".to_vec()),
+            Sequence::ApcEnd(true),
+            Sequence::Esc(Vec::new(), false, b'\\'),
+        ]);
+        assert_eq!(dispatched_in_reads(b"\x1b_Gx\x1b\x18a", &[]), [
+            Sequence::ApcStart,
+            Sequence::ApcPut(b"Gx".to_vec()),
+            Sequence::ApcEnd(true),
+            Sequence::Execute(0x18),
+            Sequence::Print('a'),
+        ]);
+    }
+
+    #[test]
+    fn sos_and_pm_are_dropped() {
+        // Only the `ESC \` that closes each is left, as the string terminator it is.
+        assert_eq!(dispatched_in_reads(b"\x1bXabc\x1b\\\x1b^def\x1b\\g", &[]), [
+            Sequence::Esc(Vec::new(), false, b'\\'),
+            Sequence::Esc(Vec::new(), false, b'\\'),
+            Sequence::Print('g'),
+        ]);
+    }
+
+    #[test]
+    fn apc_cut_anywhere_dispatches_what_the_whole_does() {
+        // Four commands around text and an escape sequence, two of them cancelled, a body
+        // with every kind of byte, and cuts between an `ESC` and its byte.
+        const INPUT: &[u8] =
+            b"a\x1b_G\x00\x7f\xc3\xa9;QQ\x1b\\\xc2\xb7\x1b[1mb\x1b_Gcut\x18c\x1b_Gx\x1b[0m\x1b_Gok\x1b\\d";
+
+        let whole = with_bodies_joined(dispatched_in_reads(INPUT, &[]));
+        assert_eq!(whole.iter().filter(|sequence| **sequence == Sequence::ApcStart).count(), 4);
+
+        for first in 0..=INPUT.len() {
+            for second in first..=INPUT.len() {
+                assert_eq!(
+                    with_bodies_joined(dispatched_in_reads(INPUT, &[first, second])),
+                    whole,
+                    "cut at {first} and {second}"
+                );
+            }
+        }
+
+        let every_byte: Vec<usize> = (1..INPUT.len()).collect();
+        assert_eq!(with_bodies_joined(dispatched_in_reads(INPUT, &every_byte)), whole);
     }
 }
