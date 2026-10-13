@@ -69,7 +69,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi::{self, Handler as _, Timeout as _};
 
-use crate::handler::{ClusterHandler, Utf8Seam};
+use crate::handler::ClusterHandler;
 use crate::reader::{MAX_LOCKED_READ, READ_BUFFER_SIZE};
 use crate::session::{GridSize, Osc52, TerminalOptions, history_of_vt, term_config, wipe};
 use crate::settings::{CaretShape, CursorBlink};
@@ -963,9 +963,6 @@ struct Scratch {
     /// DECSET 1016 as the replay has it: `Term` does not keep the mode, the
     /// wrapper does, and the encoder writes it back into the new base's VT.
     pixels: AtomicBool,
-    /// The character the last fed slice cut ([`Utf8Seam`]): the replay
-    /// crosses the reader's seams the way the reader did.
-    seam: Utf8Seam,
     tail: Tail,
     options: TerminalOptions,
     cluster: bool,
@@ -984,15 +981,12 @@ impl Scratch {
         let mut last_input = false;
         let pixels = AtomicBool::new(false);
         // The chunks cut wherever `CHUNK` falls, characters included.
-        let mut seam = Utf8Seam::default();
         for chunk in base.vt.chunks(CHUNK) {
-            seam.feed(chunk, |bytes| {
-                parser.advance(
-                    &mut ClusterHandler::new(&mut term, base.cluster, &mut last_input)
-                        .pixel_mouse(&pixels),
-                    bytes,
-                );
-            });
+            parser.advance(
+                &mut ClusterHandler::new(&mut term, base.cluster, &mut last_input)
+                    .pixel_mouse(&pixels),
+                chunk,
+            );
             progress.fetch_add(1, Ordering::AcqRel);
         }
         let mut scratch = Self {
@@ -1001,7 +995,6 @@ impl Scratch {
             parser: ansi::Processor::new(),
             pixels,
             last_input: base.last_input,
-            seam: Utf8Seam::default(),
             tail: Tail::default(),
             options: base.options,
             cluster: base.cluster,
@@ -1015,13 +1008,11 @@ impl Scratch {
         if bytes.is_empty() {
             return;
         }
-        self.seam.feed(bytes, |bytes| {
-            self.parser.advance(
-                &mut ClusterHandler::new(&mut self.term, self.cluster, &mut self.last_input)
-                    .pixel_mouse(&self.pixels),
-                bytes,
-            );
-        });
+        self.parser.advance(
+            &mut ClusterHandler::new(&mut self.term, self.cluster, &mut self.last_input)
+                .pixel_mouse(&self.pixels),
+            bytes,
+        );
         self.tail.feed(bytes);
     }
 

@@ -688,7 +688,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 let valid_bytes = err.valid_up_to();
                 // If we have any valid bytes, that means we partially copied another
                 // utf8 character into `partial_utf8`. Since we only care about the
-                // first character, we just ignore the rest.
+                // first character, we just ignore the rest. Ignoring means leaving it in
+                // the input: only the first character's bytes count as consumed, or the
+                // bytes between it and the cut character after it would never be parsed.
                 if valid_bytes > 0 {
                     let c = unsafe {
                         let parsed = str::from_utf8_unchecked(&self.partial_utf8[..valid_bytes]);
@@ -698,7 +700,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                     performer.print(c);
 
                     self.partial_utf8_len = 0;
-                    return valid_bytes - old_bytes;
+                    return c.len_utf8() - old_bytes;
                 }
 
                 match err.error_len() {
@@ -1453,6 +1455,66 @@ mod tests {
         assert_eq!(dispatcher.dispatched.len(), 2);
         assert_eq!(dispatcher.dispatched[0], Sequence::Print('ĸ'));
         assert_eq!(dispatcher.dispatched[1], Sequence::Print('🎉'));
+    }
+
+    #[test]
+    fn partial_utf8_keeps_the_bytes_after_the_character() {
+        // "· ·": the first read ends inside the first `·`. The three bytes copied to
+        // complete it are the rest of that `·`, a space, and the start of the next `·`: the
+        // space must survive.
+        const INPUT: &[u8] = b"\xC2\xB7 \xC2\xB7";
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, &INPUT[..1]);
+        parser.advance(&mut dispatcher, &INPUT[1..]);
+
+        assert_eq!(dispatcher.dispatched, [
+            Sequence::Print('·'),
+            Sequence::Print(' '),
+            Sequence::Print('·'),
+        ]);
+    }
+
+    /// `input` through one parser in the reads `cuts` marks, the way a terminal gets a stream.
+    fn dispatched_in_reads(input: &[u8], cuts: &[usize]) -> Vec<Sequence> {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        let mut start = 0;
+        for end in cuts.iter().copied().chain(core::iter::once(input.len())) {
+            parser.advance(&mut dispatcher, &input[start..end]);
+            start = end;
+        }
+
+        dispatcher.dispatched
+    }
+
+    #[test]
+    fn utf8_cut_anywhere_dispatches_what_the_whole_does() {
+        // One-, two-, three- and four-byte characters next to each other, next to ASCII and
+        // around an escape sequence, so a cut lands inside a character whose neighbours are
+        // themselves cut by the bytes read ahead to complete it.
+        const INPUT: &str = "a· ·é€x😀 ·🎉€·é\x1b[1m·\x1b[0m ĸ🎉·\u{10FFFF}€ \u{7FF}·";
+
+        let input = INPUT.as_bytes();
+        let whole = dispatched_in_reads(input, &[]);
+        let printed = whole.iter().filter(|sequence| matches!(sequence, Sequence::Print(_)));
+        assert_eq!(printed.count(), INPUT.chars().count() - "\x1b[1m\x1b[0m".len());
+
+        for first in 0..=input.len() {
+            for second in first..=input.len() {
+                assert_eq!(
+                    dispatched_in_reads(input, &[first, second]),
+                    whole,
+                    "cut at {first} and {second}"
+                );
+            }
+        }
+
+        let every_byte: Vec<usize> = (1..input.len()).collect();
+        assert_eq!(dispatched_in_reads(input, &every_byte), whole);
     }
 
     #[test]

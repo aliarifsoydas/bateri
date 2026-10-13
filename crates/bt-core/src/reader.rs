@@ -64,7 +64,7 @@ use alacritty_terminal::{thread, tty};
 use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
 use crate::graphics::{MARKER_LEN, Sink};
-use crate::handler::{ClusterHandler, Utf8Seam};
+use crate::handler::ClusterHandler;
 use crate::journal::{Journal, Side};
 
 /// The most bytes read from the PTY before a forced synchronization.
@@ -181,9 +181,6 @@ pub(crate) struct State {
     /// `advance`: a cluster split across two `read` chunks (`👍` · `🏽`) is
     /// still unclosed.
     last_input: bool,
-    /// The character the last read cut, which the next read completes a
-    /// byte at a time ([`Utf8Seam`]).
-    seam: Utf8Seam,
 }
 
 impl State {
@@ -632,15 +629,12 @@ where
                 }),
             };
 
-            // Parse the incoming bytes — into `Term` through the wrapper,
-            // across the seam a read may have cut a character at.
-            state.seam.feed(&buf[..unprocessed], |bytes| {
-                state.parser.advance(
-                    &mut ClusterHandler::new(&mut **terminal, self.cluster, &mut state.last_input)
-                        .graphics(self.graphics.as_deref()),
-                    bytes,
-                );
-            });
+            // Parse the incoming bytes — into `Term` through the wrapper.
+            state.parser.advance(
+                &mut ClusterHandler::new(&mut **terminal, self.cluster, &mut state.last_input)
+                    .graphics(self.graphics.as_deref()),
+                &buf[..unprocessed],
+            );
             // The journal's applied count, under the terminal lock and by the
             // slice `advance` got — not the bytes read: the reads before the
             // lock accumulate into one `advance`.

@@ -74,6 +74,11 @@ fmt:
 #   interface, reaches bt-shell-macos only through `embed`. A shortcut past
 #   that door would work in bateri and silently not in an application that
 #   hosts the pane.
+# - The parser is the fork: `vte` resolves to `vendor/vte` through
+#   `[patch.crates-io]`. If the patch stops applying (alacritty_terminal moves
+#   to a vte version the fork is not), cargo falls back to the registry's vte
+#   with nothing but a warning in its output and the fork's changes silently
+#   vanish.
 # - It does NOT fail on a dependency change, it warns: a deliberate dependency
 #   decision also changes Cargo.lock; review looks for the decision's record.
 audit:
@@ -85,6 +90,7 @@ audit:
 	if $(CARGO) tree -p bt-shell-common -e normal --depth 1 | grep -E "(^|[ ─])objc2 v|objc2-app-kit|objc2-quartz-core|objc2-foundation|objc2-user-notifications|block2|bt-shell-(macos|linux)"; then echo "audit: bt-shell-common links to a platform shell or the AppKit family"; fail=1; fi; \
 	if grep -rnE "objc2|dispatch2|block2" crates/bt-shell-common/src | grep -v "^crates/bt-shell-common/src/watch/dispatch.rs:" | grep -v ":[[:space:]]*//"; then echo "audit: platform call in bt-shell-common outside watch's macOS body (watch/dispatch.rs)"; fail=1; fi; \
 	if grep -rn "objc2\|core_text\|core_graphics" crates/bt-core/src | grep -v ":[[:space:]]*//"; then echo "audit: platform call in bt-core source"; fail=1; fi; \
+	if ! $(CARGO) tree -p bt-core -e normal | grep -qE "vte v[0-9.]+ \(.*/vendor/vte\)"; then echo "audit: vte does not resolve to the fork in vendor/vte — is [patch.crates-io] in Cargo.toml still used?"; fail=1; fi; \
 	if $(CARGO) tree -p bt-gpu -e normal,dev --depth 1 | grep -E "objc2|dispatch2|block2|metal"; then echo "audit: bt-gpu links directly to a platform library"; fail=1; fi; \
 	if grep -rnE "objc2|dispatch2|block2|metal" crates/bt-gpu/src | grep -v ":[[:space:]]*//"; then echo "audit: platform call in bt-gpu source"; fail=1; fi; \
 	for f in crates/bt-core/src/*.rs; do \
@@ -111,8 +117,13 @@ clippy:
 # workspace has none — yet rustdoc still compiles every crate once more to find
 # that out, and that pass was most of the test step's time. A doc-test added
 # later must not stay silent: put `--doc` back here in the same commit.
+# The fork of the parser (`vendor/vte`) is not a workspace member — the gate does
+# not reformat or lint upstream's code — but its tests, upstream's and ours, run
+# here: `-p` reaches it as a patched dependency, and cannot be combined with
+# `--workspace`, hence a second command.
 test:
 	$(CARGO) test --workspace --all-targets
+	$(CARGO) test -p vte --all-targets
 
 # Opens the window, and when BT_RUN_SECONDS expires looks at the number of
 # frames, cells, glyphs, rule lines and atlas slots:

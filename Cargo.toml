@@ -9,6 +9,10 @@ members = [
     "crates/bt-embed",
     "crates/bateri",
 ]
+# The fork of the terminal parser (`[patch.crates-io]` below) is upstream's code
+# in upstream's style: not a member, so `fmt` and `clippy` leave it alone. Its
+# tests run from the Makefile (`make test`); `exclude` lets cargo be run inside it.
+exclude = ["vendor/vte"]
 
 [workspace.package]
 version = "0.14.0"
@@ -97,8 +101,8 @@ block2 = "0.6"
 # The version is pinned **exactly** (`=`): the reader loop is a copy of this
 # version's `event_loop.rs` (`bt-core/src/reader.rs`) and the copy leans on its
 # two `pub(crate)` constants (the PTY tokens) — even a patch release could
-# silently shift them. This pin does not pin vte (alacritty asks
-# for `^0.15.0`): its version is held by `Cargo.lock`, and a new method that
+# silently shift them. The pin holds vte as well, through the fork below
+# (alacritty asks for `^0.15.0`, the fork is that version), and a new method that
 # arrives in `Handler` is caught by the wrapper's `missing_trait_methods` guard.
 alacritty_terminal = { version = "=0.26.0", default-features = false }
 # Settings and theme files (`bt-core::settings`). User-approved dependency
@@ -197,3 +201,13 @@ bt-atlas = { path = "crates/bt-atlas" }
 bt-gpu = { path = "crates/bt-gpu" }
 bt-shell-common = { path = "crates/bt-shell-common" }
 bt-shell-macos = { path = "crates/bt-shell-macos" }
+
+# `vte`, the parser inside `alacritty_terminal`, is a fork kept in `vendor/vte`: upstream
+# 0.15.0 plus the changes listed in its `FORK.md`. User-approved dependency decision
+# (2026-10-13): vte 0.15.0 drops the byte after a character that a read cut in two.
+# Same name and version, so `alacritty_terminal` resolves to it unchanged; when it
+# asks for a newer vte the fork is carried over by hand (`FORK.md` says how), and
+# `make audit` fails if the patch stops applying — cargo only warns, then quietly
+# builds the registry's vte.
+[patch.crates-io]
+vte = { path = "vendor/vte" }
