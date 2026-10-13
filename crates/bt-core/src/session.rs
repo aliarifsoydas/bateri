@@ -86,7 +86,7 @@ use crate::cluster::{ClusterId, Clusters};
 use crate::color::{self, LinearRgba, Theme};
 use crate::commands::{CommandId, CommandState, command_state};
 use crate::dock::{self, Dock, DockBudget, DockCols, DockEdit, DockPoint};
-use crate::graphics::{self, Hub, Pictures, Piece, Receiver, Splitter};
+use crate::graphics::{self, Hub, Intake, Pictures};
 use crate::grid_input;
 use crate::handler::ClusterHandler;
 use crate::identity::{LC_TERMINAL, PaneUuid, TERM_PROGRAM, TERM_PROGRAM_VERSION};
@@ -2319,12 +2319,12 @@ impl EventListener for Adapter {
 /// returns exactly what it read from the inner `Pty`, only showing the slice
 /// to the scanner before returning. The exception is a kitty graphics command
 /// (`ESC _ G … ESC \`): it is taken out of the stream, decoded and queued,
-/// and [`graphics::MARK`] stands in its place ([`crate::graphics`] says why
-/// there and not later). A command that shows an image and moves the cursor
-/// (`C=0`) brings that movement with it as ordinary escape sequences around
-/// the marker — the rows before it, the columns after it ([`graphics::Motion`]
-/// says why the marker is between them) — so everything downstream moves its
-/// cursor the same way. Everything after the separation — the journal, the
+/// and a marker stands in its place ([`graphics::Motion::mark`];
+/// [`crate::graphics`] says why there and not later). A command that shows an
+/// image and moves the cursor (`C=0`) brings that movement with it in the
+/// marker, as numbers — the wrapper that dispatches the marker does the
+/// moving — so everything downstream, a replay included, moves its cursor the
+/// same way. Everything after the separation — the journal, the
 /// tail, the scanner, the parser — sees the stream **without** the command,
 /// so a replay of the journal never has an image payload in it. The second
 /// thing that enters the parser's **call** path is a separate layer
@@ -2338,9 +2338,13 @@ impl EventListener for Adapter {
 /// base64, inflate, PNG — happens in the read loop between the read and its
 /// parse, with neither the lease nor the lock held
 /// ([`graphics::Hub::decode_pending`]); so does reading the file or shared
-/// memory object a command names, which here is only a name. The one touch
-/// of a file in `read` is the first bytes of a named PNG, to know how far
-/// the cursor moves (`graphics::source::peek`).
+/// memory object a command names, which here is only a name. **No file is
+/// touched in `read`**, which is why the cursor's movement is never made from
+/// what a file holds: the size is the command's own (`s=`, `v=`), or the
+/// cursor stays. **And nothing of a read outlives the loop's turn**: what the
+/// buffer has no room for (a marker is longer than a short command) is the
+/// next thing `read` returns, and the loop does not end its turn before it has
+/// read it ([`graphics::Intake::read`]).
 ///
 /// **`Reader = Self` is the core of the decision.** `Pty::reader()` returns
 /// `&mut File`, so borrowing suffices to hand over the reader: **no second fd
@@ -2415,25 +2419,19 @@ struct TappedPty {
     /// on under it, so this copy sometimes runs under the lock too (at most
     /// `MAX_LOCKED_READ` bytes): a copy, no wait, no system call.
     journal: Option<Arc<Journal>>,
-    /// Finds the graphics commands in what `read_raw` returns.
-    splitter: Splitter,
-    /// Assembles the chunks of a graphics transmission and decodes it.
-    receiver: Receiver,
-    /// The separated stream that did not fit the caller's buffer.
-    spill: graphics::Spill,
+    /// Takes the graphics commands out of what `read_raw` returns.
+    intake: Intake,
 }
 
 impl TappedPty {
     /// The bytes read but not yet applied by any parser, behind
-    /// [`Self::tail`]'s: what the separation had not delivered (and so what
-    /// no journal, tail or scanner has seen) and the graphics command it was
-    /// in the middle of, or the beginning of one it was holding back. The
-    /// handover carries them on; the adopting side's reader finishes the
-    /// command from what the master has left.
+    /// [`Self::tail`]'s: the graphics command the separation was in the
+    /// middle of, or the beginning of one it was holding back (no journal,
+    /// tail or scanner has seen them). The handover carries them on; the
+    /// adopting side's reader finishes the command from what the master has
+    /// left.
     fn undelivered(&self) -> Vec<u8> {
-        let mut bytes = self.spill.rest().to_vec();
-        bytes.extend_from_slice(&self.splitter.inflight());
-        bytes
+        self.intake.undelivered()
     }
 
     /// The bytes since the parser last stood in its ground state — read once
@@ -2442,89 +2440,48 @@ impl TappedPty {
         self.tail.bytes()
     }
 
-    /// The next read: the carried prefix first, then the fd.
-    fn read_raw(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.prefix_at < self.prefix.len() {
-            let rest = &self.prefix[self.prefix_at..];
-            let n = rest.len().min(buf.len());
-            buf[..n].copy_from_slice(&rest[..n]);
-            self.prefix_at += n;
-            if self.prefix_at == self.prefix.len() {
-                self.prefix = Vec::new();
-                self.prefix_at = 0;
-            }
-            return Ok(n);
-        }
-        if self.muting {
-            self.muting = false;
-            self.adapter.0.muted.store(false, Ordering::Release);
-        }
-        match &mut self.pty {
-            PtyKind::Spawned(pty) => pty.reader().read(buf),
-            PtyKind::Adopted(pty) => pty.file().read(buf),
-        }
-    }
-}
-
-impl TappedPty {
-    /// The stream the parser reads: `read_raw`'s bytes with every graphics
-    /// command taken out ([`crate::graphics`]) and its marker in its place.
-    ///
-    /// A read that ends inside a command, or on the first bytes of one,
-    /// delivers less than it read (the rest waits in the splitter), and a
-    /// read of nothing but command delivers nothing: that is `WouldBlock`,
-    /// not `Ok(0)`, which the loop reads as "nothing to read" on macOS and
-    /// stops on.
+    /// The stream the parser reads: the next bytes of the PTY — the carried
+    /// prefix first, then the fd — with every graphics command taken out
+    /// ([`crate::graphics`]) and its marker in its place ([`Intake::read`]).
+    /// No file is touched here.
     fn read_stream(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if !self.spill.is_empty() {
-            return Ok(self.spill.serve(buf));
-        }
-        let read = self.read_raw(buf)?;
-        if read == 0 || self.splitter.passes(&buf[..read]) {
-            return Ok(read);
-        }
         let adapter = &self.adapter;
-        let hub = &adapter.0.graphics;
-        let size = *lock(&adapter.0.size);
-        let env = graphics::Env {
-            cell: (size.cell_width, size.cell_height),
-            columns: size.num_cols,
-            lines: size.num_lines,
-        };
-        let stored = |echo| hub.stored_size(echo);
-        let out = self.spill.begin();
-        let receiver = &mut self.receiver;
-        self.splitter.feed(&buf[..read], |piece| match piece {
-            Piece::Bytes(bytes) => out.extend_from_slice(bytes),
-            Piece::Command(apc) => receiver.receive(apc, Instant::now(), env, &stored, |outcome| {
-                match outcome {
-                    graphics::Outcome::Pending(pending) => {
-                        // The cursor's movement is written around the marker:
-                        // the rows before it, the columns after it.
-                        let motion = pending.motion();
-                        motion.lead(env.lines, out);
-                        hub.queue(pending);
-                        out.extend_from_slice(graphics::MARK);
-                        motion.trail(out);
+        let size = &adapter.0.size;
+        self.intake.read(
+            buf,
+            Instant::now(),
+            |buf| {
+                if self.prefix_at < self.prefix.len() {
+                    let rest = &self.prefix[self.prefix_at..];
+                    let n = rest.len().min(buf.len());
+                    buf[..n].copy_from_slice(&rest[..n]);
+                    self.prefix_at += n;
+                    if self.prefix_at == self.prefix.len() {
+                        self.prefix = Vec::new();
+                        self.prefix_at = 0;
                     }
-                    // A query's answer goes now, ahead of everything the
-                    // parser answers from this read: a program that asks what
-                    // the terminal can draw and then for its attributes
-                    // (`ESC [ c`) takes the second answer as "the first is not
-                    // coming". The channel is first in, first out.
-                    graphics::Outcome::Query(reply) => {
-                        if let Some(bytes) = reply.encode() {
-                            graphics::Sink::reply(adapter, bytes);
-                        }
-                    }
+                    return Ok(n);
                 }
-            }),
-        });
-        hub.set_open(self.splitter.inside() || self.receiver.is_open());
-        if self.spill.is_empty() {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
-        Ok(self.spill.serve(buf))
+                if self.muting {
+                    self.muting = false;
+                    adapter.0.muted.store(false, Ordering::Release);
+                }
+                match &mut self.pty {
+                    PtyKind::Spawned(pty) => pty.reader().read(buf),
+                    PtyKind::Adopted(pty) => pty.file().read(buf),
+                }
+            },
+            &adapter.0.graphics,
+            || {
+                let size = *lock(size);
+                graphics::Env {
+                    cell: (size.cell_width, size.cell_height),
+                    columns: size.num_cols,
+                    lines: size.num_lines,
+                }
+            },
+            &mut |bytes| graphics::Sink::reply(adapter, bytes),
+        )
     }
 }
 
@@ -2966,6 +2923,13 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// chunks of a transmission: the next chunk, which names no action, reaches
 /// the adopting side as a command of its own and is answered with an error.
 const COMMAND_GRACE: Duration = Duration::from_millis(500);
+
+/// How long [`Session::freeze`] waits for the reader to stop. The reader is
+/// in a decode when the stop message reaches it, and the decode of an image
+/// that names a file can wait as long as the file's mount does; a handover
+/// does not wait with it. Past this the freeze fails, giving back what it
+/// took, and the caller closes the pane the old way.
+const FREEZE_GRACE: Duration = Duration::from_secs(2);
 
 /// The result of [`Session::shutdown`] — the source of the `teardown=` token in
 /// the smoke/measurement report.
@@ -5420,11 +5384,15 @@ impl Session {
             prefix_at: 0,
             muting: mute_prefix,
             journal: journal.clone(),
-            splitter: Splitter::new(graphics::PAYLOAD_LIMIT),
-            receiver: Receiver::new(),
-            spill: graphics::Spill::default(),
+            intake: Intake::new(),
         };
         adapter.0.muted.store(mute_prefix, Ordering::Release);
+        // Asked when a command names a file: a pane in a remote session is
+        // not on the machine the name belongs to.
+        adapter.0.graphics.set_remote_gate(Box::new({
+            let shell = Arc::clone(&shell);
+            move || lock(&shell).context.remote_host().is_some()
+        }));
 
         let config = term_config(options.terminal);
         let term = Arc::new(FairMutex::new(Term::new(config, &grid, adapter.clone())));
@@ -12024,7 +11992,11 @@ impl Session {
     /// `Err` if the session already shut down or its master copy failed at
     /// birth — nothing to hand over; the session is untouched — or if the
     /// reader had panicked (the `Pty` dropped while unwinding: the child is
-    /// already hung up).
+    /// already hung up) — or if the reader did not stop within
+    /// [`FREEZE_GRACE`] (`TimedOut`: it is in a decode that waits on a file; it
+    /// has been told to stop, the session keeps its reader and master copy,
+    /// and closing it the old way — [`Session::begin_shutdown`] — hangs the
+    /// child up and waits for the reader like any other).
     ///
     /// **Not journaled:** the session's life ends with it — what
     /// the journal records leads up to this, not past it.
@@ -12053,6 +12025,24 @@ impl Session {
             ));
         };
         self.send(Msg::Shutdown);
+        // The reader is waited for by its thread's end, which has a time limit
+        // (`JoinHandle::join` has none): a reader stuck in a decode must not
+        // hold the handover. One that misses it goes back to the session with
+        // the master copy, and so does everything the old way of closing
+        // needs — it was told to stop and does as soon as the decode lets it,
+        // and the shutdown the caller turns to hangs the child up.
+        let started = Instant::now();
+        while !reader.is_finished() {
+            if started.elapsed() >= FREEZE_GRACE {
+                *lock(&self.master) = Some(master);
+                *lock(&self.reader) = Some(reader);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the reader did not stop in time",
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
         let Ok((mut event_loop, mut state)) = reader.join() else {
             return Err(io::Error::other("the reader thread ended with a panic"));
         };
@@ -29045,6 +29035,10 @@ e\\314\\201.'; sleep 5";
         journal: Arc<Journal>,
         fifo: File,
         written: u64,
+        /// What the reader's splitter holds of what was written, which it
+        /// would: the end of a read that may be the beginning of a sequence it
+        /// looks at ([`crate::graphics::Splitter`]).
+        splitter: crate::graphics::Splitter,
         _dir: TempDir,
     }
 
@@ -29088,6 +29082,7 @@ e\\314\\201.'; sleep 5";
                 journal,
                 fifo,
                 written: 0,
+                splitter: crate::graphics::Splitter::new(crate::graphics::PAYLOAD_LIMIT),
                 _dir: dir,
             }
         }
@@ -29099,14 +29094,11 @@ e\\314\\201.'; sleep 5";
             self.fifo
                 .write_all(bytes)
                 .expect("the fifo takes the bytes");
-            // A trailing `ESC` or `ESC _` may begin a graphics command, so the
-            // reader holds it until the next byte says it does not
-            // ([`crate::graphics::Splitter`]); the next send applies it.
-            let held = match bytes {
-                [.., 0x1b, b'_'] => 2,
-                [.., 0x1b] => 1,
-                _ => 0,
-            };
+            // A trailing `ESC`, `ESC _`, `ESC [` or `ESC [ ?` and what follows
+            // may begin a sequence the reader looks at, so it holds it until
+            // the next byte says it does not; the next send applies it.
+            self.splitter.feed(bytes, |_| {});
+            let held = self.splitter.held().len() as u64;
             self.written += bytes.len() as u64;
             let (journal, target) = (Arc::clone(&self.journal), self.written - held);
             wait_until(
@@ -29984,8 +29976,13 @@ e\\314\\201.'; sleep 5";
 
         /// A shell command that puts the file's name, in base64, in `$name`.
         fn encoded(&self) -> String {
+            self.encoded_as("name")
+        }
+
+        /// The same, in the variable `var`.
+        fn encoded_as(&self, var: &str) -> String {
             format!(
-                "name=$(printf %s '{}' | base64 | tr -d '\\n')",
+                "{var}=$(printf %s '{}' | base64 | tr -d '\\n')",
                 self.0.display()
             )
         }
@@ -30032,6 +30029,119 @@ e\\314\\201.'; sleep 5";
         assert!(!text.contains("Ga="), "{text:?}");
         assert_eq!(stored_ids(&session), (vec![6], vec![]));
         assert!(file.0.exists());
+        session.shutdown();
+    }
+
+    impl NamedFile {
+        /// An 18 × 36 pixel PNG: two columns and two rows of the test cells.
+        fn png(stem: &str) -> Self {
+            let mut bytes = Vec::new();
+            let mut encoder = png::Encoder::new(&mut bytes, 18, 36);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("header");
+            writer.write_image_data(&[9; 18 * 36 * 4]).expect("data");
+            writer.finish().expect("finish");
+            Self::new(stem, &bytes)
+        }
+    }
+
+    /// The text goes on at the cell after a placed PNG, on its last row, and
+    /// the placement is where the cursor was: the movement is the size the
+    /// command gave (`s=18,v=36`), not what the file says.
+    fn assert_png_placed(session: &Session) {
+        let (cells, pictures, _) = picture_frame(session);
+        let [picture] = pictures.grid() else {
+            panic!("one picture, got {:?}", pictures.grid().len());
+        };
+        assert_eq!((picture.row, picture.col), (2, 4));
+        assert_eq!((picture.width, picture.height), (18, 36));
+        let ready = cells.iter().find(|cell| cell.ch == Some('R')).expect("R");
+        assert_eq!((ready.row, ready.col), (3, 6));
+    }
+
+    #[test]
+    fn a_png_in_a_file_is_placed_and_the_cursor_goes_after_it() {
+        let file = NamedFile::png("bt-session-placed");
+        let script = format!(
+            r#"stty -echo; {}; printf '\033[3;5H\033_Ga=T,t=f,f=100,s=18,v=36,i=1;%s\033\\READY' "$name"; sleep 8"#,
+            file.encoded()
+        );
+        let session = spawn_session(&script, Arc::new(TestWake::default()));
+        wait_text(&session, "READY");
+        assert_png_placed(&session);
+        assert!(file.0.exists());
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_png_in_a_file_inside_a_synchronized_update_is_placed_where_the_update_puts_it() {
+        let file = NamedFile::png("bt-session-sync");
+        let script = format!(
+            r#"stty -echo; {}; printf '\033[?2026h\033[3;5H\033_Ga=T,t=f,f=100,s=18,v=36,i=1;%s\033\\' "$name"; printf '\033[?2026lREADY'; sleep 8"#,
+            file.encoded()
+        );
+        let session = spawn_session(&script, Arc::new(TestWake::default()));
+        wait_text(&session, "READY");
+        assert_png_placed(&session);
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_name_is_refused_once_the_pane_is_in_a_remote_session() {
+        // The script runs a command (`C`), sends a file query that works,
+        // waits for the probe to be told the command is remote, and sends
+        // another: one of its own temporary files, which stays.
+        let first = NamedFile::new("bt-session-q1", &[1, 2, 3]);
+        let second = NamedFile::new("tty-graphics-protocol-session-q2", &[1, 2, 3]);
+        let script = format!(
+            r#"stty echo echoctl; printf '{}'; read _; printf '\033]133;C\007'; {}; {}; printf '\033_Gi=11,a=q,t=f,f=24,s=1,v=1;%s\033\\' "$name"; read -r _; printf '\033_Gi=12,a=q,t=t,f=24,s=1,v=1;%s\033\\' "$name2"; sleep 8"#,
+            anchored_prompt(1),
+            first.encoded(),
+            second.encoded_as("name2"),
+        );
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_docked_session(&script, Arc::clone(&wake));
+        session.write(b"\n");
+        assert_eq!(wake.wait_commands(1, Duration::from_secs(5)), 1);
+        let text = wait_text(&session, "^[_Gi=11;OK^[\\");
+        assert!(text.contains("^[_Gi=11;OK^[\\"), "{text:?}");
+        let command = session.running_command().expect("running after `C`");
+        assert!(session.set_remote(command, Some(&RemoteTarget::ssh("prod"))));
+        session.write(b"\n");
+        let text = wait_text(&session, "Gi=12;EBADF");
+        assert!(text.contains("EBADF"), "{text:?}");
+        assert!(second.0.exists(), "a remote program's name is not read");
+        assert!(first.0.exists());
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_name_sent_just_before_the_remote_command_ends_is_still_refused() {
+        // The remote program sends a name and exits, and the local `D` and the
+        // next prompt arrive in the same read: the scanner has ended the remote
+        // session by the time the name is decoded, and the name is the
+        // server's all the same.
+        let file = NamedFile::new("tty-graphics-protocol-session-last", &[1, 2, 3]);
+        let script = format!(
+            r#"stty echo echoctl; printf '{}'; read _; printf '\033]133;C\007'; {}; read -r _; printf '\033_Ga=t,t=t,f=24,s=1,v=1,i=21;%s\033\\\033]133;D;0\007{}' "$name"; sleep 8"#,
+            anchored_prompt(1),
+            file.encoded(),
+            anchored_prompt(2),
+        );
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_docked_session(&script, Arc::clone(&wake));
+        session.write(b"\n");
+        assert_eq!(wake.wait_commands(1, Duration::from_secs(5)), 1);
+        let command = session.running_command().expect("running after `C`");
+        assert!(session.set_remote(command, Some(&RemoteTarget::ssh("prod"))));
+        assert!(session.remote_target().is_some());
+        session.write(b"\n");
+        let text = wait_text(&session, "Gi=21;EBADF");
+        assert!(text.contains("EBADF"), "{text:?}");
+        assert!(file.0.exists(), "the server's name was read here");
+        assert_eq!(session.remote_target(), None, "the `D` ended the session");
+        assert_eq!(stored_ids(&session), (vec![], vec![]));
         session.shutdown();
     }
 
@@ -30099,6 +30209,48 @@ e\\314\\201.'; sleep 5";
         let text = wait_text(&new, "Q");
         assert!(!text.contains("AA"), "{text:?}");
         assert_eq!(stored_ids(&new), (vec![8], vec![]));
+    }
+
+    #[test]
+    fn a_freeze_does_not_wait_for_a_reader_stuck_in_a_decode() {
+        // A decode that reads a file on a stalled mount can take as long as
+        // the mount does; the handover does not wait with it. It fails the way
+        // a session with nothing to hand over does, and the pane is closed the
+        // old way.
+        let session = spawn_session(
+            &format!(
+                "stty -echo; printf a; sleep 0.3; printf '{}READY'; sleep 8",
+                printf_pixel(2)
+            ),
+            Arc::new(TestWake::default()),
+        );
+        let (entered, in_decode) = mpsc::channel::<()>();
+        let (release, released) = mpsc::channel::<()>();
+        session.adapter.0.graphics.on_decode(Box::new(move || {
+            let _ = entered.send(());
+            let _ = released.recv_timeout(Duration::from_secs(20));
+        }));
+        in_decode
+            .recv_timeout(Duration::from_secs(8))
+            .expect("the reader reaches the decode");
+        let started = Instant::now();
+        let result = session.freeze();
+        let waited = started.elapsed();
+        let _ = release.send(());
+        let Err(error) = result else {
+            panic!("the freeze gave a handover although the reader was stuck");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        // The session is whole enough to be closed the old way: it still has
+        // its reader, and the shutdown hangs the child up.
+        let closing = session
+            .begin_shutdown()
+            .expect("the session kept its reader and can be shut down");
+        let _ = closing.wait_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            waited >= FREEZE_GRACE && waited < FREEZE_GRACE * 4,
+            "{waited:?}"
+        );
     }
 
     #[test]
@@ -30429,7 +30581,11 @@ e\\314\\201.'; sleep 5";
         wait_text(&session, "READY");
         let records = journal.records();
         let bytes = String::from_utf8_lossy(&records.bytes).into_owned();
-        assert!(bytes.contains("a\x1b[?8166hb READY"), "{bytes:?}");
+        // The marker has no movement, and its command's random id.
+        assert!(
+            bytes.contains("a\x1b[?16384;16384;16384;") && bytes.contains(";8166hb READY"),
+            "{bytes:?}"
+        );
         assert!(
             !bytes.contains("_G") && !bytes.contains("AAAAAA"),
             "{bytes:?}"

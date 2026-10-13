@@ -8,11 +8,11 @@
 //! the lease nor the terminal lock is held
 //! ([`Hub::decode_pending`](super::Hub::decode_pending), called by the read
 //! loop between a read and the parse of it): a frame must not wait for an
-//! image to inflate or a disk to answer. The one read of a named file that
-//! cannot wait is the first bytes of a PNG, which say how far the cursor
-//! moves ([`sniff`]): a few hundred bytes of a regular file, opened without
-//! blocking. Nothing here panics on a bad payload: every way it can be wrong
-//! is an [`Error`] that becomes the program's answer.
+//! image to inflate or a disk to answer. Nothing in the first stage touches
+//! a file: the size the cursor's movement is made from is the command's own
+//! (`s=` and `v=`, or the head of a PNG the sequence carries), never the
+//! file's ([`sniff`]). Nothing here panics on a bad payload: every way it can
+//! be wrong is an [`Error`] that becomes the program's answer.
 
 use std::io::Cursor;
 use std::time::Instant;
@@ -115,13 +115,17 @@ impl Receiver {
     }
 
     /// Takes one command; `out` is called for what it comes to, in order.
-    /// `stored` tells the size of an image the store already holds.
+    /// `stored` tells the size of an image the store already holds; `remote`
+    /// whether the pane is in a remote session now, asked only of a command
+    /// that names a file or shared memory object (the name is the server's,
+    /// not this machine's, and is refused unread).
     pub(crate) fn receive(
         &mut self,
         apc: Apc,
         now: Instant,
         env: Env,
         stored: &dyn Fn(Echo) -> Option<(u32, u32)>,
+        remote: &dyn Fn() -> bool,
         mut out: impl FnMut(Outcome),
     ) {
         if let Some(open) = &self.open
@@ -148,7 +152,7 @@ impl Receiver {
             }
         };
         if self.open.is_some() && !command.explicit_action {
-            self.chunk(command, apc, now, env, &mut out);
+            self.chunk(command, apc, now, env, remote, &mut out);
             return;
         }
         // A command that names its action ends a transmission in progress.
@@ -177,7 +181,7 @@ impl Receiver {
                     return;
                 }
                 if last {
-                    self.finish(open, env, &mut out);
+                    self.finish(open, env, remote, &mut out);
                 } else {
                     self.open = Some(open);
                 }
@@ -234,6 +238,7 @@ impl Receiver {
         apc: Apc,
         now: Instant,
         env: Env,
+        remote: &dyn Fn() -> bool,
         out: &mut impl FnMut(Outcome),
     ) {
         let Some(mut open) = self.open.take() else {
@@ -253,7 +258,7 @@ impl Receiver {
             return;
         }
         if last {
-            self.finish(open, env, out);
+            self.finish(open, env, remote, out);
         } else {
             self.open = Some(open);
         }
@@ -264,10 +269,27 @@ impl Receiver {
     /// names a file (it is answered at its marker, in order); a query with its
     /// pixels in the sequence is answered here and now, so it is decoded now
     /// — which is why it may only be small.
-    fn finish(&mut self, open: Open, env: Env, out: &mut impl FnMut(Outcome)) {
+    fn finish(
+        &mut self,
+        open: Open,
+        env: Env,
+        remote: &dyn Fn() -> bool,
+        out: &mut impl FnMut(Outcome),
+    ) {
         let Open { command, text, .. } = open;
         let (query, echo) = (command.action == Action::Query, command.echo);
         let named = command.medium != Medium::Direct;
+        // The server's name, not this machine's: nothing is looked at. (Asked
+        // here, where the command is taken out of the stream, and not only
+        // when it is decoded: the scanner has seen all of the read by then,
+        // and a session that ended in it — its `D`, the next prompt — would no
+        // longer be remote while the name is the server's. The other way, a
+        // session that ended earlier in the same read, a local command is
+        // refused for: the safe side of a limit.)
+        if named && remote() {
+            out(failure(query, echo, Error::unreadable()));
+            return;
+        }
         // What a command that names its pixels carries is a name, whole.
         let text = if named {
             match source::name(&text) {
@@ -286,10 +308,17 @@ impl Receiver {
             if let Some(size) = size {
                 self.remember(command.echo, size);
             }
-            let motion = if command.action == Action::TransmitAndPut {
-                Self::motion(&command, size, env)
-            } else {
+            // With both sides given in cells the movement does not depend on the
+            // pixels at all: an image whose size is not known (a named PNG with
+            // no `s=`, `v=`) still moves the cursor by the cells it covers. (The
+            // keys against the file's real size: a program that lies in `s=` and
+            // `v=` moves the cursor by the lie — the file is not looked at.)
+            let motion = if command.action != Action::TransmitAndPut {
                 Motion::NONE
+            } else if size.is_none() && command.columns > 0 && command.rows > 0 {
+                Self::motion(&command, Some((1, 1)), env)
+            } else {
+                Self::motion(&command, size, env)
             };
             out(Outcome::Pending(Pending::Raw {
                 command,
@@ -346,13 +375,14 @@ impl Open {
 }
 
 /// The pixel size a transmission holds, read without decoding the image: a
-/// raw payload's is in its keys, a PNG's is in its first bytes (`IHDR`),
-/// after inflating the head of the stream when it is compressed. `text` is
-/// the payload's base64, or the name of the file it is in (a PNG in shared
-/// memory is not looked into). `None` when it cannot be told, and the cursor
-/// then stays.
+/// raw payload's is in its keys, and so is a named PNG's (`kitten icat` sends
+/// `s=` and `v=` for a PNG too; the file is never looked at, so that is all
+/// there is), a PNG in the sequence has it in its first bytes (`IHDR`), after
+/// inflating the head of the stream when it is compressed. `text` is the
+/// payload's base64. `None` when it cannot be told — a named PNG with no keys
+/// — and the cursor then stays.
 fn sniff(command: &Command, text: &[u8]) -> Option<(u32, u32)> {
-    if command.format != Format::Png {
+    if command.format != Format::Png || command.medium != Medium::Direct {
         let (width, height) = (command.width, command.height);
         return (width > 0 && height > 0).then_some((width, height));
     }
@@ -361,14 +391,9 @@ fn sniff(command: &Command, text: &[u8]) -> Option<(u32, u32)> {
     } else {
         HEAD_PLAIN
     };
-    let mut bytes = if command.medium == Medium::Direct {
-        let head = text.get(..take.min(text.len()))?;
-        let mut bytes = Vec::with_capacity(head.len() / 4 * 3 + 3);
-        decode_base64(head, &mut bytes)?;
-        bytes
-    } else {
-        source::peek(command, text, take / 4 * 3)?
-    };
+    let head = text.get(..take.min(text.len()))?;
+    let mut bytes = Vec::with_capacity(head.len() / 4 * 3 + 3);
+    decode_base64(head, &mut bytes)?;
     if command.zlib {
         bytes = match decompress_to_vec_zlib_with_limit(&bytes, PNG_HEAD) {
             Ok(inflated) => inflated,

@@ -2,7 +2,7 @@
 //! how placing it moves the cursor.
 //!
 //! Everything here is arithmetic on numbers and none of it reads the grid:
-//! the reader's side (which writes the cursor's movement into the stream),
+//! the reader's side (which writes the cursor's movement into the marker),
 //! the parser's side (which anchors the placement) and the frame (which hands
 //! the placement to the drawing) all ask the same functions, so the three
 //! agree on how many cells an image takes. The rules are kitty's: a placement
@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use super::command::Command;
+use super::{ARG_BASE, ARG_MAX, MARK_MODE};
 
 /// The largest number of cells a placement may cover in either direction.
 /// Past it the numbers saturate, so that arithmetic on a hostile `c=` or
@@ -175,19 +176,19 @@ fn cell_size(cell: (u16, u16)) -> (u32, u32) {
 /// at the cell after the image on the image's last row, scrolling the screen
 /// if that row is below the bottom.
 ///
-/// The reader writes the movement into the stream as ordinary escape
-/// sequences around the marker — the rows before it, the columns after it —
-/// so a replay of the journal moves the cursor the same way without the
-/// marker doing anything. The marker sits between the two halves on purpose:
-/// at the marker the cursor is in the image's *first* column, on its *last*
-/// row, so the parser anchors the placement from the grid itself, whatever
-/// the movement scrolled, and the clamp of the columns' movement at the right
-/// edge cannot hide where the image began.
+/// The reader writes the movement into the marker as numbers ([`Motion::mark`]),
+/// so the stream the journal records and a replay reads carries it too, and
+/// the wrapper that dispatches the marker does the moving. It is done in two
+/// halves around the anchoring on purpose: at the placement the cursor is in
+/// the image's *first* column, on its *last* row, so the parser anchors the
+/// placement from the grid itself, whatever the movement scrolled, and the
+/// clamp of the columns' movement at the right edge cannot hide where the
+/// image began.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Motion {
     /// How many rows below the placement's top the cursor is at the marker.
     pub(crate) rows: u32,
-    /// How many columns the cursor moves right after the marker.
+    /// How many columns the cursor moves right after the placement.
     pub(crate) cols: u32,
     /// The image is as wide as the screen: the cursor goes to the start of
     /// the next line instead (kitty wraps a cursor that leaves the screen).
@@ -213,23 +214,45 @@ impl Motion {
         }
     }
 
-    /// The bytes that go before the marker: the rows, as indexes, which
-    /// scroll at the bottom where a cursor-down would stop. No more than a
-    /// screen's worth are written: past that the screen is already all new.
-    pub(crate) fn lead(&self, lines: u16, out: &mut Vec<u8>) {
-        let count = self.rows.min(u32::from(lines));
-        for _ in 0..count {
-            out.extend_from_slice(b"\x1bD");
-        }
+    /// The marker for this movement and the command with `id` (28 bits),
+    /// written to `out`: `CSI ? rows ; cols ; wrap ; id ; id ; 8166 h`
+    /// ([`MARK_MODE`]) with each number offset by [`ARG_BASE`], so that it is
+    /// always 38 bytes. The rows are the indexes that scroll at the bottom
+    /// where a cursor-down would stop; no more than a screen's worth
+    /// (`lines`) are written, since past that the screen is already all new.
+    /// At the marker the wrapper moves the cursor down, anchors the placement
+    /// and moves it right (or, for an image as wide as the screen, to the
+    /// start of the next line).
+    pub(crate) fn mark(&self, lines: u16, id: u32, out: &mut Vec<u8>) {
+        let rows = self.rows.min(u32::from(lines)).min(u32::from(ARG_MAX));
+        let cols = if self.wrap {
+            0
+        } else {
+            self.cols.min(u32::from(ARG_MAX))
+        };
+        let (base, mask) = (u32::from(ARG_BASE), u32::from(ARG_MAX));
+        out.extend_from_slice(
+            format!(
+                "\x1b[?{};{};{};{};{};{MARK_MODE}h",
+                base + rows,
+                base + cols,
+                base + u32::from(self.wrap),
+                base + (id >> 14 & mask),
+                base + (id & mask),
+            )
+            .as_bytes(),
+        );
     }
 
-    /// The bytes that go after the marker.
-    pub(crate) fn trail(&self, out: &mut Vec<u8>) {
-        if self.wrap {
-            out.extend_from_slice(b"\x1bD\r");
-        } else if self.cols > 0 {
-            out.extend_from_slice(format!("\x1b[{}C", self.cols).as_bytes());
-        }
+    /// The movement and the id a marker's arguments (the numbers before
+    /// [`MARK_MODE`], less [`ARG_BASE`]) stand for.
+    pub(crate) fn from_marker(args: [u16; 5]) -> (Self, u32) {
+        let motion = Self {
+            rows: u32::from(args[0]),
+            cols: u32::from(args[1]),
+            wrap: args[2] != 0,
+        };
+        (motion, u32::from(args[3]) << 14 | u32::from(args[4]))
     }
 
     /// The rows the placement's top is above the cursor at the marker.
@@ -449,11 +472,10 @@ mod tests {
                 wrap: false
             }
         );
-        let (mut before, mut after) = (Vec::new(), Vec::new());
-        motion.lead(24, &mut before);
-        motion.trail(&mut after);
-        assert_eq!(before, b"\x1bD\x1bD");
-        assert_eq!(after, b"\x1b[4C");
+        let mut marker = Vec::new();
+        motion.mark(24, 5, &mut marker);
+        assert_eq!(marker, b"\x1b[?16386;16388;16384;16384;16389;8166h");
+        assert_eq!(Motion::from_marker([2, 4, 0, 0, 5]), (motion, 5));
         assert_eq!(motion.above(), 2);
     }
 
@@ -462,9 +484,13 @@ mod tests {
         let spec = spec("a=p,i=1,c=80,r=2", (40, 60));
         let motion = Motion::of(&spec, CELL, 80);
         assert!(motion.wrap);
-        let mut after = Vec::new();
-        motion.trail(&mut after);
-        assert_eq!(after, b"\x1bD\r");
+        let mut marker = Vec::new();
+        motion.mark(24, 0x0abc_def1, &mut marker);
+        assert_eq!(marker, b"\x1b[?16385;16384;16385;27379;24305;8166h");
+        assert_eq!(
+            Motion::from_marker([1, 0, 1, 10995, 7921]),
+            (motion, 0x0abc_def1)
+        );
     }
 
     #[test]
@@ -472,17 +498,25 @@ mod tests {
         let spec = spec("a=p,i=1,c=1,r=500", (40, 60));
         let motion = Motion::of(&spec, CELL, 80);
         assert_eq!(motion.above(), 499, "the anchor still lies 499 rows up");
-        let mut before = Vec::new();
-        motion.lead(24, &mut before);
-        assert_eq!(before.len(), 48);
+        let mut marker = Vec::new();
+        motion.mark(24, 7, &mut marker);
+        assert_eq!(marker, b"\x1b[?16408;16385;16384;16384;16391;8166h");
     }
 
     #[test]
-    fn a_cursor_that_stays_writes_nothing() {
-        let (mut before, mut after) = (Vec::new(), Vec::new());
-        Motion::NONE.lead(24, &mut before);
-        Motion::NONE.trail(&mut after);
-        assert!(before.is_empty() && after.is_empty());
+    fn a_marker_is_the_same_length_whatever_it_carries() {
+        let mut stays = Vec::new();
+        Motion::NONE.mark(24, 1, &mut stays);
+        // The largest numbers there are, too: every argument five digits.
+        let motion = Motion {
+            rows: u32::MAX,
+            cols: u32::MAX,
+            wrap: false,
+        };
+        let mut largest = Vec::new();
+        motion.mark(u16::MAX, u32::MAX, &mut largest);
+        assert_eq!(stays.len(), crate::graphics::MARKER_LEN);
+        assert_eq!(largest.len(), stays.len());
     }
 
     #[test]

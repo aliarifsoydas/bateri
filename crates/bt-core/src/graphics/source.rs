@@ -7,42 +7,65 @@
 //! (`cat` of a downloaded page is enough). The rules are kitty's, and each
 //! one closes a way for that text to do something the user did not ask for:
 //!
-//! - The policy is on the **canonical path** and it is applied **before** the
-//!   file is opened — opening can have effects (a device, a pipe's other end)
-//!   and whether it works tells the program the file exists. `/proc`, `/sys`
-//!   and `/dev` (but `/dev/shm`, a temporary directory on Linux) are never
-//!   read; a relative name is refused, because nothing here says what it is
-//!   relative to; and what the canonical path names must be a regular file
-//!   before it is opened.
-//! - It is then opened without following a link at its last step, and what
-//!   was opened must be what the path names (a swap between the check and the
-//!   open is caught by comparing the two).
+//! - **A name is judged before it is opened, and what was opened is judged
+//!   again.** The name's canonical path must be a place that may be read
+//!   (`/proc`, `/sys` and `/dev` are not, but `/dev/shm`, a temporary
+//!   directory on Linux, is) and a regular file, before anything is opened:
+//!   opening a device resets what is on the other end of it, and opening a
+//!   pipe frees a writer waiting for a reader. Between that check and the
+//!   open the name can be pointed elsewhere, so the handle is asked what it
+//!   is (`fstat`: a regular file) and where it is (its real path, from the
+//!   kernel: `F_GETPATH` on macOS, `/proc/self/fd` on Linux), and the rules
+//!   are applied to that. A relative name is refused, because nothing here
+//!   says what it is relative to. The open does not block on a pipe
+//!   (`O_NONBLOCK`; a regular file is read with `pread`, which it does not
+//!   touch), does not follow a link (the path was resolved) and does not
+//!   take a terminal (`O_NOCTTY`).
 //! - A temporary file (`t=t`) is read only inside a temporary directory and
-//!   only if its name carries `tty-graphics-protocol`, and is deleted once it
-//!   is read, whether or not the read worked; a file that is refused, or whose
-//!   command was refused before the file was looked at, is left alone. A
-//!   shared memory object is removed once it is opened.
+//!   only if its name carries `tty-graphics-protocol`, and the file that was
+//!   opened — at the real path the handle gave, if it is still that file — is
+//!   deleted once it is read, whether or not the read worked; a file that is
+//!   refused, or whose command was refused before the file was looked at, is
+//!   left alone. A shared memory object is removed once it is opened.
 //! - **No answer carries anything about the file.** Every failure after a
 //!   name was acted on is the same [`Error::unreadable`], with no name and no
 //!   size in it: an answer is written into the PTY's input, so a name echoed
 //!   back would be typed into whatever reads it, and a size or a reason would
 //!   be the answer to "does this machine have this file".
 //!
+//! **A pane in a remote session never gets here.** Over `ssh` a name is the
+//! server's, not this machine's, and a program there that names a file would
+//! be asking this machine for it: the hub refuses the command, before
+//! anything is touched, whenever the pane is remote at the point of the stream
+//! where the command is taken out ([`super::Receiver::receive`]) or at the moment
+//! the name would be read ([`super::Hub::set_remote_gate`]); the program's own
+//! test (`a=q` with a file of its own) fails and it sends the picture itself.
+//! The probe that finds a session remote runs after the command starts, so
+//! output that arrives before it is not covered.
+//!
 //! **Known limits**, each one kitty's too: whether a read works still tells
-//! the program the file is there and, with `O=` and `S=`, how long it is, to
-//! whatever is writing to the terminal (an `ssh` session included — the
-//! program's own `t=f` test is what keeps it from naming files that are not
-//! on this machine); any shared memory object of the user's can be removed
-//! by naming it (the protocol makes the terminal its owner once it is
-//! named); the check of the path and the open are two steps, and a directory
-//! on the way can be swapped for a link between them (only the last step is
-//! opened without following); and a file on a slow or stalled mount (a
-//! network share, a placeholder that has to be fetched) can hold the open
-//! for as long as the mount takes.
+//! the program the file is there and, with `O=` and `S=`, how long it is, to a
+//! program running on this machine, or to whatever is printed before a remote
+//! session is found; any shared memory object of the user's can be removed by
+//! naming it (the protocol makes the terminal its owner once it is named);
+//! a name pointed at a pipe between the check and the open is opened (read-only,
+//! without blocking), which frees a writer waiting for a reader;
+//! the deletion of a temporary file (`remove_if_same`) asks whether the path
+//! is still the file that was read and then removes the path, and a name or
+//! a directory above it changed between the two goes with it; and a file on a
+//! slow or stalled mount (a network share, a placeholder that has to be
+//! fetched) can hold the open for as long as the mount takes — in the decode,
+//! where it stalls this pane's reader and no frame.
 //!
 //! Reading happens where decoding does ([`super::receive::decode_payload`]),
-//! never in `TappedPty::read`; the one exception is [`peek`], the first
-//! bytes of a file, which tell how far the cursor moves.
+//! never in `TappedPty::read`: nothing in this module is called from there
+//! but [`name`], which only decodes base64. The cursor's movement is not made
+//! from what a file holds for the same reason: the size is the command's own
+//! (`s=`, `v=`, or the cells `c=` and `r=` give), and what the keys say against
+//! what the file turns out to be is the program's affair. A named PNG with
+//! none of them leaves the cursor where it is, and so does a placement of it
+//! (`a=p`) in the same read, since the store does not know its size before it
+//! is decoded; one in a later read moves the cursor by the size it finds.
 
 use std::ffi::{CString, OsStr};
 use std::fs::{File, Metadata, OpenOptions};
@@ -83,17 +106,6 @@ pub(super) fn load(command: &Command, name: &[u8], limit: usize) -> Result<Vec<u
     read.ok_or_else(Error::unreadable)
 }
 
-/// The first `len` bytes, from `O=`, of the file a command names; `None`
-/// where the file would not be read, or for shared memory, which is not
-/// looked into. Nothing is deleted.
-pub(super) fn peek(command: &Command, name: &[u8], len: usize) -> Option<Vec<u8>> {
-    if !matches!(command.medium, Medium::File | Medium::Temp) {
-        return None;
-    }
-    let (_, file) = open(name, command.medium == Medium::Temp)?;
-    read_range(&file, u64::from(command.data_offset), 0, len, false)
-}
-
 fn read_file(command: &Command, name: &[u8], limit: usize) -> Option<Vec<u8>> {
     let temp = command.medium == Medium::Temp;
     let (path, file) = open(name, temp)?;
@@ -116,32 +128,88 @@ fn same_file(a: &Metadata, b: &Metadata) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino()
 }
 
-/// Applies the path policy and opens the file it names.
+/// Whether a canonical path may be read at all and, for a temporary file,
+/// taken and deleted.
+fn allowed(path: &Path, temp: bool) -> bool {
+    readable(path) && (!temp || (in_temp_dir(path) && named_for_graphics(path)))
+}
+
+/// Judges a name, opens the file it names and judges what was opened: the
+/// rules and the kind of file are asked of the name's canonical path before
+/// anything is opened, so that a device, a pipe or a descriptor is not
+/// touched, and again of the handle, which says what it is and where it is
+/// (the name may have been pointed elsewhere between the two).
 fn open(name: &[u8], temp: bool) -> Option<(PathBuf, File)> {
     let path = Path::new(OsStr::from_bytes(name));
     if !path.is_absolute() {
         return None;
     }
-    let path = std::fs::canonicalize(path).ok()?;
-    if !readable(&path) {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if !allowed(&canonical, temp) || !std::fs::metadata(&canonical).ok()?.is_file() {
         return None;
     }
-    if temp && !(in_temp_dir(&path) && named_for_graphics(&path)) {
-        return None;
-    }
-    // Only a regular file is opened: a pipe or a socket is not, however
-    // it is opened.
-    if !std::fs::symlink_metadata(&path).ok()?.is_file() {
-        return None;
-    }
+    #[cfg(test)]
+    before_open(name);
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY)
-        .open(&path)
+        .open(&canonical)
         .ok()?;
-    let opened = file.metadata().ok()?;
-    let named = std::fs::symlink_metadata(&path).ok()?;
-    (opened.is_file() && same_file(&opened, &named)).then_some((path, file))
+    let real = path_of(&file)?;
+    if !allowed(&real, temp) || !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    Some((real, file))
+}
+
+/// Where an open file is, as the kernel has it now.
+#[cfg(target_os = "macos")]
+fn path_of(file: &File) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd;
+
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: `F_GETPATH` writes a NUL-terminated path of at most `PATH_MAX`
+    // bytes into the buffer it is given, which is that long.
+    let done = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+    if done == -1 {
+        return None;
+    }
+    let path = std::ffi::CStr::from_bytes_until_nul(&buf).ok()?;
+    Some(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
+}
+
+/// Where an open file is, as the kernel has it now.
+#[cfg(not(target_os = "macos"))]
+fn path_of(file: &File) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd;
+
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+}
+
+/// Test hook: runs between the judgement of a name and the open of it, where
+/// a swap of what it names is the thing to try.
+#[cfg(test)]
+type Hook = Box<dyn Fn(&[u8]) + Send>;
+
+#[cfg(test)]
+static BEFORE_OPEN: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn on_open(hook: Option<Hook>) {
+    *BEFORE_OPEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+}
+
+#[cfg(test)]
+fn before_open(name: &[u8]) {
+    if let Some(hook) = BEFORE_OPEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        hook(name);
+    }
 }
 
 /// Whether a canonical path is one that may be read at all: not `/proc`, not
@@ -166,7 +234,7 @@ fn readable(path: &Path) -> bool {
 
 /// The temporary directories, canonical, found once: the environment does not
 /// change under us (nothing here sets it) and resolving them is four path
-/// lookups, which `peek` would otherwise do in the read.
+/// lookups.
 fn temp_dirs() -> &'static [PathBuf] {
     static DIRECTORIES: OnceLock<Vec<PathBuf>> = OnceLock::new();
     DIRECTORIES.get_or_init(|| {

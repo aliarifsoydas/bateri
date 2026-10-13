@@ -85,6 +85,12 @@ pub const JOURNAL_FORMAT: u32 = 1;
 /// it holds the terminal lock and, holding it, keeps reading into the whole
 /// buffer until `MAX_LOCKED_READ` went through — so less than the sum. The
 /// read gate closes when the byte stream has less free.
+///
+/// What the stream records is the stream after the graphics commands were
+/// separated from it, where a command is longer than on the wire (a marker
+/// is 38 bytes). Only a read of a great many tiny commands comes to more
+/// than the sum, and the journal that has no room for it breaks, as for any
+/// read the gate let through that does not fit.
 pub(crate) const GATE_ROOM: usize = READ_BUFFER_SIZE + MAX_LOCKED_READ;
 
 /// How much earlier than the gate the compaction is asked for: one more

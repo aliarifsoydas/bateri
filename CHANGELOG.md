@@ -27,7 +27,10 @@ of every installed copy. A version without a section is not released.
   reads only ordinary files (never `/dev`, `/proc` or `/sys`), deletes only a
   temporary file named for the purpose, removes the shared memory object the
   program hands over, and never writes a name a program gave back into its
-  answers. Images do not survive an update or a crash of bateri; the text does, and a
+  answers. In an interactive `ssh` or `mosh` session the names a program
+  sends are not read (they would be the server's files), so a program there
+  sends the picture itself.
+  Images do not survive an update or a crash of bateri; the text does, and a
   program that redraws when its window is signalled draws its images again.
 - **bash gets the command blocks and the dock.** When your login shell is
   bash 4.4 or newer, the stripe beside each command, the duration of a long

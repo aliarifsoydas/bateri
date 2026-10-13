@@ -9,7 +9,8 @@
 //!   `TappedPty::read`, before the parser, and only separates: it takes
 //!   `ESC _ G … ESC \` out of the bytes, joins the chunks of a transmission
 //!   as base64 text and queues that, undecoded, as a [`Pending::Raw`] record.
-//!   In the stream it leaves [`MARK`] in the command's place. (A query whose
+//!   In the stream it leaves a marker ([`Motion::mark`]: the cursor's movement
+//!   and the command's id, as numbers) in the command's place. (A query whose
 //!   pixels are in the sequence is the exception: its answer is due at once, so
 //!   it is decoded there, and it may only be small — [`QUERY_LIMIT`]. One that
 //!   names a file or shared memory object is not: it is read with the rest and
@@ -18,28 +19,50 @@
 //!   base64, zlib, PNG. The read loop does it between a read and the parse of
 //!   it, with the terminal's lease and lock both let go, because a frame
 //!   waits for either and an image can take long to inflate.
-//! - **The parser's side** ([`Hub::apply_next`]) runs when the parser
-//!   dispatches [`MARK`] (`handler::ClusterHandler`): the oldest record is
-//!   applied to the store of the screen that is showing **at that point of
+//! - **The parser's side** ([`Hub::apply`]) runs when the parser dispatches
+//!   the marker (`handler::ClusterHandler`): the record with the marker's id
+//!   is applied to the store of the screen that is showing **at that point of
 //!   the stream** — so an `?1049h` in the same read has already happened, and
 //!   a synchronized update (`?2026`) buffers the marker with the rest of the
 //!   frame. A marker with no record (a program wrote the bytes itself, or
-//!   the stream is being replayed) does nothing.
+//!   the stream is being replayed) applies nothing.
 //!
 //! **Placing** is the parser's side too. A placement is anchored to the
 //! cursor's grid line at its marker; when the command moves the cursor
-//! (`C=0`, the default) the reader writes that movement into the stream
-//! beside the marker as ordinary escape sequences ([`Motion`]), so the
-//! journal's copy of the screen moves its cursor the same way without any of
-//! this. How placements keep their lines while the content scrolls is
-//! [`follow`]'s, and what the frame draws is [`Pictures`].
+//! (`C=0`, the default) the movement is in the marker itself, as numbers
+//! ([`Motion`]): the parser's wrapper moves the cursor, anchors the
+//! placement and moves it again, all at the marker. The numbers are in the
+//! stream, so the journal's copy of the screen and a handover's replay move
+//! their cursors the same way without any of this. How placements keep their
+//! lines while the content scrolls is [`follow`]'s, and what the frame draws
+//! is [`Pictures`].
+//!
+//! **A program cannot write a marker that does anything.** A marker takes the
+//! record of the command that carries its id, a random number the program
+//! never sees, and only that one; the marker of a record that is not waiting
+//! moves the cursor and nothing else, as the program could with its own
+//! cursor movements. The parser's wrapper moves the cursor from the marker's
+//! numbers alone, so a replay of the stream finds the cursor where the live
+//! terminal does. Nothing reads the bytes of a program for markers: the
+//! splitter looks at `ESC _` and at nothing else.
+//!
+//! **A read is the PTY's whole buffer.** A command can become longer in the
+//! stream than on the wire (a marker is 38 bytes, a command five at the
+//! least), so what a read comes to may not fit the buffer it was read into;
+//! the rest waits in the read side and the loop reads it in the same turn,
+//! before it goes back to the PTY ([`Intake::read`]).
 //!
 //! **Where the pixels come from** is the command's `t=`. In the escape
 //! sequence itself (`d`) they travel as the payload. A file (`f`), a
 //! temporary file (`t`) or a shared memory object (`s`) is named by the payload
 //! instead, and [`source`] reads it — where the decoding is, never in the
 //! read — under rules that treat the name as what it is: text any program, and
-//! anything a program prints, can write.
+//! anything a program prints, can write, and the server's, not this machine's,
+//! in a remote session (where it is refused). The cursor's movement is never
+//! made from a file: a named image says how big it is in its `s=` and `v=`
+//! keys (`kitten icat` sends them for a PNG too), and one that does not leaves
+//! the cursor where it is — the file is read where the decoding is, long after
+//! the stream has moved on.
 //!
 //! Nothing here draws. The store holds decoded pixels and placements per
 //! screen ([`Images`]); the frame hands them over as [`Picture`]s.
@@ -47,37 +70,51 @@
 mod apc;
 mod command;
 mod follow;
+mod intake;
 mod place;
 mod receive;
 mod source;
 mod store;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::Term;
 
 pub(crate) use apc::{Piece, Splitter};
+pub(crate) use intake::Intake;
 pub(crate) use place::Motion;
 pub(crate) use place::Screen;
 pub use place::{Picture, PictureLayer, Pictures};
 pub(crate) use receive::{Env, Outcome, Receiver};
 pub(crate) use store::{Window, screen_of};
 
-use command::{Action, Command};
+use command::{Action, Command, Medium};
 use receive::Decoded;
 use store::Images;
 
 /// The private mode whose `set` is the marker. No terminal uses the number,
 /// and the parser reports an unknown mode to the handler instead of dropping
-/// it, which is what lets the marker be dispatched in stream order.
+/// it, which is what lets the marker be dispatched in stream order. Its
+/// arguments come before it in the same sequence, as private modes of their
+/// own: `CSI ? rows ; cols ; wrap ; id ; id ; 8166 h` ([`Motion::mark`]), each
+/// the value plus [`ARG_BASE`]. Every one is a mode no terminal has, which the
+/// parser reports to the handler, in order, in one dispatch.
 pub(crate) const MARK_MODE: u16 = 8166;
 
-/// What stands in the stream where a graphics command was taken out.
-pub(crate) const MARK: &[u8] = b"\x1b[?8166h";
+/// The length of a marker, which is the same for every command: `ESC [ ?`,
+/// five arguments of five digits and a `;` after each, `8166` and `h`.
+pub(crate) const MARKER_LEN: usize = 3 + 5 * (5 + 1) + 4 + 1;
+
+/// What an argument of the marker is offset by, to be a number that is no
+/// private mode.
+pub(crate) const ARG_BASE: u16 = 16384;
+
+/// The largest value an argument of the marker carries.
+pub(crate) const ARG_MAX: u16 = ARG_BASE - 1;
 
 /// The most stored pixel bytes one screen keeps: kitty's own quota, so a
 /// program that fits kitty fits here. Past it the images with no placement
@@ -277,6 +314,8 @@ pub(crate) enum Pending {
     Raw {
         command: Command,
         text: Vec<u8>,
+        /// What the reader wrote in the marker, if the command shows the
+        /// image (`a=T`).
         motion: Motion,
     },
     /// Keep a decoded image (and show it, for `a=T`).
@@ -315,11 +354,25 @@ pub(crate) struct Hub {
     /// no record carries yet. A handover cut here would turn the rest of the
     /// command into text on the other side.
     open: AtomicBool,
+    /// Whether the read side holds stream the buffer had no room for
+    /// ([`Intake::read`]): the read loop reads on until it is gone.
+    backlog: AtomicBool,
+    /// How many PTY bytes the read side has taken in, before the commands in
+    /// them became markers: the count a prefix of carried bytes is measured by
+    /// ([`Hub::raw_taken`]).
+    raw: AtomicU64,
+    /// How many queued records still to be decoded name a file or shared
+    /// memory object: only they ask whether the pane is remote.
+    named: AtomicUsize,
+    /// Whether the pane is in a remote session, asked when a file is about
+    /// to be read: the name then belongs to another machine.
+    remote: OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 #[derive(Default)]
 struct Inbox {
-    queue: VecDeque<Pending>,
+    /// The records, each with the id its marker carries.
+    queue: VecDeque<(u32, Pending)>,
     /// Bytes the queued records hold: pixels, or text not yet decoded.
     bytes: usize,
 }
@@ -346,6 +399,12 @@ impl Pending {
             Self::Delete(_) | Self::Reply(_) => Motion::NONE,
         }
     }
+
+    /// Whether the record names a file or shared memory object that is still
+    /// to be read.
+    fn names_something(&self) -> bool {
+        matches!(self, Self::Raw { command, .. } if command.medium != Medium::Direct)
+    }
 }
 
 impl Hub {
@@ -365,14 +424,18 @@ impl Hub {
             #[cfg(test)]
             decoding: Mutex::new(None),
             open: AtomicBool::new(false),
+            backlog: AtomicBool::new(false),
+            raw: AtomicU64::new(0),
+            named: AtomicUsize::new(0),
+            remote: OnceLock::new(),
         }
     }
 
-    /// Queues a record for the marker that is about to follow it in the
-    /// stream. What waits for its marker is bounded too: a synchronized
+    /// Queues a record for the marker with `id` that is about to follow it in
+    /// the stream. What waits for its marker is bounded too: a synchronized
     /// update can hold markers back while the reader goes on reading, and a
     /// record that would not fit becomes its own failure instead.
-    pub(crate) fn queue(&self, pending: Pending) {
+    pub(crate) fn queue(&self, id: u32, pending: Pending) {
         let mut inbox = lock(&self.inbox);
         let pending = match pending {
             Pending::Raw { command, text, .. }
@@ -387,9 +450,12 @@ impl Hub {
         };
         if matches!(pending, Pending::Raw { .. }) {
             self.undecoded.fetch_add(1, Ordering::AcqRel);
+            if pending.names_something() {
+                self.named.fetch_add(1, Ordering::AcqRel);
+            }
         }
         inbox.bytes += pending.weight();
-        inbox.queue.push_back(pending);
+        inbox.queue.push_back((id, pending));
     }
 
     /// Whether a queued transmission still has to be decoded.
@@ -403,9 +469,13 @@ impl Hub {
     /// so a frame does not wait for an image to inflate. Only the reader
     /// takes the queue's lock, so holding it meanwhile blocks no one.
     pub(crate) fn decode_pending(&self) {
+        // Asked once, before the queue is locked (the answer comes from the
+        // shell's state, a lock of its own), and only if a record names
+        // something.
+        let remote = self.named.load(Ordering::Acquire) > 0 && self.in_remote_session();
         let mut inbox = lock(&self.inbox);
         let Inbox { queue, bytes } = &mut *inbox;
-        for slot in queue.iter_mut() {
+        for (_, slot) in queue.iter_mut() {
             if !matches!(slot, Pending::Raw { .. }) {
                 continue;
             }
@@ -423,16 +493,49 @@ impl Hub {
             };
             *bytes -= text.len();
             self.undecoded.fetch_sub(1, Ordering::AcqRel);
-            *slot = self.decoded(command, text, motion, *bytes);
+            if command.medium != Medium::Direct {
+                self.named.fetch_sub(1, Ordering::AcqRel);
+            }
+            *slot = self.decoded(command, text, motion, *bytes, remote);
             *bytes += slot.weight();
         }
     }
 
+    /// Installs the question "is this pane in a remote session", asked when
+    /// a record that names a file or shared memory object is decoded. The
+    /// read side asks it too, when it takes the command out of the stream
+    /// ([`Receiver::receive`]); a command is refused if either answer is yes,
+    /// since a session can be found to be remote between the two, and can end
+    /// between them (the scanner has seen the whole read by the decode).
+    pub(crate) fn set_remote_gate(&self, gate: Box<dyn Fn() -> bool + Send + Sync>) {
+        let _ = self.remote.set(gate);
+    }
+
+    /// Whether the pane is in a remote session now.
+    pub(crate) fn in_remote_session(&self) -> bool {
+        self.remote.get().is_some_and(|gate| gate())
+    }
+
     /// The record a transmission comes to once its text is decoded; `held`
-    /// is what the queue holds besides it.
-    fn decoded(&self, command: Command, text: Vec<u8>, motion: Motion, held: usize) -> Pending {
+    /// is what the queue holds besides it. `motion`: what the reader wrote in
+    /// the marker.
+    fn decoded(
+        &self,
+        command: Command,
+        text: Vec<u8>,
+        motion: Motion,
+        held: usize,
+        remote: bool,
+    ) -> Pending {
         let echo = command.echo;
-        match receive::decode_payload(&command, text) {
+        // A name is the machine's of whoever wrote it. In a remote session
+        // that is not this one: refuse it, with nothing touched.
+        let decoded = if remote && command.medium != Medium::Direct {
+            Err(Error::unreadable())
+        } else {
+            receive::decode_payload(&command, text)
+        };
+        match decoded {
             // A query that names a file is a transmission that is not kept:
             // it only waits here, for its marker, to be answered in order.
             Ok(_) if command.action == Action::Query => Pending::Reply(Reply::ok(echo)),
@@ -451,13 +554,38 @@ impl Hub {
         }
     }
 
+    /// Applies the record the marker with `id` stands for to the screen that
+    /// is showing now and returns the bytes to answer with, if any. The ids
+    /// are random, so a marker a program wrote names no record and applies
+    /// nothing. The records queued before the one found lost their markers
+    /// (a marker that never reached the parser) and are dropped, so one that
+    /// is lost cannot hold the rest back. They are dropped without a word: no
+    /// answer goes for them, and the file of a dropped `t=t` is not deleted.
+    pub(crate) fn apply(&self, id: u32, screen: &Screen) -> Option<Vec<u8>> {
+        {
+            let mut inbox = lock(&self.inbox);
+            let Inbox { queue, bytes } = &mut *inbox;
+            let at = queue.iter().position(|(queued, _)| *queued == id)?;
+            for (_, lost) in queue.drain(..at) {
+                *bytes -= lost.weight();
+                if let Pending::Raw { command, .. } = &lost {
+                    self.undecoded.fetch_sub(1, Ordering::AcqRel);
+                    if command.medium != Medium::Direct {
+                        self.named.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
+            }
+        }
+        self.apply_next(screen)
+    }
+
     /// Applies the oldest record to the screen that is showing now and
     /// returns the bytes to answer with, if any. `None` and nothing applied
     /// when no record is waiting.
-    pub(crate) fn apply_next(&self, screen: &Screen) -> Option<Vec<u8>> {
+    fn apply_next(&self, screen: &Screen) -> Option<Vec<u8>> {
         let pending = {
             let mut inbox = lock(&self.inbox);
-            let pending = inbox.queue.pop_front()?;
+            let (_, pending) = inbox.queue.pop_front()?;
             inbox.bytes -= pending.weight();
             pending
         };
@@ -471,7 +599,13 @@ impl Hub {
                 motion,
             } => {
                 self.undecoded.fetch_sub(1, Ordering::AcqRel);
-                self.decoded(command, text, motion, 0)
+                // Asked here and only for a name: the shell's state is a lock
+                // of its own, and this is under the terminal's.
+                let remote = command.medium != Medium::Direct && {
+                    self.named.fetch_sub(1, Ordering::AcqRel);
+                    self.in_remote_session()
+                };
+                self.decoded(command, text, motion, 0, remote)
             }
             other => other,
         };
@@ -575,6 +709,29 @@ impl Hub {
         self.open.store(open, Ordering::Release);
     }
 
+    /// Records whether the read side holds stream the buffer had no room for
+    /// ([`Hub::backlog`]).
+    pub(crate) fn set_backlog(&self, on: bool) {
+        self.backlog.store(on, Ordering::Release);
+    }
+
+    /// Whether the read side holds stream the buffer had no room for.
+    pub(crate) fn backlog(&self) -> bool {
+        self.backlog.load(Ordering::Acquire)
+    }
+
+    /// Counts PTY bytes the read side took in (`read` of them).
+    pub(crate) fn note_raw(&self, read: usize) {
+        self.raw.fetch_add(read as u64, Ordering::AcqRel);
+    }
+
+    /// How many PTY bytes the read side has taken in so far: the measure of a
+    /// carried prefix, which is in bytes of the PTY and not in bytes of the
+    /// stream they became.
+    pub(crate) fn raw_taken(&self) -> u64 {
+        self.raw.load(Ordering::Acquire)
+    }
+
     /// Waits, at most `grace`, for no command to be half-received. The
     /// reader goes on reading meanwhile, so a command in flight finishes.
     /// A client that stopped mid-command costs the whole grace.
@@ -587,13 +744,16 @@ impl Hub {
 
     /// Queues a transmission as a read of the PTY would: undecoded.
     #[cfg(test)]
-    pub(crate) fn queue_raw(&self, control: &str, text: &[u8]) {
+    pub(crate) fn queue_raw(&self, id: u32, control: &str, text: &[u8]) {
         let command = Command::parse(control.as_bytes()).expect("a command");
-        self.queue(Pending::Raw {
-            command,
-            text: text.to_vec(),
-            motion: Motion::NONE,
-        });
+        self.queue(
+            id,
+            Pending::Raw {
+                command,
+                text: text.to_vec(),
+                motion: Motion::NONE,
+            },
+        );
     }
 
     /// `hook` runs before each queued image is decoded.
@@ -619,43 +779,6 @@ impl Hub {
     }
 }
 
-/// Separated stream that did not fit the buffer the reader gave: the
-/// marker is longer than the shortest command it replaces, so a buffer full
-/// of commands is longer after the separation than before it.
-#[derive(Default)]
-pub(crate) struct Spill {
-    bytes: Vec<u8>,
-    at: usize,
-}
-
-impl Spill {
-    /// Nothing is waiting to be served.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.at >= self.bytes.len()
-    }
-
-    /// Starts a new separation: the (empty) buffer to put its output in.
-    pub(crate) fn begin(&mut self) -> &mut Vec<u8> {
-        self.bytes.clear();
-        self.at = 0;
-        &mut self.bytes
-    }
-
-    /// Moves what fits of the waiting bytes into `buf`; how many.
-    pub(crate) fn serve(&mut self, buf: &mut [u8]) -> usize {
-        let rest = &self.bytes[self.at..];
-        let n = rest.len().min(buf.len());
-        buf[..n].copy_from_slice(&rest[..n]);
-        self.at += n;
-        n
-    }
-
-    /// The bytes not yet served.
-    pub(crate) fn rest(&self) -> &[u8] {
-        &self.bytes[self.at..]
-    }
-}
-
 /// What the parser's side needs from the session it runs in.
 pub(crate) trait Sink: Send + Sync {
     fn hub(&self) -> &Hub;
@@ -675,4 +798,4 @@ pub(crate) trait Sink: Send + Sync {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

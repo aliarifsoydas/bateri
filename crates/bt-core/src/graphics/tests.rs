@@ -1,6 +1,9 @@
 use std::ffi::CString;
+use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -19,7 +22,90 @@ const ENV: Env = Env {
 const ESC_G: &[u8] = b"\x1b_G";
 const ST: &[u8] = b"\x1b\\";
 
-fn base64(bytes: &[u8]) -> String {
+/// The marker of a command whose cursor moves `rows` rows down and `cols`
+/// columns right at the cell size and width of [`ENV`].
+fn marker(rows: u32, cols: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    Motion {
+        rows,
+        cols,
+        wrap: false,
+    }
+    .mark(ENV.lines, 0, &mut out);
+    out
+}
+
+/// The marker of an image as wide as the screen: down `rows`, then to the
+/// start of the next line.
+fn wrapped(rows: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    Motion {
+        rows,
+        cols: 0,
+        wrap: true,
+    }
+    .mark(ENV.lines, 0, &mut out);
+    out
+}
+
+/// The marker of a command that leaves the cursor, with no id (the real ones
+/// are random; see [`anonymous`]).
+fn mark() -> Vec<u8> {
+    marker(0, 0)
+}
+
+/// The markers a stream carries: where each begins, and its five arguments
+/// (the cursor's movement and the id, less [`ARG_BASE`]).
+fn marks(stream: &[u8]) -> Vec<(usize, [u16; 5])> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(offset) = stream[at..].windows(3).position(|w| w == b"\x1b[?") {
+        let start = at + offset;
+        let end = stream[start..]
+            .iter()
+            .position(|&byte| byte == b'h')
+            .map_or(stream.len(), |end| start + end);
+        let modes: Vec<u16> = String::from_utf8_lossy(&stream[start + 3..end])
+            .split(';')
+            .filter_map(|mode| mode.parse().ok())
+            .collect();
+        if let [a, b, c, d, e, last] = modes[..]
+            && last == MARK_MODE
+        {
+            let args = [a, b, c, d, e].map(|arg| arg - ARG_BASE);
+            found.push((start, args));
+        }
+        at = end.max(start + 1);
+    }
+    found
+}
+
+/// How many markers a stream carries.
+fn markers(stream: &[u8]) -> usize {
+    marks(stream).len()
+}
+
+/// The ids of the markers a stream carries, in order.
+fn ids(stream: &[u8]) -> Vec<u32> {
+    marks(stream)
+        .into_iter()
+        .map(|(_, args)| Motion::from_marker(args).1)
+        .collect()
+}
+
+/// The stream with the id of each marker set to 0: the ids are random, the
+/// rest of a marker is what the command said.
+fn anonymous(stream: &[u8]) -> Vec<u8> {
+    let mut out = stream.to_vec();
+    for (start, args) in marks(stream) {
+        let mut marker = Vec::new();
+        Motion::from_marker(args).0.mark(u16::MAX, 0, &mut marker);
+        out[start..start + marker.len()].copy_from_slice(&marker);
+    }
+    out
+}
+
+pub(crate) fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut text = String::new();
     for group in bytes.chunks(3) {
@@ -38,7 +124,7 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 /// One command as a program writes it.
-fn wire(control: &str, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn wire(control: &str, payload: &[u8]) -> Vec<u8> {
     [
         ESC_G,
         control.as_bytes(),
@@ -49,7 +135,7 @@ fn wire(control: &str, payload: &[u8]) -> Vec<u8> {
     .concat()
 }
 
-fn rgba(width: u32, height: u32, seed: u8) -> Vec<u8> {
+pub(crate) fn rgba(width: u32, height: u32, seed: u8) -> Vec<u8> {
     (0..width * height * 4)
         .map(|at| seed.wrapping_add(at as u8))
         .collect()
@@ -87,9 +173,45 @@ fn png_file(
 /// The reader's two halves and the store, joined the way a session joins
 /// them: bytes in, the stream the parser would read out, and the answers
 /// the parser's side wrote back.
+/// The loop's turn over a PTY that has `chunk` to give: reads into `buf`,
+/// which takes as much of it as fits each time, until the PTY has nothing
+/// more and the read side holds nothing the buffer had no room for. Returns
+/// the stream, which is nothing for reads that only feed a command still
+/// arriving (`WouldBlock`).
+fn turn(
+    intake: &mut Intake,
+    hub: &Hub,
+    buf: &mut [u8],
+    chunk: &[u8],
+    now: Instant,
+    env: Env,
+    reply: &mut dyn FnMut(Vec<u8>),
+) -> Vec<u8> {
+    let mut stream = Vec::new();
+    let mut left = chunk;
+    loop {
+        let got = intake.read(
+            buf,
+            now,
+            |room| {
+                let take = left.len().min(room.len());
+                room[..take].copy_from_slice(&left[..take]);
+                left = &left[take..];
+                Ok(take)
+            },
+            hub,
+            || env,
+            reply,
+        );
+        stream.extend_from_slice(&buf[..got.unwrap_or(0)]);
+        if left.is_empty() && !hub.backlog() {
+            return stream;
+        }
+    }
+}
+
 struct Rig {
-    splitter: Splitter,
-    receiver: Receiver,
+    intake: Intake,
     hub: Hub,
     /// Which screen the parser is on when a marker arrives.
     alt: bool,
@@ -97,6 +219,9 @@ struct Rig {
     cursor: (i32, u16),
     /// The answers to queries, which are the reader's own.
     queries: Vec<Vec<u8>>,
+    /// Whether the pane is in a remote session: what the stream and the
+    /// decode are told.
+    remote: Arc<AtomicBool>,
 }
 
 impl Rig {
@@ -105,14 +230,22 @@ impl Rig {
     }
 
     fn with_hub(hub: Hub) -> Self {
+        let remote = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&remote);
+        hub.set_remote_gate(Box::new(move || flag.load(Ordering::Acquire)));
         Self {
-            splitter: Splitter::new(PAYLOAD_LIMIT),
-            receiver: Receiver::new(),
+            intake: Intake::new(),
             hub,
             alt: false,
             cursor: (0, 0),
             queries: Vec::new(),
+            remote,
         }
+    }
+
+    /// What the reader knows of the terminal.
+    fn env(&self) -> Env {
+        ENV
     }
 
     fn screen(&self) -> Screen {
@@ -131,44 +264,46 @@ impl Rig {
         self.run_at(bytes, &mut now, &mut stream)
     }
 
+    /// The PTY's reads of `bytes` and what each leads to, the way the read
+    /// loop runs them: the images decoded between a read and its parse, the
+    /// markers dispatched.
     fn run_at(
         &mut self,
         bytes: &[u8],
         now: &mut Instant,
         stream: &mut Vec<u8>,
     ) -> (Vec<u8>, Vec<u8>) {
-        let hub = &self.hub;
-        let queries = &mut self.queries;
-        let receiver = &mut self.receiver;
-        let mut out = Vec::new();
-        self.splitter.feed(bytes, |piece| match piece {
-            Piece::Bytes(bytes) => out.extend_from_slice(bytes),
-            Piece::Command(apc) => {
-                receiver.receive(apc, *now, ENV, &|echo| hub.stored_size(echo), |outcome| {
-                    match outcome {
-                        Outcome::Pending(pending) => {
-                            let motion = pending.motion();
-                            motion.lead(ENV.lines, &mut out);
-                            hub.queue(pending);
-                            out.extend_from_slice(MARK);
-                            motion.trail(&mut out);
-                        }
-                        Outcome::Query(reply) => queries.extend(reply.encode()),
-                    }
-                })
-            }
-        });
-        stream.extend_from_slice(&out);
-        // The read loop decodes between a read and its parse.
-        hub.decode_pending();
+        let mut buf = vec![0u8; 1 << 20];
         let mut answers = Vec::new();
         let screen = self.screen();
-        let mut rest = out.as_slice();
-        while let Some(at) = rest.windows(MARK.len()).position(|window| window == MARK) {
-            answers.extend(hub.apply_next(&screen).unwrap_or_default());
-            rest = &rest[at + MARK.len()..];
+        for chunk in bytes.chunks(buf.len()) {
+            let delivered = self.read(&mut buf, chunk, *now);
+            stream.extend_from_slice(&delivered);
+            // The read loop decodes between a read and its parse.
+            self.hub.decode_pending();
+            for id in ids(&delivered) {
+                answers.extend(self.hub.apply(id, &screen).unwrap_or_default());
+            }
         }
-        (stream.clone(), answers)
+        (anonymous(stream), answers)
+    }
+
+    /// The loop's turn over one read of the PTY that gave `chunk`: the read
+    /// into `buf` and the reads of what did not fit, until none is left. The
+    /// stream it comes to (none for a read that only feeds a command still
+    /// arriving, which is `WouldBlock`).
+    fn read(&mut self, buf: &mut [u8], chunk: &[u8], now: Instant) -> Vec<u8> {
+        let env = self.env();
+        let queries = &mut self.queries;
+        turn(
+            &mut self.intake,
+            &self.hub,
+            buf,
+            chunk,
+            now,
+            env,
+            &mut |reply| queries.push(reply),
+        )
     }
 
     fn main_ids(&self) -> Vec<u32> {
@@ -200,7 +335,7 @@ fn a_raw_rgba_transmission_is_stored_and_acknowledged() {
     let mut rig = Rig::new();
     let pixels = rgba(2, 1, 1);
     let (stream, answers) = rig.run(&wire("a=t,f=32,s=2,v=1,i=7", &pixels));
-    assert_eq!(stream, MARK, "the command is replaced by the marker");
+    assert_eq!(stream, mark(), "the command is replaced by the marker");
     assert_eq!(answers, ok(7));
     assert_eq!(rig.pixels(7), Some(pixels));
     rig.hub.with_images(|images| {
@@ -342,7 +477,7 @@ fn a_chunked_transmission_is_one_image_whose_chunks_name_only_m() {
         wire_bytes.extend([ESC_G, control.as_bytes(), b";", piece, ST].concat());
     }
     let (stream, answers) = rig.run(&wire_bytes);
-    assert_eq!(stream, MARK, "the chunks make one marker, at the last");
+    assert_eq!(stream, mark(), "the chunks make one marker, at the last");
     assert_eq!(answers, ok(11), "one answer, after the last chunk");
     assert_eq!(rig.pixels(11), Some(pixels));
 }
@@ -374,10 +509,10 @@ fn nothing_is_applied_until_the_last_chunk_and_the_flag_says_so() {
         stream.is_empty(),
         "an unfinished transmission leaves no marker"
     );
-    assert!(rig.receiver.is_open());
+    assert!(rig.intake.receiver.is_open());
     assert!(rig.main_ids().is_empty());
     rig.run_at(&[ESC_G, b"m=0;AA==", ST].concat(), &mut now, &mut stream);
-    assert!(!rig.receiver.is_open());
+    assert!(!rig.intake.receiver.is_open());
     assert_eq!(rig.main_ids(), [1]);
 }
 
@@ -411,9 +546,9 @@ fn a_transmission_that_keeps_coming_is_not_one_that_waited_too_long() {
 fn a_command_that_names_its_action_ends_a_transmission_in_progress() {
     let mut rig = Rig::new();
     rig.run(&[ESC_G, b"a=t,f=32,s=1,v=1,i=1,m=1;AAAA", ST].concat());
-    assert!(rig.receiver.is_open());
+    assert!(rig.intake.receiver.is_open());
     rig.run(&wire("a=t,f=32,s=1,v=1,i=2", &[1, 2, 3, 4]));
-    assert!(!rig.receiver.is_open());
+    assert!(!rig.intake.receiver.is_open());
     assert_eq!(rig.main_ids(), [2]);
 }
 
@@ -525,7 +660,7 @@ fn invalid_base64_is_refused() {
 #[test]
 fn a_payload_past_the_limit_is_refused_without_keeping_it() {
     let mut rig = Rig::new();
-    rig.splitter = Splitter::new(8);
+    rig.intake.splitter = Splitter::new(8);
     let (_, answers) = rig.run(&wire("a=t,f=32,s=2,v=2,i=1", &rgba(2, 2, 0)));
     assert!(error_of(&answers).starts_with("\x1b_Gi=1;EFBIG:"));
     assert!(rig.main_ids().is_empty());
@@ -812,18 +947,18 @@ fn records_are_applied_in_the_order_they_were_queued() {
     ]
     .concat();
     let hub = &rig.hub;
-    let receiver = &mut rig.receiver;
-    rig.splitter.feed(&both, |piece| {
+    let receiver = &mut rig.intake.receiver;
+    rig.intake.splitter.feed(&both, |piece| {
         if let Piece::Command(apc) = piece {
-            receiver.receive(apc, now, ENV, &|_| None, |outcome| {
+            receiver.receive(apc, now, ENV, &|_| None, &|| false, |outcome| {
                 if let Outcome::Pending(pending) = outcome {
-                    hub.queue(pending);
-                    stream.extend_from_slice(MARK);
+                    hub.queue(1, pending);
+                    stream.extend_from_slice(&mark());
                 }
             });
         }
     });
-    assert_eq!(stream.len(), 2 * MARK.len());
+    assert_eq!(stream.len(), 2 * mark().len());
     assert!(hub.has_undecoded());
     hub.decode_pending();
     assert!(!hub.has_undecoded());
@@ -836,18 +971,11 @@ fn records_are_applied_in_the_order_they_were_queued() {
 /// Queues what `bytes` carry without decoding or applying anything, as a
 /// read does before the loop decodes.
 fn queue_only(rig: &mut Rig, bytes: &[u8]) {
+    let mut buf = vec![0u8; 1 << 20];
     let now = Instant::now();
-    let hub = &rig.hub;
-    let receiver = &mut rig.receiver;
-    rig.splitter.feed(bytes, |piece| {
-        if let Piece::Command(apc) = piece {
-            receiver.receive(apc, now, ENV, &|_| None, |outcome| {
-                if let Outcome::Pending(pending) = outcome {
-                    hub.queue(pending);
-                }
-            });
-        }
-    });
+    for chunk in bytes.chunks(buf.len()) {
+        rig.read(&mut buf, chunk, now);
+    }
 }
 
 #[test]
@@ -963,33 +1091,13 @@ fn the_open_flag_and_the_wait_for_it() {
     hub.set_open(false);
 }
 
-#[test]
-fn what_does_not_fit_the_readers_buffer_is_served_in_order_on_the_next_reads() {
-    let mut spill = Spill::default();
-    assert!(spill.is_empty());
-    spill.begin().extend_from_slice(b"0123456789");
-    assert_eq!(spill.rest(), b"0123456789");
-    let mut buf = [0u8; 4];
-    let mut got = Vec::new();
-    while !spill.is_empty() {
-        let n = spill.serve(&mut buf);
-        got.extend_from_slice(&buf[..n]);
-    }
-    assert_eq!(got, b"0123456789");
-    assert!(spill.rest().is_empty());
-    // A new separation starts from nothing, whatever was left.
-    spill.begin().extend_from_slice(b"abc");
-    spill.serve(&mut buf[..1]);
-    assert_eq!(spill.rest(), b"bc");
-    spill.begin().extend_from_slice(b"xyz");
-    assert_eq!(spill.rest(), b"xyz");
-}
-
 // ─── bytes ──────────────────────────────────────────────────────────────
 
 #[test]
 fn the_marker_is_a_dispatchable_private_mode() {
-    assert_eq!(MARK, format!("\x1b[?{MARK_MODE}h").as_bytes());
+    let base = ARG_BASE;
+    let expected = format!("\x1b[?{base};{base};{base};{base};{base};{MARK_MODE}h");
+    assert_eq!(mark(), expected.as_bytes());
 }
 
 #[test]
@@ -1023,6 +1131,7 @@ fn garbled_controls_never_reach_a_command() {
         Instant::now(),
         ENV,
         &|_| None,
+        &|| false,
         |_| seen += 1,
     );
     assert_eq!(seen, 0);
@@ -1046,7 +1155,7 @@ fn a_transmission_that_shows_places_the_image_at_the_cursor_and_moves_it() {
     let (stream, answers) = rig.run(&wire("a=T,f=32,s=20,v=40,i=1", &tile()));
     // One row down before the marker (the image is two rows tall), two
     // columns across after it.
-    assert_eq!(stream, [b"\x1bD".as_slice(), MARK, b"\x1b[2C"].concat());
+    assert_eq!(stream, marker(1, 2));
     assert_eq!(answers, ok(1));
     // At the marker the cursor is on the image's last row: the top is one up.
     assert_eq!(placed(&rig), [(1, 2, 5)]);
@@ -1057,7 +1166,7 @@ fn a_cursor_that_is_asked_to_stay_does_not_move() {
     let mut rig = Rig::new();
     rig.cursor = (3, 5);
     let (stream, _) = rig.run(&wire("a=T,f=32,s=20,v=40,i=1,C=1", &tile()));
-    assert_eq!(stream, MARK);
+    assert_eq!(stream, mark());
     assert_eq!(placed(&rig), [(1, 3, 5)]);
 }
 
@@ -1065,7 +1174,7 @@ fn a_cursor_that_is_asked_to_stay_does_not_move() {
 fn an_image_as_wide_as_the_screen_leaves_the_cursor_on_the_next_line() {
     let mut rig = Rig::new();
     let (stream, _) = rig.run(&wire("a=T,f=32,s=800,v=20,i=1,c=80,r=1", &rgba(800, 20, 0)));
-    assert_eq!(stream, [MARK, b"\x1bD\r"].concat());
+    assert_eq!(stream, wrapped(0));
 }
 
 #[test]
@@ -1080,7 +1189,7 @@ fn a_png_is_sized_from_its_header_without_decoding_it() {
         &rgba(30, 40, 3),
     );
     // 30 × 40 pixels are three columns by two rows.
-    let around = [b"\x1bD".as_slice(), MARK, b"\x1b[3C"].concat();
+    let around = marker(1, 3);
     let mut rig = Rig::new();
     let (stream, _) = rig.run(&wire("a=T,f=100,i=1", &png));
     assert_eq!(stream, around);
@@ -1115,7 +1224,7 @@ fn an_image_whose_size_cannot_be_told_leaves_the_cursor_alone() {
         "a=T,f=100,i=1",
         b"not a PNG, not even the start of one",
     ));
-    assert_eq!(stream, MARK);
+    assert_eq!(stream, mark());
     assert!(error_of(&answers).contains("EINVAL"));
     assert!(placed(&rig).is_empty());
 }
@@ -1127,16 +1236,16 @@ fn placing_a_stored_image_is_sized_from_the_store_or_from_the_command_before_it(
         wire("a=p,i=1,p=9", &[]),
     ]
     .concat();
-    let around = [b"\x1bD".as_slice(), MARK, b"\x1b[2C"].concat();
+    let around = marker(1, 2);
     // Both in one read: the image is still waiting for its marker.
     let mut rig = Rig::new();
     rig.cursor = (4, 0);
     let (stream, _) = rig.run(&both);
-    assert_eq!(stream, [MARK, &around].concat());
+    assert_eq!(stream, [&mark()[..], &around].concat());
     // The image was sent long ago, and the receiver has forgotten it.
     let mut rig = Rig::new();
     rig.run(&wire("a=t,f=32,s=20,v=40,i=1", &tile()));
-    rig.receiver = Receiver::new();
+    rig.intake.receiver = Receiver::new();
     let (stream, answers) = rig.run(&wire("a=p,i=1,p=9", &[]));
     assert_eq!(stream, around);
     assert_eq!(answers, b"\x1b_Gi=1,p=9;OK\x1b\\");
@@ -1146,7 +1255,7 @@ fn placing_a_stored_image_is_sized_from_the_store_or_from_the_command_before_it(
 fn placing_what_is_not_there_is_an_answer_and_moves_nothing() {
     let mut rig = Rig::new();
     let (stream, answers) = rig.run(&wire("a=p,i=9", &[]));
-    assert_eq!(stream, MARK);
+    assert_eq!(stream, mark());
     assert!(error_of(&answers).starts_with("\x1b_Gi=9;ENOENT:"));
     assert!(placed(&rig).is_empty());
 }
@@ -1422,8 +1531,7 @@ mod screenful {
     /// the reader's separation, the decoding, and a real grid behind the
     /// parser with the marker's handler.
     struct Screenful {
-        splitter: Splitter,
-        receiver: Receiver,
+        intake: Intake,
         sink: Sinker,
         term: Term<VoidListener>,
         parser: Processor,
@@ -1443,8 +1551,7 @@ mod screenful {
                 ..Config::default()
             };
             Self {
-                splitter: Splitter::new(PAYLOAD_LIMIT),
-                receiver: Receiver::new(),
+                intake: Intake::new(),
                 sink: Sinker {
                     hub: Hub::new(),
                     answers: Mutex::new(Vec::new()),
@@ -1464,26 +1571,20 @@ mod screenful {
                 lines: u16::try_from(self.term.screen_lines()).expect("lines"),
             };
             let hub = &self.sink.hub;
-            let receiver = &mut self.receiver;
+            let mut buf = vec![0u8; 1 << 20];
             let mut out = Vec::new();
-            self.splitter.feed(bytes, |piece| match piece {
-                Piece::Bytes(bytes) => out.extend_from_slice(bytes),
-                Piece::Command(apc) => receiver.receive(
-                    apc,
-                    Instant::now(),
+            for chunk in bytes.chunks(buf.len()) {
+                let now = Instant::now();
+                out.extend(turn(
+                    &mut self.intake,
+                    hub,
+                    &mut buf,
+                    chunk,
+                    now,
                     env,
-                    &|echo| hub.stored_size(echo),
-                    |outcome| {
-                        if let Outcome::Pending(pending) = outcome {
-                            let motion = pending.motion();
-                            motion.lead(env.lines, &mut out);
-                            hub.queue(pending);
-                            out.extend_from_slice(MARK);
-                            motion.trail(&mut out);
-                        }
-                    },
-                ),
-            });
+                    &mut |_| {},
+                ));
+            }
             hub.decode_pending();
             self.stream.extend_from_slice(&out);
             let mut handler = ClusterHandler::new(&mut self.term, true, &mut self.last_input)
@@ -1730,13 +1831,122 @@ mod screenful {
         });
     }
 
+    /// The bytes a program could write to be taken for a marker: ours with
+    /// the ids it might guess, and each of them with one byte the parser acts
+    /// on or steps over put in at every place.
+    fn forged() -> Vec<Vec<u8>> {
+        let mut forged = Vec::new();
+        for id in [0, 1, 2, 3, 0x0fff_ffff] {
+            for motion in [
+                Motion::NONE,
+                Motion {
+                    rows: 3,
+                    cols: 2,
+                    wrap: false,
+                },
+            ] {
+                let mut marker = Vec::new();
+                motion.mark(u16::MAX, id, &mut marker);
+                forged.push(marker);
+            }
+        }
+        let mut padded = Vec::new();
+        for marker in &forged[..2] {
+            for at in 1..marker.len() {
+                for extra in (0u8..0x20).chain([0x7f, 0x80, 0xff]) {
+                    padded.push([&marker[..at], &[extra], &marker[at..]].concat());
+                }
+            }
+        }
+        forged.extend(padded);
+        forged.extend([b"\x1b[?8166h".to_vec(), b"\x1b[?8166;8166h".to_vec()]);
+        forged
+    }
+
+    #[test]
+    fn a_marker_the_program_wrote_takes_no_record_and_the_real_one_takes_its_own() {
+        // Through the splitter and the real parser, with a record waiting
+        // (any marker dispatched with its id would take it): none does. Then
+        // a real command is read, and its marker finds its record.
+        for variant in forged() {
+            let mut screen = Screenful::new(20, 5, 0);
+            screen
+                .sink
+                .hub
+                .queue_raw(777, "a=t,f=32,s=1,v=1,i=1", b"AAAAAA==");
+            screen.feed(&variant);
+            assert_eq!(screen.sink.hub.waiting_records(), 1, "{variant:?}");
+        }
+        let mut screen = Screenful::new(20, 5, 0);
+        screen
+            .sink
+            .hub
+            .queue_raw(777, "a=t,f=32,s=1,v=1,i=1", b"AAAAAA==");
+        let mut own = Vec::new();
+        Motion::NONE.mark(5, 777, &mut own);
+        screen.feed(&own);
+        assert_eq!(screen.sink.hub.waiting_records(), 0, "a marker with its id");
+        screen.feed(&tile_command("a=T,f=32,s=20,v=40,i=2,C=1"));
+        assert_eq!(screen.placed(), [(2, 0, 0)]);
+    }
+
+    #[test]
+    fn a_marker_the_program_wrote_moves_the_cursor_by_no_more_than_a_screen() {
+        // Live, and in a replay with no sink: the same rows, no more than the
+        // screen has, whatever the marker says.
+        let mut marker = Vec::new();
+        Motion {
+            rows: u32::MAX,
+            cols: 0,
+            wrap: false,
+        }
+        .mark(u16::MAX, 9, &mut marker);
+        let mut screen = Screenful::new(20, 5, 100);
+        screen.feed(&marker);
+        assert_eq!(screen.cursor(), (4, 0));
+        assert!(screen.history() <= 5, "{} lines scrolled", screen.history());
+        let mut term = Term::new(Config::default(), &size(20, 5), VoidListener);
+        let mut parser: Processor = Processor::new();
+        let mut last_input = false;
+        parser.advance(
+            &mut ClusterHandler::new(&mut term, true, &mut last_input),
+            &marker,
+        );
+        assert_eq!(term.grid().cursor.point.line.0, 4);
+        assert!(term.history_size() <= 5);
+    }
+
+    #[test]
+    fn a_replay_with_no_command_to_apply_moves_the_cursor_all_the_same() {
+        // The journal's copy and a handover's replay have no sink: the
+        // marker applies nothing, and its movement is the stream's.
+        let mut term = Term::new(Config::default(), &size(20, 10), VoidListener);
+        let mut parser: Processor = Processor::new();
+        let mut last_input = false;
+        let mut run = |term: &mut Term<VoidListener>, bytes: &[u8]| {
+            parser.advance(&mut ClusterHandler::new(term, true, &mut last_input), bytes);
+            let point = term.grid().cursor.point;
+            (point.line.0, point.column.0)
+        };
+        let (line, column) = run(&mut term, &at(2, 2));
+        // One down and two right.
+        assert_eq!(run(&mut term, &marker(1, 2)), (line + 1, column + 2));
+        // An image as wide as the screen: down a line more, to its start.
+        assert_eq!(run(&mut term, &wrapped(0)), (line + 2, 0));
+        assert_eq!(
+            run(&mut term, &mark()),
+            (line + 2, 0),
+            "a plain marker stays"
+        );
+    }
+
     #[test]
     fn a_marker_a_program_wrote_itself_does_not_move_a_placement() {
         let mut screen = Screenful::new(20, 10, 100);
         screen.feed(&at(2, 2));
         screen.feed(&tile_command("a=T,f=32,s=20,v=40,i=1,C=1"));
-        screen.feed(MARK);
-        screen.feed(MARK);
+        screen.feed(&mark());
+        screen.feed(&mark());
         assert_eq!(screen.placed(), [(1, 2, 2)]);
     }
 
@@ -1903,7 +2113,7 @@ fn a_file_is_read_where_it_lies_and_left_there() {
     let file = Scratch::temp("bt-image", &pixels);
     let mut rig = Rig::new();
     let (stream, answers) = rig.run(&wire("a=t,t=f,f=32,s=2,v=1,i=7", file.name()));
-    assert_eq!(stream, MARK);
+    assert_eq!(stream, mark());
     assert_eq!(answers, ok(7));
     assert_eq!(rig.pixels(7), Some(pixels));
     assert!(file.exists(), "t=f does not delete");
@@ -1944,7 +2154,7 @@ fn rgb_zlib_and_png_come_out_of_a_file_as_they_do_out_of_the_stream() {
 }
 
 #[test]
-fn a_png_in_a_file_is_sized_from_its_header_like_one_in_the_stream() {
+fn a_named_png_moves_the_cursor_by_its_keys_and_never_by_its_file() {
     let png = png_file(
         30,
         40,
@@ -1954,21 +2164,54 @@ fn a_png_in_a_file_is_sized_from_its_header_like_one_in_the_stream() {
         None,
         &rgba(30, 40, 3),
     );
-    let around = [b"\x1bD".as_slice(), MARK, b"\x1b[3C"].concat();
+    // 30 × 40 pixels are three columns by two rows.
     for (name, medium) in [("bt-image", "f"), ("tty-graphics-protocol-image", "t")] {
         let file = Scratch::temp(name, &png);
         let mut rig = Rig::new();
-        let (stream, _) = rig.run(&wire(&format!("a=T,t={medium},f=100,i=1"), file.name()));
-        assert_eq!(stream, around, "t={medium}");
+        let (stream, _) = rig.run(&wire(
+            &format!("a=T,t={medium},f=100,s=30,v=40,i=1"),
+            file.name(),
+        ));
+        assert_eq!(stream, marker(1, 3), "t={medium}");
         assert_eq!(placed(&rig), [(1, -1, 0)], "t={medium}");
+        // The keys are the program's word and the file is not looked at: a
+        // wrong size moves the cursor by the wrong size.
+        let mut rig = Rig::new();
+        let (stream, _) = rig.run(&wire(
+            &format!("a=T,t={medium},f=100,s=10,v=20,i=1"),
+            file.name(),
+        ));
+        assert_eq!(stream, marker(0, 1), "t={medium}");
     }
-    // Compressed, and with the PNG not at the start of the file.
-    let mut padded = vec![0; 16];
-    padded.extend_from_slice(&zlib(&png));
-    let file = Scratch::temp("bt-image", &padded);
+    // Without them the cursor stays: the size is in the file, and the file is
+    // read long after the stream moved on.
+    let file = Scratch::temp("bt-image", &png);
     let mut rig = Rig::new();
-    let (stream, _) = rig.run(&wire("a=T,t=f,f=100,o=z,O=16,i=1", file.name()));
-    assert_eq!(stream, around);
+    let (stream, _) = rig.run(&wire("a=T,t=f,f=100,i=1", file.name()));
+    assert_eq!(stream, mark());
+    // And the file is not even opened to find out.
+    let temp = Scratch::temp("tty-graphics-protocol-image", &png);
+    queue_only(&mut rig, &wire("a=T,t=t,f=100,i=2", temp.name()));
+    assert!(temp.exists());
+}
+
+#[test]
+fn what_kitten_icat_sends_for_a_file_moves_the_cursor_by_the_size_it_says() {
+    // `kitten icat photo.png` as it goes out: the file, its kind and its size
+    // — for a PNG too — and nothing about the cursor.
+    let png = tall_png();
+    let file = Scratch::temp("bt-image", &png);
+    let mut rig = Rig::new();
+    let (stream, answers) = rig.run(&wire("a=T,t=f,f=100,s=30,v=40,i=7,q=2", file.name()));
+    assert_eq!(stream, marker(1, 3));
+    assert!(answers.is_empty(), "q=2 asked not to hear");
+    assert_eq!(rig.pixels(7), Some(rgba(30, 40, 3)));
+    assert!(file.exists());
+    // And through a temporary file it made for the occasion.
+    let temp = Scratch::temp("tty-graphics-protocol-icat", &png);
+    let (stream, _) = rig.run(&wire("a=T,t=t,f=100,s=30,v=40,i=8", temp.name()));
+    assert_eq!(stream, marker(1, 3));
+    assert!(!temp.exists());
 }
 
 #[test]
@@ -2038,6 +2281,42 @@ fn a_temporary_file_that_may_not_be_taken_is_refused_and_left_alone() {
 }
 
 #[test]
+fn what_a_name_comes_to_after_it_was_judged_is_judged_again() {
+    // A directory in the name is made a link to another one between the
+    // judging of the name and the open of it: what is opened is a file where
+    // a temporary file may not be, and the open handle says so. It is not
+    // read, and not deleted.
+    let dir = std::env::temp_dir().join(unique("tty-graphics-dir"));
+    std::fs::create_dir(&dir).expect("a directory");
+    let leaf = "tty-graphics-protocol-swapped";
+    std::fs::write(dir.join(leaf), rgba(1, 1, 1)).expect("a file");
+    let outside = Path::new(env!("CARGO_MANIFEST_DIR")).join(unique("bt-outside"));
+    std::fs::create_dir(&outside).expect("a directory");
+    std::fs::write(outside.join(leaf), rgba(1, 1, 2)).expect("a file");
+    let name = dir.join(leaf).as_os_str().as_bytes().to_vec();
+    let (moved, link, target) = (dir.with_extension("moved"), dir.clone(), outside.clone());
+    let swapping = name.clone();
+    source::on_open(Some(Box::new(move |named| {
+        if named == swapping {
+            let _ = std::fs::rename(&link, &moved);
+            let _ = std::os::unix::fs::symlink(&target, &link);
+        }
+    })));
+    let mut rig = Rig::new();
+    let (_, answers) = rig.run(&wire("a=t,t=t,f=32,s=1,v=1,i=1", &name));
+    source::on_open(None);
+    assert_eq!(answers, unreadable(1));
+    assert!(
+        outside.join(leaf).exists(),
+        "what the open handle was is deleted"
+    );
+    assert!(rig.main_ids().is_empty());
+    let _ = std::fs::remove_file(&dir);
+    let _ = std::fs::remove_dir_all(dir.with_extension("moved"));
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
 fn a_file_the_protocol_may_not_name_is_refused_before_it_is_opened() {
     let mut rig = Rig::new();
     let names: [&[u8]; 7] = [
@@ -2053,17 +2332,56 @@ fn a_file_the_protocol_may_not_name_is_refused_before_it_is_opened() {
         let (_, answers) = rig.run(&wire("a=t,t=f,f=32,s=1,v=1,i=1", name));
         assert_eq!(answers, unreadable(1), "{}", String::from_utf8_lossy(name));
     }
-    // A pipe is no file: opening it for reading would wait for a writer.
+    // A pipe is no file, and opening it frees a writer waiting for a reader:
+    // the writer here stays where it was.
     let fifo = std::env::temp_dir().join(unique("bt-fifo"));
     let c_path = CString::new(fifo.as_os_str().as_bytes()).expect("a path");
     // SAFETY: a NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let released = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (fifo, released) = (fifo.clone(), Arc::clone(&released));
+        std::thread::spawn(move || {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            released.store(true, Ordering::Release);
+        })
+    };
+    std::thread::sleep(Duration::from_millis(50));
     let (_, answers) = rig.run(&wire(
         "a=t,t=f,f=32,s=1,v=1,i=1",
         fifo.as_os_str().as_bytes(),
     ));
-    let _ = std::fs::remove_file(&fifo);
     assert_eq!(answers, unreadable(1));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!released.load(Ordering::Acquire), "the writer was let go");
+    // (Opened for reading, the pipe lets the writer go.)
+    let _reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo);
+    writer.join().expect("the writer");
+    let _ = std::fs::remove_file(&fifo);
+    // A descriptor of the terminal's own is no name for a file: the pipe
+    // keeps what was put in it, which nothing read.
+    let mut ends = [0; 2];
+    // SAFETY: `ends` has room for the two descriptors `pipe` writes.
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+    // SAFETY: the descriptors were just made and belong to these two files.
+    let (reader, mut writer) = unsafe {
+        (
+            std::fs::File::from_raw_fd(ends[0]),
+            std::fs::File::from_raw_fd(ends[1]),
+        )
+    };
+    std::io::Write::write_all(&mut writer, b"kept").expect("a pipe");
+    let name = format!("/dev/fd/{}", ends[0]);
+    let (_, answers) = rig.run(&wire("a=t,t=f,f=32,s=1,v=1,i=1", name.as_bytes()));
+    assert_eq!(answers, unreadable(1));
+    let mut kept = [0; 4];
+    // SAFETY: a read into a buffer of that size.
+    let got = unsafe { libc::read(ends[0], kept.as_mut_ptr().cast(), kept.len()) };
+    assert_eq!((got, &kept), (4, b"kept"), "something read the pipe");
+    drop((reader, writer));
     // A directory is no file either.
     let (_, answers) = rig.run(&wire(
         "a=t,t=f,f=32,s=1,v=1,i=1",
@@ -2117,7 +2435,7 @@ fn a_name_is_whole_in_its_command_and_m_does_not_wait_for_more() {
     let mut rig = Rig::new();
     let (_, answers) = rig.run(&wire("a=t,t=f,f=32,s=1,v=1,m=1,i=2", file.name()));
     assert_eq!(answers, ok(2));
-    assert!(!rig.receiver.is_open());
+    assert!(!rig.intake.receiver.is_open());
 }
 
 #[test]
@@ -2139,7 +2457,7 @@ fn shared_memory_is_read_and_removed() {
     let object = Object::new(&pixels);
     let mut rig = Rig::new();
     let (stream, answers) = rig.run(&wire("a=t,t=s,f=32,s=2,v=1,i=4", object.name()));
-    assert_eq!(stream, MARK);
+    assert_eq!(stream, mark());
     assert_eq!(answers, ok(4));
     assert_eq!(rig.pixels(4), Some(pixels));
     assert!(!object.exists(), "t=s removes the object once it is read");
@@ -2182,7 +2500,7 @@ fn a_query_that_names_its_pixels_is_answered_at_its_marker_and_keeps_nothing() {
     let mut rig = Rig::new();
     let plain = Scratch::temp("bt-image", &[1, 2, 3]);
     let (stream, answers) = rig.run(&wire("i=9,a=q,t=f,f=24,s=1,v=1", plain.name()));
-    assert_eq!(stream, MARK, "it waits for its place in the stream");
+    assert_eq!(stream, mark(), "it waits for its place in the stream");
     assert_eq!(answers, ok(9));
     assert!(plain.exists());
     let temp = Scratch::temp("tty-graphics-protocol-image", &[1, 2, 3]);
@@ -2229,5 +2547,252 @@ fn whatever_is_wrong_with_a_named_file_is_one_answer() {
         let (_, answers) = rig.run(&wire(control, name));
         assert_eq!(answers, unreadable(1), "{control}");
     }
+    assert!(rig.main_ids().is_empty());
+}
+
+// ─── what a read becomes ────────────────────────────────────────────────
+
+/// A 30 × 40 pixel PNG: three columns and two rows at the test cell size.
+fn tall_png() -> Vec<u8> {
+    png_file(
+        30,
+        40,
+        png::ColorType::Rgba,
+        png::BitDepth::Eight,
+        None,
+        None,
+        &rgba(30, 40, 3),
+    )
+}
+
+#[test]
+fn a_named_images_size_is_remembered_for_the_placement_that_follows_it() {
+    // `a=p` of an image whose pixels a file held, in the same read: the size
+    // the keys gave.
+    let file = Scratch::temp("bt-image", &tall_png());
+    let mut rig = Rig::new();
+    let input = [
+        wire("a=T,t=f,f=100,s=30,v=40,i=1,C=1", file.name()),
+        wire("a=p,i=1", &[]),
+    ]
+    .concat();
+    let (stream, _) = rig.run(&input);
+    // The first leaves the cursor; the second moves it by the size.
+    assert_eq!(stream, [mark(), marker(1, 3)].concat());
+}
+
+#[test]
+fn a_read_of_many_small_commands_is_read_to_its_end_whatever_the_buffer() {
+    // The stream grows: `ESC _ G a=p,i=1 ESC \` is twelve bytes and its marker
+    // is 38. A read is offered the whole buffer, so what it comes to may not
+    // fit: the rest is the next thing the read side returns, before the PTY
+    // is read again, and the loop's turn does not end without it.
+    let mut input = wire("a=t,f=32,s=30,v=40,i=1", &tile_30x40());
+    // Shortest commands that carry a movement (a known image placed), the
+    // shortest that carry none, and a transmission whose answer is a marker.
+    let movers = wire("a=p,i=1", &[]);
+    let stayers = [ESC_G, b"a=d", ST].concat();
+    let bare = [ESC_G, ST].concat();
+    for at in 0..300 {
+        input.extend_from_slice(match at % 3 {
+            0 => &movers,
+            1 => &stayers,
+            _ => &bare,
+        });
+        input.push(b"x\x1b"[at % 2]);
+    }
+    // What a buffer too big to need it makes of the same read.
+    let mut whole = Rig::new();
+    let mut big = vec![0u8; 1 << 20];
+    let raw = whole.read(&mut big, &input, Instant::now());
+    let reference = anonymous(&raw);
+    assert!(markers(&reference) > 250, "{} markers", markers(&reference));
+    // Each command has an id of its own, and none has the id a marker with
+    // no command has.
+    let mut all = ids(&raw);
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), markers(&raw));
+    assert!(!all.contains(&0));
+    for room in [mark().len(), 64, 257, 4096] {
+        let mut rig = Rig::new();
+        let mut buf = vec![0u8; room];
+        let got = rig.read(&mut buf, &input, Instant::now());
+        // Nothing was dropped on the way, and nothing is out of order.
+        assert_eq!(anonymous(&got), reference, "room {room}");
+        assert!(!rig.hub.backlog(), "room {room}: stream left behind");
+    }
+}
+
+#[test]
+fn a_command_becomes_at_most_two_markers() {
+    // A command is one marker, or none, and two when it ended a chunked
+    // transmission that had run out of time (a failure) and has its own.
+    let mut rig = Rig::new();
+    rig.run(&wire("a=t,f=32,s=30,v=40,i=1", &tile_30x40()));
+    let mut stream = Vec::new();
+    let mut now = Instant::now();
+    rig.run_at(
+        &[ESC_G, b"a=t,f=32,s=1,v=1,i=6,m=1;AAAA", ST].concat(),
+        &mut now,
+        &mut stream,
+    );
+    let before = stream.len();
+    now += OPEN_TIMEOUT + Duration::from_secs(1);
+    // A placement with the biggest numbers a marker has: down a screen's worth
+    // and, as wide as 9000 cells are, to the start of the next line.
+    rig.run_at(&wire("a=p,i=1,c=9000,r=500", &[]), &mut now, &mut stream);
+    assert_eq!(markers(&stream[before..]), 2);
+    assert_eq!(stream.len() - before, 2 * mark().len());
+    // Everything else a command can do ends in one marker, or none.
+    for control in [
+        "a=p,i=1,c=9000,r=500",
+        "a=T,f=32,s=1,v=1,i=2,c=9000,r=500",
+        "a=d",
+        "a=f,i=1",
+        "garbage",
+        "a=p,i=999",
+    ] {
+        let mut rig = Rig::new();
+        rig.run(&wire("a=t,f=32,s=30,v=40,i=1", &tile_30x40()));
+        let mut stream = Vec::new();
+        rig.run_at(
+            &wire(control, &rgba(1, 1, 0)),
+            &mut Instant::now(),
+            &mut stream,
+        );
+        assert!(markers(&stream) <= 1, "{control}");
+        assert!(stream.len() <= mark().len(), "{control}: {}", stream.len());
+    }
+}
+
+#[test]
+fn a_record_whose_marker_was_lost_does_not_hold_back_the_ones_behind_it() {
+    let rig = Rig::new();
+    rig.hub.queue_raw(5, "a=t,f=32,s=1,v=1,i=1", b"AAAAAA==");
+    rig.hub.queue_raw(6, "a=t,f=32,s=1,v=1,i=2", b"AAAAAA==");
+    rig.hub.queue_raw(7, "a=t,f=32,s=1,v=1,i=3", b"AAAAAA==");
+    rig.hub.decode_pending();
+    let screen = Screen::blank(false);
+    assert_eq!(rig.hub.apply(0, &screen), None, "no record has the id 0");
+    assert_eq!(rig.hub.waiting_records(), 3);
+    // The marker of 5 never came: 6's takes the way, and 5 is dropped.
+    assert_eq!(rig.hub.apply(6, &screen), Some(ok(2)));
+    assert_eq!(rig.hub.waiting_records(), 1);
+    assert_eq!(rig.hub.apply(5, &screen), None);
+    assert_eq!(rig.hub.apply(7, &screen), Some(ok(3)));
+    assert_eq!(rig.main_ids(), [2, 3]);
+}
+
+#[test]
+fn a_named_png_with_cells_and_no_size_moves_the_cursor_by_the_cells() {
+    let file = Scratch::temp("bt-image", &tall_png());
+    let mut rig = Rig::new();
+    let (stream, _) = rig.run(&wire("a=T,t=f,f=100,c=20,r=5,i=1", file.name()));
+    assert_eq!(stream, marker(4, 20));
+    // A placement of it later is made from the store, which has the size by
+    // then (the read that sent it had none to remember).
+    let (stream, _) = rig.run(&wire("a=p,i=1", &[]));
+    assert_eq!(stream, marker(1, 3));
+}
+
+fn tile_30x40() -> Vec<u8> {
+    rgba(30, 40, 3)
+}
+
+// ─── a remote session ───────────────────────────────────────────────────
+
+/// A rig, and the flag that makes its pane remote.
+fn remote_rig() -> (Rig, Arc<AtomicBool>) {
+    let rig = Rig::new();
+    let remote = Arc::clone(&rig.remote);
+    (rig, remote)
+}
+
+#[test]
+fn in_a_remote_session_a_name_is_refused_without_touching_what_it_names() {
+    let (mut rig, remote) = remote_rig();
+    remote.store(true, Ordering::Release);
+    let plain = Scratch::temp("bt-image", &rgba(1, 1, 1));
+    let temp = Scratch::temp("tty-graphics-protocol-image", &rgba(1, 1, 1));
+    let object = Object::new(&rgba(1, 1, 1));
+    let png = Scratch::temp("bt-image", &tall_png());
+    for (control, name) in [
+        ("a=t,t=f,f=32,s=1,v=1,i=1", plain.name()),
+        ("a=t,t=t,f=32,s=1,v=1,i=1", temp.name()),
+        ("a=t,t=s,f=32,s=1,v=1,i=1", object.name()),
+        // And one that would move the cursor.
+        ("a=T,t=f,f=100,s=30,v=40,i=1", png.name()),
+    ] {
+        let (stream, answers) = rig.run(&wire(control, name));
+        assert_eq!(answers, unreadable(1), "{control}");
+        // Nothing moves: a refused command is only its marker.
+        assert_eq!(stream, mark(), "{control}");
+    }
+    // A query is answered where it is read, as every query with its pixels
+    // in the sequence is.
+    for (control, name) in [
+        ("i=1,a=q,t=f,f=32,s=1,v=1", plain.name()),
+        ("i=1,a=q,t=t,f=32,s=1,v=1", temp.name()),
+        ("i=1,a=q,t=s,f=32,s=1,v=1", object.name()),
+    ] {
+        rig.queries.clear();
+        let (stream, answers) = rig.run(&wire(control, name));
+        assert!(stream.is_empty() && answers.is_empty(), "{control}");
+        assert_eq!(rig.queries, [unreadable(1)], "{control}");
+    }
+    assert!(plain.exists() && temp.exists() && png.exists());
+    assert!(object.exists(), "shared memory is left alone too");
+    assert!(rig.main_ids().is_empty());
+    // What the pane's own program sends in the sequence is its own.
+    let (_, answers) = rig.run(&wire("a=t,f=32,s=1,v=1,i=2", &rgba(1, 1, 1)));
+    assert_eq!(answers, ok(2));
+    // And the session ending is the end of the refusal.
+    remote.store(false, Ordering::Release);
+    let (_, answers) = rig.run(&wire("a=t,t=f,f=32,s=1,v=1,i=3", plain.name()));
+    assert_eq!(answers, ok(3));
+}
+
+#[test]
+fn a_session_that_ended_before_the_decode_still_refuses_what_was_read_in_it() {
+    // The scanner has acted on the whole of a read before the decode runs: a
+    // `D` and a prompt in it end the remote session, and the name a program
+    // there sent in the same read would be read here, as local. The state at
+    // the point of the stream is what counts.
+    let (mut rig, remote) = remote_rig();
+    let temp = Scratch::temp("tty-graphics-protocol-image", &rgba(1, 1, 1));
+    remote.store(true, Ordering::Release);
+    queue_only(&mut rig, &wire("a=t,t=t,f=32,s=1,v=1,i=1", temp.name()));
+    // What the stream says next ends the session; the record is already
+    // what it will be.
+    remote.store(false, Ordering::Release);
+    rig.hub.decode_pending();
+    let answers = rig.hub.apply_next(&rig.screen()).unwrap_or_default();
+    assert_eq!(answers, unreadable(1));
+    assert!(temp.exists());
+}
+
+#[test]
+fn a_remote_session_found_while_a_command_waits_refuses_that_command_too() {
+    // The probe that finds a session remote runs apart from the stream: a
+    // command read just before it is decoded just after, and must not be read.
+    let (mut rig, remote) = remote_rig();
+    let temp = Scratch::temp("tty-graphics-protocol-image", &rgba(1, 1, 1));
+    let png = Scratch::temp("bt-image", &tall_png());
+    queue_only(&mut rig, &wire("a=t,t=t,f=32,s=1,v=1,i=1", temp.name()));
+    queue_only(&mut rig, &wire("i=2,a=q,t=f,f=32,s=1,v=1", png.name()));
+    assert!(rig.hub.has_undecoded());
+    remote.store(true, Ordering::Release);
+    rig.hub.decode_pending();
+    let screen = rig.screen();
+    assert_eq!(
+        rig.hub.apply_next(&screen).unwrap_or_default(),
+        unreadable(1)
+    );
+    assert_eq!(
+        rig.hub.apply_next(&screen).unwrap_or_default(),
+        unreadable(2)
+    );
+    assert!(temp.exists() && png.exists(), "neither was opened");
     assert!(rig.main_ids().is_empty());
 }

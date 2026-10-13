@@ -29,10 +29,19 @@
 //!
 //! **The graphics marker is dispatched here.** The reader takes a kitty
 //! graphics command out of the byte stream and leaves a marker (a private
-//! mode `set`, [`crate::graphics::MARK`]) in its place; this wrapper catches
-//! it before `Term` sees it and applies the oldest queued command to the
-//! screen showing at that point of the stream, anchoring a placement at the
-//! cursor. A move to or from the alternate screen drops what that screen's
+//! mode `set`, [`MARK_MODE`], with the cursor's movement and the command's id
+//! as arguments) in its place; this wrapper catches it before `Term` sees it
+//! and applies the queued command with that id to the screen showing at that
+//! point of the stream, anchoring a placement at the cursor. The arguments
+//! are private modes of their own that come before it in the same sequence
+//! ([`Motion::mark`]); they are held until it arrives, and the wrapper moves
+//! the cursor down, applies the command and moves it right, so the movement
+//! is in the stream — and a replay of the stream, with no command to apply,
+//! moves the cursor the same way. A program can write a marker of its own:
+//! it names no command (the ids are random, and kept from it), so the cursor
+//! moves, as it could with a cursor movement, and nothing else happens (before
+//! graphics the sequence did nothing at all). A
+//! move to or from the alternate screen drops what that screen's
 //! store holds; a clear of the screen (`CSI 2 J`, `CSI 3 J`) and a reset
 //! delete the placements in stream order, before the rows move. Without a
 //! [`Sink`] (a replay, a snapshot) the marker is read and does nothing.
@@ -66,7 +75,7 @@ use alacritty_terminal::vte::ansi::{
 // `Cargo.toml`.
 use cursor_icon::CursorIcon;
 
-use crate::graphics::{MARK_MODE, Sink, screen_of};
+use crate::graphics::{ARG_BASE, MARK_MODE, Motion, Sink, screen_of};
 use crate::input::PIXEL_MOUSE_MODE;
 
 /// The `Handler` the parser sees: it borrows `Term` and forwards calls to
@@ -90,6 +99,11 @@ pub(crate) struct ClusterHandler<'a, U: EventListener> {
     /// no flag to keep: the mode is read and does nothing, as the graphics
     /// marker does without a [`Sink`].
     pixels: Option<&'a AtomicBool>,
+    /// The last five arguments of a marker seen so far (the cursor's movement
+    /// and the command's id), which the marker itself ([`MARK_MODE`]) turns
+    /// into the movement and the record to apply. A sequence is dispatched
+    /// whole by one `advance`, so they do not outlive this value.
+    marker_args: [u16; 5],
 }
 
 impl<'a, U: EventListener> ClusterHandler<'a, U> {
@@ -100,6 +114,7 @@ impl<'a, U: EventListener> ClusterHandler<'a, U> {
             last_input,
             graphics: None,
             pixels: None,
+            marker_args: [0; 5],
         }
     }
 
@@ -124,23 +139,46 @@ impl<'a, U: EventListener> ClusterHandler<'a, U> {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
-    /// The graphics marker was dispatched: the oldest queued command takes
-    /// effect here, on the screen showing at this point of the stream.
-    fn graphics_mark(&mut self) {
+    /// The graphics marker was dispatched: the queued command with `id` takes
+    /// effect here, on the screen showing at this point of the stream, between
+    /// the two halves of the cursor's `motion` (down first, so that the cursor
+    /// is on the image's last row where the placement is anchored; right
+    /// after). The movement is made whatever the id: a stream with no sink
+    /// moves the cursor all the same, and so does a marker that names no
+    /// command. No more than a screen's worth of rows, as the reader writes.
+    fn graphics_mark(&mut self, motion: Motion, id: u32) {
         *self.last_input = false;
-        let Some(graphics) = self.graphics else {
-            return;
-        };
-        let (hub, cell) = (graphics.hub(), graphics.cell());
-        // The placements already here are brought to the grid as it is now
-        // before a new one is anchored in it.
-        hub.look(&*self.term, cell);
-        let screen = screen_of(&*self.term, cell);
-        let reply = hub.apply_next(&screen);
-        hub.settle(&*self.term);
-        if let Some(reply) = reply {
-            graphics.reply(reply);
+        let screen_lines = u32::try_from(self.term.screen_lines()).unwrap_or(u32::MAX);
+        for _ in 0..motion.rows.min(screen_lines) {
+            self.term.linefeed();
         }
+        if let Some(graphics) = self.graphics {
+            let (hub, cell) = (graphics.hub(), graphics.cell());
+            // The placements already here are brought to the grid as it is
+            // now before a new one is anchored in it.
+            hub.look(&*self.term, cell);
+            let screen = screen_of(&*self.term, cell);
+            let reply = hub.apply(id, &screen);
+            hub.settle(&*self.term);
+            if let Some(reply) = reply {
+                graphics.reply(reply);
+            }
+        }
+        if motion.wrap {
+            self.term.linefeed();
+            self.term.carriage_return();
+        } else if motion.cols > 0 {
+            self.term
+                .move_forward(usize::try_from(motion.cols).unwrap_or(usize::MAX));
+        }
+    }
+
+    /// A private mode number in the range of the marker's arguments: kept,
+    /// the oldest forgotten.
+    fn marker_arg(&mut self, value: u16) {
+        *self.last_input = false;
+        self.marker_args.rotate_left(1);
+        self.marker_args[4] = value;
     }
 
     /// DECSET/DECRST 1016: the pointer reports turn to pixels or back.
@@ -339,8 +377,19 @@ impl<U: EventListener> Handler for ClusterHandler<'_, U> {
     }
 
     fn set_private_mode(&mut self, mode: PrivateMode) {
-        if mode == PrivateMode::Unknown(MARK_MODE) {
-            return self.graphics_mark();
+        if let PrivateMode::Unknown(number) = mode {
+            if number == MARK_MODE {
+                let (motion, id) = Motion::from_marker(std::mem::take(&mut self.marker_args));
+                return self.graphics_mark(motion, id);
+            }
+            // The marker's arguments are modes of their own that the marker
+            // names after them; a program's own setting of such a number goes
+            // on to `Term` (which knows no such mode) like any other.
+            if let Some(value) = number.checked_sub(ARG_BASE)
+                && value < ARG_BASE
+            {
+                self.marker_arg(value);
+            }
         }
         if mode == PrivateMode::Unknown(PIXEL_MOUSE_MODE) {
             return self.pixel_mouse_mode(true);
