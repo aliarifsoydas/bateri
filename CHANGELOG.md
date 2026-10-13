@@ -21,8 +21,9 @@ of every installed copy. A version without a section is not released.
   are in come with it, and the `ssh` integration reaches servers from fish
   too. Nothing is written to your fish files. To keep your own fish prompt, set
   `[shell] integration = "blocks"`: the command blocks stay and the dock
-  goes. Selecting text in the dock and typing over it does not work in fish
-  yet.
+  goes. With fish 4.1 or newer, clicking in the dock moves the caret there,
+  as it does in zsh; selecting text in the dock and typing over it does not
+  work in fish yet.
 - **Resize in steps.** A new setting, Resize in steps (`[appearance]
   resize_in_steps`, off by default), resizes a window a whole cell at a time
   while you drag its edge, as Terminal does: a tab with one pane then keeps

@@ -1284,6 +1284,12 @@ pub struct Blocks {
     /// published to the shell ledger after it is released, so the buffer is
     /// here — it keeps its capacity across frames like [`Self::input`].
     line: DockState,
+    /// Where each character of [`Self::line`] was drawn
+    /// ([`grid_input::read`]); published with it.
+    line_cells: Vec<grid_input::GridPos>,
+    /// The block [`Self::line`] was read for: publishing it asks whether that
+    /// is still the open one.
+    line_block: u32,
     /// Whether [`Self::line`] was read in this frame.
     line_read: bool,
 }
@@ -5731,8 +5737,12 @@ impl Session {
             });
         if let Some(found) = grid_found {
             blocks.line.cluster = blocks.input_cluster;
-            grid_input::read(&term, found, cursor_point, colors, &theme, &mut blocks.line);
+            let Blocks {
+                line, line_cells, ..
+            } = &mut *blocks;
+            grid_input::read(&term, found, cursor_point, colors, &theme, line, line_cells);
             blocks.line_read = true;
+            blocks.line_block = suppressed_block.map_or(0, |input| input.block);
         }
         let grid_hidden = grid_found
             .filter(|_| (0..rows).contains(&cursor_row))
@@ -6781,9 +6791,14 @@ impl Session {
         if blocks.line_read {
             let answers = self.key_gen.load(Ordering::Acquire);
             let mut log = lock(&self.shell);
-            if log.publish_grid(&blocks.line, answers) {
+            if log.publish_grid(&blocks.line, &blocks.line_cells, blocks.line_block, answers) {
                 cursor.input_rows = input_rows_of(dock::needed_rows(&log.dock, budget.cols));
             }
+        } else if suppressed_block.is_some_and(|input| input.grid) {
+            // The line could not be found this frame (its anchor is out of reach, the
+            // alternate screen is up): the places of the last one are not where it
+            // is now, and a click must not use them.
+            lock(&self.shell).dock_cells.clear();
         }
         // **The stale hover drops here**, after the `Term` lock (a leaf lock does
         // not go under it), and only if the slot still holds the copy this frame
@@ -8972,8 +8987,13 @@ impl Session {
     /// If the caret is already there **nothing is sent**: it would advance the
     /// input generation for nothing and the gate would wait for the next edit
     /// until its answer comes.
+    ///
+    /// A shell that does not mirror its line (fish) has no widget to command;
+    /// if it announced mouse clicks at this prompt the same click is **its**
+    /// click ([`Session::click_grid_line`]).
     pub fn dock_click(&self) {
         let Some(line) = self.dock_edit_line() else {
+            self.click_grid_line();
             return;
         };
         // A click falling on `PREBUFFER` does not move the caret: ZLE accepted
@@ -8988,6 +9008,31 @@ impl Session {
         if index != line.caret {
             self.send_dock_edit(&line, index, index);
         }
+    }
+
+    /// A click in the dock on a line the shell owns and the terminal only reads
+    /// ([`ShellLog::grid_click`]): the shell is clicked where that character
+    /// was drawn on the grid, as an SGR press and release of the left button,
+    /// and moves its own caret — the dock follows when the grid shows it.
+    ///
+    /// The row is the **screen's**, not the window's: the shell addresses the
+    /// live screen whatever the user has scrolled to, and a send returns the
+    /// view to the bottom ([`Session::send_input`]) like any typed key.
+    /// Nothing is sent if the caret is already there.
+    fn click_grid_line(&self) {
+        let Some(place) = lock(&self.shell).grid_click() else {
+            return;
+        };
+        let encoding = MouseEncoding::Sgr;
+        let button = input::button_byte(MouseButton::Left, MouseModifiers::default());
+        let (col, row) = (place.col, u16::try_from(place.line).unwrap_or(u16::MAX));
+        let mut bytes = Vec::new();
+        for pressed in [true, false] {
+            bytes.extend(
+                input::mouse_report(encoding, button, pressed, col, row).unwrap_or_default(),
+            );
+        }
+        self.write_owned(bytes);
     }
 
     /// The terminal's counterpart of a key while there is a dock selection;
@@ -13257,7 +13302,10 @@ mod tests {
         let session = Session::spawn(options, Arc::clone(&wake) as Arc<dyn Wake>).unwrap();
         {
             let mut log = lock(&session.shell);
-            log.apply(crate::shell::Mark::PromptStart { id: Some(1) });
+            log.apply(crate::shell::Mark::PromptStart {
+                id: Some(1),
+                click_events: false,
+            });
             log.apply(crate::shell::Mark::PromptEnd);
             log.dock.status = DockStatus::Live;
             log.dock.insert_keymap = true;
@@ -14087,7 +14135,10 @@ mod tests {
         {
             use crate::shell::{DockEvent, Mark, ScanEvent};
             let mut log = lock(&session.shell);
-            log.apply_scan(ScanEvent::Mark(Mark::PromptStart { id: None }));
+            log.apply_scan(ScanEvent::Mark(Mark::PromptStart {
+                id: None,
+                click_events: false,
+            }));
             log.apply_scan(ScanEvent::Mark(Mark::PromptEnd));
             log.apply_scan(ScanEvent::Dock(DockEvent::End));
         }
@@ -15066,6 +15117,258 @@ mod tests {
         assert_eq!(line.buffer, "\u{1F44D}\u{1F3FD}");
         assert!(line.cluster);
         assert_eq!(line.cursor, 2);
+        session.shutdown();
+    }
+
+    /// The places the grid-sourced line was drawn at, as the dock's click reads them.
+    fn line_places(session: &Session) -> Vec<(i32, u16)> {
+        lock(&session.shell)
+            .dock_cells
+            .iter()
+            .map(|place| (place.line, place.col))
+            .collect()
+    }
+
+    #[test]
+    fn a_grid_line_keeps_the_place_of_every_character() {
+        // One place per character and one after the last, in grid lines and columns:
+        // the text starts at the third column of the prompt's line.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_grid_session(&format!("{}git start", grid_prompt(2)), wake);
+        wait_grid_line(&session, "the line was not read", |state| {
+            state.buffer == "git start"
+        });
+        let expected: Vec<(i32, u16)> = (2..=11).map(|col| (2, col)).collect();
+        assert_eq!(line_places(&session), expected);
+        session.shutdown();
+
+        // A wrapped line goes on at the next line's first column, and the place after the
+        // last character is just past it.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_grid_session(&format!("{}{}", grid_prompt(2), "a".repeat(45)), wake);
+        wait_grid_line(&session, "the line was not read", |state| {
+            state.display_chars == 45
+        });
+        let places = line_places(&session);
+        assert_eq!(places.len(), 46);
+        assert_eq!(
+            (places[0], places[37], places[38], places[44], places[45]),
+            ((2, 2), (2, 39), (3, 0), (3, 6), (3, 7))
+        );
+        session.shutdown();
+
+        // A hard line break is a character too, placed where its row ends.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_grid_session(&format!("{}echo a\r\nb", grid_prompt(2)), wake);
+        wait_grid_line(&session, "the line was not read", |state| {
+            state.buffer == "echo a\nb"
+        });
+        let places = line_places(&session);
+        assert_eq!(places.len(), 9, "{places:?}");
+        assert_eq!(
+            (places[5], places[6], places[7], places[8]),
+            ((2, 7), (2, 8), (3, 0), (3, 1))
+        );
+        session.shutdown();
+
+        // A cluster's code points share their cell; a wide character's end place is past
+        // both its columns.
+        let wake = Arc::new(TestWake::default());
+        let mut options = test_options(
+            sh(&format!(
+                "printf '{}cmd1{}{}\u{1F44D}\u{1F3FD}'; sleep 5",
+                anchored_prompt(1),
+                ran(1, 0, "out"),
+                grid_prompt(2),
+            )),
+            40,
+        );
+        options.dock = true;
+        options.cluster = true;
+        let session = Session::spawn(options, wake).unwrap();
+        wait_grid_line(&session, "the line was not read", |state| {
+            state.display_chars == 2
+        });
+        assert_eq!(line_places(&session), [(2, 2), (2, 2), (2, 4)]);
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_places_of_a_line_that_cannot_be_found_are_not_kept() {
+        // The alternate screen comes up over the prompt: the frame cannot find the line,
+        // and the places of the last frame that could are not where anything is now.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_grid_session(
+            &format!("{}ab'; sleep 0.5; printf '\\033[?1049h", grid_prompt(2)),
+            wake,
+        );
+        wait_grid_line(&session, "the line was not read", |state| {
+            state.buffer == "ab"
+        });
+        assert_eq!(line_places(&session).len(), 3);
+        wait_until(
+            "the places outlived the line",
+            Duration::from_secs(5),
+            || {
+                wait_settled(&session);
+                line_places(&session).is_empty()
+            },
+        );
+        session.shutdown();
+    }
+
+    /// A fish dock whose child dumps the first `count` bytes it is sent into `sent` (raw, no
+    /// echo): the line `git sta` with the suggestion `rt`, the caret after `sta`. The shell
+    /// announces clicks at this prompt (`click_events=1` on its own `A`) if `announce`.
+    fn spawn_clickable_grid_session(
+        announce: bool,
+        count: usize,
+        sent: &std::path::Path,
+    ) -> Session {
+        let announced = if announce {
+            "\\033]133;A;click_events=1\\007"
+        } else {
+            ""
+        };
+        spawn_docked_session(
+            &format!(
+                "stty raw -echo; printf '{}cmd1{}\\033]133;A;bt_block=2\\007{announced}{}\
+                 git sta\\033[90mrt\\033[m\\033[2D'; dd bs=1 count={count} of={} 2>/dev/null; \
+                 sleep 5",
+                anchored_prompt(1),
+                ran(1, 0, "out"),
+                grid_repaint(2),
+                sent.display(),
+            ),
+            Arc::new(TestWake::default()),
+        )
+    }
+
+    /// Clicks the dock before the character at `index` of `git sta`.
+    fn click_dock_at(session: &Session, index: u16) {
+        draw_dock(session);
+        session.dock_select(SelectKind::Simple, dock_point(index, CellHalf::Left));
+        session.dock_click();
+    }
+
+    #[test]
+    fn a_click_in_the_dock_clicks_the_shell_where_the_character_was_drawn() {
+        let home = empty_home("grid-click");
+        let sent = home.join("sent");
+        let session = spawn_clickable_grid_session(true, 18, &sent);
+        wait_grid_line(&session, "the line was not read", |state| {
+            state.status == DockStatus::Live && state.buffer == "git sta"
+        });
+        // `dd` creates the file when it starts reading: from then on a click would reach it.
+        wait_until(
+            "the child did not start reading",
+            Duration::from_secs(5),
+            || sent.exists(),
+        );
+        let generation = session.key_gen.load(Ordering::Acquire);
+
+        // The caret is where it already is: nothing is sent, and the generation does not
+        // move for a click that did nothing.
+        click_dock_at(&session, 7);
+        // A click on the suggestion is the end of what was typed: the same.
+        click_dock_at(&session, 8);
+        assert_eq!(session.key_gen.load(Ordering::Acquire), generation);
+        assert!(std::fs::read(&sent).is_ok_and(|bytes| bytes.is_empty()));
+
+        // Before `s`: the cell it was drawn in (line 2, column 6; the report is 1-based),
+        // pressed and released with the left button.
+        click_dock_at(&session, 4);
+        wait_until("the click was not sent", Duration::from_secs(5), || {
+            std::fs::read(&sent).is_ok_and(|bytes| bytes.len() == 18)
+        });
+        assert_eq!(
+            std::fs::read(&sent).unwrap(),
+            b"\x1b[<0;7;3M\x1b[<0;7;3m",
+            "the press and release at the character's cell"
+        );
+        assert_eq!(session.key_gen.load(Ordering::Acquire), generation + 1);
+        // The click is user input: it dropped the selection the press made.
+        assert_eq!(lock(&session.shell).dock_selection, None);
+        session.shutdown();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_click_in_the_dock_sends_nothing_to_a_shell_that_did_not_announce_it() {
+        // fish 3, a prompt that never said `click_events=1`: the click stays what it was,
+        // a selection of nothing.
+        let home = empty_home("grid-click-silent");
+        let sent = home.join("sent");
+        let session = spawn_clickable_grid_session(false, 18, &sent);
+        wait_grid_line(&session, "the line was not read", |state| {
+            state.status == DockStatus::Live && state.buffer == "git sta"
+        });
+        wait_until(
+            "the child did not start reading",
+            Duration::from_secs(5),
+            || sent.exists(),
+        );
+        let generation = session.key_gen.load(Ordering::Acquire);
+        click_dock_at(&session, 4);
+        assert_eq!(session.key_gen.load(Ordering::Acquire), generation);
+        assert!(std::fs::read(&sent).is_ok_and(|bytes| bytes.is_empty()));
+        session.shutdown();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A fish dock that prints `echo su` with the suggestion `garcane`, waits for a byte, types
+    /// the `g` (the suggestion shrinks to `arcane`), waits for a byte and then lengthens the
+    /// suggestion to `arcane-juice` without touching what was typed.
+    fn spawn_typing_grid_session() -> Session {
+        spawn_docked_session(
+            &format!(
+                "stty raw -echo; printf '{}cmd1{}\\033]133;A;bt_block=2\\007{}\
+                 echo su\\033[90mgarcane\\033[m\\033[7D'; \
+                 dd bs=1 count=1 of=/dev/null 2>/dev/null; \
+                 printf 'g\\033[90marcane\\033[m\\033[6D'; \
+                 dd bs=1 count=1 of=/dev/null 2>/dev/null; \
+                 printf '\\033[6C\\033[90m-juice\\033[m\\033[12D'; sleep 5",
+                anchored_prompt(1),
+                ran(1, 0, "out"),
+                grid_repaint(2),
+            ),
+            Arc::new(TestWake::default()),
+        )
+    }
+
+    #[test]
+    fn typing_into_a_grid_line_comes_alive_and_the_suggestion_does_not() {
+        // The typing animation reads `BUFFER` only. With the suggestion told apart a typed
+        // letter is an insertion even though the suggestion under it shrank; with the
+        // suggestion in `BUFFER` the same frame would be a replacement and nothing would
+        // play. A suggestion that changes under unchanged text keeps the glyphs in flight.
+        let session = spawn_typing_grid_session();
+        let (_, _, before) = wait_grid_line(&session, "the line was not read", |state| {
+            state.buffer == "echo su"
+        });
+        assert_eq!(before.postdisplay, "garcane");
+
+        session.write(b"g");
+        let (_, _, typed) = wait_grid_line(&session, "the typed letter was not read", |state| {
+            state.buffer == "echo sug"
+        });
+        assert_eq!(typed.postdisplay, "arcane");
+        assert_eq!(
+            dock::change(&before, &typed),
+            Some(dock::Change::Insert { start: 7, end: 8 }),
+            "the typed `g` should come alive: {before:?} -> {typed:?}"
+        );
+
+        session.write(b"x");
+        let (_, _, longer) = wait_grid_line(&session, "the suggestion was not read", |state| {
+            state.postdisplay == "arcane-juice"
+        });
+        assert_eq!(longer.buffer, "echo sug");
+        assert_eq!(
+            dock::change(&typed, &longer),
+            Some(dock::Change::Same),
+            "a suggestion that changed must leave the glyphs in flight alone"
+        );
         session.shutdown();
     }
 

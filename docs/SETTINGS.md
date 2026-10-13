@@ -1406,6 +1406,10 @@ terminal works as it is.
   prompt back](#getting-your-prompt-back)), and one you define later is taken
   back at the next prompt. A `ssh` function of your own is left alone. What
   differs from zsh:
+  - clicking in the dock moves the caret there when your fish is 4.1 or newer
+    (those versions take a mouse click on the command line; with an older fish
+    a click only selects). It is fish that moves the caret, so a click on the
+    gray suggestion lands at the end of what you typed and does not accept it;
   - selecting text in the dock and then typing does not replace it (the
     selection drops and the key goes to fish);
   - a multi-line command with the caret on one of its upper lines shows the

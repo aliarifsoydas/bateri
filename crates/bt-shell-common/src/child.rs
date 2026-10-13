@@ -1983,6 +1983,8 @@ pub(crate) mod tests {
     /// The fish on this machine, held for the test's length.
     struct Fish {
         path: PathBuf,
+        /// `(major, minor)` of `fish --version`; `(0, 0)` if it could not be read.
+        version: (u32, u32),
         /// One fish session at a time: each starts a fish that asks the terminal about itself
         /// and waits for the answers, beside the rest of the suite's shells; in turn their
         /// load on the machine stays what one test makes of it.
@@ -2019,8 +2021,17 @@ pub(crate) mod tests {
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
             .unwrap_or_default();
         println!("fish: {version} ({})", path.display());
+        // `fish, version 4.9.3` (a development build adds `-12-gabcdef`).
+        let mut numbers = version
+            .rsplit(' ')
+            .next()
+            .unwrap_or_default()
+            .split(['.', '-'])
+            .map(|part| part.parse::<u32>().unwrap_or(0));
+        let version = (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0));
         Some(Fish {
             path,
+            version,
             _serial: SERIAL
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
@@ -2479,6 +2490,144 @@ pub(crate) mod tests {
             let dock = fish_dock(&session, &blocks);
             dock.status == DockStatus::Live && dock.buffer.is_empty()
         });
+        session.shutdown();
+    }
+
+    /// One frame and one drawing of the dock, as the window does: the drawing is what leaves
+    /// the dock's last drawn window behind, and a click in the dock is resolved against it.
+    fn draw_fish_dock(session: &Session, blocks: &std::cell::RefCell<Blocks>) {
+        let cursor = session.frame(
+            |_| (),
+            |_| (),
+            &mut blocks.borrow_mut(),
+            &mut bt_core::SelectionRuns::default(),
+            &mut bt_core::SearchRuns::default(),
+            &mut bt_core::TrackMarks::default(),
+            &mut bt_core::Clusters::default(),
+            ScrollGlide::default(),
+            bt_core::DockBudget {
+                share: 0.5,
+                cols: 80,
+            },
+        );
+        session.dock(
+            bt_core::DockCols {
+                input: 80,
+                context: 80,
+            },
+            cursor.band_rows(),
+            &mut DockState::default(),
+            &mut bt_core::DockContext::default(),
+            cursor.caret_in_dock,
+            &mut Vec::new(),
+            &mut bt_core::Clusters::default(),
+            |_| (),
+            |_| (),
+        );
+    }
+
+    /// A click in the dock the way the window ends one: press on the character's left half,
+    /// release without a drag.
+    fn click_fish_dock(session: &Session, blocks: &std::cell::RefCell<Blocks>, index: u16) {
+        draw_fish_dock(session, blocks);
+        session.dock_select(
+            bt_core::SelectKind::Simple,
+            bt_core::SelectionPoint {
+                col: bt_core::DOCK_TEXT_COL + index % 78,
+                row: index / 78,
+                half: bt_core::CellHalf::Left,
+            },
+        );
+        session.dock_click();
+    }
+
+    #[test]
+    fn a_click_in_the_fish_dock_moves_fishs_caret() {
+        // The dock cannot edit fish's line: fish owns it. What it can do is click fish where
+        // the character was drawn (fish 4.1's `click_events`, announced on its own `A`), and
+        // fish moves its caret the way it does for a click in its own prompt. The whole chain
+        // is real: the script's `g`, fish's `A;click_events=1`, the cells the line was read
+        // from, the SGR press and release the click sends, fish's reading of them (it asks the
+        // terminal where its prompt is, and the session answers) and the dock reading the
+        // moved caret back.
+        let Some(fish) = fish() else { return };
+        let root = TempRoot::new("fish-click");
+        let session = spawn_fish_dock(&fish, &root);
+        let blocks = std::cell::RefCell::new(Blocks::default());
+        let caret = || fish_dock(&session, &blocks).cursor;
+
+        session.write(b"echo hello world");
+        wait_until("the dock did not show the typed line", || {
+            let dock = fish_dock(&session, &blocks);
+            dock.status == DockStatus::Live && dock.buffer == "echo hello world"
+        });
+        wait_until("the caret was not at the end", || caret() == 16);
+
+        // Clicks are fish 4.1's: an older fish never announces them, and the dock's click
+        // must then do what it did before — nothing reaches fish.
+        if fish.version < (4, 1) {
+            println!(
+                "fish {:?} takes no clicks: checking that none is sent",
+                fish.version
+            );
+            click_fish_dock(&session, &blocks, 5);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            assert_eq!(
+                caret(),
+                16,
+                "a click moved a fish that does not take clicks"
+            );
+            session.shutdown();
+            return;
+        }
+
+        // The middle of the line, then its start, then a place back to the right: fish's caret
+        // lands on the character clicked, which the dock shows as the caret's index.
+        for index in [5u16, 0, 11] {
+            click_fish_dock(&session, &blocks, index);
+            wait_until("the caret did not follow the click", || {
+                caret() == usize::from(index)
+            });
+        }
+
+        // Past the last character: the end of the line, however the click is aimed at it.
+        click_fish_dock(&session, &blocks, 16);
+        wait_until("a click at the end did not reach the end", || caret() == 16);
+        click_fish_dock(&session, &blocks, 40);
+        wait_until("a click past the line did not reach the end", || {
+            caret() == 16
+        });
+
+        // The caret moved while the text did not: the line is still typed text, not a
+        // new line.
+        let dock = fish_dock(&session, &blocks);
+        assert_eq!(dock.buffer, "echo hello world", "{dock:?}");
+
+        // With a suggestion after the typed text: a click on the suggestion is a click at the
+        // end of what was typed (the dock's hit test), and fish does not take the suggestion.
+        session.write(b"\n");
+        wait_until("the command did not finish", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.phase == ShellPhase::Input && state.last_exit == Some(0))
+                && fish_dock(&session, &blocks).buffer.is_empty()
+        });
+        session.write(b"echo he");
+        wait_until("the dock did not show the suggestion", || {
+            let dock = fish_dock(&session, &blocks);
+            dock.buffer == "echo he" && dock.postdisplay == "llo world"
+        });
+        click_fish_dock(&session, &blocks, 2);
+        wait_until("the caret did not move into the typed text", || {
+            caret() == 2
+        });
+        click_fish_dock(&session, &blocks, 12);
+        wait_until(
+            "a click on the suggestion did not reach the end of the text",
+            || caret() == 7,
+        );
+        let dock = fish_dock(&session, &blocks);
+        assert_eq!(dock.buffer, "echo he", "the suggestion was taken: {dock:?}");
         session.shutdown();
     }
 

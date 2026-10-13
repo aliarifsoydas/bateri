@@ -46,6 +46,14 @@ pub(crate) struct InputLines {
     pub(crate) bottom: i32,
 }
 
+/// A place on the grid: the line in grid line numbers (the scrollback is
+/// negative) and the column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GridPos {
+    pub(crate) line: i32,
+    pub(crate) col: u16,
+}
+
 /// The row at `line`, if the grid has one. Indexing is guarded here so the
 /// frame path never takes the grid's panic.
 fn row_at<T>(term: &Term<T>, line: i32) -> Option<&Row<Cell>> {
@@ -169,6 +177,14 @@ fn close_run(into: &mut DockState, start: usize, end: usize, style: HighlightSty
 ///   the prompt's second space. Without a distinct sample style everything
 ///   is `buffer`. Only the dock's typing animation reads the split.
 ///
+/// - **Places:** `cells` gets one [`GridPos`] per character of the display
+///   (typed text and suggestion, a line break's too), then one for the place
+///   just after the last — the cell a click "at the end" lands on. A cell's
+///   zero-width characters share its place. The dock turns a click into the
+///   character it landed before ([`crate::shell::DockSelection::click`]) and
+///   the place says where the shell has to be clicked for its caret to land
+///   there.
+///
 /// `into.answers` and `into.cluster` are the caller's.
 pub(crate) fn read<T>(
     term: &Term<T>,
@@ -177,6 +193,7 @@ pub(crate) fn read<T>(
     colors: &Colors,
     theme: &Theme,
     into: &mut DockState,
+    cells: &mut Vec<GridPos>,
 ) {
     into.status = DockStatus::Live;
     into.predisplay.clear();
@@ -186,8 +203,15 @@ pub(crate) fn read<T>(
     into.highlights.clear();
     into.insert_keymap = false;
     into.last_ink = None;
+    cells.clear();
 
     let columns = term.columns();
+    let last_column = columns.saturating_sub(1);
+    let place = |line: i32, col: usize| GridPos {
+        line,
+        col: u16::try_from(col.min(last_column)).unwrap_or(u16::MAX),
+    };
+    let mut after = place(found.bottom, 0);
     let mut sample = HighlightStyle::default();
     let mut chars = 0usize;
     let mut caret = None;
@@ -228,6 +252,7 @@ pub(crate) fn read<T>(
         if cursor_here && !soft {
             end = end.max(cursor.column.0);
         }
+        let mut row_after = first;
         for (col, cell) in row.into_iter().enumerate().take(end).skip(first) {
             if cursor_here && Column(col) == cursor.column {
                 caret = Some(chars);
@@ -238,6 +263,13 @@ pub(crate) fn read<T>(
             {
                 continue;
             }
+            // The place after this cell: a wide character takes two.
+            row_after = col
+                + if cell.flags.contains(Flags::WIDE_CHAR) {
+                    2
+                } else {
+                    1
+                };
             let style = style_of(cell, colors, theme);
             if style != run_style {
                 close_run(into, run_start, chars, run_style);
@@ -247,11 +279,14 @@ pub(crate) fn read<T>(
             let head = if cell.c == '\0' { ' ' } else { cell.c };
             into.buffer.push(head);
             chars += 1;
+            cells.push(place(line, col));
             for &extra in cell.zerowidth().unwrap_or(&[]) {
                 into.buffer.push(extra);
                 chars += 1;
+                cells.push(place(line, col));
             }
         }
+        after = place(line, row_after);
         if cursor_here && caret.is_none() {
             // Left of the line's start (inside the prompt) or past its last cell.
             caret = Some(if cursor.column.0 < first {
@@ -266,9 +301,11 @@ pub(crate) fn read<T>(
             run_style = HighlightStyle::default();
             into.buffer.push('\n');
             chars += 1;
+            cells.push(after);
         }
     }
     close_run(into, run_start, chars, run_style);
+    cells.push(after);
 
     let caret = caret.unwrap_or(chars).min(chars);
     into.cursor = caret;

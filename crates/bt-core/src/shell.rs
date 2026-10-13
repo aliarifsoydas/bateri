@@ -111,6 +111,7 @@ use std::time::{Duration, Instant, SystemTime};
 use unicode_width::UnicodeWidthChar;
 
 use crate::dock::{self, DockPoint};
+use crate::grid_input::GridPos;
 use crate::notify::{self, NOTIFY_OSC, NOTIFY_PAYLOAD_LIMIT, Notification, Pending};
 use crate::program_status::{
     self, PROGRESS_OSC, PROGRESS_PAYLOAD_LIMIT, ProgramStatus, Report, STATUS_OSC,
@@ -130,7 +131,11 @@ use crate::settings::{HostMark, HostRule, MarkSubject, RemoteStatsMode};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mark {
     /// `A` — the prompt starts here; the block opens here too.
-    PromptStart { id: Option<u32> },
+    ///
+    /// `click_events` is fish's own field (`A;click_events=1`): the shell
+    /// takes a mouse click on its command line as an SGR report and moves its
+    /// caret there ([`ShellLog::click_events`]).
+    PromptStart { id: Option<u32>, click_events: bool },
     /// `B` — the prompt is done, what follows is the command the user typed.
     PromptEnd,
     /// `C` — the command started running, what follows is output.
@@ -2053,6 +2058,28 @@ pub(crate) struct ShellLog {
     /// (`e`, after which the line belongs to the grid) clear it. A prompt that
     /// never prints `g` keeps the mirror's behaviour byte for byte.
     pub(crate) dock_grid: bool,
+    /// Whether the shell announced **at this prompt** that it reads a mouse
+    /// click on its command line as an SGR report and moves its caret there
+    /// (fish 4.1's `A;click_events=1`). With [`Self::dock_grid`] it is what
+    /// lets a click in the dock reach the line the shell owns
+    /// ([`Self::grid_click`]).
+    ///
+    /// Its lifetime is the prompt's, and **every `A` sets it from its own
+    /// fields**: fish prints one on each redraw, after the script's `A` and
+    /// before the prompt string with the script's `g`, so the last `A` of a
+    /// prompt is the one that tells. A shell that never says it (fish 3, zsh)
+    /// keeps the click's old behaviour byte for byte.
+    pub(crate) click_events: bool,
+    /// Where each character of [`Self::dock`] was drawn on the grid, read in
+    /// the same walk as the text ([`crate::grid_input::read`]): one entry per
+    /// character of the line, then one for the place just after it. Only a
+    /// grid-sourced line has them; empty otherwise.
+    ///
+    /// **Next to** the mirror, not in it, with [`Self::dock_selection`]'s reason
+    /// (the scanner refreshes the mirror wholesale). It is replaced when the
+    /// cells move even if the text does not — a resize reflows a line without
+    /// changing a character.
+    pub(crate) dock_cells: Vec<GridPos>,
     /// The **expected** result of the last editing command: until the
     /// mirror answers that command, the editing gate looks at this line
     /// ([`DockPrediction`]). Its lifetime is only one generation — any intervening
@@ -2428,6 +2455,8 @@ impl ShellLog {
             dock_scroll: None,
             dock_editable: false,
             dock_grid: false,
+            click_events: false,
+            dock_cells: Vec::new(),
             dock_pending: None,
             command: 0,
             paste_since_remote: false,
@@ -2486,7 +2515,7 @@ impl ShellLog {
         // shell's own process group, and the probe never marks a program in that group
         // ([`crate::Session::note_raw`]'s caller), so its marks still drive the phase.
         let identified = match mark {
-            Mark::PromptStart { id } | Mark::CommandEnd { id, .. } => id.is_some(),
+            Mark::PromptStart { id, .. } | Mark::CommandEnd { id, .. } => id.is_some(),
             Mark::PromptEnd | Mark::CommandStart => false,
         };
         if identified {
@@ -2509,7 +2538,7 @@ impl ShellLog {
         }
         let mut outcome = ScanOutcome::default();
         match mark {
-            Mark::PromptStart { id } => {
+            Mark::PromptStart { id, click_events } => {
                 // The remote state goes **by itself**: no round trip to `bt-shell`
                 // to end it. `A` is `D`'s defensive arm — like the clock's, so that a lost `D`
                 // does not carry the remote indicator into the next prompt. The remote shell's
@@ -2517,6 +2546,8 @@ impl ShellLog {
                 outcome.title = self.context.clear_remote();
                 self.dock_editable = false;
                 self.dock_grid = false;
+                self.dock_cells.clear();
+                self.click_events = click_events;
                 self.dock_pending = None;
                 // The phase, the clock's reset and the block ([`BlockTrack::prompt`]).
                 self.local.prompt(id);
@@ -2644,7 +2675,7 @@ impl ShellLog {
                 // A new prompt ends what a program reported — ours, or the one of
                 // a shell that never printed our identity (the same rule that
                 // closes the command, [`Self::apply`]).
-                let ended = matches!(mark, Mark::PromptStart { id } if id.is_some() || !self.ours)
+                let ended = matches!(mark, Mark::PromptStart { id, .. } if id.is_some() || !self.ours)
                     && self.program.prompt();
                 outcome = self.apply(mark);
                 outcome.status |= ended;
@@ -2954,6 +2985,7 @@ impl ShellLog {
                 self.dock_scroll = None;
                 self.dock_editable = false;
                 self.dock_grid = false;
+                self.dock_cells.clear();
                 self.dock_pending = None;
                 // An empty line is an answer too: see [`DockState::answers`]. A held line too —
                 // `e` is ⏎'s answer and the freshness gate asks it throughout the hold (the
@@ -3305,21 +3337,83 @@ impl ShellLog {
     /// clock) must not look like an answer to the user's last key. `answers`
     /// is read by the caller after the cells, never before: a stamp ahead of
     /// the text only loosens the typing animation's glyph bound.
-    pub(crate) fn publish_grid(&mut self, staged: &DockState, answers: u64) -> bool {
-        let open = self.dock_grid
+    pub(crate) fn publish_grid(
+        &mut self,
+        staged: &DockState,
+        cells: &[GridPos],
+        block: u32,
+        answers: u64,
+    ) -> bool {
+        // The line was read for `block`; the reader thread can have run the
+        // whole of `e C D A g B` since, and the new prompt is not that line.
+        let current = matches!(
+            self.local.blocks.last(),
+            Some((last, Outcome::Pending { .. })) if last == block
+        );
+        if !current || !self.grid_open() {
+            return false;
+        }
+        // The cells follow the grid in the same lock turn as the text, so a
+        // click is always resolved against the line it was drawn with — and
+        // they are replaced on their own: a resize moves a line without
+        // changing a character, and `apply_dock` below would not run.
+        self.dock_cells.clear();
+        self.dock_cells.extend_from_slice(cells);
+        if self.dock.status == DockStatus::Live && self.dock.same_line(staged) {
+            return false;
+        }
+        self.apply_dock(DockEvent::Update(staged), answers);
+        self.observe_caret();
+        true
+    }
+
+    /// Whether a grid-sourced line may be published and clicked at this
+    /// moment: the shell said `g` at this prompt, the line is still being
+    /// written, and the dock has an input row at all — a remote session or a
+    /// program reading the keyboard itself has none.
+    fn grid_open(&self) -> bool {
+        self.dock_grid
             && self.end_since.is_none()
             && self.context.remote.is_none()
             && !self.raw_active()
             && self
                 .local
                 .state
-                .is_some_and(|state| state.phase == ShellPhase::Input);
-        if !open || (self.dock.status == DockStatus::Live && self.dock.same_line(staged)) {
-            return false;
+                .is_some_and(|state| state.phase == ShellPhase::Input)
+    }
+
+    /// Where on the grid the shell should be clicked to move its caret to the
+    /// place the dock was just clicked at: the cell of the character the click
+    /// landed before ([`DockSelection::click`]), from the cells the line was
+    /// read from.
+    ///
+    /// `None` is every reason to send nothing: the shell did not announce
+    /// clicks at this prompt ([`Self::click_events`]), the click was a drag,
+    /// the caret is already there (a click that sends nothing must not advance
+    /// the input generation either), the place is above the screen (a line
+    /// that has scrolled into the history cannot be addressed), or the cells
+    /// do not match the line on show — the safe side of each is a click that
+    /// does nothing.
+    ///
+    /// **There is no freshness gate** like the mirror's `answers` one: the
+    /// shell never answers a key, so there is no answer to wait for, and a key
+    /// that changes nothing would close a stamp-based gate for good. The
+    /// window is the time the shell takes to redraw after a key — the cells
+    /// and the caret here are those of the last frame that read the grid.
+    pub(crate) fn grid_click(&self) -> Option<GridPos> {
+        if !(self.click_events && self.grid_open() && self.dock.status == DockStatus::Live) {
+            return None;
         }
-        self.apply_dock(DockEvent::Update(staged), answers);
-        self.observe_caret();
-        true
+        // The mirror's `PREBUFFER` is empty for a grid-sourced line, so the
+        // selection's index space is the line's own.
+        let index = self.dock_selection?.click()?;
+        if index == self.dock.cursor || self.dock_cells.len() != self.dock.display_chars + 1 {
+            return None;
+        }
+        self.dock_cells
+            .get(index)
+            .copied()
+            .filter(|place| place.line >= 0)
     }
 
     /// Who owns the caret at this moment and the remainder of the hold — the ledger-
@@ -4424,6 +4518,7 @@ fn parse_mark(payload: &[u8]) -> Option<ScanEvent<'static>> {
     let mut exit = None;
     let mut id = None;
     let mut remote = None;
+    let mut click_events = false;
     // The code depends on **position** (the first field), the identities on **name** —
     // `BLOCK_ID_FIELD` (`bt_block=`) and `REMOTE_ID_FIELD` (`bt_remote=`); **not** `aid=`
     // (the reason is below, in `block_id`'s doc: a foreign `aid` must not be confused with
@@ -4435,6 +4530,8 @@ fn parse_mark(payload: &[u8]) -> Option<ScanEvent<'static>> {
             id = Some(value);
         } else if let Some(value) = remote_id(field) {
             remote = Some(value);
+        } else if letter == b"A" && field == CLICK_EVENTS_FIELD {
+            click_events = true;
         } else if index == 0 && letter == b"D" {
             exit = number(field);
         }
@@ -4446,7 +4543,7 @@ fn parse_mark(payload: &[u8]) -> Option<ScanEvent<'static>> {
         id = None;
     }
     let mark = match letter {
-        b"A" => Mark::PromptStart { id },
+        b"A" => Mark::PromptStart { id, click_events },
         b"B" => Mark::PromptEnd,
         b"C" => Mark::CommandStart,
         _ => Mark::CommandEnd { exit, id },
@@ -4571,6 +4668,10 @@ const BLOCK_ID_FIELD: &[u8] = b"bt_block=";
 fn block_id(field: &[u8]) -> Option<u32> {
     number(field.strip_prefix(BLOCK_ID_FIELD)?)
 }
+
+/// fish's announcement on its own `A` that it reads a mouse click as an SGR
+/// report and moves its caret to it (fish 4.1 and later).
+const CLICK_EVENTS_FIELD: &[u8] = b"click_events=1";
 
 /// Our remote shell's identity field: `bt_remote=<P>.<S>.<n>`
 /// ([`RemoteShell`] and the remote counter). A separate name, not `bt_block=`:
@@ -5115,9 +5216,10 @@ const STATE_HEADER: &str = "bateri-state";
 /// wall-clock start since version 2: a blob read hours later counts the
 /// gap.)
 ///
-/// Version 4: the grid source's flag ([`ShellLog::dock_grid`]) crosses, so a
-/// fish prompt on screen across an update keeps its dock; a version 3 blob
-/// reads as "no grid source".
+/// Version 4: the grid source's flag ([`ShellLog::dock_grid`]) and the
+/// shell's click announcement ([`ShellLog::click_events`]) cross, so a fish
+/// prompt on screen across an update keeps its dock and its clicks; a version
+/// 3 blob reads as "no grid source".
 ///
 /// **Only forward once released.** A bateri rolled back to the version
 /// before reads this one as unknown (the reader is strict,
@@ -5328,6 +5430,9 @@ pub(crate) struct Carried {
     /// [`ShellLog::dock_grid`]: without it a fish prompt on screen across the
     /// update would have no dock until its next `A`.
     dock_grid: bool,
+    /// [`ShellLog::click_events`]: a click in the dock reaches the fish
+    /// prompt that is on screen across the update.
+    click_events: bool,
     command: u64,
     login: Option<u64>,
     remote_up: Option<(u64, String)>,
@@ -5402,6 +5507,7 @@ impl Carried {
             format!("dock-fresh {}", u8::from(self.dock_fresh)),
             format!("editable {}", u8::from(self.dock_editable)),
             format!("dock-grid {}", u8::from(self.dock_grid)),
+            format!("click-events {}", u8::from(self.click_events)),
             format!("command {}", self.command),
             format!("login {}", render_number(self.login)),
             match &self.remote_up {
@@ -5574,10 +5680,10 @@ impl Carried {
         };
         let dock_fresh = flag(take("dock-fresh")?)?;
         let dock_editable = flag(take("editable")?)?;
-        let dock_grid = if version >= STATE_GRID {
-            flag(take("dock-grid")?)?
+        let (dock_grid, click_events) = if version >= STATE_GRID {
+            (flag(take("dock-grid")?)?, flag(take("click-events")?)?)
         } else {
-            false
+            (false, false)
         };
         let command = one(take("command")?)?.parse().ok()?;
         let login = number(take("login")?)?;
@@ -5609,6 +5715,7 @@ impl Carried {
             dock_fresh,
             dock_editable,
             dock_grid,
+            click_events,
             command,
             login,
             remote_up,
@@ -5641,6 +5748,7 @@ impl ShellLog {
             dock_fresh: self.dock.answers == answered,
             dock_editable: self.dock_editable,
             dock_grid: self.dock_grid,
+            click_events: self.click_events,
             command: self.command,
             login: self.login,
             remote_up: self.remote_up.clone(),
@@ -5681,6 +5789,7 @@ impl ShellLog {
         self.dock.cluster = cluster;
         self.dock_editable = carried.dock_editable;
         self.dock_grid = carried.dock_grid;
+        self.click_events = carried.click_events;
         self.command = carried.command;
         self.login = carried.login;
         self.remote_up = carried.remote_up;
@@ -5826,7 +5935,10 @@ mod tests {
     fn four_marks_are_recognised() {
         assert_eq!(
             marks(b"\x1b]133;A\x07"),
-            vec![Mark::PromptStart { id: None }]
+            vec![Mark::PromptStart {
+                id: None,
+                click_events: false
+            }]
         );
         assert_eq!(marks(b"\x1b]133;B\x07"), vec![Mark::PromptEnd]);
         assert_eq!(marks(b"\x1b]133;C\x07"), vec![Mark::CommandStart]);
@@ -5874,7 +5986,10 @@ mod tests {
     fn the_block_id_is_read_from_the_payload() {
         assert_eq!(
             marks(b"\x1b]133;A;bt_block=42\x07"),
-            vec![Mark::PromptStart { id: Some(42) }]
+            vec![Mark::PromptStart {
+                id: Some(42),
+                click_events: false
+            }]
         );
         assert_eq!(
             marks(b"\x1b]133;D;0;bt_block=42\x07"),
@@ -5891,11 +6006,17 @@ mod tests {
         // them must lose neither the mark nor the identity.
         assert_eq!(
             marks(b"\x1b]133;A;cl=m;bt_block=9\x07"),
-            vec![Mark::PromptStart { id: Some(9) }]
+            vec![Mark::PromptStart {
+                id: Some(9),
+                click_events: false
+            }]
         );
         assert_eq!(
             marks(b"\x1b]133;A;bt_block=\x07"),
-            vec![Mark::PromptStart { id: None }]
+            vec![Mark::PromptStart {
+                id: None,
+                click_events: false
+            }]
         );
     }
 
@@ -5916,11 +6037,17 @@ mod tests {
     fn both_terminators_end_the_sequence() {
         assert_eq!(
             marks(b"\x1b]133;A\x07"),
-            vec![Mark::PromptStart { id: None }]
+            vec![Mark::PromptStart {
+                id: None,
+                click_events: false
+            }]
         );
         assert_eq!(
             marks(b"\x1b]133;A\x1b\\"),
-            vec![Mark::PromptStart { id: None }]
+            vec![Mark::PromptStart {
+                id: None,
+                click_events: false
+            }]
         );
     }
 
@@ -5930,7 +6057,13 @@ mod tests {
         // back-to-back sequences are read without a terminator between them.
         assert_eq!(
             marks(b"\x1b]133;A\x1b]133;B\x07"),
-            vec![Mark::PromptStart { id: None }, Mark::PromptEnd]
+            vec![
+                Mark::PromptStart {
+                    id: None,
+                    click_events: false
+                },
+                Mark::PromptEnd
+            ]
         );
         // And a CSI following the ESC does not corrupt the sequence.
         assert_eq!(marks(b"\x1b]133;C\x1b[0m"), vec![Mark::CommandStart]);
@@ -5959,7 +6092,10 @@ mod tests {
         // and the state would split from the grid.
         assert_eq!(
             marks(b"\x1b\r]133;A\x07"),
-            vec![Mark::PromptStart { id: None }]
+            vec![Mark::PromptStart {
+                id: None,
+                click_events: false
+            }]
         );
         assert_eq!(marks(b"\x1b\x07]133;B\x07"), vec![Mark::PromptEnd]);
         assert_eq!(marks(b"\x1b\x80]133;C\x07"), vec![Mark::CommandStart]);
@@ -6065,7 +6201,10 @@ mod tests {
         // **The defect this test closes is silent:** a scanner stuck in a corrupt CSI
         // swallows the `ESC ] 133;…` that follows, and blocks, suppression of the input
         // line and the dock die together.
-        let mark = vec![Mark::PromptStart { id: None }];
+        let mark = vec![Mark::PromptStart {
+            id: None,
+            click_events: false,
+        }];
 
         // (1) After completed CSIs: both recognized and unrecognized.
         assert_eq!(
@@ -6179,7 +6318,13 @@ mod tests {
             }
         });
 
-        assert_eq!(seen, vec![Mark::PromptStart { id: None }]);
+        assert_eq!(
+            seen,
+            vec![Mark::PromptStart {
+                id: None,
+                click_events: false
+            }]
+        );
         assert_eq!(scanner.payload.capacity(), PAYLOAD_LIMIT);
     }
 
@@ -6200,14 +6345,23 @@ mod tests {
     fn plain_text_around_the_marks_is_ignored() {
         assert_eq!(
             marks(b"merhaba\x1b]133;A\x07dunya\x1b]133;B\x07$ ls\r\n"),
-            vec![Mark::PromptStart { id: None }, Mark::PromptEnd]
+            vec![
+                Mark::PromptStart {
+                    id: None,
+                    click_events: false
+                },
+                Mark::PromptEnd
+            ]
         );
     }
 
     #[test]
     fn marks_walk_the_state_through_a_whole_command() {
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
-        log.apply(Mark::PromptStart { id: None });
+        log.apply(Mark::PromptStart {
+            id: None,
+            click_events: false,
+        });
         assert_eq!(log.local.state.map(|s| s.phase), Some(ShellPhase::Prompt));
 
         log.apply(Mark::PromptEnd);
@@ -6245,7 +6399,10 @@ mod tests {
 
     /// Opens and closes a block; the ledger's ordinary flow.
     fn run_block(log: &mut ShellLog, id: u32, exit: Option<i32>) {
-        log.apply(Mark::PromptStart { id: Some(id) });
+        log.apply(Mark::PromptStart {
+            id: Some(id),
+            click_events: false,
+        });
         log.apply(Mark::CommandStart);
         log.apply(Mark::CommandEnd { exit, id: Some(id) });
     }
@@ -6268,7 +6425,10 @@ mod tests {
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
         run_block(&mut log, 1, Some(0));
         run_block(&mut log, 2, Some(130));
-        log.apply(Mark::PromptStart { id: Some(3) });
+        log.apply(Mark::PromptStart {
+            id: Some(3),
+            click_events: false,
+        });
 
         assert_eq!(exit_of(&log, 1), Some(Some(0)));
         assert_eq!(exit_of(&log, 2), Some(Some(130)));
@@ -6292,7 +6452,10 @@ mod tests {
     #[test]
     fn a_block_keeps_the_start_its_first_command_mark_stamped() {
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
-        log.apply(Mark::PromptStart { id: Some(1) });
+        log.apply(Mark::PromptStart {
+            id: Some(1),
+            click_events: false,
+        });
         assert_eq!(started_of(&log, 1), Some(0), "no `C` yet: unknown");
 
         let before = wall_secs();
@@ -6311,7 +6474,10 @@ mod tests {
         assert_eq!(started_of(&log, 1), Some(7));
         // Nor does one after an identity-less `A` reset the clock: the open
         // block is still the same command's.
-        log.apply(Mark::PromptStart { id: None });
+        log.apply(Mark::PromptStart {
+            id: None,
+            click_events: false,
+        });
         log.apply(Mark::CommandStart);
         assert_eq!(started_of(&log, 1), Some(7));
 
@@ -6330,26 +6496,38 @@ mod tests {
         ));
 
         // A `C` after an identity-less `A` is not the finished block's.
-        log.apply(Mark::PromptStart { id: None });
+        log.apply(Mark::PromptStart {
+            id: None,
+            click_events: false,
+        });
         log.apply(Mark::CommandStart);
         assert_eq!(started_of(&log, 1), Some(7));
 
         // A block that never saw `C` closes with its start unknown.
-        log.apply(Mark::PromptStart { id: Some(2) });
+        log.apply(Mark::PromptStart {
+            id: Some(2),
+            click_events: false,
+        });
         log.apply(Mark::CommandEnd {
             exit: Some(0),
             id: Some(2),
         });
         assert_eq!(started_of(&log, 2), Some(0));
         // Nor does a later `C` stamp it: it is finished, not unstamped.
-        log.apply(Mark::PromptStart { id: None });
+        log.apply(Mark::PromptStart {
+            id: None,
+            click_events: false,
+        });
         log.apply(Mark::CommandStart);
         assert_eq!(started_of(&log, 2), Some(0));
 
         // A reopened identity starts over.
         run_block(&mut log, 3, Some(0));
         assert_ne!(started_of(&log, 3), Some(0));
-        log.apply(Mark::PromptStart { id: Some(3) });
+        log.apply(Mark::PromptStart {
+            id: Some(3),
+            click_events: false,
+        });
         assert_eq!(started_of(&log, 3), Some(0));
     }
 
@@ -6400,7 +6578,10 @@ mod tests {
         // our block's color with someone else's code.
         assert_eq!(
             marks(b"\x1b]133;A;aid=4711\x07"),
-            vec![Mark::PromptStart { id: None }]
+            vec![Mark::PromptStart {
+                id: None,
+                click_events: false
+            }]
         );
         assert_eq!(
             marks(b"\x1b]133;D;1;aid=4711\x07"),
@@ -6413,7 +6594,10 @@ mod tests {
         // And foreign marks cannot touch our ledger.
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
         run_block(&mut log, 1, Some(0));
-        log.apply(Mark::PromptStart { id: None });
+        log.apply(Mark::PromptStart {
+            id: None,
+            click_events: false,
+        });
         log.apply(Mark::CommandEnd {
             exit: Some(1),
             id: None,
@@ -8032,7 +8216,10 @@ mod tests {
 
     /// A fish prompt as the script prints it: our `A`, the grid word, `B`.
     fn grid_prompt_events(log: &mut ShellLog, id: u32) {
-        log.apply_scan(ScanEvent::Mark(Mark::PromptStart { id: Some(id) }));
+        log.apply_scan(ScanEvent::Mark(Mark::PromptStart {
+            id: Some(id),
+            click_events: false,
+        }));
         log.apply_scan(ScanEvent::Dock(DockEvent::Grid));
         log.apply_scan(ScanEvent::Mark(Mark::PromptEnd));
     }
@@ -8052,7 +8239,7 @@ mod tests {
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
         // No prompt, no word: nothing to publish, and the mirror's gate is
         // the one in force.
-        assert!(!log.publish_grid(&typed("ls"), 1));
+        assert!(!log.publish_grid(&typed("ls"), &[], 1, 1));
         grid_prompt_events(&mut log, 1);
         let input = log.suppressed_input().expect("the prompt is open");
         assert!(input.grid && input.block == 1);
@@ -8061,25 +8248,53 @@ mod tests {
             "nothing can be typed through a grid line"
         );
 
-        assert!(log.publish_grid(&typed("ls"), 3));
+        assert!(log.publish_grid(&typed("ls"), &[], 1, 3));
         assert_eq!(
             (log.dock.status, log.dock.buffer.as_str()),
             (DockStatus::Live, "ls")
         );
         assert_eq!(log.dock.answers, 3);
         // The same line again is not an answer to anything.
-        assert!(!log.publish_grid(&typed("ls"), 4));
+        assert!(!log.publish_grid(&typed("ls"), &[], 1, 4));
         assert_eq!(log.dock.answers, 3, "the stamp moved without the text");
-        assert!(log.publish_grid(&typed("lsx"), 5));
+        assert!(log.publish_grid(&typed("lsx"), &[], 1, 5));
         assert_eq!(log.dock.answers, 5);
 
         // `line-finish` hands the line to the grid: the held copy stays for the
         // hold, but nothing publishes over it and the word is gone.
         log.apply_scan(ScanEvent::Dock(DockEvent::End));
         assert!(!log.dock_grid && log.holding_end());
-        assert!(!log.publish_grid(&typed("lsxy"), 6));
+        assert!(!log.publish_grid(&typed("lsxy"), &[], 1, 6));
         assert_eq!(log.dock.buffer, "lsx");
         assert!(!log.suppressed_input().is_some_and(|input| input.grid));
+    }
+
+    #[test]
+    fn a_line_read_for_an_earlier_block_is_not_published() {
+        // The frame read block 1's line before the lock; by the time it publishes, the
+        // reader thread has run the command and opened block 2 with its own `g`.
+        let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
+        grid_prompt_events(&mut log, 1);
+        assert!(log.publish_grid(&typed("ls"), &[], 1, 1));
+        for event in [
+            ScanEvent::Dock(DockEvent::End),
+            ScanEvent::Mark(Mark::CommandStart),
+            ScanEvent::Mark(Mark::CommandEnd {
+                exit: Some(0),
+                id: Some(1),
+            }),
+        ] {
+            log.apply_scan(event);
+        }
+        grid_prompt_events(&mut log, 2);
+        assert!(log.dock_grid);
+        assert!(
+            !log.publish_grid(&typed("ls"), &[], 1, 2),
+            "the old line was brought to the new prompt"
+        );
+        assert_eq!(log.dock.buffer, "");
+        // The new prompt's own line is.
+        assert!(log.publish_grid(&typed("pwd"), &[], 2, 2));
     }
 
     #[test]
@@ -8089,12 +8304,18 @@ mod tests {
         assert!(log.dock_grid);
         // fish prints an identity-less `A` on every redraw, the script's word
         // comes after it in the prompt string: the `A` forgets, the word is back.
-        log.apply_scan(ScanEvent::Mark(Mark::PromptStart { id: None }));
+        log.apply_scan(ScanEvent::Mark(Mark::PromptStart {
+            id: None,
+            click_events: false,
+        }));
         assert!(!log.dock_grid);
         log.apply_scan(ScanEvent::Dock(DockEvent::Grid));
         assert!(log.dock_grid);
         // A new prompt that never says it is not grid-sourced.
-        log.apply_scan(ScanEvent::Mark(Mark::PromptStart { id: Some(2) }));
+        log.apply_scan(ScanEvent::Mark(Mark::PromptStart {
+            id: Some(2),
+            click_events: false,
+        }));
         assert!(!log.dock_grid);
 
         // Behind ssh the only 8133 that can arrive is the far end's.
@@ -8110,7 +8331,10 @@ mod tests {
         // Until the frame has read the line the mirror is `Idle`; the caret must
         // not go to the grid for that frame and come back.
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
-        log.apply_scan(ScanEvent::Mark(Mark::PromptStart { id: Some(1) }));
+        log.apply_scan(ScanEvent::Mark(Mark::PromptStart {
+            id: Some(1),
+            click_events: false,
+        }));
         log.apply_scan(ScanEvent::Mark(Mark::PromptEnd));
         // Past the Dock→Grid hold, which would mask the raw answer.
         let later = Instant::now() + Duration::from_secs(1);
@@ -8124,7 +8348,7 @@ mod tests {
     fn a_published_grid_line_follows_the_mirrors_selection_rule() {
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
         grid_prompt_events(&mut log, 1);
-        assert!(log.publish_grid(&typed("git status"), 1));
+        assert!(log.publish_grid(&typed("git status"), &[], 1, 1));
         let word = DockPoint {
             index: 0,
             half: CellHalf::Left,
@@ -8139,15 +8363,180 @@ mod tests {
         // The suggestion changing does not move the selected text.
         let mut next = typed("git status");
         next.postdisplay = " -s".to_owned();
-        assert!(log.publish_grid(&next, 2));
+        assert!(log.publish_grid(&next, &[], 1, 2));
         assert!(
             log.dock_selection.is_some(),
             "a new suggestion deleted the selection"
         );
         // The text changing does.
         next.buffer = "git statu".to_owned();
-        assert!(log.publish_grid(&next, 3));
+        assert!(log.publish_grid(&next, &[], 1, 3));
         assert_eq!(log.dock_selection, None);
+    }
+
+    #[test]
+    fn the_click_announcement_is_a_field_of_the_prompts_mark() {
+        let prompt = |click_events| Mark::PromptStart {
+            id: None,
+            click_events,
+        };
+        assert_eq!(marks(b"\x1b]133;A;click_events=1\x1b\\"), [prompt(true)]);
+        // Beside our identity, in either order, and in a chunked stream.
+        assert_eq!(
+            marks(b"\x1b]133;A;bt_block=3;click_events=1\x07"),
+            [Mark::PromptStart {
+                id: Some(3),
+                click_events: true
+            }]
+        );
+        assert_eq!(
+            marks_of_chunks(&[b"\x1b]133;A;click_ev", b"ents=1;bt_block=3\x07"]),
+            [Mark::PromptStart {
+                id: Some(3),
+                click_events: true
+            }]
+        );
+        // Anything else is not the announcement, and no other mark carries it.
+        assert_eq!(marks(b"\x1b]133;A\x07"), [prompt(false)]);
+        assert_eq!(marks(b"\x1b]133;A;click_events=0\x07"), [prompt(false)]);
+        assert_eq!(marks(b"\x1b]133;A;click_events\x07"), [prompt(false)]);
+        assert_eq!(marks(b"\x1b]133;B;click_events=1\x07"), [Mark::PromptEnd]);
+        assert_eq!(
+            marks(b"\x1b]133;C;click_events=1\x07"),
+            [Mark::CommandStart]
+        );
+    }
+
+    #[test]
+    fn the_click_announcement_lasts_one_prompt_and_every_a_sets_it() {
+        let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
+        let prompt = |id, click_events| ScanEvent::Mark(Mark::PromptStart { id, click_events });
+        // Our `A`, then fish's with the announcement: the last one of the prompt tells.
+        log.apply_scan(prompt(Some(1), false));
+        assert!(!log.click_events);
+        log.apply_scan(prompt(None, true));
+        assert!(log.click_events);
+        // A redraw: fish's `A` again.
+        log.apply_scan(prompt(None, true));
+        assert!(log.click_events);
+        // The next prompt of a shell that does not announce clicks.
+        log.apply_scan(prompt(Some(2), false));
+        assert!(!log.click_events);
+    }
+
+    /// The cells of a line "ab" (and the place after it) on line 2 of the grid.
+    fn cells_of_ab() -> [GridPos; 3] {
+        [
+            GridPos { line: 2, col: 2 },
+            GridPos { line: 2, col: 3 },
+            GridPos { line: 2, col: 4 },
+        ]
+    }
+
+    /// A fish prompt that announced clicks, with `ab` published and the caret at its end;
+    /// a click before the character at `index` is staged.
+    fn clicked_log(index: usize) -> ShellLog {
+        let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
+        log.apply_scan(ScanEvent::Mark(Mark::PromptStart {
+            id: Some(1),
+            click_events: false,
+        }));
+        log.apply_scan(ScanEvent::Mark(Mark::PromptStart {
+            id: None,
+            click_events: true,
+        }));
+        log.apply_scan(ScanEvent::Dock(DockEvent::Grid));
+        log.apply_scan(ScanEvent::Mark(Mark::PromptEnd));
+        assert!(log.publish_grid(&typed("ab"), &cells_of_ab(), 1, 1));
+        let point = DockPoint {
+            index,
+            half: CellHalf::Left,
+        };
+        log.dock_selection = Some(DockSelection::new(
+            SelectKind::Simple,
+            point,
+            point,
+            &log.dock.buffer,
+            false,
+        ));
+        log
+    }
+
+    #[test]
+    fn a_click_in_a_grid_line_is_the_place_its_character_was_drawn() {
+        // Before `a` and before `b`: their own cells; at the end: the place after `b`.
+        for (index, place) in [(0, cells_of_ab()[0]), (1, cells_of_ab()[1])] {
+            // The caret is at the end (2), so none of these is where it already is.
+            assert_eq!(clicked_log(index).grid_click(), Some(place), "{index}");
+        }
+        // The caret already there: nothing to send.
+        assert_eq!(clicked_log(2).grid_click(), None);
+    }
+
+    #[test]
+    fn a_click_in_a_grid_line_goes_nowhere_it_cannot_be_trusted() {
+        // The shell did not announce clicks at this prompt.
+        let mut log = clicked_log(0);
+        log.click_events = false;
+        assert_eq!(log.grid_click(), None);
+        // Not a click but a drag, a word or a line.
+        let mut log = clicked_log(0);
+        let point = |index| DockPoint {
+            index,
+            half: CellHalf::Left,
+        };
+        log.dock_selection = Some(DockSelection::new(
+            SelectKind::Simple,
+            point(0),
+            point(1),
+            &log.dock.buffer,
+            false,
+        ));
+        assert_eq!(log.grid_click(), None, "a drag is a selection");
+        log.dock_selection = Some(DockSelection::new(
+            SelectKind::Word,
+            point(0),
+            point(0),
+            &log.dock.buffer,
+            false,
+        ));
+        assert_eq!(log.grid_click(), None, "a double click is a word");
+        // Places that do not belong to the line on show.
+        let mut log = clicked_log(0);
+        log.dock_cells.pop();
+        assert_eq!(log.grid_click(), None, "a place short of the line");
+        // A line that has scrolled into the history cannot be addressed.
+        let mut log = clicked_log(0);
+        log.dock_cells[0].line = -1;
+        assert_eq!(log.grid_click(), None);
+        // The line was handed to the grid (`e`) or a new prompt began.
+        let mut log = clicked_log(0);
+        log.apply_scan(ScanEvent::Dock(DockEvent::End));
+        assert_eq!(log.grid_click(), None, "the line is the grid's after Enter");
+        assert!(log.dock_cells.is_empty());
+        let mut log = clicked_log(0);
+        log.apply_scan(ScanEvent::Mark(Mark::PromptStart {
+            id: Some(2),
+            click_events: false,
+        }));
+        assert_eq!(log.grid_click(), None);
+        assert!(log.dock_cells.is_empty());
+    }
+
+    #[test]
+    fn the_places_follow_the_cells_when_the_text_does_not_change() {
+        // A resize reflows the line: same characters, other cells. The dock's text is not
+        // republished (no new answer), the places are.
+        let mut log = clicked_log(0);
+        assert_eq!(log.dock.answers, 1);
+        let moved = [
+            GridPos { line: 3, col: 5 },
+            GridPos { line: 3, col: 6 },
+            GridPos { line: 3, col: 7 },
+        ];
+        assert!(!log.publish_grid(&typed("ab"), &moved, 1, 2));
+        assert_eq!(log.dock.answers, 1, "the stamp moved without the text");
+        assert_eq!(log.grid_click(), Some(moved[0]));
     }
 
     /// fish prints its own identity-less marks beside ours; in the recorded
@@ -8171,10 +8560,15 @@ mod tests {
         };
         feed(&mut log, PROMPT);
         assert!(log.dock_grid && log.suppressed_input().is_some_and(|input| input.grid));
+        assert!(log.click_events, "fish's `A` after ours announces clicks");
         feed(&mut log, b"\x1b]133;A;click_events=1\x1b\\");
         assert!(!log.dock_grid, "fish's own `A` should forget the word");
         feed(&mut log, REDRAW);
         assert!(log.dock_grid, "the word did not survive a redraw");
+        assert!(
+            log.click_events,
+            "the announcement did not survive a redraw"
+        );
         assert_eq!(log.local.state.map(|s| s.phase), Some(ShellPhase::Input));
         assert_eq!(log.last_block(), Some(BlockKey::Local(1)));
 
@@ -8565,12 +8959,18 @@ mod tests {
     fn a_lost_command_end_does_not_charge_the_next_block() {
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
         // The 1st block is running but its `D` never arrives.
-        log.apply(Mark::PromptStart { id: Some(1) });
+        log.apply(Mark::PromptStart {
+            id: Some(1),
+            click_events: false,
+        });
         log.apply(Mark::CommandStart);
         assert!(log.local.running_since.is_some());
 
         // Block 2's prompt: the clock must be reset here.
-        log.apply(Mark::PromptStart { id: Some(2) });
+        log.apply(Mark::PromptStart {
+            id: Some(2),
+            click_events: false,
+        });
         assert!(
             log.local.running_since.is_none(),
             "`A` should have cleared the stale clock"
@@ -8602,7 +9002,10 @@ mod tests {
     #[test]
     fn a_foreign_integration_does_not_steal_the_clock() {
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
-        log.apply(Mark::PromptStart { id: Some(1) });
+        log.apply(Mark::PromptStart {
+            id: Some(1),
+            click_events: false,
+        });
         log.apply(Mark::PromptEnd);
         // Two `C`s: foreign + ours. The first must win.
         log.apply(Mark::CommandStart);
@@ -8617,7 +9020,10 @@ mod tests {
             exit: Some(0),
             id: Some(1),
         });
-        log.apply(Mark::PromptStart { id: Some(2) });
+        log.apply(Mark::PromptStart {
+            id: Some(2),
+            click_events: false,
+        });
 
         let measured = log
             .duration(BlockKey::Local(1), RunningBlocks::default())
@@ -8739,7 +9145,10 @@ mod tests {
     #[test]
     fn a_command_that_never_started_records_no_time() {
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
-        log.apply(Mark::PromptStart { id: Some(1) });
+        log.apply(Mark::PromptStart {
+            id: Some(1),
+            click_events: false,
+        });
         log.apply(Mark::CommandEnd {
             exit: Some(0),
             id: Some(1),
@@ -8764,7 +9173,10 @@ mod tests {
     #[test]
     fn the_clock_is_spent_when_the_command_ends() {
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
-        log.apply(Mark::PromptStart { id: Some(1) });
+        log.apply(Mark::PromptStart {
+            id: Some(1),
+            click_events: false,
+        });
         log.apply(Mark::CommandStart);
         assert!(
             log.local.running_since.is_some(),
@@ -8853,7 +9265,10 @@ mod tests {
         // While there is no remote state `A` and `D` do not touch it either.
         assert!(!title(
             &mut log,
-            ScanEvent::Mark(Mark::PromptStart { id: None })
+            ScanEvent::Mark(Mark::PromptStart {
+                id: None,
+                click_events: false
+            })
         ));
         assert_eq!(log.context.cwd, "/");
     }
@@ -8869,7 +9284,10 @@ mod tests {
     /// A ledger with a command running (`C`); its generation and phase are ready.
     fn running_log() -> ShellLog {
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
-        log.apply(Mark::PromptStart { id: Some(1) });
+        log.apply(Mark::PromptStart {
+            id: Some(1),
+            click_events: false,
+        });
         log.apply(Mark::PromptEnd);
         log.apply(Mark::CommandStart);
         log
@@ -8889,7 +9307,10 @@ mod tests {
             exit: Some(0),
             id: None,
         });
-        log.apply(Mark::PromptStart { id: None });
+        log.apply(Mark::PromptStart {
+            id: None,
+            click_events: false,
+        });
         assert!(log.apply(Mark::CommandStart).started);
         assert_eq!(log.command, 2);
     }
@@ -8912,7 +9333,10 @@ mod tests {
                 exit: Some(0),
                 id: Some(1),
             },
-            Mark::PromptStart { id: Some(2) },
+            Mark::PromptStart {
+                id: Some(2),
+                click_events: false,
+            },
         ] {
             let mut log = running_log();
             assert!(log.set_remote(Some(&RemoteTarget::ssh("prod"))));
@@ -8934,7 +9358,10 @@ mod tests {
         // our shell reached the prompt.
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
         for mark in [
-            Mark::PromptStart { id: None },
+            Mark::PromptStart {
+                id: None,
+                click_events: false,
+            },
             Mark::PromptEnd,
             Mark::CommandStart,
             Mark::CommandEnd {
@@ -8944,12 +9371,30 @@ mod tests {
         ] {
             assert!(!log.apply(mark).prompt, "{mark:?}");
         }
-        assert!(log.apply(Mark::PromptStart { id: Some(2) }).prompt);
+        assert!(
+            log.apply(Mark::PromptStart {
+                id: Some(2),
+                click_events: false
+            })
+            .prompt
+        );
         // While a remote session is going too: an identified `A` passes, deleting the remote state.
         let mut log = running_log();
         assert!(log.set_remote(Some(&RemoteTarget::ssh("prod"))));
-        assert!(!log.apply(Mark::PromptStart { id: None }).prompt);
-        assert!(log.apply(Mark::PromptStart { id: Some(3) }).prompt);
+        assert!(
+            !log.apply(Mark::PromptStart {
+                id: None,
+                click_events: false
+            })
+            .prompt
+        );
+        assert!(
+            log.apply(Mark::PromptStart {
+                id: Some(3),
+                click_events: false
+            })
+            .prompt
+        );
     }
 
     #[test]
@@ -8962,7 +9407,10 @@ mod tests {
         assert!(command.is_some());
         assert!(log.set_remote(Some(&RemoteTarget::ssh("prod"))));
         for mark in [
-            Mark::PromptStart { id: None },
+            Mark::PromptStart {
+                id: None,
+                click_events: false,
+            },
             Mark::PromptEnd,
             Mark::CommandStart,
             Mark::CommandEnd {
@@ -9003,7 +9451,10 @@ mod tests {
             id: Some(1),
         });
         assert!(!log.raw_active(), "no command runs");
-        log.apply(Mark::PromptStart { id: Some(2) });
+        log.apply(Mark::PromptStart {
+            id: Some(2),
+            click_events: false,
+        });
         log.apply(Mark::CommandStart);
         assert!(
             log.raw.is_some(),
@@ -9021,7 +9472,10 @@ mod tests {
         let command = log.running_command();
         log.raw = command;
         for mark in [
-            Mark::PromptStart { id: None },
+            Mark::PromptStart {
+                id: None,
+                click_events: false,
+            },
             Mark::PromptEnd,
             Mark::CommandStart,
             Mark::CommandEnd {
@@ -9085,7 +9539,10 @@ mod tests {
         }
         // A nested shell's identity-less marks and a second `C` leave it.
         for mark in [
-            Mark::PromptStart { id: None },
+            Mark::PromptStart {
+                id: None,
+                click_events: false,
+            },
             Mark::PromptEnd,
             Mark::CommandStart,
             Mark::CommandEnd {
@@ -9103,7 +9560,10 @@ mod tests {
         });
         assert_eq!(log.context.program, None, "`D`");
         assert!(log.set_program(Some(&bar)));
-        log.apply(Mark::PromptStart { id: Some(2) });
+        log.apply(Mark::PromptStart {
+            id: Some(2),
+            click_events: false,
+        });
         assert_eq!(log.context.program, None, "`A`");
         log.apply(Mark::PromptEnd);
         assert!(log.set_program(Some(&bar)));
@@ -9136,7 +9596,10 @@ mod tests {
             assert!(log.set_program(Some(&bar)));
             for _ in 0..2 {
                 for mark in [
-                    Mark::PromptStart { id: None },
+                    Mark::PromptStart {
+                        id: None,
+                        click_events: false,
+                    },
                     Mark::PromptEnd,
                     Mark::CommandStart,
                     Mark::CommandEnd {
@@ -9296,7 +9759,10 @@ mod tests {
         // answer is accepted.
         let mut log = running_log();
         let command = log.running_command();
-        log.apply(Mark::PromptStart { id: None });
+        log.apply(Mark::PromptStart {
+            id: None,
+            click_events: false,
+        });
         log.apply(Mark::PromptEnd);
         assert_eq!(log.running_command(), command);
         assert!(log.set_remote(Some(&RemoteTarget::ssh("prod"))));
@@ -9317,7 +9783,10 @@ mod tests {
             exit: Some(0),
             id: None,
         });
-        log.apply(Mark::PromptStart { id: None });
+        log.apply(Mark::PromptStart {
+            id: None,
+            click_events: false,
+        });
         assert_ne!(
             log.local.state.map(|state| state.phase),
             Some(ShellPhase::Running)
@@ -9331,7 +9800,10 @@ mod tests {
         // identity-less `D` has to end the command — otherwise `Running` would go on
         // forever.
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
-        log.apply(Mark::PromptStart { id: None });
+        log.apply(Mark::PromptStart {
+            id: None,
+            click_events: false,
+        });
         log.apply(Mark::CommandStart);
         assert!(log.running_command().is_some());
         log.apply(Mark::CommandEnd {
@@ -9460,7 +9932,10 @@ mod tests {
             exit: Some(0),
             id: Some(1),
         });
-        log.apply(Mark::PromptStart { id: Some(2) });
+        log.apply(Mark::PromptStart {
+            id: Some(2),
+            click_events: false,
+        });
         log.apply(Mark::PromptEnd);
         log.apply(Mark::CommandStart);
         log.set_remote(Some(&RemoteTarget::ssh("prod")));
@@ -9491,7 +9966,10 @@ mod tests {
                 exit: Some(0),
                 id: Some(1),
             },
-            Mark::PromptStart { id: Some(2) },
+            Mark::PromptStart {
+                id: Some(2),
+                click_events: false,
+            },
         ] {
             let mut log = running_log();
             remote(&mut log);
@@ -9501,7 +9979,10 @@ mod tests {
         // `C`'s transition into `Running`: in a shell that never showed our
         // identity (with it, an identity-less `C` is the far end's and ignored).
         let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
-        log.apply(Mark::PromptStart { id: None });
+        log.apply(Mark::PromptStart {
+            id: None,
+            click_events: false,
+        });
         log.apply(Mark::PromptEnd);
         remote(&mut log);
         log.apply(Mark::CommandStart);
@@ -9620,7 +10101,10 @@ mod tests {
             line: "ssh prod".to_owned(),
         };
         assert_eq!(log.context.reconnect.as_ref(), Some(&offer));
-        log.apply(Mark::PromptStart { id: Some(2) });
+        log.apply(Mark::PromptStart {
+            id: Some(2),
+            click_events: false,
+        });
         log.apply(Mark::PromptEnd);
         assert_eq!(
             log.context.reconnect.as_ref(),
@@ -9685,7 +10169,10 @@ mod tests {
         assert!(log.set_remote(Some(&RemoteTarget::ssh("prod"))));
         log.apply(our_end(255));
         assert!(log.context.reconnect.is_some());
-        log.apply(Mark::PromptStart { id: Some(2) });
+        log.apply(Mark::PromptStart {
+            id: Some(2),
+            click_events: false,
+        });
         // A new remote session (the probe after `C`) does not leave the old one's offer —
         // `C` already deleted it, `set_remote` is the second belt.
         log.context.reconnect = Some(Reconnect::default());
@@ -9752,7 +10239,14 @@ mod tests {
                   \x1b]133;C;bt_remote=7.9.1\x07\x1b]133;D;2;bt_remote=7.9.1\x07"
             ),
             vec![
-                remote(7, 1, Mark::PromptStart { id: None }),
+                remote(
+                    7,
+                    1,
+                    Mark::PromptStart {
+                        id: None,
+                        click_events: false
+                    }
+                ),
                 remote(7, 1, Mark::PromptEnd),
                 remote(7, 1, Mark::CommandStart),
                 remote(
@@ -9787,7 +10281,13 @@ mod tests {
             payload.extend_from_slice(broken);
             payload.push(0x07);
             assert!(events(&payload).is_empty(), "{broken:?}");
-            assert_eq!(marks(&payload), vec![Mark::PromptStart { id: None }]);
+            assert_eq!(
+                marks(&payload),
+                vec![Mark::PromptStart {
+                    id: None,
+                    click_events: false
+                }]
+            );
         }
     }
 
@@ -10225,7 +10725,10 @@ mod tests {
             "the history keeps its stripes"
         );
         // The next local prompt does not erase them either.
-        log.apply(Mark::PromptStart { id: Some(2) });
+        log.apply(Mark::PromptStart {
+            id: Some(2),
+            click_events: false,
+        });
         assert_eq!(
             log.stripe(key(1), log.running_blocks()),
             Some(Stripe::Success)
@@ -10242,7 +10745,10 @@ mod tests {
         );
         log.apply(our_end(0));
         // The second ssh is local block 2; its server counts from 1 again.
-        log.apply(Mark::PromptStart { id: Some(2) });
+        log.apply(Mark::PromptStart {
+            id: Some(2),
+            click_events: false,
+        });
         log.apply(Mark::CommandStart);
         feed(
             &mut log,
@@ -10552,6 +11058,11 @@ mod tests {
             "the flag is mandatory in this version"
         );
         assert!(swap("dock-grid 0", "dock-grid 2").is_none());
+        assert!(
+            swap("click-events 0\n", "").is_none(),
+            "the flag is mandatory in this version"
+        );
+        assert!(swap("click-events 0", "click-events 2").is_none());
         assert!(swap("command 41", "command x").is_none());
         assert!(swap("cwd +", "cwd ").is_none());
         assert!(swap("remote-setup decode", "remote-setup gone").is_none());
@@ -10627,7 +11138,7 @@ mod tests {
         assert_eq!(
             seen,
             [
-                "mark PromptStart { id: Some(5) }",
+                "mark PromptStart { id: Some(5), click_events: false }",
                 "mark PromptEnd",
                 "cwd /Users/me/a b true",
                 "branch feature/x",
@@ -10636,7 +11147,7 @@ mod tests {
                 "end",
                 "mark CommandStart",
                 "up 0123456789abcdef",
-                "remote 5.4242.1 PromptStart { id: None }",
+                "remote 5.4242.1 PromptStart { id: None, click_events: false }",
                 "remote 5.4242.1 CommandStart",
                 "remote 5.4242.1 CommandEnd { exit: Some(3), id: None }",
                 "setup shell",
@@ -10727,7 +11238,7 @@ mod tests {
             again,
             fixture
                 .replace("bateri-state 3\n", "bateri-state 4\n")
-                .replace("editable 1\n", "editable 1\ndock-grid 0\n")
+                .replace("editable 1\n", "editable 1\ndock-grid 0\nclick-events 0\n")
         );
         // The starts reach the ledgers.
         let mut fresh = ShellLog::new(100);
@@ -10750,8 +11261,8 @@ mod tests {
 
     #[test]
     fn the_version_4_fixture_reads_and_writes_byte_for_byte() {
-        // Written by version 4 — the current one: the grid source's flag
-        // follows `editable`, and a highlight's flags may carry `i` (italic),
+        // Written by version 4 — the current one: the grid source's flag and
+        // the click announcement follow `editable`, and a highlight's flags may carry `i` (italic),
         // which only a grid-sourced line sets.
         let fixture = "bateri-state 4\n\
                        local running 0 1791108000000 6 0/120/1791107880,p/1791108000\n\
@@ -10770,6 +11281,7 @@ mod tests {
                        dock-fresh 1\n\
                        editable 0\n\
                        dock-grid 1\n\
+                       click-events 1\n\
                        command 8\n\
                        login -\n\
                        remote-up -\n\
@@ -10780,15 +11292,18 @@ mod tests {
                        hl 0 3 r112233 - bi\n\
                        end\n";
         let carried = Carried::decode(fixture.as_bytes()).unwrap();
-        assert!(carried.dock_grid && !carried.dock_editable);
+        assert!(carried.dock_grid && carried.click_events && !carried.dock_editable);
         assert_eq!(carried.encode(), fixture.as_bytes());
         // It lands in the ledger, and an `A` clears it as it does the editing word.
         let mut fresh = ShellLog::new(100);
         fresh.restore(carried, 0);
-        assert!(fresh.dock_grid);
+        assert!(fresh.dock_grid && fresh.click_events);
         assert!(fresh.dock.highlights[0].style.italic);
-        fresh.apply(Mark::PromptStart { id: None });
-        assert!(!fresh.dock_grid);
+        fresh.apply(Mark::PromptStart {
+            id: None,
+            click_events: false,
+        });
+        assert!(!fresh.dock_grid && !fresh.click_events);
     }
 
     /// The point of version 2: the time a blob spends in a holder (a night
