@@ -12,6 +12,8 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-13
+
 ### Added
 
 - **Programs can show images.** Anything that speaks the kitty graphics
@@ -99,9 +101,6 @@ of every installed copy. A version without a section is not released.
   usual way could lose a letter the same way. It depended on how the output
   happened to be split, so it came and went with the window's size and the
   moment.
-
-### Fixed
-
 - **fish on a server keeps its own directories.** Over ssh, a server whose
   fish had no `XDG_DATA_DIRS` of its own lost `/usr/local/share` and
   `/usr/share` from its search paths for the session, so completions and
