@@ -299,6 +299,7 @@ pub unsafe extern "C" fn bt_pane_config_new(id: u64, app_name: *const c_char) ->
                 helper: None,
                 zsh_wrapper_dir: None,
                 fish_wrapper_dir: None,
+                bash_wrapper_dir: None,
             },
             settings: Settings::default(),
             theme: Theme::BATERI,
@@ -396,6 +397,27 @@ pub unsafe extern "C" fn bt_pane_config_set_fish_scripts(
     unsafe {
         with_config(config, false, |config| {
             config.identity.fish_wrapper_dir = path_arg(dir);
+            true
+        })
+    }
+}
+
+/// The shell integration's bash scripts (bateri's `Resources/shell/bash`, the directory that
+/// holds `bateri.bash`). NULL or empty: a bash pane gets no integration. It is read when the
+/// user's shell is bash 4.4 or newer, as `bt_pane_config_set_zsh_scripts`'s directory is when
+/// it is zsh; an older bash (macOS's own is 3.2) runs as it did.
+///
+/// # Safety
+/// As [`bt_pane_config_set_helper`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bt_pane_config_set_bash_scripts(
+    config: *mut BtPaneConfig,
+    dir: *const c_char,
+) -> bool {
+    // SAFETY: the caller's promises.
+    unsafe {
+        with_config(config, false, |config| {
+            config.identity.bash_wrapper_dir = path_arg(dir);
             true
         })
     }

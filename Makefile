@@ -369,7 +369,7 @@ bundle: sparkle
 	@# That the directory's inventory is EXACTLY these six files is tested
 	@# by `bundle_assets`; fish's is the one file below, in the `vendor_conf.d`
 	@# fish reads it from (`shell/` is the `XDG_DATA_DIRS` entry that
-	@# makes fish find it). The remote wrapper (`assets/shell/remote/`)
+	@# makes fish find it), and bash's is the one file `ENV` points at. The remote wrapper (`assets/shell/remote/`)
 	@# is not copied: `bateri ssh-argv` embeds it at build time.
 	mkdir -p $(STAGE)/Contents/Resources/shell/zsh
 	cp assets/shell/zsh/.zshenv assets/shell/zsh/.zprofile assets/shell/zsh/.zshrc \
@@ -377,6 +377,8 @@ bundle: sparkle
 		$(STAGE)/Contents/Resources/shell/zsh/
 	mkdir -p $(STAGE)/Contents/Resources/shell/fish/vendor_conf.d
 	cp assets/shell/fish/vendor_conf.d/bateri.fish $(STAGE)/Contents/Resources/shell/fish/vendor_conf.d/
+	mkdir -p $(STAGE)/Contents/Resources/shell/bash
+	cp assets/shell/bash/bateri.bash $(STAGE)/Contents/Resources/shell/bash/
 	mkdir -p $(STAGE)/Contents/Frameworks
 	ditto --arch arm64 $(SPARKLE_DIR)/Sparkle.framework $(STAGE)/Contents/Frameworks/Sparkle.framework
 	rm -rf $(STAGE)/Contents/Frameworks/Sparkle.framework/XPCServices \
@@ -414,7 +416,7 @@ bundle: sparkle
 	for f in Credits.html THIRD-PARTY-LICENSES.txt; do \
 		cmp -s assets/bundle/$$f $$c/Resources/$$f || fail "$$f is not in the package or differs from the input"; \
 	done; \
-	for f in zsh/.zshenv zsh/.zprofile zsh/.zshrc zsh/.zlogin zsh/bateri.zsh zsh/zdotdir.zsh fish/vendor_conf.d/bateri.fish; do \
+	for f in zsh/.zshenv zsh/.zprofile zsh/.zshrc zsh/.zlogin zsh/bateri.zsh zsh/zdotdir.zsh fish/vendor_conf.d/bateri.fish bash/bateri.bash; do \
 		cmp -s assets/shell/$$f $$c/Resources/shell/$$f || fail "shell/$$f is not in the package or differs from the input"; \
 	done; \
 	rm -rf $(APP) && mv $(STAGE) $(APP) && \
@@ -690,7 +692,7 @@ embed-swift:
 		-o $(EMBED_DIR)/swift-host
 	@if [ "$$(launchctl managername 2>/dev/null)" != Aqua ]; then \
 		echo "embed-swift: SKIPPED (no window server session)"; exit 0; fi; \
-	BT_EMBED_ZSH=$(CURDIR)/assets/shell/zsh BT_EMBED_FISH=$(CURDIR)/assets/shell/fish $(EMBED_DIR)/swift-host
+	BT_EMBED_ZSH=$(CURDIR)/assets/shell/zsh BT_EMBED_FISH=$(CURDIR)/assets/shell/fish BT_EMBED_BASH=$(CURDIR)/assets/shell/bash $(EMBED_DIR)/swift-host
 
 # The embedding interface's own release: an annotated `bt-embed-<version>` tag on the commit
 # that turned `crates/bt-embed/CHANGELOG.md`'s Unreleased section into `## [<version>] - <date>`.

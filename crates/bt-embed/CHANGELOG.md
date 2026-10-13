@@ -22,6 +22,16 @@ commit. Pushing is a separate step.
 
 ### Added
 
+- `bt_pane_config_set_bash_scripts(config, dir)`: the shell integration's
+  bash scripts (bateri's `Resources/shell/bash`, the directory that holds
+  `bateri.bash`), beside `bt_pane_config_set_zsh_scripts`. A pane whose shell
+  is bash 4.4 or newer reads it: command blocks, the stripe, the working
+  directory and the `ssh` function's remote integration come to it as they do
+  to a zsh pane, and `BT_EVENT_COMMAND_STARTED`, `_FINISHED` and `_DIRECTORY`
+  follow. The shell is started as a login bash in POSIX mode, which reads the
+  file through `ENV` and then the user's own login files in bash's order. An
+  older bash (macOS's own is 3.2) and a pane without the directory work as
+  before, with no integration.
 - `bt_pane_config_set_fish_scripts(config, dir)`: the shell integration's
   fish scripts (bateri's `Resources/shell/fish`, the directory that holds
   `vendor_conf.d`), beside `bt_pane_config_set_zsh_scripts`. A pane whose shell

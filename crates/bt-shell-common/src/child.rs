@@ -13,8 +13,9 @@
 //! why it is not followed.
 //!
 //! Which shell runs ([`shell`]) and where the shell integration script lives
-//! ([`zsh_wrapper_dir`], [`fish_wrapper_dir`]) are here too: both belong to the shell's birth
-//! and both must be answered **before the spawn**.
+//! ([`zsh_wrapper_dir`], [`fish_wrapper_dir`], [`bash_wrapper_dir`]) are here too: both belong to
+//! the shell's birth and both must be answered **before the spawn** — for bash, which version it
+//! is too ([`bash_version`]).
 //!
 //! The decisions are in pure functions ([`home_directory`], [`decide_locale`], [`is_zsh`]):
 //! the only places where the system is read are a few thin wrappers, the rest is tested.
@@ -225,23 +226,36 @@ fn passwd_field(pick: impl Fn(&libc::passwd) -> *mut std::ffi::c_char) -> Option
 ///   the login session on macOS. An unresolvable shell gives
 ///   `None`, and alacritty's own Linux path spawns the shell directly, so the
 ///   parent stays `Direct`.
-pub fn shell_command() -> (Option<(String, Vec<String>)>, ShellParent) {
+///
+/// `shell_args` are the arguments the shell integration needs the shell started with
+/// (bash's `--posix`; empty for every other case): they follow the shell's own name, before the
+/// `-l` on Linux (bash takes its long options first) and inside the `exec` on macOS.
+pub fn shell_command(shell_args: &[String]) -> (Option<(String, Vec<String>)>, ShellParent) {
     #[cfg(target_os = "macos")]
     {
-        (login_command(), ShellParent::Login)
+        (login_command(shell_args), ShellParent::Login)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        (login_shell_command(shell()), ShellParent::Direct)
+        (
+            login_shell_command(shell(), shell_args),
+            ShellParent::Direct,
+        )
     }
 }
 
 /// The **pure** half of [`shell_command`]'s Linux branch: the resolved shell
-/// with `-l`; `None` if there is no shell or its path is not UTF-8 (the other
+/// with `shell_args` and `-l`, in that order — bash only recognizes `--posix` before the
+/// single-character options; `None` if there is no shell or its path is not UTF-8 (the other
 /// side of the boundary wants a `String`).
 #[cfg(not(target_os = "macos"))]
-fn login_shell_command(shell: Option<PathBuf>) -> Option<(String, Vec<String>)> {
-    Some((shell?.to_str()?.to_owned(), vec!["-l".to_owned()]))
+fn login_shell_command(
+    shell: Option<PathBuf>,
+    shell_args: &[String],
+) -> Option<(String, Vec<String>)> {
+    let mut args = shell_args.to_vec();
+    args.push("-l".to_owned());
+    Some((shell?.to_str()?.to_owned(), args))
 }
 
 /// The command that spawns the shell on macOS — the **`-q`** counterpart of alacritty's
@@ -268,8 +282,12 @@ fn login_shell_command(shell: Option<PathBuf>) -> Option<(String, Vec<String>)> 
 /// building the command halfway and handing it over anyway — meant a terminal that does not
 /// open.
 #[cfg(target_os = "macos")]
-fn login_command() -> Option<(String, Vec<String>)> {
-    login_command_from(shell(), std::env::var("USER").ok().or_else(passwd_name))
+fn login_command(shell_args: &[String]) -> Option<(String, Vec<String>)> {
+    login_command_from(
+        shell(),
+        std::env::var("USER").ok().or_else(passwd_name),
+        shell_args,
+    )
 }
 
 /// The **pure** half of [`login_command`]: the command from resolved inputs.
@@ -282,17 +300,27 @@ fn login_command() -> Option<(String, Vec<String>)> {
 fn login_command_from(
     shell: Option<PathBuf>,
     user: Option<String>,
+    shell_args: &[String],
 ) -> Option<(String, Vec<String>)> {
     let shell = shell?;
-    Some(login_argv(shell.to_str()?, &user?))
+    Some(login_argv(shell.to_str()?, &user?, shell_args))
 }
 
 /// argv from the resolved user and shell.
+///
+/// `shell_args` ride inside the `exec` string, because the string goes to `/bin/zsh -fc` and
+/// that is the only place the shell's own arguments can be written: `login(1)` takes a command,
+/// not an argv. They are quoted (`quote::command_line`) for the same reason.
 #[cfg(target_os = "macos")]
-fn login_argv(shell: &str, user: &str) -> (String, Vec<String>) {
+fn login_argv(shell: &str, user: &str, shell_args: &[String]) -> (String, Vec<String>) {
     // `rsplit` always yields at least one piece; with an empty `$SHELL` that piece is empty
     // too, and a session opened with `exec -a -` was broken in alacritty as well.
     let name = shell.rsplit('/').next().unwrap_or(shell);
+    let tail = if shell_args.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", crate::quote::command_line(shell_args))
+    };
     (
         "/usr/bin/login".to_owned(),
         vec![
@@ -300,7 +328,7 @@ fn login_argv(shell: &str, user: &str) -> (String, Vec<String>) {
             user.to_owned(),
             "/bin/zsh".to_owned(),
             "-fc".to_owned(),
-            format!("exec -a -{name} {shell}"),
+            format!("exec -a -{name} {shell}{tail}"),
         ],
     )
 }
@@ -321,11 +349,19 @@ pub fn is_fish(shell: &Path) -> bool {
     shell.file_name().is_some_and(|name| name == "fish")
 }
 
+/// Whether the shell is bash: the last component of the path is exactly `bash`, for the
+/// reasons [`is_zsh`] gives for zsh. (`sh` is not bash even where it is a link to it: it
+/// starts in POSIX mode by its own name, which is not the start the script is written for.)
+pub fn is_bash(shell: &Path) -> bool {
+    shell.file_name().is_some_and(|name| name == "bash")
+}
+
 /// A shell bateri has an integration script for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellKind {
     Zsh,
     Fish,
+    Bash,
 }
 
 impl ShellKind {
@@ -336,6 +372,8 @@ impl ShellKind {
             Some(Self::Zsh)
         } else if is_fish(shell) {
             Some(Self::Fish)
+        } else if is_bash(shell) {
+            Some(Self::Bash)
         } else {
             None
         }
@@ -371,6 +409,120 @@ pub fn zsh_wrapper_dir() -> Option<PathBuf> {
 /// directory that holds `fish/` ([`fish_data_dir`]).
 pub fn fish_wrapper_dir() -> Option<PathBuf> {
     script_dir("fish", "vendor_conf.d/bateri.fish")
+}
+
+/// The bash wrapper's directory: `Contents/Resources/shell/bash` in the bundle, the repo's
+/// `assets/shell/bash` in a debug build — resolved like [`zsh_wrapper_dir`], and verified by the
+/// presence of the body (`bateri.bash`), the file `ENV` is pointed at.
+pub fn bash_wrapper_dir() -> Option<PathBuf> {
+    script_dir("bash", "bateri.bash")
+}
+
+/// A bash version as `BASH_VERSINFO` reports it: major and minor.
+///
+/// Ordered by major and then minor, so `>=` asks "this version or newer".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BashVersion {
+    pub major: u32,
+    pub minor: u32,
+}
+
+impl BashVersion {
+    /// The oldest bash the integration runs on: 4.4 added `PS0`, the only hook between reading
+    /// a command and running it that is not the user's `DEBUG` trap. Below it a block would
+    /// open at the prompt and never close, so the integration is not installed at all (macOS's
+    /// own `/bin/bash` is 3.2).
+    pub const MIN_INTEGRATION: Self = Self { major: 4, minor: 4 };
+
+    pub const fn new(major: u32, minor: u32) -> Self {
+        Self { major, minor }
+    }
+
+    /// Whether the integration runs on this version.
+    pub fn integrates(self) -> bool {
+        self >= Self::MIN_INTEGRATION
+    }
+}
+
+/// How long [`bash_version`] waits for the shell to answer. A feel threshold, not a measured
+/// number: bash answers in a few milliseconds, and the wait happens on the thread that opens
+/// the pane, once per path, so a bash that hangs costs the user this long and no more.
+const BASH_QUERY_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The version of the bash at `bash`, asked of the shell itself — once per path for the life of
+/// the process (a failure is remembered too: a bash that did not answer once is not asked again
+/// at every new pane).
+///
+/// The version has to be known **before** the shell starts: the dock's rows are reserved when
+/// the session is born and are not given back if the shell never prints a mark
+/// (`grid::dock_rows_for`), and below 4.4 the shell never will. Guessing from the path was
+/// rejected (`/bin/bash` is 3.2 on a stock Mac, but a hand-installed old bash would be
+/// misjudged), and so was branching inside the shell like the remote bootstrap does: it starts
+/// the shell right, but the parent could not know the dock share.
+///
+/// `None`: the shell did not answer, answered with something that is not a version, or ran
+/// out of time — the integration is not installed (the terminal works as it did before).
+pub fn bash_version(bash: &Path) -> Option<BashVersion> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    static ASKED: OnceLock<Mutex<HashMap<PathBuf, Option<BashVersion>>>> = OnceLock::new();
+    let asked = ASKED.get_or_init(Mutex::default);
+    if let Some(known) = asked
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(bash)
+    {
+        return *known;
+    }
+    let answer = query_bash_version(bash, BASH_QUERY_LIMIT);
+    asked
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(bash.to_owned(), answer);
+    answer
+}
+
+/// The uncached question of [`bash_version`]: `bash -c` prints `BASH_VERSINFO`'s first two
+/// elements. `BASH_ENV` is taken out of the environment — a non-interactive bash runs the file
+/// it names before `-c`, and the user's file has no business answering (or printing) here —
+/// and the shell gets no stdin and no stderr. A shell that outlives `limit` is killed.
+fn query_bash_version(bash: &Path, limit: std::time::Duration) -> Option<BashVersion> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut child = Command::new(bash)
+        .args([
+            "-c",
+            r#"printf '%s.%s' "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}""#,
+        ])
+        .env_remove("BASH_ENV")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(2)),
+            Ok(Some(_)) => return None,
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut text = String::new();
+    child.stdout.take()?.read_to_string(&mut text).ok()?;
+    parse_bash_version(&text)
+}
+
+/// `5.3` → 5.3; anything that is not two dot-separated numbers is `None`.
+fn parse_bash_version(text: &str) -> Option<BashVersion> {
+    let (major, minor) = text.trim().split_once('.')?;
+    Some(BashVersion::new(major.parse().ok()?, minor.parse().ok()?))
 }
 
 /// The `XDG_DATA_DIRS` entry that makes fish read the wrapper in `wrapper` (the directory
@@ -533,7 +685,7 @@ pub(crate) mod tests {
         // adds the same flag only **if** `~/.hushlogin` exists; we removed the condition,
         // because the alternative was writing a file into the user's home directory, and that
         // is forbidden in this repo.
-        let (program, args) = login_argv("/bin/zsh", "someone");
+        let (program, args) = login_argv("/bin/zsh", "someone", &[]);
         assert_eq!(program, "/usr/bin/login");
         assert_eq!(args[0], "-qflp", "banner not silenced");
 
@@ -548,7 +700,7 @@ pub(crate) mod tests {
         // The shell's **name** is the last component of the path: Homebrew's zsh is the same
         // shell and argv[0] must still be `-zsh`, otherwise the login shell would not count
         // itself as a login shell.
-        let (_, args) = login_argv("/opt/homebrew/bin/zsh", "someone");
+        let (_, args) = login_argv("/opt/homebrew/bin/zsh", "someone", &[]);
         assert_eq!(args[4], "exec -a -zsh /opt/homebrew/bin/zsh");
     }
 
@@ -558,13 +710,13 @@ pub(crate) mod tests {
         // **The direction of the fallback:** building the command halfway and handing it over
         // anyway meant a terminal that does not open. `None` brings back alacritty's own path
         // — the banner returns but the window works, and that trade-off is the right way.
-        assert!(login_command_from(Some("/bin/zsh".into()), Some("someone".into())).is_some());
-        assert!(login_command_from(None, Some("someone".into())).is_none());
-        assert!(login_command_from(Some("/bin/zsh".into()), None).is_none());
+        assert!(login_command_from(Some("/bin/zsh".into()), Some("someone".into()), &[]).is_some());
+        assert!(login_command_from(None, Some("someone".into()), &[]).is_none());
+        assert!(login_command_from(Some("/bin/zsh".into()), None, &[]).is_none());
         // A non-UTF-8 shell path takes the same branch: the other side of the boundary wants a
         // `String`, and guessing would mean spawning the wrong shell.
         let raw = PathBuf::from(OsString::from_vec(vec![0x2f, 0x62, 0xff]));
-        assert!(login_command_from(Some(raw), Some("someone".into())).is_none());
+        assert!(login_command_from(Some(raw), Some("someone".into()), &[]).is_none());
     }
 
     #[cfg(target_os = "macos")]
@@ -573,7 +725,7 @@ pub(crate) mod tests {
         // The pin on the macOS branch: the test process has `$USER` and `$SHELL` (or a
         // passwd entry), so the command resolves, goes through `login(1)`, and comes with
         // the parent the process table needs for it.
-        let (command, parent) = shell_command();
+        let (command, parent) = shell_command(&[]);
         assert_eq!(parent, ShellParent::Login);
         let (program, args) = command.expect("login command did not resolve");
         assert_eq!(program, "/usr/bin/login");
@@ -583,7 +735,7 @@ pub(crate) mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_shell_command_on_linux_is_a_direct_login_shell() {
-        let (command, parent) = shell_command();
+        let (command, parent) = shell_command(&[]);
         assert_eq!(parent, ShellParent::Direct);
         let (program, args) = command.expect("shell did not resolve");
         assert!(
@@ -593,12 +745,12 @@ pub(crate) mod tests {
         assert_eq!(args, vec!["-l".to_owned()]);
         // The pure half: an unresolved or non-UTF-8 shell falls back to alacritty's path.
         assert_eq!(
-            login_shell_command(Some("/bin/zsh".into())),
+            login_shell_command(Some("/bin/zsh".into()), &[]),
             Some(("/bin/zsh".to_owned(), vec!["-l".to_owned()]))
         );
-        assert_eq!(login_shell_command(None), None);
+        assert_eq!(login_shell_command(None, &[]), None);
         let raw = PathBuf::from(OsString::from_vec(vec![0x2f, 0x62, 0xff]));
-        assert_eq!(login_shell_command(Some(raw)), None);
+        assert_eq!(login_shell_command(Some(raw), &[]), None);
     }
 
     #[test]
@@ -701,7 +853,145 @@ pub(crate) mod tests {
             Some(ShellKind::Fish)
         );
         assert_eq!(ShellKind::of(Path::new("/bin/zsh")), Some(ShellKind::Zsh));
-        assert_eq!(ShellKind::of(Path::new("/bin/bash")), None);
+        assert_eq!(ShellKind::of(Path::new("/usr/bin/sh")), None);
+    }
+
+    #[test]
+    fn bash_is_recognized_by_name_not_by_path() {
+        assert!(is_bash(Path::new("/opt/homebrew/bin/bash")));
+        assert!(is_bash(Path::new("/bin/bash")));
+        assert!(is_bash(Path::new("bash")));
+        // `sh` starts in POSIX mode by its own name, whatever it links to; a versioned name is
+        // not how bash is installed.
+        assert!(!is_bash(Path::new("/bin/sh")));
+        assert!(!is_bash(Path::new("/usr/local/bin/bash-5.2")));
+        assert!(!is_bash(Path::new("/bin/zsh")));
+        assert!(!is_bash(Path::new("")));
+        assert_eq!(
+            ShellKind::of(Path::new("/opt/homebrew/bin/bash")),
+            Some(ShellKind::Bash)
+        );
+    }
+
+    #[test]
+    fn the_bash_wrapper_ships_with_the_crate() {
+        // The repo branch (tests run in a debug build): the file `ENV` is pointed at is there.
+        let dir = bash_wrapper_dir().expect("bash wrapper not found in the repo branch");
+        assert!(dir.ends_with("bash"));
+        assert!(dir.join("bateri.bash").is_file());
+    }
+
+    #[test]
+    fn a_bash_version_is_two_numbers_and_ordered() {
+        assert_eq!(parse_bash_version("5.3"), Some(BashVersion::new(5, 3)));
+        assert_eq!(parse_bash_version("3.2\n"), Some(BashVersion::new(3, 2)));
+        assert_eq!(parse_bash_version("4.10"), Some(BashVersion::new(4, 10)));
+        for junk in ["", "5", "5.", ".3", "five.three", "5.3.1", "5,3", "-1.2"] {
+            assert_eq!(parse_bash_version(junk), None, "{junk:?}");
+        }
+        // 4.10 is newer than 4.4: the comparison is by number, not by text.
+        assert!(BashVersion::new(4, 10) > BashVersion::new(4, 4));
+        assert!(BashVersion::new(5, 0) > BashVersion::new(4, 99));
+        // `PS0` came in 4.4.
+        assert!(!BashVersion::new(3, 2).integrates());
+        assert!(!BashVersion::new(4, 3).integrates());
+        assert!(BashVersion::new(4, 4).integrates());
+        assert!(BashVersion::new(5, 3).integrates());
+    }
+
+    /// A stand-in "bash" in `dir`: an executable script with `body`.
+    fn stand_in(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("stand-in");
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        path
+    }
+
+    #[test]
+    fn the_version_is_what_the_shell_answers_in_time() {
+        let root = TempRoot::new("bash-version");
+        let limit = std::time::Duration::from_secs(5);
+        let answer = |body: &str| {
+            let path = stand_in(&root.0, "bash", body);
+            query_bash_version(&path, limit)
+        };
+        assert_eq!(answer("printf 5.3"), Some(BashVersion::new(5, 3)));
+        assert_eq!(answer("printf 3.2"), Some(BashVersion::new(3, 2)));
+        // Not a version, a failure, and a shell that prints and then fails are all "no answer".
+        assert_eq!(answer("printf hello"), None);
+        assert_eq!(answer("exit 1"), None);
+        assert_eq!(answer("printf 5.3; exit 1"), None);
+        assert_eq!(answer(""), None);
+        assert_eq!(
+            query_bash_version(&root.0.join("missing"), limit),
+            None,
+            "a path with no program"
+        );
+        // A shell that does not answer is killed when the limit passes; the pane is not kept
+        // waiting for it.
+        let hang = stand_in(&root.0, "hang", "exec sleep 30");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            query_bash_version(&hang, std::time::Duration::from_millis(200)),
+            None
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the question outlived its limit: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_version_is_asked_once_per_path_failures_included() {
+        let root = TempRoot::new("bash-version-cache");
+        let log = root.0.join("asked");
+        for (name, body) in [("good", "printf 5.3"), ("bad", "exit 1")] {
+            let path = stand_in(
+                &root.0,
+                name,
+                &format!("echo asked >> '{}.{name}'\n{body}", log.display()),
+            );
+            let first = bash_version(&path);
+            let second = bash_version(&path);
+            assert_eq!(first, second, "{name}");
+            assert_eq!(first.is_some(), name == "good", "{name}");
+            let asked = std::fs::read_to_string(format!("{}.{name}", log.display()))
+                .expect("the stand-in was run");
+            assert_eq!(asked, "asked\n", "{name}: the shell was asked again");
+        }
+    }
+
+    #[test]
+    fn the_argv_carries_the_shells_own_arguments() {
+        #[cfg(target_os = "macos")]
+        {
+            // After the shell's name inside the `exec` string (the only place `login(1)` lets
+            // an argument go), quoted for `/bin/zsh -fc`.
+            let args = ["--posix".to_owned()];
+            let (_, argv) = login_argv("/opt/homebrew/bin/bash", "someone", &args);
+            assert_eq!(argv[4], "exec -a -bash /opt/homebrew/bin/bash --posix");
+            let args = ["--init-file".to_owned(), "a b; c".to_owned()];
+            let (_, argv) = login_argv("/opt/homebrew/bin/bash", "someone", &args);
+            assert_eq!(
+                argv[4],
+                "exec -a -bash /opt/homebrew/bin/bash --init-file a\\ b\\;\\ c"
+            );
+            // No arguments: the string is what it was, byte for byte.
+            let (_, argv) = login_argv("/bin/zsh", "someone", &[]);
+            assert_eq!(argv[4], "exec -a -zsh /bin/zsh");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                login_shell_command(Some("/bin/bash".into()), &["--posix".to_owned()]),
+                Some((
+                    "/bin/bash".to_owned(),
+                    vec!["--posix".to_owned(), "-l".to_owned()]
+                ))
+            );
+        }
     }
 
     #[test]
@@ -2088,37 +2378,53 @@ pub(crate) mod tests {
         }
         let dock = env.get("BATERI_DOCK").is_none_or(|value| value != "off");
         Session::spawn(
-            SessionOptions {
-                // `-l -i`: the shape of our session (`login` makes argv[0] `-fish`).
-                command: Some((
+            // `-l -i`: the shape of our session (`login` makes argv[0] `-fish`).
+            shell_options(
+                (
                     fish.path.display().to_string(),
                     vec!["-l".to_owned(), "-i".to_owned()],
-                )),
-                working_directory: Some(home.to_owned()),
-                home: Some(home.to_owned()),
+                ),
+                home,
                 env,
-                cols: 80,
-                rows: 20,
-                cell_px: (9, 18),
-                terminal: TerminalOptions {
-                    scrollback: 100,
-                    osc52: Osc52::Off,
-                    cursor: CaretShape::default(),
-                    blink: CursorBlink::default(),
-                },
-                theme: Theme::BATERI,
                 dock,
-                cluster: false,
-                initial_input: None,
-                shell_marks: false,
-                pane_uuid: None,
-                hostname: None,
-                replay: None,
-                journal: None,
-            },
+            ),
             Arc::new(SilentWake),
         )
         .expect("could not open the session")
+    }
+
+    /// The options of a real-shell session: `command` in `home`, with `env` added, 80 × 20
+    /// cells and the default theme. `dock` is the share the application would reserve.
+    fn shell_options(
+        command: (String, Vec<String>),
+        home: &Path,
+        env: HashMap<String, String>,
+        dock: bool,
+    ) -> SessionOptions {
+        SessionOptions {
+            command: Some(command),
+            working_directory: Some(home.to_owned()),
+            home: Some(home.to_owned()),
+            env,
+            cols: 80,
+            rows: 20,
+            cell_px: (9, 18),
+            terminal: TerminalOptions {
+                scrollback: 100,
+                osc52: Osc52::Off,
+                cursor: CaretShape::default(),
+                blink: CursorBlink::default(),
+            },
+            theme: Theme::BATERI,
+            dock,
+            cluster: false,
+            initial_input: None,
+            shell_marks: false,
+            pane_uuid: None,
+            hostname: None,
+            replay: None,
+            journal: None,
+        }
     }
 
     /// `config.fish` of a fake home.
@@ -2925,5 +3231,500 @@ pub(crate) mod tests {
             }
             session.shutdown();
         }
+    }
+
+    // ── bash ─────────────────────────────────────────────────────────────
+
+    /// A bash on this machine the wrapper runs on (4.4 or newer), held for the test's length.
+    struct Bash {
+        path: PathBuf,
+        version: BashVersion,
+    }
+
+    /// The first bash on `PATH` or in the usual places that is new enough, or `None` after the
+    /// line the other real-shell tests print for a missing tool. macOS's own `/bin/bash` is 3.2
+    /// and is passed over, as the terminal passes over it. The version is printed: the wrapper is
+    /// checked on whichever bash runs the test, and a green run says which one that was.
+    fn bash() -> Option<Bash> {
+        let on_path = std::env::var_os("PATH")
+            .map(|path| {
+                std::env::split_paths(&path)
+                    .map(|dir| dir.join("bash"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let usual = [
+            "/opt/homebrew/bin/bash",
+            "/usr/local/bin/bash",
+            "/usr/bin/bash",
+            "/bin/bash",
+        ]
+        .map(PathBuf::from);
+        for path in on_path.into_iter().chain(usual) {
+            if !path.is_file() {
+                continue;
+            }
+            let Some(version) = query_bash_version(&path, std::time::Duration::from_secs(5)) else {
+                continue;
+            };
+            if version.integrates() {
+                println!(
+                    "bash: {}.{} ({})",
+                    version.major,
+                    version.minor,
+                    path.display()
+                );
+                return Some(Bash { path, version });
+            }
+        }
+        println!("SKIPPED: no bash 4.4 or newer on this machine");
+        None
+    }
+
+    /// A real bash session with the wrapper installed the way the application installs it
+    /// (`launch::integration_env`'s bash arm): `ENV` names the file and the shell is started
+    /// `--posix -l` (the Linux shape of the command; on macOS `login(1)` gives the same shell
+    /// its login name).
+    ///
+    /// `HOME` is the test's own: bash writes its history there, and the user's real files are
+    /// never read. `extra` is the rest of the contract (`BATERI_ENV`, `BATERI_BIN`, …).
+    fn spawn_bash(bash: &Bash, home: &Path, extra: &[(&str, String)]) -> Session {
+        let wrapper = bash_wrapper_dir().expect("bash wrapper not found");
+        let mut env = HashMap::from([
+            ("HOME".to_owned(), home.display().to_string()),
+            (
+                "ENV".to_owned(),
+                wrapper.join("bateri.bash").display().to_string(),
+            ),
+            ("BATERI_DOCK".to_owned(), "off".to_owned()),
+        ]);
+        for (key, value) in extra {
+            env.insert((*key).to_owned(), value.clone());
+        }
+        let dock = env.get("BATERI_DOCK").is_none_or(|value| value != "off");
+        Session::spawn(
+            shell_options(
+                (
+                    bash.path.display().to_string(),
+                    vec!["--posix".to_owned(), "-l".to_owned()],
+                ),
+                home,
+                env,
+                dock,
+            ),
+            Arc::new(SilentWake),
+        )
+        .expect("could not open the session")
+    }
+
+    /// A file of a fake home.
+    fn write_home_file(home: &Path, name: &str, text: &str) -> PathBuf {
+        std::fs::create_dir_all(home).expect("could not set up the fake home directory");
+        let path = home.join(name);
+        std::fs::write(&path, text).expect("home file not written");
+        path
+    }
+
+    fn at_the_prompt(session: &Session) {
+        wait_until("prompt marks did not arrive", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.phase == ShellPhase::Input)
+        });
+    }
+
+    #[test]
+    fn the_bash_wrapper_loads_the_login_files_and_reports_marks() {
+        // The real test of the bash wrapper: a real bash, a real PTY and a real user
+        // configuration. In one round:
+        //
+        // 1. The login files were read in bash's order, from our file, with a broken line in
+        //    the first and a `PROMPT_COMMAND` that rewrites `PS1` at every prompt: only
+        //    `~/.bash_profile` ran (not `~/.profile`, not `~/.bashrc`), the prompt it
+        //    defines is the one drawn, and the blocks still have their anchors.
+        // 2. What is ours is out of the environment by then: `ENV` (the user's own is back, or
+        //    gone), `BATERI_*`; the shell is out of POSIX mode and says so in no variable;
+        //    the history file is `~/.bash_history`, not POSIX mode's `~/.sh_history`, unless
+        //    the environment named one.
+        // 3. The marks arrive: a finished command's code, the working directory, the block
+        //    anchors on the grid, the duration.
+        // 4. It is a login shell (`logout` works and `~/.bash_logout` is read) and nothing of
+        //    the user's was written.
+        let Some(bash) = bash() else { return };
+        let profile = "PS1='$ '\n\
+                       PROMPT_COMMAND='PS1=\"$ \"'\n\
+                       export FROM_PROFILE=1\n\
+                       bateri_missing_command\n\
+                       echo \"$FROM_PROFILE [${ENV-unset}] [${BATERI_ENV-unset}] [$HISTFILE] \
+                       [${POSIXLY_CORRECT-unset}] [${BATERI_DOCK-unset}] [${BATERI_BIN-unset}]\" \
+                       > \"$HOME/profile_seen\"\n";
+        for (name, extra, user_env, history) in [
+            ("none", vec![], "unset", ".bash_history"),
+            (
+                "env",
+                vec![("BATERI_ENV", "/home/me/.shrc".to_owned())],
+                "/home/me/.shrc",
+                ".bash_history",
+            ),
+            ("histfile", Vec::new(), "unset", ".sh_history"),
+        ] {
+            let root = TempRoot::new(&format!("bash-wrapper-{name}"));
+            let home = root.0.join("home");
+            let profile_path = write_home_file(&home, ".bash_profile", profile);
+            write_home_file(&home, ".profile", "touch \"$HOME/profile_read\"\n");
+            write_home_file(&home, ".bashrc", "touch \"$HOME/bashrc_read\"\n");
+            write_home_file(&home, ".bash_logout", "touch \"$HOME/logout_ran\"\n");
+            std::fs::create_dir_all(home.join("sub dir")).expect("sub dir");
+            let mut extra = extra;
+            if name == "histfile" {
+                // An exported `HISTFILE` is the user's, whatever it is.
+                extra.push(("HISTFILE", home.join(".sh_history").display().to_string()));
+            }
+
+            let session = spawn_bash(&bash, &home, &extra);
+            at_the_prompt(&session);
+            assert!(
+                shown(&session, "$"),
+                "{name}: the user's prompt is not drawn"
+            );
+            let seen = home.join("profile_seen");
+            wait_until("~/.bash_profile did not run", || seen.is_file());
+            assert_eq!(
+                std::fs::read_to_string(&seen).expect("profile_seen").trim(),
+                format!(
+                    "1 [{user_env}] [unset] [{}] [unset] [unset] [unset]",
+                    home.join(history).display()
+                ),
+                "{name}: a variable of ours leaked, or the history file is wrong"
+            );
+            assert!(
+                !home.join("profile_read").exists(),
+                "{name}: ~/.profile ran"
+            );
+            assert!(!home.join("bashrc_read").exists(), "{name}: ~/.bashrc ran");
+            if name != "none" {
+                session.write(b"exit\n");
+                wait_until("logout did not run", || home.join("logout_ran").is_file());
+                session.shutdown();
+                continue;
+            }
+
+            // 3: the code, the directory, the anchors and the duration.
+            session.write(b"false\n");
+            wait_until("the command's exit code did not reach the state", || {
+                session
+                    .shell_state()
+                    .is_some_and(|state| state.last_exit == Some(1))
+            });
+            session.write(b"cd 'sub dir'\n");
+            wait_until("the directory did not reach the session", || {
+                session
+                    .working_directory()
+                    .is_some_and(|dir| dir.ends_with("sub dir"))
+            });
+            // The two finished commands' anchors are on the grid, each with its stripe (the
+            // failed one's differs from the other's); the prompt waiting for input has none yet.
+            // The user's `PROMPT_COMMAND` wrote `PS1` again before each of them.
+            let mut blocks = Blocks::default();
+            screen(&session, &mut blocks);
+            assert_eq!(
+                blocks.as_slice().len(),
+                2,
+                "the prompts' anchors were not on the grid: {:?}",
+                blocks.as_slice()
+            );
+            assert_ne!(blocks.as_slice()[0].stripe, blocks.as_slice()[1].stripe);
+            // A command that exceeds the threshold: the counter appears only when our `D`
+            // found the clock the `C` planted.
+            session.write(b"sleep 2\n");
+            wait_until("finished command's duration not shown", || {
+                let drawn = screen(&session, &mut Blocks::default()).join("\n");
+                drawn.contains("2.0s") || drawn.contains("2.1s")
+            });
+
+            // 4: `logout` only works in a login shell; its file and the history were written.
+            session.write(b"logout\n");
+            wait_until("~/.bash_logout was not read", || {
+                home.join("logout_ran").is_file()
+            });
+            wait_until("history was not written", || {
+                home.join(".bash_history").is_file()
+            });
+            assert!(
+                !home.join(".sh_history").exists(),
+                "POSIX mode's history file was written"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&profile_path).expect("~/.bash_profile"),
+                profile,
+                "~/.bash_profile was written to"
+            );
+            session.shutdown();
+        }
+    }
+
+    #[test]
+    fn the_bash_prompt_is_wrapped_once_and_again_after_a_rewrite() {
+        // The user's `PS1` is wrapped (anchor in front, end mark behind) and what is wrapped
+        // is remembered: a prompt that comes back unchanged is wrapped again from the user's
+        // own text with the new block's id, never the wrapper's own string wrapped twice. One
+        // that a hook rewrote is the user's new text.
+        let Some(bash) = bash() else { return };
+        let root = TempRoot::new("bash-ps1");
+        let home = root.0.join("home");
+        write_home_file(&home, ".bash_profile", "PS1='\\[\\e[1m\\]$ \\[\\e[0m\\]'\n");
+        let session = spawn_bash(&bash, &home, &[]);
+        at_the_prompt(&session);
+        let seen = home.join("ps1_seen");
+        let ask = |session: &Session| {
+            let _ = std::fs::remove_file(&seen);
+            session.write(
+                b"printf '%s|%s|%s' \"$PS1\" \"$__bateri_user_ps1\" \"$__bateri_block\" > \"$HOME/ps1_seen\"\n",
+            );
+            wait_until("the prompt was not read", || seen.is_file());
+            std::fs::read_to_string(&seen).expect("ps1_seen")
+        };
+        for _ in 0..3 {
+            session.write(b"true\n");
+            wait_until("the next prompt did not arrive", || {
+                session
+                    .shell_state()
+                    .is_some_and(|state| state.last_exit == Some(0))
+            });
+        }
+        let user = "\\[\\e[1m\\]$ \\[\\e[0m\\]";
+        let got = ask(&session);
+        // Ours was set before this prompt's command ran: the block is the one of the prompt
+        // the printf was typed at (four prompts so far, this is the fifth).
+        let block = got.rsplit('|').next().expect("block").to_owned();
+        assert_eq!(
+            got,
+            format!(
+                "\\[\\e]8;;bateri://block/{block}\\a\\]{user}\\[\\e]133;B\\a\\]|{user}|{block}"
+            ),
+            "the prompt was wrapped twice or lost the user's text"
+        );
+        // A hook rewrites it: the new text is the user's from now on.
+        session.write(b"PS1='% '\n");
+        wait_until("the rewritten prompt did not come", || {
+            shown(&session, "% ")
+        });
+        let got = ask(&session);
+        let block = got.rsplit('|').next().expect("block").to_owned();
+        assert_eq!(
+            got,
+            format!("\\[\\e]8;;bateri://block/{block}\\a\\]% \\[\\e]133;B\\a\\]|% |{block}")
+        );
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_users_prompt_command_keeps_running_in_every_form() {
+        // Ours go around the user's, in whatever form it is: a string, one that ends in a
+        // comment (the joiner is a newline, not `;`), and — bash 5.1 and newer — an array,
+        // whose other elements stay.
+        let Some(bash) = bash() else { return };
+        let mut forms = vec![
+            ("string", "PROMPT_COMMAND='touch \"$HOME/ran_one\"'\n"),
+            (
+                "comment",
+                "PROMPT_COMMAND='touch \"$HOME/ran_one\" # a trailing comment'\n",
+            ),
+            ("none", "unset PROMPT_COMMAND\n"),
+        ];
+        if bash.version >= BashVersion::new(5, 1) {
+            forms.push((
+                "array",
+                "PROMPT_COMMAND=('touch \"$HOME/ran_one\"' 'touch \"$HOME/ran_two\"')\n",
+            ));
+        }
+        for (name, profile) in forms {
+            let root = TempRoot::new(&format!("bash-pc-{name}"));
+            let home = root.0.join("home");
+            write_home_file(&home, ".bash_profile", profile);
+            let session = spawn_bash(&bash, &home, &[]);
+            at_the_prompt(&session);
+            session.write(b"true\n");
+            wait_until("the second prompt did not arrive", || {
+                session
+                    .shell_state()
+                    .is_some_and(|state| state.last_exit == Some(0))
+            });
+            if name != "none" {
+                wait_until(&format!("{name}: the user's hook did not run"), || {
+                    home.join("ran_one").is_file()
+                });
+            }
+            if name == "array" {
+                wait_until("array: the second element did not run", || {
+                    home.join("ran_two").is_file()
+                });
+            }
+            // And ours did: the finished command's anchor is on the grid.
+            let mut blocks = Blocks::default();
+            screen(&session, &mut blocks);
+            assert_eq!(
+                blocks.as_slice().len(),
+                1,
+                "{name}: {:?}",
+                blocks.as_slice()
+            );
+            session.shutdown();
+        }
+    }
+
+    #[test]
+    fn a_bash_prompt_waiting_for_a_command_closes_no_block_without_one() {
+        // An empty line and a line cancelled with Ctrl-C read no command: `PS0` never runs, so
+        // no `D` is printed for the block they leave — zsh's rule — and the last exit code is
+        // still the last command's, not the cancelled line's 130.
+        let Some(bash) = bash() else { return };
+        let root = TempRoot::new("bash-empty");
+        let home = root.0.join("home");
+        write_home_file(&home, ".bash_profile", "PS1='$ '\n");
+        let session = spawn_bash(&bash, &home, &[]);
+        at_the_prompt(&session);
+        session.write(b"false\n");
+        wait_until("the exit code did not arrive", || {
+            session
+                .shell_state()
+                .is_some_and(|state| state.last_exit == Some(1))
+        });
+        session.write(b"\n");
+        session.write(b"abc\x03");
+        // The interrupt flushes what the terminal had queued for the shell, so the next line is
+        // typed once the prompt after the cancelled one is on the screen.
+        wait_until("the prompt after the cancelled line did not come", || {
+            let rows = screen(&session, &mut Blocks::default());
+            rows.iter()
+                .rposition(|row| row.contains("^C"))
+                .is_some_and(|at| rows[at + 1..].iter().any(|row| row.starts_with('$')))
+        });
+        session.write(b"echo marker-after\n");
+        wait_until("the command after the cancelled line did not run", || {
+            shown(&session, "marker-after")
+                && session
+                    .shell_state()
+                    .is_some_and(|s| s.last_exit == Some(0))
+        });
+        // Four prompts have come and gone (`false`, empty, cancelled, echo) but only the two
+        // commands that ran have a stripe: the other two blocks never got their `D`.
+        let mut blocks = Blocks::default();
+        screen(&session, &mut blocks);
+        assert_eq!(blocks.as_slice().len(), 2, "{:?}", blocks.as_slice());
+        assert_ne!(blocks.as_slice()[0].stripe, blocks.as_slice()[1].stripe);
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_bash_wrappers_ssh_function_asks_the_binary() {
+        // `ssh` is the user's until the wrapper is read: a function or an alias of their own
+        // wins, and otherwise ours asks the binary (`bateri ssh-argv`, one parser) for the
+        // wrapped arguments, NUL-separated, an empty one included.
+        let Some(bash) = bash() else { return };
+        let root = TempRoot::new("bash-ssh");
+        let home = root.0.join("home");
+        let bin = root.0.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let log = root.0.join("asked");
+        let fall = root.0.join("fall");
+        stand_in(
+            &bin,
+            "bateri",
+            &format!(
+                "echo \"$*\" >> '{}'\ncase \"$1 $2\" in\n\
+                 'ssh-argv --tty') printf -- '-t\\0x\\0y z\\0\\0BOOT\\0' ;;\n\
+                 ssh-fell-back*) [ -f '{}' ] && printf -- 'PLAIN\\0x\\0' ;;\nesac\nexit 0\n",
+                log.display(),
+                fall.display()
+            ),
+        );
+        let code = root.0.join("code");
+        stand_in(
+            &bin,
+            "ssh",
+            &format!(
+                "for a in \"$@\"; do printf '[%s]' \"$a\"; done; echo\n\
+                 [ -f '{0}' ] && exit \"$(cat '{0}')\"\nexit 0\n",
+                code.display()
+            ),
+        );
+        let spawn = |rc: &str| {
+            // The stand-ins first on `PATH`, after the system's login files (macOS's
+            // `path_helper` rewrites it for a login shell).
+            write_home_file(
+                &home,
+                ".bash_profile",
+                &format!("PATH={}:$PATH\nPS1='$ '\n{rc}", bin.display()),
+            );
+            spawn_bash(
+                &bash,
+                &home,
+                &[
+                    ("BATERI_BIN", bin.join("bateri").display().to_string()),
+                    ("BATERI_SSH_INSTANCE", "0a1b2c3d".to_owned()),
+                    ("BATERI_SSH_CWD", "/srv/my app".to_owned()),
+                ],
+            )
+        };
+
+        let session = spawn("");
+        at_the_prompt(&session);
+        session.write(
+            b"ssh x 'y z'; ssh x | cat; echo \"leak<${BATERI_BIN-}${BATERI_SSH_INSTANCE-}${BATERI_SSH_CWD-}>\"\n",
+        );
+        wait_until("the wrapped call did not run", || {
+            shown(&session, "[-t][x][y z][][BOOT]") && shown(&session, "leak<>")
+        });
+        let asked = std::fs::read_to_string(&log).expect("the binary was asked");
+        // `--block` is the command's own block: the first prompt's; the folder went with the
+        // first call and not the second; the wrapped call asked the fallback with its arguments.
+        assert_eq!(
+            asked,
+            "ssh-argv --tty --block 1 --instance 0a1b2c3d --cwd /srv/my app -- x y z\n\
+             ssh-fell-back --rc 0 --instance 0a1b2c3d -- -t x y z  BOOT\n\
+             ssh-argv --block 1 --instance 0a1b2c3d -- x\n"
+        );
+        std::fs::remove_file(&log).expect("log");
+
+        // A fallback answer is rerun plain; the code is the rerun's.
+        std::fs::write(&fall, "").expect("fall");
+        std::fs::write(&code, "7").expect("code");
+        session.write(b"ssh x; echo \"rc=$?\"\n");
+        wait_until("the plain rerun did not run", || {
+            shown(&session, "[PLAIN][x]") && shown(&session, "rc=7")
+        });
+        // Inside a multiplexer nothing is wrapped.
+        std::fs::remove_file(&fall).expect("fall");
+        std::fs::write(&code, "255").expect("code");
+        session.write(b"export TMUX=t; ssh x; echo \"r2=$?\"\n");
+        wait_until("the tmux call did not run", || shown(&session, "r2=255"));
+        session.shutdown();
+
+        // A user's own function or alias wins: ours is not defined over it.
+        for (rc, shown_text) in [
+            ("ssh() { echo USER-SSH; }\n", "USER-SSH"),
+            ("alias ssh='echo ALIAS-SSH'\n", "ALIAS-SSH"),
+        ] {
+            let session = spawn(rc);
+            at_the_prompt(&session);
+            session.write(b"ssh x\n");
+            wait_until("the user's ssh did not run", || shown(&session, shown_text));
+            session.shutdown();
+        }
+
+        // Without the binary's path there is no function at all.
+        write_home_file(&home, ".bash_profile", "PS1='$ '\n");
+        let session = spawn_bash(&bash, &home, &[]);
+        at_the_prompt(&session);
+        session.write(b"echo \"kind=$(type -t ssh)\"\n");
+        wait_until("the kind was not shown", || {
+            shown(&session, "kind=file") || shown(&session, "kind=\n")
+        });
+        assert!(
+            !shown(&session, "kind=function"),
+            "ssh was wrapped without the binary"
+        );
+        session.shutdown();
     }
 }

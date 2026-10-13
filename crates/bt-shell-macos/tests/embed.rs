@@ -120,6 +120,7 @@ fn main() {
         helper: None,
         zsh_wrapper_dir: None,
         fish_wrapper_dir: None,
+        bash_wrapper_dir: None,
     });
     let config = embed::Config::new(
         mtm,

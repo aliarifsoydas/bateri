@@ -47,7 +47,7 @@ use crate::arrange::{self, HOLD_DELAY, Hold, Tool};
 use crate::embed;
 use crate::handover::{self, Arrival, HeldPane, PaneState};
 use crate::keeper::{self, Keeper, QuitKind, QuitPath};
-use crate::launch::{self, Adopted, Identity, Launch, Note, fallen_back};
+use crate::launch::{self, Adopted, Identity, Integration, Launch, Note, ProcessEnv, fallen_back};
 use crate::menu::ShellMenuDelegate;
 use crate::moves::{self, Move, Plan, Refusal, Slot, Step};
 use crate::notices::{Notices, Source};
@@ -794,7 +794,7 @@ fn clamp_frame(frame: Frame, screens: &[Frame]) -> Frame {
     }
 }
 
-/// The environment shell integration adds to the child — empty if not set up,
+/// What shell integration adds to the child — nothing if not set up,
 /// and never in a timed run: `make smoke`'s result must not depend on the
 /// measuring machine's shell or its configuration, so neither `shell` nor
 /// `script_dir` is consulted there (`hermetic_run_does_not_set_up_shell_integration`).
@@ -804,13 +804,13 @@ fn shell_integration_env(
     setting: ShellIntegration,
     shell: impl FnOnce() -> Option<PathBuf>,
     script_dir: impl FnOnce(child::ShellKind) -> Option<PathBuf>,
-    zdotdir: Option<OsString>,
-    data_dirs: Option<OsString>,
-) -> Vec<(String, String)> {
+    bash_version: impl FnOnce(&Path) -> Option<child::BashVersion>,
+    process: ProcessEnv,
+) -> Integration {
     if matches!(inputs, Inputs::Hermetic) {
-        return Vec::new();
+        return Integration::default();
     }
-    launch::integration_env(setting, shell, script_dir, zdotdir, data_dirs)
+    launch::integration_env(setting, shell, script_dir, bash_version, process)
 }
 
 /// The daily preview sweep's period — "once a day", a design
@@ -2464,6 +2464,7 @@ impl AppDelegate {
                 helper: std::env::current_exe().ok(),
                 zsh_wrapper_dir: child::zsh_wrapper_dir(),
                 fish_wrapper_dir: child::fish_wrapper_dir(),
+                bash_wrapper_dir: child::bash_wrapper_dir(),
             }),
             restore_lock: RefCell::new(None),
             arrival: RefCell::new(arrival),
@@ -3967,7 +3968,7 @@ impl AppDelegate {
                     initial.as_deref(),
                     session.remote_target().map(|(_, target, _)| target.kind),
                     session.remote_link_directory(),
-                    &integration.0,
+                    &integration.env,
                 )
             })
             .into_iter()
@@ -4661,7 +4662,7 @@ impl AppDelegate {
     ///
     /// Both keys from **one borrow**: a reload falling between separate `borrow()`s
     /// could read the two from different files.
-    pub(crate) fn shell_integration(&self) -> (Vec<(String, String)>, u16) {
+    pub(crate) fn shell_integration(&self) -> Integration {
         let setting = self.ivars().settings.borrow().shell_integration;
         let identity = &self.ivars().identity;
         let wrapper = shell_integration_env(
@@ -4669,8 +4670,8 @@ impl AppDelegate {
             setting,
             child::shell,
             |kind| identity.script_dir(kind),
-            std::env::var_os("ZDOTDIR"),
-            std::env::var_os("XDG_DATA_DIRS"),
+            child::bash_version,
+            ProcessEnv::current(),
         );
         launch::with_dock(
             identity,
@@ -6038,6 +6039,31 @@ mod tests {
     use super::*;
     use crate::launch::{dock_rows_at_birth, smooth_scroll as resolve_smooth_scroll, with_helper};
 
+    /// [`super::shell_integration_env`] as the zsh and fish tests ask it: their two process
+    /// variables, an up-to-date bash, and the environment alone as the answer.
+    fn shell_integration_env(
+        inputs: &Inputs,
+        setting: ShellIntegration,
+        shell: impl FnOnce() -> Option<PathBuf>,
+        script_dir: impl FnOnce(child::ShellKind) -> Option<PathBuf>,
+        zdotdir: Option<OsString>,
+        data_dirs: Option<OsString>,
+    ) -> Vec<(String, String)> {
+        super::shell_integration_env(
+            inputs,
+            setting,
+            shell,
+            script_dir,
+            |_| Some(child::BashVersion::new(5, 3)),
+            ProcessEnv {
+                zdotdir,
+                data_dirs,
+                env: None,
+            },
+        )
+        .env
+    }
+
     /// The **measured** tail of a healthy smoke run (2026-09-16, the lowest of
     /// thirty-seven runs: `1742,29 ms`).
     /// Tests that do not ask about the gate get this so the `quiet` arm does not
@@ -7336,12 +7362,12 @@ mod tests {
         let env = shell_integration_env(
             &user,
             ShellIntegration::Auto,
-            || Some(PathBuf::from("/bin/bash")),
+            || Some(PathBuf::from("/bin/sh")),
             |_| panic!("script looked up for a shell without one"),
             None,
             None,
         );
-        assert!(env.is_empty(), "wrapper installed for bash");
+        assert!(env.is_empty(), "wrapper installed for sh");
         // The shell could not be resolved at all (passwd unreadable, no `$SHELL`): the same silent
         // fallback.
         let env =
@@ -7505,6 +7531,166 @@ mod tests {
             None,
         );
         assert!(env.is_empty());
+    }
+
+    /// The whole decision for bash at `/opt/homebrew/bin/bash`, with the version the shell
+    /// "answers" and the user's own `ENV`.
+    fn bash_integration(
+        setting: ShellIntegration,
+        answer: Option<child::BashVersion>,
+        user_env: Option<OsString>,
+    ) -> Integration {
+        super::shell_integration_env(
+            &Inputs::User { config_root: None },
+            setting,
+            || Some(PathBuf::from("/opt/homebrew/bin/bash")),
+            |kind| {
+                assert_eq!(
+                    kind,
+                    child::ShellKind::Bash,
+                    "bash asked for another script"
+                );
+                Some(PathBuf::from("/opt/bateri/shell/bash"))
+            },
+            |path| {
+                assert_eq!(path, Path::new("/opt/homebrew/bin/bash"));
+                answer
+            },
+            ProcessEnv {
+                zdotdir: Some("/home/someone/zsh".into()),
+                data_dirs: Some("/a:/b".into()),
+                env: user_env,
+            },
+        )
+    }
+
+    #[test]
+    fn bash_is_read_through_env_in_posix_mode_with_marks_only() {
+        // `ENV` names the file a `--posix` bash reads; the arguments and the environment are
+        // one answer. Whatever the setting says, the wrapper has no dock arm yet: it is told
+        // there is none and no share is reserved.
+        for setting in [ShellIntegration::Auto, ShellIntegration::Blocks] {
+            let got = bash_integration(setting, Some(child::BashVersion::new(5, 3)), None);
+            assert_eq!(
+                got.env,
+                vec![
+                    (
+                        "ENV".to_owned(),
+                        "/opt/bateri/shell/bash/bateri.bash".to_owned()
+                    ),
+                    ("BATERI_DOCK".to_owned(), "off".to_owned()),
+                ],
+                "{setting:?}"
+            );
+            assert_eq!(got.shell_args, vec!["--posix".to_owned()], "{setting:?}");
+            assert_eq!(dock_rows_at_birth(&got.env, setting), 0, "{setting:?}");
+        }
+        // Another shell's variables never reach bash.
+        let got = bash_integration(
+            ShellIntegration::Auto,
+            Some(child::BashVersion::new(5, 3)),
+            None,
+        );
+        assert!(
+            !got.env
+                .iter()
+                .any(|(key, _)| key.contains("ZDOTDIR") || key.contains("XDG")),
+            "bash got another shell's environment: {:?}",
+            got.env
+        );
+    }
+
+    #[test]
+    fn a_bash_before_4_4_is_left_as_it_was() {
+        // `PS0` is 4.4's: below it a block would open at the prompt and never close. The
+        // answer is everything or nothing — no environment, no argument, no share — and a
+        // shell that did not answer counts as too old.
+        for (name, answer) in [
+            ("3.2", Some(child::BashVersion::new(3, 2))),
+            ("4.3", Some(child::BashVersion::new(4, 3))),
+            ("no answer", None),
+        ] {
+            let got = bash_integration(ShellIntegration::Auto, answer, None);
+            assert_eq!(got, Integration::default(), "{name}");
+        }
+        for (major, minor) in [(4, 4), (5, 0), (5, 3)] {
+            let got = bash_integration(
+                ShellIntegration::Auto,
+                Some(child::BashVersion::new(major, minor)),
+                None,
+            );
+            assert!(!got.env.is_empty(), "{major}.{minor} was refused");
+        }
+    }
+
+    #[test]
+    fn the_version_is_asked_only_of_a_bash_that_would_use_it() {
+        // A process is started for the question: `"off"`, a missing script and the other
+        // shells never pay for it.
+        let user = Inputs::User { config_root: None };
+        let never = |_: &Path| -> Option<child::BashVersion> { panic!("the version was asked") };
+        let bash = || Some(PathBuf::from("/opt/homebrew/bin/bash"));
+        let got = super::shell_integration_env(
+            &user,
+            ShellIntegration::Off,
+            || panic!("\"off\" resolved the shell"),
+            |_| panic!("\"off\" looked for the script"),
+            never,
+            ProcessEnv::default(),
+        );
+        assert_eq!(got, Integration::default());
+        let got = super::shell_integration_env(
+            &user,
+            ShellIntegration::Auto,
+            bash,
+            |_| None,
+            never,
+            ProcessEnv::default(),
+        );
+        assert_eq!(got, Integration::default(), "a bash without a script");
+        let (shell, dir) = zsh_and_dir();
+        let got = super::shell_integration_env(
+            &user,
+            ShellIntegration::Auto,
+            shell,
+            dir,
+            never,
+            ProcessEnv::default(),
+        );
+        assert!(!got.env.is_empty(), "zsh lost its wrapper");
+        assert!(got.shell_args.is_empty(), "zsh was given arguments");
+    }
+
+    #[test]
+    fn the_users_env_comes_back_through_bateri_env() {
+        let new = Some(child::BashVersion::new(5, 3));
+        let script = "/opt/bateri/shell/bash/bateri.bash".to_owned();
+        // The user's own `ENV` is carried for the script to put back.
+        let got = bash_integration(ShellIntegration::Auto, new, Some("/home/me/.shrc".into()));
+        assert!(
+            got.env
+                .contains(&("BATERI_ENV".to_owned(), "/home/me/.shrc".to_owned())),
+            "{:?}",
+            got.env
+        );
+        // Absent, empty, or already ours (leaked from a parent): nothing to put back, and the
+        // script then unsets `ENV` instead of handing it its own file as the user's.
+        for value in [None, Some(OsString::new()), Some(script.clone().into())] {
+            let got = bash_integration(ShellIntegration::Auto, new, value.clone());
+            assert!(
+                !got.env.iter().any(|(key, _)| key == "BATERI_ENV"),
+                "{value:?}: {:?}",
+                got.env
+            );
+        }
+        // A value that is not UTF-8 cannot be handed back, and the script would delete a
+        // variable of the user's it never saw: the integration is not installed.
+        use std::os::unix::ffi::OsStringExt as _;
+        let odd = OsString::from_vec(b"/x/\xff".to_vec());
+        assert_eq!(
+            bash_integration(ShellIntegration::Auto, new, Some(odd)),
+            Integration::default()
+        );
     }
 
     #[test]

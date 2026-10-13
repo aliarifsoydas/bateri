@@ -80,7 +80,7 @@ use crate::focus::Moment;
 use crate::grid::{self, Grid, split_into_grid};
 use crate::jobs::{self, Foreground, Probe, ShellParent, SystemTable};
 use crate::journal::PaneJournal;
-use crate::launch::{Adopted, Closing, Identity, Launch};
+use crate::launch::{Adopted, Closing, Identity, Integration, Launch};
 use crate::notices::{Source, font_messages};
 use crate::pacer::MacPacer;
 use crate::password_sheet::PasswordSheet;
@@ -800,9 +800,9 @@ pub(crate) struct PaneLaunch {
     pub(crate) theme: Theme,
     /// Start directory and first input.
     pub(crate) launch: Launch,
-    /// Shell integration's environment and the dock reserve — from **a single
-    /// question** (`AppDelegate::shell_integration`): two separate calls could diverge.
-    pub(crate) integration: (Vec<(String, String)>, u16),
+    /// Shell integration's environment, the shell's arguments and the dock reserve — from **a
+    /// single question** (`AppDelegate::shell_integration`): separate calls could diverge.
+    pub(crate) integration: Integration,
     /// Resolved value of Reduce Motion.
     pub(crate) reduce_motion: bool,
     /// Resolved mode of the wheel.
@@ -831,7 +831,7 @@ struct Birth {
     settings: Settings,
     theme: Theme,
     launch: Launch,
-    integration: (Vec<(String, String)>, u16),
+    integration: Integration,
 }
 
 /// Main-queue half of the title notification: the flag drops **before every
@@ -3161,7 +3161,7 @@ impl TerminalPane {
         let Some(birth) = self.ivars().birth.take() else {
             return Err(std::io::Error::other("pane started a second time"));
         };
-        let (_, rows) = birth.integration;
+        let rows = birth.integration.dock_rows;
         self.ivars().dock_rows_at_birth.set(rows);
         self.ivars().dock_rows.set(rows);
         // The grid size derives from the window; the session is born with its
@@ -3186,7 +3186,12 @@ impl TerminalPane {
             settings,
             theme,
             launch,
-            integration: (integration, _),
+            integration:
+                Integration {
+                    env: integration,
+                    shell_args,
+                    dock_rows: _,
+                },
         } = birth;
         let Launch {
             working_directory,
@@ -3214,7 +3219,7 @@ impl TerminalPane {
         // they are `Direct`; deciding the parent in the same branch as the
         // command is what keeps the two from disagreeing.
         let (command, shell_parent) = match self.ivars().run {
-            None => child::shell_command(),
+            None => child::shell_command(&shell_args),
             Some(run) => (
                 Some(match run.workload {
                     Workload::Smoke => smoke_shell(),
@@ -3870,7 +3875,9 @@ impl TerminalPane {
             .birth
             .borrow()
             .as_ref()
-            .map_or(self.ivars().dock_rows.get(), |birth| birth.integration.1)
+            .map_or(self.ivars().dock_rows.get(), |birth| {
+                birth.integration.dock_rows
+            })
     }
 
     /// The pane is lifted for arranging ([`crate::arrange`]), or set down:

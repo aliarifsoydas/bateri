@@ -37,6 +37,11 @@ fn fish_asset_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/shell/fish")
 }
 
+/// The input directory of the bash wrapper (`assets/shell/bash`).
+fn bash_asset_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/shell/bash")
+}
+
 fn read_asset(name: &str) -> String {
     let path = asset(name);
     std::fs::read_to_string(&path)
@@ -219,6 +224,33 @@ fn fish_wrapper_inventory_is_exactly_what_the_bundle_copies() {
         found,
         ["vendor_conf.d/bateri.fish"],
         "the assets/shell/fish inventory changed; `make bundle`'s copy and cmp \
+         lists must be updated too"
+    );
+}
+
+/// The bash wrapper's inventory is **exactly** one file, `bateri.bash`.
+///
+/// For the reasons of the zsh test above: `make bundle` copies the file by name and `cmp`s it,
+/// so a second file added to the directory never enters the package while everything stays
+/// green. `ENV` names the one file; nothing else in the directory is ever read.
+#[test]
+fn bash_wrapper_inventory_is_exactly_what_the_bundle_copies() {
+    let mut found: Vec<String> = std::fs::read_dir(bash_asset_dir())
+        .expect("assets/shell/bash could not be read")
+        .map(|entry| {
+            entry
+                .expect("directory entry could not be read")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name != ".DS_Store")
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        ["bateri.bash"],
+        "the assets/shell/bash inventory changed; `make bundle`'s copy and cmp \
          lists must be updated too"
     );
 }

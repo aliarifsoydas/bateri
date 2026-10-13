@@ -42,6 +42,9 @@ pub struct Identity {
     /// holds `vendor_conf.d`). `None`: a fish pane gets no integration, as a
     /// zsh pane without [`Self::zsh_wrapper_dir`].
     pub fish_wrapper_dir: Option<PathBuf>,
+    /// The same for bash (bateri's `Resources/shell/bash`, the directory that holds
+    /// `bateri.bash`, the file `ENV` is pointed at). `None`: a bash pane gets no integration.
+    pub bash_wrapper_dir: Option<PathBuf>,
 }
 
 impl Identity {
@@ -50,67 +53,122 @@ impl Identity {
         match kind {
             child::ShellKind::Zsh => self.zsh_wrapper_dir.clone(),
             child::ShellKind::Fish => self.fish_wrapper_dir.clone(),
+            child::ShellKind::Bash => self.bash_wrapper_dir.clone(),
         }
     }
 }
 
-/// The wrapper's environment `wrapper` ([`integration_env`]) completed: the
+/// What shell integration gives a new pane's shell: the environment the wrapper is read
+/// through, the arguments the shell must be started with, and the dock rows the session is
+/// born with. One value, because the three are one decision: a shell started with the
+/// environment but without the arguments (or the reverse) reads nothing, and a dock reserved
+/// for a shell that never draws it is not given back.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Integration {
+    /// Added to the child's environment. Empty: no integration, and then so is the rest.
+    pub env: Vec<(String, String)>,
+    /// Arguments after the shell's own name (bash's `--posix`; none for zsh and fish).
+    pub shell_args: Vec<String>,
+    /// The dock share reserved while the session is born ([`dock_rows_at_birth`]).
+    pub dock_rows: u16,
+}
+
+/// Our own process's environment, as far as the wrappers hand it back to the user: variables
+/// the terminal replaces to get the wrapper read, and the script restores.
+///
+/// **Eager**: these are our own process's variables, not entries open to the user's world, and
+/// in the hermetic arm their values never reach the child anyway.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProcessEnv {
+    /// `ZDOTDIR` (zsh).
+    pub(crate) zdotdir: Option<OsString>,
+    /// `XDG_DATA_DIRS` (fish).
+    pub(crate) data_dirs: Option<OsString>,
+    /// `ENV` (bash).
+    pub(crate) env: Option<OsString>,
+}
+
+impl ProcessEnv {
+    pub(crate) fn current() -> Self {
+        Self {
+            zdotdir: std::env::var_os("ZDOTDIR"),
+            data_dirs: std::env::var_os("XDG_DATA_DIRS"),
+            env: std::env::var_os("ENV"),
+        }
+    }
+}
+
+/// The wrapper's integration `wrapper` ([`integration_env`]) completed: the
 /// helper beside it ([`with_helper`]) and the dock share it makes
 /// ([`dock_rows_at_birth`]).
 pub(crate) fn with_dock(
     identity: &Identity,
     setting: ShellIntegration,
-    wrapper: Vec<(String, String)>,
+    wrapper: Integration,
     instance: Option<&str>,
-) -> (Vec<(String, String)>, u16) {
-    let integration = with_helper(wrapper, identity.helper.clone(), instance);
-    let birth = dock_rows_at_birth(&integration, setting);
-    (integration, birth)
+) -> Integration {
+    let env = with_helper(wrapper.env, identity.helper.clone(), instance);
+    let dock_rows = dock_rows_at_birth(&env, setting);
+    Integration {
+        env,
+        shell_args: wrapper.shell_args,
+        dock_rows,
+    }
 }
 
-/// The environment shell integration adds to the child — empty if not set up.
+/// What shell integration adds to the child — nothing if not set up.
 ///
 /// **The whole decision is here and pure**: which shell, which setting, where
-/// the script is. Whoever opens a pane asks it the same way; bateri's timed
-/// run never does (its gate is the application's).
+/// the script is, whether the shell is new enough. Whoever opens a pane asks it
+/// the same way; bateri's timed run never does (its gate is the application's).
 ///
-/// `shell` and `script_dir` are **closures**: in the session of a user who
-/// says `"off"` neither is ever consulted, and `script_dir` is asked only for
-/// the kind of shell the user runs.
+/// `shell`, `script_dir` and `bash_version` are **closures**: in the session of a user who
+/// says `"off"` none is ever consulted, `script_dir` is asked only for the kind of shell the
+/// user runs, and `bash_version` — which starts a process — only for a bash whose script is
+/// there to be used. `bash_version` answers for the shell at the path it is given
+/// ([`child::bash_version`]); below [`child::BashVersion::MIN_INTEGRATION`] or without an
+/// answer the bash is left as it is, **entirely**: no environment, no arguments, no dock share.
+/// The share is reserved when the session is born and is not given back when the shell prints
+/// no mark, so the version has to be known before the birth.
 ///
-/// `zdotdir` and `data_dirs` are **eager**: they are our own process's
-/// environment (`ZDOTDIR`, `XDG_DATA_DIRS`), not entries open to the user's
-/// world, and in the hermetic arm their values never reach the child anyway.
-///
-/// The return is a `Vec`, not an `Option`: the environment set up can be not
-/// one pair but several and the caller chains it next to `locale_env()`.
+/// The return is a value, not an `Option`: the environment set up can be not one pair but
+/// several and the caller chains it next to `locale_env()`.
 pub(crate) fn integration_env(
     setting: ShellIntegration,
     shell: impl FnOnce() -> Option<PathBuf>,
     script_dir: impl FnOnce(child::ShellKind) -> Option<PathBuf>,
-    zdotdir: Option<OsString>,
-    data_dirs: Option<OsString>,
-) -> Vec<(String, String)> {
+    bash_version: impl FnOnce(&Path) -> Option<child::BashVersion>,
+    process: ProcessEnv,
+) -> Integration {
     if !setting.installs_wrapper() {
-        return Vec::new();
+        return Integration::default();
     }
     // A shell we do not recognize silently falls back: the terminal works as
     // today, only the marks do not arrive.
-    let Some(kind) = shell().as_deref().and_then(child::ShellKind::of) else {
-        return Vec::new();
+    let Some(shell) = shell() else {
+        return Integration::default();
+    };
+    let Some(kind) = child::ShellKind::of(&shell) else {
+        return Integration::default();
     };
     // A non-UTF-8 path is the same silent fallback: `SessionOptions.env`
     // wants a `String` and a session without integration is better than a
     // half-set-up one.
     let Some(dir) = script_dir(kind).and_then(|dir| dir.into_os_string().into_string().ok()) else {
-        return Vec::new();
+        return Integration::default();
     };
-    let mut env = match kind {
-        child::ShellKind::Zsh => zsh_env(dir, zdotdir),
-        child::ShellKind::Fish => fish_env(&dir, data_dirs),
+    let (mut env, shell_args) = match kind {
+        child::ShellKind::Zsh => (zsh_env(dir, process.zdotdir), Vec::new()),
+        child::ShellKind::Fish => (fish_env(&dir, process.data_dirs), Vec::new()),
+        child::ShellKind::Bash => {
+            if !bash_version(&shell).is_some_and(child::BashVersion::integrates) {
+                return Integration::default();
+            }
+            (bash_env(&dir, process.env), vec!["--posix".to_owned()])
+        }
     };
     if env.is_empty() {
-        return env;
+        return Integration::default();
     }
     // **Sent only where there is no dock** (the same shape as `BATERI_ZDOTDIR`
     // being conditional): in the default arm we add not a single byte to the
@@ -124,10 +182,17 @@ pub(crate) fn integration_env(
     // decision, the shell is not asked (`ShellIntegration::wants_dock`). fish
     // is no exception: its dock reads the line from the grid, so it needs no
     // mirror, only the script's prompt.
-    if !setting.wants_dock() {
+    //
+    // bash's wrapper has no dock arm yet, so whatever the setting says it is told there is
+    // none: it adds the marks around the user's prompt, and no share is reserved for it.
+    if !setting.wants_dock() || kind == child::ShellKind::Bash {
         env.push(("BATERI_DOCK".to_owned(), "off".to_owned()));
     }
-    env
+    Integration {
+        env,
+        shell_args,
+        dock_rows: 0,
+    }
 }
 
 /// zsh's half of [`integration_env`]: `ZDOTDIR` points at the wrapper's
@@ -165,6 +230,36 @@ fn zsh_env(dir: String, zdotdir: Option<OsString>) -> Vec<(String, String)> {
     let mut env = vec![("ZDOTDIR".to_owned(), dir)];
     if let Some(original) = original {
         env.push(("BATERI_ZDOTDIR".to_owned(), original));
+    }
+    env
+}
+
+/// bash's half of [`integration_env`]: `ENV` names the wrapper's file, which a bash started
+/// with `--posix` reads (the only startup file an interactive shell reads in that mode), and the
+/// user's own `ENV` travels beside it for the script to put back.
+///
+/// `dir` is the wrapper's directory; the file in it is `bateri.bash`. An empty `ENV` counts as
+/// undefined, as an empty `ZDOTDIR` does. **A self-pointing value** is dropped for the reason
+/// the zsh arm gives: handed back as "the user's original value" it would be this very file. A
+/// non-UTF-8 value rejects the integration entirely (an empty return): the script would
+/// otherwise delete a variable of the user's it never saw.
+fn bash_env(dir: &str, user_env: Option<OsString>) -> Vec<(String, String)> {
+    let file = Path::new(dir).join("bateri.bash");
+    let Some(file) = file.to_str() else {
+        return Vec::new();
+    };
+    let original = match user_env {
+        None => None,
+        Some(value) if value.is_empty() => None,
+        Some(value) => match value.into_string() {
+            Ok(value) if value == file => None,
+            Ok(value) => Some(value),
+            Err(_) => return Vec::new(),
+        },
+    };
+    let mut env = vec![("ENV".to_owned(), file.to_owned())];
+    if let Some(original) = original {
+        env.push(("BATERI_ENV".to_owned(), original));
     }
     env
 }

@@ -1384,9 +1384,9 @@ ports = true
 > back](#getting-your-prompt-back).
 
 Integration lets the shell tell the terminal "the prompt started here, the
-command ran here, it ended with this code". Today it exists for **zsh** and
-**fish**; in another shell (bash) `"auto"` does nothing either and the
-terminal works as it is.
+command ran here, it ended with this code". Today it exists for **zsh**,
+**fish** and **bash** 4.4 or newer; in another shell, or an older bash, `"auto"`
+does nothing either and the terminal works as it is.
 
 - **`"auto"` (the default)** — if the shell is zsh, `ZDOTDIR` points to
   bateri's own directory. The files in that directory load **your** startup
@@ -1420,6 +1420,22 @@ terminal works as it is.
     previewing and the `search:` field under it;
   - `fish --no-config` reads no `vendor_conf.d`, so it gets no marks and no
     dock — the line you type stays in the grid.
+- **bash** (4.4 or newer) gets the command blocks, the stripe, the duration
+  counter, the working directory and the `ssh` integration. The dock does not
+  open for bash yet: the line you type stays in the grid and your prompt shows
+  as it is. bateri starts bash as a login shell in POSIX mode with `ENV` naming
+  its own file; that file leaves POSIX mode and reads your login files itself,
+  in bash's order (`/etc/profile`, then the first of `~/.bash_profile`,
+  `~/.bash_login` and `~/.profile`), so `logout` and `~/.bash_logout` work,
+  your history stays in `~/.bash_history`, and nothing is written to your
+  bash files. Its hooks are put in after your files have run, so a prompt
+  theme that rewrites `PS1` or `PROMPT_COMMAND` at startup does not take them
+  away; one that is re-sourced later in the session (`source ~/.bashrc` typed
+  by hand) can, and the marks stop until the next tab.
+  **macOS's own `/bin/bash` is version 3.2 and is left exactly as it is** —
+  no marks, no change in how it starts. To have them, install a newer bash
+  (for example `brew install bash`) and make it your login shell. A `ssh`
+  function or alias of your own is left alone.
 - **`"blocks"`** — the same setup, but **the input line stays yours**: the
   dock does not open, the line you type stays in the grid, and your prompt
   (p10k, starship, a `PS1` or `fish_prompt` you wrote by hand) shows as it is.
@@ -1705,7 +1721,7 @@ command line of a program running as root, so a script run with `sudo`
 
 #### Remote shell integration
 
-While `integration = true`, a plain `ssh` typed in the local zsh or fish also
+While `integration = true`, a plain `ssh` typed in the local zsh, fish or bash also
 sets up shell integration on the server: the directory (OSC 7) and then
 command blocks work remotely too. On the server, bateri only writes a few
 small files under `~/.local/share/bateri/shell/`; it does not touch the

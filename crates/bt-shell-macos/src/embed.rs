@@ -44,7 +44,7 @@ use crate::launch::{self, Adopted, Launch};
 use crate::pane::{Holder, PaneLaunch};
 
 pub use crate::footer::ListeningPort;
-pub use crate::launch::Identity;
+pub use crate::launch::{Identity, Integration};
 pub use crate::pane::{LinkRequest, PaneHost as Host, TerminalPane};
 pub use crate::sheets::{Cover, Owner, OwnerSlot, WeakCover};
 pub use bt_shell_common::jobs::Foreground;
@@ -81,9 +81,9 @@ pub struct Config {
     /// The application's ssh masters, one registry for every pane, if it keeps them: remote
     /// file jobs ride the user's own connection through them.
     pub masters: Option<Arc<Masters>>,
-    /// The shell integration's environment and the dock rows it is born with
-    /// ([`shell_integration`]).
-    pub integration: (Vec<(String, String)>, u16),
+    /// The shell integration's environment, the arguments the shell is started with and the dock
+    /// rows it is born with ([`shell_integration`]).
+    pub integration: Integration,
     /// Reduce Motion, resolved.
     pub reduce_motion: bool,
     /// Whether the wheel scrolls smoothly, resolved.
@@ -176,14 +176,14 @@ pub fn shell_integration(
     identity: &Identity,
     settings: &Settings,
     masters: Option<&Masters>,
-) -> (Vec<(String, String)>, u16) {
+) -> Integration {
     let setting = settings.shell_integration;
     let wrapper = launch::integration_env(
         setting,
         child::shell,
         |kind| identity.script_dir(kind),
-        std::env::var_os("ZDOTDIR"),
-        std::env::var_os("XDG_DATA_DIRS"),
+        child::bash_version,
+        launch::ProcessEnv::current(),
     );
     launch::with_dock(identity, setting, wrapper, masters.map(Masters::instance))
 }
