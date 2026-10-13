@@ -141,6 +141,15 @@ polling = "3.8"
 # grid's the symptom is silent — the dock shifts by a column. In `Cargo.lock`
 # only an edge is added to `bt-core`'s list, no version moves.
 unicode-width = "0.2"
+# The kitty graphics protocol's image payloads (`bt-core::graphics`): `png`
+# decodes `f=100` (what `kitten icat` sends) and `miniz_oxide` inflates `o=z`.
+# User-approved dependency decision (2026-10-13): pure Rust (the Linux gate
+# does not change), MIT/Apache/Zlib licensed (GPL-3 compatible), and writing our
+# own PNG or inflate was rejected. `miniz_oxide` is NOT a second inflate: it
+# is the one `png` pulls in (same 0.8 line), named directly because `png`
+# does not re-export it and `o=z` data is not a PNG stream.
+png = "0.18"
+miniz_oxide = "0.8"
 
 # The renderer's measured move from Metal to wgpu. User-approved
 # dependency decision (2026-09-28). `bt-gpu`'s only GPU dependency. The feature set is kept

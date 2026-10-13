@@ -27,6 +27,14 @@
 //! other forwarding clears the bit — an intervening `CUP` or SGR closes the
 //! cluster.
 //!
+//! **The graphics marker is dispatched here.** The reader takes a kitty
+//! graphics command out of the byte stream and leaves a marker (a private
+//! mode `set`, [`crate::graphics::MARK`]) in its place; this wrapper catches
+//! it before `Term` sees it and applies the oldest queued command to the
+//! screen showing at that point of the stream. A move to or from the
+//! alternate screen drops what that screen's store holds. Without a
+//! [`Sink`] (a replay, a snapshot) the marker is read and does nothing.
+//!
 //! **The forwarding list is in one macro and guarded.** Every `Handler`
 //! method has an empty default; a method dropped from the list still
 //! compiles but never reaches `Term`'s implementation, and the symptom is
@@ -48,6 +56,8 @@ use alacritty_terminal::vte::ansi::{
 // `Cargo.toml`.
 use cursor_icon::CursorIcon;
 
+use crate::graphics::{MARK_MODE, Sink};
+
 /// The `Handler` the parser sees: it borrows `Term` and forwards calls to
 /// it. It is reborn **on every `advance` and `stop_sync` call** — one lock
 /// round can hold several `advance`s (`pty_read`'s read loop) — so it has no
@@ -59,6 +69,11 @@ pub(crate) struct ClusterHandler<'a, U: EventListener> {
     cluster: bool,
     /// Whether the last `Handler` call was `input`: is there an open cluster.
     last_input: &'a mut bool,
+    /// The session's graphics commands ([`crate::graphics`]): where the
+    /// marker finds its record and the store follows the screen. `None` for
+    /// every stream that is not the live one (the journal's replay, the
+    /// handover's snapshot): there the marker is read and does nothing.
+    graphics: Option<&'a dyn Sink>,
 }
 
 impl<'a, U: EventListener> ClusterHandler<'a, U> {
@@ -67,6 +82,42 @@ impl<'a, U: EventListener> ClusterHandler<'a, U> {
             term,
             cluster,
             last_input,
+            graphics: None,
+        }
+    }
+
+    /// Lets the wrapper apply the graphics commands the stream carries.
+    pub(crate) fn graphics(mut self, graphics: Option<&'a dyn Sink>) -> Self {
+        self.graphics = graphics;
+        self
+    }
+
+    fn on_alternate_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// The graphics marker was dispatched: the oldest queued command takes
+    /// effect here, on the screen showing at this point of the stream.
+    fn graphics_mark(&mut self) {
+        *self.last_input = false;
+        let Some(graphics) = self.graphics else {
+            return;
+        };
+        if let Some(reply) = graphics.hub().apply_next(self.on_alternate_screen()) {
+            graphics.reply(reply);
+        }
+    }
+
+    /// Runs a private mode change and drops the alternate screen's images
+    /// when it moved to or from that screen.
+    fn switching_screens(&mut self, change: impl FnOnce(&mut Term<U>)) {
+        *self.last_input = false;
+        let before = self.on_alternate_screen();
+        change(self.term);
+        if let Some(graphics) = self.graphics
+            && self.on_alternate_screen() != before
+        {
+            graphics.hub().drop_alt();
         }
     }
 
@@ -215,6 +266,17 @@ impl<U: EventListener> Handler for ClusterHandler<'_, U> {
         }
     }
 
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        if mode == PrivateMode::Unknown(MARK_MODE) {
+            return self.graphics_mark();
+        }
+        self.switching_screens(|term| term.set_private_mode(mode));
+    }
+
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        self.switching_screens(|term| term.unset_private_mode(mode));
+    }
+
     forward! {
         fn set_title(&mut self, title: Option<String>);
         fn set_cursor_style(&mut self, style: Option<CursorStyle>);
@@ -259,8 +321,6 @@ impl<U: EventListener> Handler for ClusterHandler<'_, U> {
         fn set_mode(&mut self, mode: Mode);
         fn unset_mode(&mut self, mode: Mode);
         fn report_mode(&mut self, mode: Mode);
-        fn set_private_mode(&mut self, mode: PrivateMode);
-        fn unset_private_mode(&mut self, mode: PrivateMode);
         fn report_private_mode(&mut self, mode: PrivateMode);
         fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>);
         fn set_keypad_application_mode(&mut self);

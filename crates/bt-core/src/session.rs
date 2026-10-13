@@ -20,7 +20,10 @@
 //! their doc. A new site that changes the content records one too.
 //! The lock **order** is the same everywhere — `term` first, `size` second;
 //! when adding a new site this order is followed, because if the two locks
-//! are taken in reverse order a deadlock arises. `theme`, `shell`, `search`
+//! are taken in reverse order a deadlock arises. The graphics store
+//! (`images`, inside `Adapter`; [`crate::graphics`]) comes after `term` the
+//! same way: the parser applies a graphics command while it holds `Term`, so
+//! nothing takes `term` while holding `images`. `theme`, `shell`, `search`
 //! and `block_index` are **leaf** locks outside this order: while one is
 //! held no other lock is taken, so which lock it is taken under does not
 //! matter — `frame` takes
@@ -83,6 +86,7 @@ use crate::cluster::{ClusterId, Clusters};
 use crate::color::{self, LinearRgba, Theme};
 use crate::commands::{CommandId, CommandState, command_state};
 use crate::dock::{self, Dock, DockBudget, DockCols, DockEdit, DockPoint};
+use crate::graphics::{self, Hub, Piece, Receiver, Splitter};
 use crate::grid_input;
 use crate::handler::ClusterHandler;
 use crate::identity::{LC_TERMINAL, PaneUuid, TERM_PROGRAM, TERM_PROGRAM_VERSION};
@@ -2048,6 +2052,13 @@ struct AdapterInner {
     /// land in the shell as typed input, a copy would replace what the user
     /// copied since. `TappedPty` clears it at the master's first read.
     muted: AtomicBool,
+    /// The kitty graphics commands: the queue between the reader's two
+    /// halves and the images of each screen ([`crate::graphics`]).
+    ///
+    /// **Leaf lock under `Term`** (`term` → `images`): the parser applies a
+    /// command while it holds `Term`, so the reverse order exists nowhere.
+    /// The decoding of an image never takes it; only the applying does.
+    graphics: Hub,
 }
 
 impl Adapter {
@@ -2070,6 +2081,7 @@ impl Adapter {
             search_pending: AtomicBool::new(false),
             child_exited: AtomicBool::new(false),
             muted: AtomicBool::new(false),
+            graphics: Hub::new(),
         }))
     }
 
@@ -2099,6 +2111,18 @@ impl Adapter {
             return;
         }
         self.input(text.into_bytes());
+    }
+}
+
+impl graphics::Sink for Adapter {
+    fn hub(&self) -> &Hub {
+        &self.0.graphics
+    }
+
+    fn reply(&self, bytes: Vec<u8>) {
+        if !self.0.muted.load(Ordering::Acquire) {
+            self.input(bytes);
+        }
     }
 }
 
@@ -2270,12 +2294,25 @@ impl EventListener for Adapter {
 ///
 /// `EventLoop` ([`crate::reader`]) is generic over the PTY type; the only
 /// thing that interposes on the **byte** path is this wrapper and it **does
-/// not touch the bytes** — [`io::Read::read`] returns exactly what it read
-/// from the inner `Pty`, only showing the slice to the scanner before
-/// returning. The parser therefore sees a stream identical to today's. The
-/// second thing that enters the parser's **call** path is a separate layer
+/// not touch the bytes** except one kind of sequence — [`io::Read::read`]
+/// returns exactly what it read from the inner `Pty`, only showing the slice
+/// to the scanner before returning. The exception is a kitty graphics command
+/// (`ESC _ G … ESC \`): it is taken out of the stream, decoded and queued,
+/// and [`graphics::MARK`] stands in its place ([`crate::graphics`] says why
+/// there and not later). Everything after the separation — the journal, the
+/// tail, the scanner, the parser — sees the stream **without** the command,
+/// so a replay of the journal never has an image payload in it. The second
+/// thing that enters the parser's **call** path is a separate layer
 /// ([`crate::handler::ClusterHandler`]): it sees not the bytes but the
-/// `Handler` calls going to `Term`, i.e. the two do not do each other's job.
+/// `Handler` calls going to `Term`, i.e. the two do not do each other's job
+/// — except for the marker, which that layer dispatches.
+///
+/// **The separation is cheap on purpose.** `read` runs under the read lease
+/// (a frame waits for it) and, once the loop has the lock, under that too, so
+/// a command's payload is only assembled here, as base64 text. Decoding it —
+/// base64, inflate, PNG — happens in the read loop between the read and its
+/// parse, with neither the lease nor the lock held
+/// ([`graphics::Hub::decode_pending`]).
 ///
 /// **`Reader = Self` is the core of the decision.** `Pty::reader()` returns
 /// `&mut File`, so borrowing suffices to hand over the reader: **no second fd
@@ -2350,9 +2387,27 @@ struct TappedPty {
     /// on under it, so this copy sometimes runs under the lock too (at most
     /// `MAX_LOCKED_READ` bytes): a copy, no wait, no system call.
     journal: Option<Arc<Journal>>,
+    /// Finds the graphics commands in what `read_raw` returns.
+    splitter: Splitter,
+    /// Assembles the chunks of a graphics transmission and decodes it.
+    receiver: Receiver,
+    /// The separated stream that did not fit the caller's buffer.
+    spill: graphics::Spill,
 }
 
 impl TappedPty {
+    /// The bytes read but not yet applied by any parser, behind
+    /// [`Self::tail`]'s: what the separation had not delivered (and so what
+    /// no journal, tail or scanner has seen) and the graphics command it was
+    /// in the middle of, or the beginning of one it was holding back. The
+    /// handover carries them on; the adopting side's reader finishes the
+    /// command from what the master has left.
+    fn undelivered(&self) -> Vec<u8> {
+        let mut bytes = self.spill.rest().to_vec();
+        bytes.extend_from_slice(&self.splitter.inflight());
+        bytes
+    }
+
     /// The bytes since the parser last stood in its ground state — read once
     /// the reader has stopped, so no byte comes after them.
     fn tail(&self) -> &[u8] {
@@ -2383,9 +2438,51 @@ impl TappedPty {
     }
 }
 
+impl TappedPty {
+    /// The stream the parser reads: `read_raw`'s bytes with every graphics
+    /// command taken out ([`crate::graphics`]) and its marker in its place.
+    ///
+    /// A read that ends inside a command, or on the first bytes of one,
+    /// delivers less than it read (the rest waits in the splitter), and a
+    /// read of nothing but command delivers nothing: that is `WouldBlock`,
+    /// not `Ok(0)`, which the loop reads as "nothing to read" on macOS and
+    /// stops on.
+    fn read_stream(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.spill.is_empty() {
+            return Ok(self.spill.serve(buf));
+        }
+        let read = self.read_raw(buf)?;
+        if read == 0 || self.splitter.passes(&buf[..read]) {
+            return Ok(read);
+        }
+        let hub = &self.adapter.0.graphics;
+        let out = self.spill.begin();
+        let receiver = &mut self.receiver;
+        self.splitter.feed(&buf[..read], |piece| match piece {
+            Piece::Bytes(bytes) => out.extend_from_slice(bytes),
+            Piece::Command(apc) => receiver.receive(apc, Instant::now(), |outcome| {
+                match outcome {
+                    graphics::Outcome::Pending(pending) => {
+                        hub.queue(pending);
+                        out.extend_from_slice(graphics::MARK);
+                    }
+                    // A query's answer is not sent yet: the program is told,
+                    // as before, that the terminal does not draw.
+                    graphics::Outcome::Query(_) => {}
+                }
+            }),
+        });
+        hub.set_open(self.splitter.inside() || self.receiver.is_open());
+        if self.spill.is_empty() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        Ok(self.spill.serve(buf))
+    }
+}
+
 impl io::Read for TappedPty {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let read = self.read_raw(buf)?;
+        let read = self.read_stream(buf)?;
         if let Some(journal) = &self.journal {
             journal.record_bytes(&buf[..read]);
         }
@@ -2795,6 +2892,17 @@ type Reader = JoinHandle<(EventLoop<TappedPty, Adapter>, State)>;
 /// would drift silently and the sentinel would either cut a healthy shutdown
 /// or never cut.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+
+/// How long [`Session::freeze`] waits for a graphics command that is half
+/// received to finish before it cuts the stream anyway. A bound, not a
+/// measurement: a command in flight finishes in the time its bytes take to
+/// arrive, and this is what a client that went quiet in the middle of one
+/// costs the update. A cut inside a command is still not text: the command
+/// so far goes in the handover's tail ([`TappedPty::undelivered`]) and the
+/// adopting side finishes it. The one cut that is not carried is between the
+/// chunks of a transmission: the next chunk, which names no action, reaches
+/// the adopting side as a command of its own and is answered with an error.
+const COMMAND_GRACE: Duration = Duration::from_millis(500);
 
 /// The result of [`Session::shutdown`] — the source of the `teardown=` token in
 /// the smoke/measurement report.
@@ -5209,6 +5317,9 @@ impl Session {
             prefix_at: 0,
             muting: mute_prefix,
             journal: journal.clone(),
+            splitter: Splitter::new(graphics::PAYLOAD_LIMIT),
+            receiver: Receiver::new(),
+            spill: graphics::Spill::default(),
         };
         adapter.0.muted.store(mute_prefix, Ordering::Release);
 
@@ -5252,6 +5363,7 @@ impl Session {
             drain_on_exit,
             options.cluster,
         )?;
+        event_loop.graphics(Arc::new(adapter.clone()));
         let sender = event_loop.channel();
         // The channel is born only here; since the adapter's copies share the
         // same body a single `set` binds them all.
@@ -11725,6 +11837,12 @@ impl Session {
     /// **Not journaled:** the session's life ends with it — what
     /// the journal records leads up to this, not past it.
     pub fn freeze(&self) -> io::Result<Frozen> {
+        // A graphics command taken out of the stream but not finished would
+        // be cut by the stop below: its rest, read by the adopting side, would
+        // print as text. The reader goes on while this waits, so one in flight
+        // finishes ([`COMMAND_GRACE`] bounds a client that went quiet in the
+        // middle of one).
+        self.adapter.0.graphics.wait_closed(COMMAND_GRACE);
         // Both or neither: a session with a reader but no master copy has
         // nothing to hand over and must stay untouched.
         let taken = {
@@ -11747,7 +11865,10 @@ impl Session {
             return Err(io::Error::other("the reader thread ended with a panic"));
         };
         event_loop.stop_sync(&mut state);
-        let tail = event_loop.pty_mut().tail().to_vec();
+        let mut tail = event_loop.pty_mut().tail().to_vec();
+        // What the separation had read but not delivered goes behind it: no
+        // parser applied it, so the adopting side's must.
+        tail.extend_from_slice(&event_loop.pty_mut().undelivered());
         let mut input = event_loop.unsent(&mut state);
         // A first input still waiting for our first identified `A` goes now,
         // with the keys held behind it, by the reader's own rule: a ready line that finds
@@ -28585,8 +28706,16 @@ e\\314\\201.'; sleep 5";
             self.fifo
                 .write_all(bytes)
                 .expect("the fifo takes the bytes");
+            // A trailing `ESC` or `ESC _` may begin a graphics command, so the
+            // reader holds it until the next byte says it does not
+            // ([`crate::graphics::Splitter`]); the next send applies it.
+            let held = match bytes {
+                [.., 0x1b, b'_'] => 2,
+                [.., 0x1b] => 1,
+                _ => 0,
+            };
             self.written += bytes.len() as u64;
-            let (journal, target) = (Arc::clone(&self.journal), self.written);
+            let (journal, target) = (Arc::clone(&self.journal), self.written - held);
             wait_until(
                 "the loopback's bytes applied",
                 Duration::from_secs(10),
@@ -29345,6 +29474,371 @@ e\\314\\201.'; sleep 5";
             String::from_utf8_lossy(&live_vt)
         );
         session.shutdown();
+    }
+
+    // ─── kitty graphics commands in the stream ─────────────────────────
+
+    /// The ids stored on the main and on the alternate screen.
+    fn stored_ids(session: &Session) -> (Vec<u32>, Vec<u32>) {
+        session
+            .adapter
+            .0
+            .graphics
+            .with_images(|images| (images.main().ids(), images.alt().ids()))
+    }
+
+    /// A one-pixel RGBA transmission with `id`, as `printf` writes it.
+    fn printf_pixel(id: u32) -> String {
+        format!("\\033_Ga=t,f=32,s=1,v=1,i={id};AAAAAA==\\033\\\\")
+    }
+
+    #[test]
+    fn a_graphics_command_is_stored_and_never_reaches_the_screen() {
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_session(
+            &format!("printf 'one{}two READY'; sleep 8", printf_pixel(5)),
+            wake,
+        );
+        let text = wait_text(&session, "READY");
+        // The grid text leaves spaces out; the image's own answer is the line
+        // discipline's echo of it.
+        assert!(text.contains("onetwoREADY"), "{text:?}");
+        assert_eq!(stored_ids(&session), (vec![5], vec![]));
+        session.shutdown();
+    }
+
+    #[test]
+    fn an_image_lands_on_the_screen_that_shows_when_its_marker_is_reached() {
+        let wake = Arc::new(TestWake::default());
+        // Entering the alternate screen and the image are in one write: the
+        // image is the alternate screen's although nothing had applied the
+        // `?1049h` when the command was taken out of the stream.
+        let session = spawn_session(
+            &format!(
+                "printf '{}M\\033[?1049h{}ALT'; sleep 8",
+                printf_pixel(1),
+                printf_pixel(2)
+            ),
+            Arc::clone(&wake),
+        );
+        wait_text(&session, "ALT");
+        assert_eq!(stored_ids(&session), (vec![1], vec![2]));
+        session.shutdown();
+        // Leaving the alternate screen takes its images with it; the main
+        // screen's wait for it.
+        let session = spawn_session(
+            &format!(
+                "printf '{}M\\033[?1049h{}ALT\\033[?1049lBACK'; sleep 8",
+                printf_pixel(1),
+                printf_pixel(2)
+            ),
+            wake,
+        );
+        wait_text(&session, "BACK");
+        assert_eq!(stored_ids(&session), (vec![1], vec![]));
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_query_is_taken_out_of_the_stream_and_not_answered_yet() {
+        let wake = Arc::new(TestWake::default());
+        // The answers land in the PTY's input, where the line discipline
+        // echoes them (`echoctl`); the device attributes' answer comes
+        // after, so a graphics answer would be on the screen by then.
+        let session = spawn_session(
+            "stty echo echoctl; printf '\\033_Gi=4207,a=q,t=d,f=24,s=1,v=1;AAAA\\033\\\\\\033[c'; sleep 8",
+            wake,
+        );
+        let text = wait_text(&session, "[?6c");
+        assert!(!text.contains("4207"), "{text:?}");
+        assert_eq!(stored_ids(&session), (vec![], vec![]));
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_stored_image_is_answered_in_the_stream() {
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_session(
+            &format!(
+                "stty echo echoctl; printf '{}READY'; sleep 8",
+                printf_pixel(31)
+            ),
+            wake,
+        );
+        let text = wait_text(&session, "READY");
+        assert!(text.contains("^[_Gi=31;OK^[\\"), "{text:?}");
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_command_cut_by_reads_is_one_command() {
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_session(
+            "stty -echo; printf '\\033_Ga=t,f=32,s=1,v=1,'; sleep 0.15; printf 'i=9;AAAA'; sleep 0.15; \
+             printf 'AA==\\033'; sleep 0.15; printf '\\\\READY'; sleep 8",
+            wake,
+        );
+        let text = wait_text(&session, "READY");
+        assert!(!text.contains("Ga=") && !text.contains("AAAA"), "{text:?}");
+        assert_eq!(stored_ids(&session), (vec![9], vec![]));
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_command_still_arriving_when_the_freeze_gives_up_finishes_on_the_adopting_side() {
+        // The client stalls inside the payload for longer than the freeze
+        // waits: the command so far goes in the tail, and the new side's
+        // reader gets the rest from the master — an image, not text.
+        let old = spawn_session(
+            "printf '\\033_Ga=t,f=32,s=1,v=1,i=8;AAAA'; sleep 1; printf 'AA==\\033\\\\Q'; sleep 8",
+            Arc::new(TestWake::default()),
+        );
+        wait_until("the command opens", Duration::from_secs(8), || {
+            old.adapter.0.graphics.is_open()
+        });
+        let frozen = old.freeze().expect("the session did not freeze");
+        let carried = String::from_utf8_lossy(&frozen.tail).into_owned();
+        assert!(carried.ends_with("i=8;AAAA"), "{carried:?}");
+        let (exit, _alive) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let new = Session::adopt(
+            test_options(sh("unused"), frozen.cols),
+            Adoption {
+                master: frozen.master,
+                exit: OwnedFd::from(exit),
+                pid: frozen.pid,
+                vt: frozen.vt,
+                blob: frozen.blob,
+                prefix: frozen.tail,
+                input: frozen.input,
+                ops: Arc::new(RecordingOps::default()),
+                mode: AdoptMode::Update,
+            },
+            Arc::new(TestWake::default()),
+        )
+        .expect("adopted");
+        let text = wait_text(&new, "Q");
+        assert!(!text.contains("AA"), "{text:?}");
+        assert_eq!(stored_ids(&new), (vec![8], vec![]));
+    }
+
+    #[test]
+    fn a_synchronized_update_applies_its_commands_in_stream_order() {
+        // The whole update is one read. Taken out of the stream at once, the
+        // two images would both land on the screen the parser was on when the
+        // read began; applied at their markers, the first is the alternate
+        // screen's and goes with it.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_session(
+            &format!(
+                "stty -echo; printf '\\033[?2026h\\033[?1049h{}\\033[?1049l{}\\033[?2026lDONE'; sleep 8",
+                printf_pixel(1),
+                printf_pixel(2)
+            ),
+            wake,
+        );
+        wait_text(&session, "DONE");
+        assert_eq!(stored_ids(&session), (vec![2], vec![]));
+        session.shutdown();
+    }
+
+    #[test]
+    fn an_image_in_the_stream_is_decoded_while_a_frame_can_take_the_terminal() {
+        // The decode of an image is the one thing in the read path that can
+        // take long. A frame (`lock()`, from another thread) must get the
+        // terminal while it runs.
+        let session = spawn_session(
+            &format!(
+                "stty -echo; printf a; sleep 0.5; printf '{}READY'; sleep 8",
+                printf_pixel(2)
+            ),
+            Arc::new(TestWake::default()),
+        );
+        let (go, go_rx) = mpsc::channel::<()>();
+        let (got, got_rx) = mpsc::channel::<()>();
+        let term = Arc::clone(&session.term);
+        let frame = std::thread::spawn(move || {
+            if go_rx.recv().is_ok() {
+                drop(term.lock());
+                let _ = got.send(());
+            }
+        });
+        let free = Arc::new(AtomicBool::new(false));
+        {
+            let free = Arc::clone(&free);
+            session.adapter.0.graphics.on_decode(Box::new(move || {
+                let _ = go.send(());
+                free.store(
+                    got_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+                    Ordering::Release,
+                );
+            }));
+        }
+        wait_text(&session, "READY");
+        frame.join().unwrap();
+        assert!(
+            free.load(Ordering::Acquire),
+            "the terminal was held while decoding"
+        );
+        assert_eq!(stored_ids(&session), (vec![2], vec![]));
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_marker_a_program_wrote_itself_does_nothing() {
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_session("printf 'a\\033[?8166hb READY'; sleep 8", wake);
+        let text = wait_text(&session, "READY");
+        assert!(text.contains("abREADY"), "{text:?}");
+        assert_eq!(stored_ids(&session), (vec![], vec![]));
+        assert_eq!(session.adapter.0.graphics.waiting_records(), 0);
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_command_that_fills_whole_reads_does_not_close_the_pane() {
+        // Three megabytes of payload in one command: reads that hold nothing
+        // but the middle of it deliver nothing, and nothing is not the end
+        // of the stream.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_session(
+            "printf '\\033_Ga=t,f=24,s=1000,v=750,i=3;'; head -c 3000000 /dev/zero | tr '\\0' A; \
+             printf '\\033\\\\READY'; sleep 8",
+            wake,
+        );
+        wait_text(&session, "READY");
+        assert!(session.reader_alive());
+        assert_eq!(stored_ids(&session), (vec![3], vec![]));
+        session.adapter.0.graphics.with_images(|images| {
+            assert_eq!(images.main().bytes(), 1000 * 750 * 4);
+        });
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_stream_of_nothing_but_commands_loses_none_of_its_markers() {
+        // Every marker reaches the parser and finds its record, however the
+        // reads cut the stream.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_session(
+            "chunk=$(printf '\\033_G\\033\\\\%.0s' $(seq 1 500)); i=0; \
+             while [ $i -lt 100 ]; do printf '%s' \"$chunk\"; i=$((i+1)); done; \
+             printf 'READY'; sleep 8",
+            wake,
+        );
+        let text = wait_text(&session, "READY");
+        assert!(!text.contains("_G"), "{text:?}");
+        assert_eq!(session.adapter.0.graphics.waiting_records(), 0);
+        assert!(session.reader_alive());
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_journal_records_the_stream_after_the_separation() {
+        let journal = manual_journal(64 << 20, Duration::from_secs(60));
+        let mut options = test_options(
+            sh(&format!(
+                "stty -echo; printf 'a{}b READY'; sleep 8",
+                printf_pixel(7)
+            )),
+            40,
+        );
+        options.journal = Some(Arc::clone(&journal));
+        let session = Session::spawn(options, Arc::new(TestWake::default())).unwrap();
+        wait_text(&session, "READY");
+        let records = journal.records();
+        let bytes = String::from_utf8_lossy(&records.bytes).into_owned();
+        assert!(bytes.contains("a\x1b[?8166hb READY"), "{bytes:?}");
+        assert!(
+            !bytes.contains("_G") && !bytes.contains("AAAAAA"),
+            "{bytes:?}"
+        );
+        assert_eq!(
+            journal.applied_bytes(),
+            records.bytes_at + records.bytes.len() as u64
+        );
+        assert_eq!(stored_ids(&session), (vec![7], vec![]));
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_freeze_waits_for_a_command_in_flight_and_does_not_cut_it() {
+        let session = spawn_session(
+            "printf '\\033_Ga=t,f=32,s=1,v=1,i=8;AAAA'; sleep 0.4; printf 'AA==\\033\\\\READY'; sleep 8",
+            Arc::new(TestWake::default()),
+        );
+        wait_until("the command opens", Duration::from_secs(8), || {
+            session.adapter.0.graphics.is_open()
+        });
+        let started = Instant::now();
+        let frozen = session.freeze().expect("the session did not freeze");
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "it did not wait"
+        );
+        assert!(!session.adapter.0.graphics.is_open());
+        let tail = String::from_utf8_lossy(&frozen.tail).into_owned();
+        let vt = String::from_utf8_lossy(&frozen.vt).into_owned();
+        assert!(
+            !tail.contains("Ga=") && !vt.contains("AAAA"),
+            "{tail:?} {vt:?}"
+        );
+        assert_eq!(
+            stored_ids(&session).0,
+            [8],
+            "the command finished before the stop"
+        );
+    }
+
+    #[test]
+    fn a_freeze_gives_up_on_a_command_that_never_finishes() {
+        let session = spawn_session(
+            "printf '\\033_Ga=t,f=32,s=1,v=1,i=8;AA'; sleep 8",
+            Arc::new(TestWake::default()),
+        );
+        wait_until("the command opens", Duration::from_secs(8), || {
+            session.adapter.0.graphics.is_open()
+        });
+        let started = Instant::now();
+        session.freeze().expect("the session did not freeze");
+        let waited = started.elapsed();
+        assert!(
+            waited >= COMMAND_GRACE && waited < COMMAND_GRACE * 6,
+            "{waited:?}"
+        );
+    }
+
+    #[test]
+    fn a_freeze_carries_the_beginning_of_a_command_it_was_holding() {
+        for (script, held) in [
+            ("printf 'X\\033'; sleep 8", &b"\x1b"[..]),
+            ("printf 'X\\033_'; sleep 8", &b"\x1b_"[..]),
+        ] {
+            let session = spawn_session(script, Arc::new(TestWake::default()));
+            wait_text(&session, "X");
+            let frozen = session.freeze().expect("the session did not freeze");
+            assert_eq!(frozen.tail, held, "{script}");
+        }
+    }
+
+    #[test]
+    fn a_command_cut_by_an_update_finishes_on_the_adopting_side() {
+        // The old side holds `ESC _`, hands it over as the prefix and the
+        // new side's reader, given the rest of the command by the master,
+        // takes it out of the stream: the image is the new side's and
+        // nothing prints.
+        let (_old, new, _alive) = adopt_frozen_with(
+            "printf 'P\\033_'; sleep 1; printf 'Ga=t,f=32,s=1,v=1,i=3;AAAAAA==\\033\\\\Q'; sleep 8",
+            "P",
+            AdoptMode::Update,
+            b"",
+            None,
+            Arc::new(RecordingOps::default()),
+            Arc::new(TestWake::default()),
+        )
+        .expect("adopted");
+        let text = wait_text(&new, "Q");
+        assert!(text.contains("PQ"), "{text:?}");
+        assert_eq!(stored_ids(&new), (vec![3], vec![]));
     }
 
     /// The race's stall: generous, the race must not break the journal.

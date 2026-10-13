@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 alacritty_terminal = { workspace = true }
 cursor-icon = { workspace = true }
+miniz_oxide = { workspace = true }
+png = { workspace = true }
 polling = { workspace = true }
 toml_edit = { workspace = true }
 unicode-width = { workspace = true }

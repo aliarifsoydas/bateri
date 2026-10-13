@@ -51,6 +51,7 @@ mod cluster;
 mod color;
 mod commands;
 mod dock;
+mod graphics;
 mod grid_input;
 mod handler;
 mod identity;

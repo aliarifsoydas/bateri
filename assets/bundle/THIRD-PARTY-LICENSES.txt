@@ -475,6 +475,10 @@ MIT, alone or as one of its license options). The license text follows
 the list.
 ================================================================================
 
+adler2 2.0.1
+  Copyright (c) Jonas Schievink, oyvindln
+  https://github.com/oyvindln/adler2
+
 aho-corasick 1.1.5
   Copyright (c) 2015 Andrew Gallant
   https://github.com/BurntSushi/aho-corasick
@@ -523,6 +527,10 @@ cfg_aliases 0.2.2
   Copyright (c) 2020 Katharos Technology
   https://github.com/katharostech/cfg_aliases
 
+crc32fast 1.5.2
+  Copyright (c) 2018 Sam Rijs, Alex Crichton and contributors
+  https://github.com/srijs/rust-crc32fast
+
 cursor-icon 1.2.0
   Copyright (c) 2023 Kirill Chibisov
   https://github.com/rust-windowing/cursor-icon
@@ -542,6 +550,14 @@ equivalent 1.0.2
 errno 0.3.14
   Copyright (c) 2014 Chris Wong
   https://github.com/lambda-fairy/rust-errno
+
+fdeflate 0.3.7
+  Copyright (c) The image-rs Developers
+  https://github.com/image-rs/fdeflate
+
+flate2 1.1.10
+  Copyright (c) 2014-2026 Alex Crichton
+  https://github.com/rust-lang/flate2-rs
 
 half 2.7.1
   Copyright (c) Kathryn Long
@@ -592,6 +608,20 @@ log 0.4.34
 memchr 2.8.3
   Copyright (c) 2015 Andrew Gallant
   https://github.com/BurntSushi/memchr
+
+miniz_oxide 0.8.9
+  Copyright 2013-2014 RAD Game Tools and Valve Software
+  Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
+  Copyright (c) 2017 Frommi
+  Copyright (c) 2017-2024 oyvindln
+  https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
+
+miniz_oxide 0.9.1
+  Copyright 2013-2014 RAD Game Tools and Valve Software
+  Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
+  Copyright (c) 2017 Frommi
+  Copyright (c) 2017-2024 oyvindln
+  https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
 
 naga 30.0.1
   Copyright (c) 2025 The gfx-rs developers
@@ -661,6 +691,10 @@ parking_lot_core 0.9.12
   Copyright (c) 2016 The Rust Project Developers
   https://github.com/Amanieu/parking_lot
 
+png 0.18.1
+  Copyright (c) 2015 nwin
+  https://github.com/image-rs/image-png
+
 polling 3.11.0
   Copyright (c) Stjepan Glavina, John Nunley
   https://github.com/smol-rs/polling
@@ -716,6 +750,10 @@ signal-hook 0.4.4
 signal-hook-registry 1.4.8
   Copyright (c) 2017 tokio-jsonrpc developers
   https://github.com/vorner/signal-hook
+
+simd-adler32 0.3.10
+  Copyright (c) [2021] [Marvin Countryman]
+  https://github.com/mcountryman/simd-adler32
 
 smallvec 1.16.0
   Copyright (c) 2018 The Servo Project Developers

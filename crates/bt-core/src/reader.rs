@@ -19,6 +19,10 @@
 //! - the PTY tokens are `pub(crate)` in alacritty, their values were copied
 //!   here (and are `pub(crate)` here too: an adopted PTY registers on them);
 //! - comments were translated (first to Turkish, later to English);
+//! - an image a read carried (a graphics command) is decoded between that
+//!   read and its parse, with the terminal's lease and lock **let go**
+//!   ([`crate::graphics::Hub::decode_pending`]) — a frame waits for the
+//!   lease as well as the lock, so decoding under either would hold it back;
 //! - the update handover: an opt-in read before the first poll
 //!   ([`EventLoop::read_first`], so a carried prefix reaches the parser on
 //!   a quiet PTY) and, on the loop handed back after `join`, the DEC 2026
@@ -35,8 +39,9 @@
 //! The version is pinned with `=0.26.0` for that reason (root `Cargo.toml`).
 //!
 //! Preserved contracts — `session.rs`'s lock order and shutdown lean on
-//! them: the terminal lease is held for the whole of `pty_read` (the `term`
-//! → `shell` order in the module header), the locked read is bounded by
+//! them: the terminal lease is held for the whole of `pty_read` but for that
+//! one decode (the `term` → `shell` order in the module header, which the
+//! decode does not touch), the locked read is bounded by
 //! [`MAX_LOCKED_READ`], `Wakeup` is sent only if unsynchronized bytes were
 //! processed, and [`EventLoop::spawn`] returns the `(EventLoop, State)` pair
 //! — the `Pty` drops, hence `SIGHUP`, when that pair drops.
@@ -57,6 +62,7 @@ use alacritty_terminal::vte::ansi;
 use alacritty_terminal::{thread, tty};
 use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
+use crate::graphics::Sink;
 use crate::handler::{ClusterHandler, Utf8Seam};
 use crate::journal::{Journal, Side};
 
@@ -236,6 +242,9 @@ pub(crate) struct EventLoop<T: tty::EventedPty, U: EventListener> {
     /// The session's journal ([`EventLoop::journal`]); `None`: none, and
     /// the loop runs as alacritty's does.
     journal: Option<Arc<Journal>>,
+    /// The session's graphics ([`EventLoop::graphics`]); `None`: none, and
+    /// the marker the stream may carry does nothing.
+    graphics: Option<Arc<dyn Sink>>,
 }
 
 /// The read gate's state between two loop rounds: while closed, since when
@@ -283,7 +292,14 @@ where
             cluster,
             read_first: None,
             journal: None,
+            graphics: None,
         })
+    }
+
+    /// Applies the graphics commands the stream carries ([`crate::graphics`]):
+    /// the parser's wrapper dispatches their markers into `graphics`.
+    pub(crate) fn graphics(&mut self, graphics: Arc<dyn Sink>) {
+        self.graphics = Some(graphics);
     }
 
     /// Records the PTY into `journal`: the bytes `advance` applies are
@@ -398,11 +414,14 @@ where
     /// handed back after `join` (the handover's freeze): the snapshot
     /// must see what the application already sent.
     pub(crate) fn stop_sync(&mut self, state: &mut State) {
-        state.parser.stop_sync(&mut ClusterHandler::new(
-            &mut *self.terminal.lock(),
-            self.cluster,
-            &mut state.last_input,
-        ));
+        state.parser.stop_sync(
+            &mut ClusterHandler::new(
+                &mut *self.terminal.lock(),
+                self.cluster,
+                &mut state.last_input,
+            )
+            .graphics(self.graphics.as_deref()),
+        );
     }
 
     /// The input bytes the loop never wrote, in order: the buffer being
@@ -457,8 +476,9 @@ where
 
         // Reserve the next terminal lock for the PTY read. The lease is held
         // for the whole read and `TappedPty::read` runs under it —
-        // `session.rs`'s `term` → `shell` lock order depends on this.
-        let _terminal_lease = Some(self.terminal.lease());
+        // `session.rs`'s `term` → `shell` lock order depends on this. The one
+        // time it is let go is to decode an image (below).
+        let mut lease = Some(self.terminal.lease());
         let mut terminal = None;
 
         loop {
@@ -479,6 +499,23 @@ where
                 },
             }
 
+            // An image the read carried is decoded here, **between the read
+            // and its parse**, and with the terminal neither locked nor
+            // leased: a frame waits for the lease as well as the lock, so
+            // inflating or decoding a large image under either would hold
+            // every frame back for as long as it takes. The bytes of this
+            // round wait in `buf`, as they do when the lock is busy; the
+            // markers in them are not dispatched until the records behind
+            // them are decoded, which is also why the order is kept.
+            if let Some(graphics) = self.graphics.as_deref()
+                && graphics.hub().has_undecoded()
+            {
+                terminal = None;
+                drop(lease.take());
+                graphics.hub().decode_pending();
+                lease = Some(self.terminal.lease());
+            }
+
             // Try to lock the terminal.
             let terminal = match &mut terminal {
                 Some(terminal) => terminal,
@@ -497,7 +534,8 @@ where
             // across the seam a read may have cut a character at.
             state.seam.feed(&buf[..unprocessed], |bytes| {
                 state.parser.advance(
-                    &mut ClusterHandler::new(&mut **terminal, self.cluster, &mut state.last_input),
+                    &mut ClusterHandler::new(&mut **terminal, self.cluster, &mut state.last_input)
+                        .graphics(self.graphics.as_deref()),
                     bytes,
                 );
             });
@@ -622,11 +660,14 @@ where
                 if events.is_empty() && self.rx.peek().is_none() {
                     if sync_due(sync, self.journal.is_some(), Instant::now()) {
                         let mut terminal = self.terminal.lock();
-                        state.parser.stop_sync(&mut ClusterHandler::new(
-                            &mut terminal,
-                            self.cluster,
-                            &mut state.last_input,
-                        ));
+                        state.parser.stop_sync(
+                            &mut ClusterHandler::new(
+                                &mut terminal,
+                                self.cluster,
+                                &mut state.last_input,
+                            )
+                            .graphics(self.graphics.as_deref()),
+                        );
                         // In the same lock round: the replay applies the
                         // buffer after exactly the bytes applied so far.
                         if let Some(journal) = &self.journal {
@@ -740,3 +781,169 @@ const EVENTS_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
     Some(capacity) => capacity,
     None => panic!("event capacity cannot be zero"), // audit: const evaluation, zero is a compile error
 };
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::Dimensions as _;
+    use alacritty_terminal::index::{Column, Line};
+    use alacritty_terminal::term::Config;
+    use alacritty_terminal::term::test::TermSize;
+
+    use super::*;
+    use crate::graphics::{Hub, MARK};
+
+    /// The graphics side of a session, without a session.
+    struct TestSink {
+        hub: Hub,
+    }
+
+    impl Sink for TestSink {
+        fn hub(&self) -> &Hub {
+            &self.hub
+        }
+
+        fn reply(&self, _: Vec<u8>) {}
+    }
+
+    /// One read of the scripted PTY.
+    enum Step {
+        Text(&'static str),
+        /// A graphics command: its record is queued, undecoded, and the
+        /// marker is what the read returns — what `TappedPty` does.
+        Image,
+    }
+
+    struct ScriptedPty {
+        steps: VecDeque<Step>,
+        sink: Arc<TestSink>,
+        void: io::Sink,
+    }
+
+    impl Read for ScriptedPty {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let bytes: Vec<u8> = match self.steps.pop_front() {
+                Some(Step::Text(text)) => text.as_bytes().to_vec(),
+                Some(Step::Image) => {
+                    self.sink.hub.queue_raw("a=t,f=32,s=1,v=1,i=1", b"AAAAAA==");
+                    MARK.to_vec()
+                }
+                None => return Err(ErrorKind::WouldBlock.into()),
+            };
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    impl tty::EventedReadWrite for ScriptedPty {
+        type Reader = Self;
+        type Writer = io::Sink;
+
+        unsafe fn register(
+            &mut self,
+            _: &Arc<Poller>,
+            _: PollingEvent,
+            _: PollMode,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn reregister(&mut self, _: &Arc<Poller>, _: PollingEvent, _: PollMode) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn deregister(&mut self, _: &Arc<Poller>) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn reader(&mut self) -> &mut Self::Reader {
+            self
+        }
+
+        fn writer(&mut self) -> &mut Self::Writer {
+            &mut self.void
+        }
+    }
+
+    impl tty::EventedPty for ScriptedPty {
+        fn next_child_event(&mut self) -> Option<tty::ChildEvent> {
+            None
+        }
+    }
+
+    impl OnResize for ScriptedPty {
+        fn on_resize(&mut self, _: WindowSize) {}
+    }
+
+    /// An image carried by a read that comes **after** the loop has taken the
+    /// terminal's lock for the one before it: decoding it must not happen
+    /// under that lock, nor under the lease a frame also waits for.
+    #[test]
+    fn an_image_is_decoded_with_neither_the_terminal_lease_nor_its_lock_held() {
+        let sink = Arc::new(TestSink { hub: Hub::new() });
+        let terminal = Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &TermSize::new(20, 4),
+            VoidListener,
+        )));
+        let pty = ScriptedPty {
+            steps: VecDeque::from([Step::Text("hello"), Step::Image, Step::Text("world")]),
+            sink: Arc::clone(&sink),
+            void: io::sink(),
+        };
+        let mut event_loop =
+            EventLoop::new(Arc::clone(&terminal), VoidListener, pty, false, false).expect("loop");
+        event_loop.graphics(Arc::clone(&sink) as Arc<dyn Sink>);
+
+        // What a frame does: `lock()`, from another thread, while the image
+        // is being decoded.
+        let (go, go_rx) = mpsc::channel::<()>();
+        let (got, got_rx) = mpsc::channel::<()>();
+        let frame = {
+            let terminal = Arc::clone(&terminal);
+            std::thread::spawn(move || {
+                if go_rx.recv().is_ok() {
+                    drop(terminal.lock());
+                    let _ = got.send(());
+                }
+            })
+        };
+        let free = Arc::new(AtomicBool::new(false));
+        {
+            let free = Arc::clone(&free);
+            sink.hub.on_decode(Box::new(move || {
+                let _ = go.send(());
+                free.store(
+                    got_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+                    Ordering::Release,
+                );
+            }));
+        }
+
+        let mut state = State::default();
+        let mut buf = vec![0; 4096];
+        let processed = event_loop
+            .pty_read(&mut state, &mut buf, true)
+            .expect("read");
+        frame.join().expect("the frame thread");
+
+        assert!(
+            free.load(Ordering::Acquire),
+            "a frame could not take the terminal while an image was decoded"
+        );
+        assert_eq!(processed, 5 + MARK.len() + 5);
+        // The order is kept: the text on both sides of the marker reached the
+        // grid, and the image its marker named is stored.
+        let terminal = terminal.lock();
+        let row: String = (0..terminal.columns())
+            .map(|column| terminal.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert!(row.starts_with("helloworld"), "{row:?}");
+        drop(terminal);
+        assert!(!sink.hub.has_undecoded());
+        assert_eq!(sink.hub.with_images(|images| images.main().ids()), [1]);
+    }
+}
