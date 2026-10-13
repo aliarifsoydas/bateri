@@ -1295,6 +1295,9 @@ impl Core {
         // borrow `frame` (`Frame::take_clusters`). `clear` above emptied it;
         // both sinks write to the same table.
         let mut clusters = frame.take_clusters();
+        // The pictures too are outside `Frame` for the call, and for the same
+        // reason; `clear` above emptied the list.
+        let mut pictures = frame.take_pictures();
         let cursor = self.session.frame(
             |cell| frame.push(cell),
             |cell| fill.push(cell),
@@ -1303,8 +1306,7 @@ impl Core {
             &mut self.search.borrow_mut(),
             &mut self.marks.borrow_mut(),
             &mut clusters,
-            // No picture is drawn yet: the list is asked for and dropped.
-            &mut bt_core::Pictures::default(),
+            &mut pictures,
             // The share **does not wake**: this tick draws the frame anyway
             // (`Session::frame`). If its generation changed it drops there.
             glide,
@@ -1325,6 +1327,7 @@ impl Core {
         // glide ends there (`Motion::observe_scroll`) — without either, frame
         // after frame would be drawn for shares hitting the clamp.
         frame.put_clusters(clusters);
+        frame.put_pictures(pictures);
         motion.observe_scroll(
             cursor.scroll_generation,
             (cursor.display_offset, cursor.scroll_frac),

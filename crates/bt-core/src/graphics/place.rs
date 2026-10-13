@@ -312,6 +312,30 @@ pub struct Picture {
     pub pixels: Arc<Vec<u8>>,
 }
 
+/// Where in the stack of a cell a picture is drawn, from its `z`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PictureLayer {
+    /// Under the cells' backgrounds: the picture shows only where a cell has
+    /// no background of its own.
+    Ground,
+    /// Over the backgrounds, under the text.
+    Text,
+    /// Over the text.
+    Over,
+}
+
+impl Picture {
+    /// The layer the picture's `z` puts it in (the protocol's three: below
+    /// `-1 073 741 824`, the other negatives, zero and above).
+    pub fn layer(&self) -> PictureLayer {
+        match self.z {
+            i32::MIN..-1_073_741_824 => PictureLayer::Ground,
+            -1_073_741_824..0 => PictureLayer::Text,
+            0..=i32::MAX => PictureLayer::Over,
+        }
+    }
+}
+
 /// The pictures of one frame: the grid's and the fill band's, each in the
 /// order they are drawn (by layer, then by age). The caller keeps the buffer
 /// so a frame allocates nothing once it has grown.
@@ -322,6 +346,14 @@ pub struct Pictures {
 }
 
 impl Pictures {
+    /// A list built by hand: what a layer that draws pictures is tested with.
+    /// Each list is in drawing order, as [`Session::frame`] fills them.
+    ///
+    /// [`Session::frame`]: crate::Session::frame
+    pub fn new(grid: Vec<Picture>, band: Vec<Picture>) -> Self {
+        Self { grid, band }
+    }
+
     /// The pictures that touch the grid's rows.
     pub fn grid(&self) -> &[Picture] {
         &self.grid

@@ -309,7 +309,7 @@ fn caret_radius_px(cell_px: (u16, u16), ratio: f32) -> usize {
 /// window, the test has no window and if it is not stated the frame fails with
 /// `GpuError::NoAtlas`. The fit check is not dead: on a machine with a large default point
 /// size the cell exceeds the texture and `cell_rows` would read outside the texture.
-fn fitting_cell_px(r: &TestRenderer, edge: usize, cols: usize) -> (u16, u16) {
+pub(crate) fn fitting_cell_px(r: &TestRenderer, edge: usize, cols: usize) -> (u16, u16) {
     let (cw, ch) = r.cell_metrics(1.0).cell_px();
     assert!(
         usize::from(cw) * cols <= edge && usize::from(ch) <= edge,
@@ -321,7 +321,7 @@ fn fitting_cell_px(r: &TestRenderer, edge: usize, cols: usize) -> (u16, u16) {
 /// A cell with ink; the foreground is [`WHITE`] on every call. The third shape beside
 /// `bg_cell` and `rule_cell` — three tests that draw glyphs used to build the same quad by
 /// hand and when one changed the others would silently diverge.
-fn glyph_cell(col: u16, ch: char, bg: Option<LinearRgba>) -> Cell {
+pub(crate) fn glyph_cell(col: u16, ch: char, bg: Option<LinearRgba>) -> Cell {
     Cell {
         col,
         row: 0,

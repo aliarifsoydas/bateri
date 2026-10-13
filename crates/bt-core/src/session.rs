@@ -2469,8 +2469,9 @@ impl TappedPty {
         if read == 0 || self.splitter.passes(&buf[..read]) {
             return Ok(read);
         }
-        let hub = &self.adapter.0.graphics;
-        let size = *lock(&self.adapter.0.size);
+        let adapter = &self.adapter;
+        let hub = &adapter.0.graphics;
+        let size = *lock(&adapter.0.size);
         let env = graphics::Env {
             cell: (size.cell_width, size.cell_height),
             columns: size.num_cols,
@@ -2492,9 +2493,16 @@ impl TappedPty {
                         out.extend_from_slice(graphics::MARK);
                         motion.trail(out);
                     }
-                    // A query's answer is not sent yet: the program is told,
-                    // as before, that the terminal does not draw.
-                    graphics::Outcome::Query(_) => {}
+                    // A query's answer goes now, ahead of everything the
+                    // parser answers from this read: a program that asks what
+                    // the terminal can draw and then for its attributes
+                    // (`ESC [ c`) takes the second answer as "the first is not
+                    // coming". The channel is first in, first out.
+                    graphics::Outcome::Query(reply) => {
+                        if let Some(bytes) = reply.encode() {
+                            graphics::Sink::reply(adapter, bytes);
+                        }
+                    }
                 }
             }),
         });
@@ -29690,17 +29698,24 @@ e\\314\\201.'; sleep 5";
     }
 
     #[test]
-    fn a_query_is_taken_out_of_the_stream_and_not_answered_yet() {
+    fn a_query_is_answered_before_the_device_attributes_that_follow_it() {
         let wake = Arc::new(TestWake::default());
         // The answers land in the PTY's input, where the line discipline
-        // echoes them (`echoctl`); the device attributes' answer comes
-        // after, so a graphics answer would be on the screen by then.
+        // echoes them (`echoctl`), in the order they were written. Both come
+        // from one write: the graphics answer is given where the command is
+        // taken out of the stream, the device attributes' where the parser
+        // reaches them, and a program that asks for both (terminal-browser
+        // does) gives up when the second comes first.
         let session = spawn_session(
             "stty echo echoctl; printf '\\033_Gi=4207,a=q,t=d,f=24,s=1,v=1;AAAA\\033\\\\\\033[c'; sleep 8",
             wake,
         );
         let text = wait_text(&session, "[?6c");
-        assert!(!text.contains("4207"), "{text:?}");
+        let graphics = text
+            .find("^[_Gi=4207;OK^[\\")
+            .unwrap_or_else(|| panic!("no graphics answer in {text:?}"));
+        let attributes = text.find("[?6c").expect("the attributes");
+        assert!(graphics < attributes, "{text:?}");
         assert_eq!(stored_ids(&session), (vec![], vec![]));
         session.shutdown();
     }

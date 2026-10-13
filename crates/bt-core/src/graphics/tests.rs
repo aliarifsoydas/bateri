@@ -1176,6 +1176,36 @@ fn a_layer_is_signed() {
 }
 
 #[test]
+fn the_layer_changes_at_the_protocols_two_thresholds() {
+    let mut rig = Rig::new();
+    let layers: Vec<_> = [i32::MIN, -1_073_741_825, -1_073_741_824, -1, 0, i32::MAX]
+        .into_iter()
+        .map(|z| {
+            rig.cursor = (0, 0);
+            rig.run(&wire(&format!("a=T,f=32,s=20,v=40,i=1,z={z},C=1"), &tile()));
+            let mut pictures = Pictures::default();
+            rig.hub.with_images(|images| {
+                images.collect(
+                    false,
+                    (10, 20),
+                    80,
+                    Window {
+                        first: 0,
+                        last: 23,
+                        shift: 0,
+                    },
+                    None,
+                    &mut pictures,
+                );
+            });
+            pictures.grid()[0].layer()
+        })
+        .collect();
+    use crate::PictureLayer::{Ground, Over, Text};
+    assert_eq!(layers, [Ground, Ground, Text, Text, Over, Over]);
+}
+
+#[test]
 fn deleting_the_visible_placements_leaves_what_has_gone_up_into_the_history() {
     let mut rig = Rig::new();
     rig.run(&wire("a=t,f=32,s=20,v=40,i=1", &tile()));

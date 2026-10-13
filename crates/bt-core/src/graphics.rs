@@ -53,7 +53,7 @@ use alacritty_terminal::term::Term;
 pub(crate) use apc::{Piece, Splitter};
 pub(crate) use place::Motion;
 pub(crate) use place::Screen;
-pub use place::{Picture, Pictures};
+pub use place::{Picture, PictureLayer, Pictures};
 pub(crate) use receive::{Env, Outcome, Receiver};
 pub(crate) use store::{Window, screen_of};
 

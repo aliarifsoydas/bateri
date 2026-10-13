@@ -67,7 +67,7 @@ pub(crate) enum Outcome {
     Pending(Pending),
     /// A query's answer. It is not stored and has no place in the stream, so
     /// it is the reader's to send, now.
-    Query(#[allow(dead_code, reason = "the reader does not send it yet")] Reply),
+    Query(Reply),
 }
 
 /// The size of an image the receiver has seen go by.

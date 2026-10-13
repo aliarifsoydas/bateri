@@ -1,11 +1,12 @@
 //! The renderer: wgpu, one device per process ([`Gpu`]) and one [`Renderer`]
 //! per pane (the atlas's key includes the pane's point size).
 //!
-//! The device is pinned to wgpu's Metal backend on macOS ([`Gpu::new`]). Six
+//! The device is pinned to wgpu's Metal backend on macOS ([`Gpu::new`]). The
 //! pipelines draw on three surfaces (grid, fill band, dock): `cell_bg` and
 //! `caret` (background quads; the caret's SDF, also used by the dock's
 //! buttons), `cell` and `emoji` (glyphs and rules from the atlas's two
-//! planes), `selection` (the mouse selection and the search highlights) and
+//! planes), `selection` (the mouse selection and the search highlights),
+//! `image` (the pictures programs send, one texture each) and
 //! `glyph_fx` (the dock's typing effects). Why each pipeline exists is
 //! written on [`Gpu`]'s fields; why the draws come in the
 //! order they do, per surface, is written in [`Renderer::plan`].
@@ -28,7 +29,7 @@
 //! `crate::link`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -36,12 +37,12 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use bt_atlas::{Atlas, Metrics, Plane, Spacing, TOFU};
-use bt_core::{Clusters, FontOptions, LinearRgba};
+use bt_core::{Clusters, FontOptions, LinearRgba, Picture, PictureLayer};
 
 use crate::GpuError;
 use crate::frame::{
     CursorBlock, FX_INSTANCE_OFFSETS, Frame, FxCell, FxInstance, GLYPH_INSTANCE_OFFSETS, GlyphCell,
-    GlyphInstance, INSTANCE_OFFSETS, Instance, RuleCell, WaveDraw,
+    GlyphInstance, INSTANCE_OFFSETS, Instance, PictureSurface, RuleCell, WaveDraw,
 };
 use crate::metrics::{CellMetrics, FontNotice};
 use crate::slots::{self, SlotUpload};
@@ -178,6 +179,29 @@ const _: () = assert!(std::mem::offset_of!(FxImmediates, slot_offset) == 48);
 // 64 ≤ 128: immediates.
 const _: () = assert!(size_of::<FxImmediates>() as u32 <= IMMEDIATE_BUDGET);
 
+/// Field-for-field twin of `image.wgsl` → `Immediates`: the picture's
+/// rectangle and the part of its texture shown, both per draw (a picture is a
+/// draw of its own, there is no instance buffer), and the NDC scale and the
+/// top fade the other pipelines carry. rect@0, uv@16, viewport_px@32,
+/// edge_px@40; WGSL rounds 44 up to 48 and the trailing 4 bytes are the
+/// explicit `pad`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ImageImmediates {
+    rect: [f32; 4],
+    uv: [f32; 4],
+    viewport_px: [f32; 2],
+    edge_px: f32,
+    pad: f32,
+}
+
+const _: () = assert!(size_of::<ImageImmediates>() == 48);
+const _: () = assert!(std::mem::offset_of!(ImageImmediates, uv) == 16);
+const _: () = assert!(std::mem::offset_of!(ImageImmediates, viewport_px) == 32);
+const _: () = assert!(std::mem::offset_of!(ImageImmediates, edge_px) == 40);
+// 48 ≤ 128: immediates.
+const _: () = assert!(size_of::<ImageImmediates>() as u32 <= IMMEDIATE_BUDGET);
+
 /// `Instance`'s vertex buffer layout: the three `@location`s of
 /// `cell_bg.wgsl` → `Instance`; offsets come from `frame.rs`'s `offset_of!`
 /// (`INSTANCE_OFFSETS`), not from hand-written numbers.
@@ -290,6 +314,9 @@ unsafe impl GpuBytes for GlyphImmediates {}
 // SAFETY: `repr(C)`, `f32` fields only; WGSL's trailing padding is the
 // explicit `pad`, size 48 is asserted.
 unsafe impl GpuBytes for FxImmediates {}
+// SAFETY: `repr(C)`, `f32` fields only; WGSL's trailing padding is the
+// explicit `pad`, size 48 is asserted.
+unsafe impl GpuBytes for ImageImmediates {}
 
 /// The bytes of a slice; the element type is bounded by [`GpuBytes`].
 fn bytes_of<T: GpuBytes>(values: &[T]) -> &[u8] {
@@ -347,6 +374,15 @@ enum Op {
         range: Range<u32>,
         color: [f32; 4],
         radius: f32,
+    },
+    /// One picture: the `image` pipeline over the texture cached under `key`
+    /// ([`ImageCache`]), `rect` (x, y, width, height) in the viewport's pixels
+    /// and `uv` (u0, v0, u1, v1) the part of the texture shown. The rectangle
+    /// is already cut to its surface ([`Frame::picture_quad`]).
+    Image {
+        key: u64,
+        rect: [f32; 4],
+        uv: [f32; 4],
     },
     /// The `cell` (mask) or `emoji` (colour) pipeline over a range of the
     /// glyph buffer, with that plane's texture bound. `cursor` is the text
@@ -763,6 +799,63 @@ impl SlotUpload for WgpuUpload<'_> {
     }
 }
 
+/// One picture on the GPU: its texture and the bind group that samples it
+/// with the `image` pipeline's layout.
+struct ImageTexture {
+    /// Kept so the texture lives exactly as long as the bind group over it.
+    _texture: wgpu::Texture,
+    bind: wgpu::BindGroup,
+    /// The plan being made draws it ([`ImageCache::begin`]).
+    seen: bool,
+}
+
+/// The textures of the pictures the plans draw, by the picture's generation
+/// ([`Picture::image`]).
+///
+/// A texture is made the first time a plan draws its picture and **dropped by
+/// the first plan that does not**: the store keeps the pixels as long as the
+/// program may place them again, the GPU keeps them only while they show. A
+/// picture scrolled out and back in is uploaded again, which is a copy the
+/// size of the image, not a frame-time problem; the alternative, an age or a
+/// byte budget, would leave megabytes on a pane that went idle after a
+/// `clear`, and an idle pane draws no frame to let them go.
+///
+/// The generation is the key because it changes whenever the program sends an
+/// id again: a texture cached under it never shows stale pixels.
+#[derive(Default)]
+struct ImageCache {
+    textures: HashMap<u64, ImageTexture>,
+}
+
+impl ImageCache {
+    /// A plan starts: nothing is wanted yet.
+    fn begin(&mut self) {
+        for texture in self.textures.values_mut() {
+            texture.seen = false;
+        }
+    }
+
+    /// A plan is done: what it did not draw goes.
+    fn end(&mut self) {
+        self.textures.retain(|_, texture| texture.seen);
+    }
+
+    /// Makes sure the picture has its texture and marks it wanted. `false`:
+    /// it cannot be drawn ([`Gpu::picture_texture`]), and the plan leaves it
+    /// out.
+    fn ensure(&mut self, gpu: &Gpu, picture: &Picture) -> bool {
+        if let Some(texture) = self.textures.get_mut(&picture.image) {
+            texture.seen = true;
+            return true;
+        }
+        let Some(texture) = gpu.picture_texture(picture) else {
+            return false;
+        };
+        self.textures.insert(picture.image, texture);
+        true
+    }
+}
+
 /// A renderer's own state: its three instance buffers and its atlas.
 ///
 /// Per renderer, not per device: the queue is shared, and any `submit` on it
@@ -785,6 +878,8 @@ struct State {
     /// **silently at @1x**. `None` makes that path loud: a frame with glyphs
     /// but no atlas fails with [`GpuError::NoAtlas`].
     atlas: Option<WgpuAtlas>,
+    /// The textures of the pictures on screen ([`ImageCache`]).
+    images: ImageCache,
     /// The frame's plan, kept between frames: `clear` keeps the capacity of
     /// its lists (and of the `slots` scratch lists), so the steady state does
     /// not allocate.
@@ -831,7 +926,7 @@ impl Fault {
     }
 }
 
-/// What every renderer shares: the wgpu device, its queue, the six pipelines,
+/// What every renderer shares: the wgpu device, its queue, the pipelines,
 /// the bind group layouts and the samplers.
 ///
 /// Split from [`Renderer`] because the atlas cannot be shared: `bt-atlas`
@@ -902,6 +997,11 @@ pub(crate) struct Gpu {
     /// need no sibling: both textures are bound and the plane comes from the
     /// instance.
     glyph_fx: wgpu::RenderPipeline,
+    /// The pictures programs send (`image_fragment`): one quad and one
+    /// texture per draw, the rectangle in the immediates. Its bind group
+    /// layout is the atlas planes' (a texture and a filtering sampler), the
+    /// sampler the linear one: a picture is scaled, a glyph is not.
+    image: wgpu::RenderPipeline,
     /// The atlas planes' bind group layout: texture @0, sampler @1.
     plane_layout: wgpu::BindGroupLayout,
     /// The effects' layout: mask @0, colour @1, nearest @2, linear @3.
@@ -922,7 +1022,7 @@ pub(crate) struct Gpu {
 
 impl Gpu {
     /// The process-wide device: created once and shared by every renderer —
-    /// every pane of every window (an adapter, a device and six pipelines are
+    /// every pane of every window (an adapter, a device and the pipelines are
     /// not worth paying per pane). A failure is kept too, so every pane reports the same error
     /// instead of retrying the adapter request.
     pub(crate) fn get() -> Result<&'static Self, GpuError> {
@@ -954,7 +1054,7 @@ impl Gpu {
         &self.device
     }
 
-    /// A device on the platform's backend and six pipelines.
+    /// A device on the platform's backend and the pipelines.
     ///
     /// The backend is **pinned per target**, not wgpu's `PRIMARY`: Metal on
     /// macOS (the product target; a wider mask would change which adapters
@@ -1116,6 +1216,31 @@ impl Gpu {
             "glyph_fx_vertex",
             "glyph_fx_fragment",
         );
+        // Pictures: no vertex buffer, the plane layout's bind group and the
+        // top edge's ramp appended, as for the cells.
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("image.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(
+                    include_str!("../shaders/image.wgsl"),
+                    include_str!("../shaders/edge.wgsl")
+                )
+                .into(),
+            ),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("image"),
+            bind_group_layouts: &[Some(&plane_layout)],
+            immediate_size: size_of::<ImageImmediates>() as u32,
+        });
+        let image = pipeline_over(
+            &device,
+            &layout,
+            &module,
+            &[],
+            "image_vertex",
+            "image_fragment",
+        );
         // `nearest`, not `linear`: slots have no padding between them and
         // `linear`'s last column would blend the neighbour slot.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1149,6 +1274,7 @@ impl Gpu {
             cell,
             emoji,
             glyph_fx,
+            image,
             plane_layout,
             fx_layout,
             sampler,
@@ -1198,6 +1324,79 @@ impl Gpu {
             view,
             bind,
         }
+    }
+
+    /// A picture's texture: its pixels uploaded once, `Rgba8UnormSrgb` (the
+    /// colour plane's format, for the same reason: the target counts the
+    /// fragment as linear, so the picture's sRGB bytes must be decoded when
+    /// sampled).
+    ///
+    /// `None` for a picture the device cannot hold: a side past
+    /// `max_texture_dimension_2d` (the protocol allows 10 000 px, a device
+    /// may stop at 8 192) would be a validation error that fails the whole
+    /// frame, and a picture whose bytes are not `4 × width × height` is not
+    /// one. Both are left undrawn.
+    fn picture_texture(&self, picture: &Picture) -> Option<ImageTexture> {
+        let (width, height) = picture.size;
+        let limit = self.device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > limit || height > limit {
+            return None;
+        }
+        if picture.pixels.len() as u64 != u64::from(width) * u64::from(height) * 4 {
+            return None;
+        }
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("picture"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COLOR_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // `write_texture` stages the copy on the queue: it lands before the
+        // next submit's commands, which is the frame that samples it.
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &picture.pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("picture"),
+            layout: &self.plane_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.linear),
+                },
+            ],
+        });
+        Some(ImageTexture {
+            _texture: texture,
+            bind,
+            seen: true,
+        })
     }
 
     /// The effects' bind group: both plane views and both samplers.
@@ -1936,9 +2135,10 @@ impl Renderer {
         frame: &Frame,
         viewport_px: [f32; 2],
         atlas: &mut Option<WgpuAtlas>,
+        images: &mut ImageCache,
         plan: &mut Plan,
     ) -> Result<(), GpuError> {
-        self.plan(frame, viewport_px, atlas, plan)?;
+        self.plan(frame, viewport_px, atlas, images, plan)?;
         let mut recycled = false;
         while let Some(entry) = atlas.as_mut() {
             match room(entry.atlas.take_overflow(), recycled, entry.atlas.crowded()) {
@@ -1954,7 +2154,7 @@ impl Renderer {
                     entry.drop_textures();
                 }
             }
-            self.plan(frame, viewport_px, atlas, plan)?;
+            self.plan(frame, viewport_px, atlas, images, plan)?;
         }
         Ok(())
     }
@@ -2045,6 +2245,15 @@ impl Renderer {
     /// selection's own, the glyphs'). At zero the ramp's factor is exactly
     /// `1.0` and the frame is bit for bit the one without the fade.
     ///
+    /// **Pictures** — three layers on each of the grid and the band, in the
+    /// surface's own viewport, so they ride the offset with the text: under
+    /// the cell backgrounds (before `bg`), between the backgrounds and the
+    /// text (right after `bg`, so the search, selection and caret still show
+    /// over them), and over the text (after the band's glyphs, still inside
+    /// the top fade). Each is one draw with its own texture, cut to its
+    /// surface ([`Frame::picture_quad`]); the dock has none. A frame with no
+    /// pictures plans exactly what it did before them.
+    ///
     /// **Scroll bar** — between the band and the dock, in a viewport at the
     /// window's origin: the thumb belongs to the window's edge and must not
     /// slide with the grid's offset or the band's. After every grid and band
@@ -2115,9 +2324,11 @@ impl Renderer {
         frame: &Frame,
         viewport_px: [f32; 2],
         atlas: &mut Option<WgpuAtlas>,
+        images: &mut ImageCache,
         plan: &mut Plan,
     ) -> Result<(), GpuError> {
         plan.clear();
+        images.begin();
         // **The dock's drawn top is decided first** (the one place it is
         // worked out), and with it the dust scene's field: that is drawn twice,
         // in two places of the plan, from one list. Both places are in window
@@ -2158,7 +2369,23 @@ impl Renderer {
             origin,
             free,
         )?;
+        self.picture_draws(
+            plan,
+            images,
+            frame,
+            PictureSurface::Grid,
+            PictureLayer::Ground,
+            origin,
+        );
         plan.quads(frame.bg_instances());
+        self.picture_draws(
+            plan,
+            images,
+            frame,
+            PictureSurface::Grid,
+            PictureLayer::Text,
+            origin,
+        );
         plan.search(frame, false);
         plan.selection(
             frame.selection_instances(),
@@ -2178,7 +2405,23 @@ impl Renderer {
         let band = frame.fill_rows() != 0;
         if band {
             plan.ops.push(Op::Viewport(fill_origin));
+            self.picture_draws(
+                plan,
+                images,
+                frame,
+                PictureSurface::Band,
+                PictureLayer::Ground,
+                fill_origin,
+            );
             plan.quads(frame.fill_bg());
+            self.picture_draws(
+                plan,
+                images,
+                frame,
+                PictureSurface::Band,
+                PictureLayer::Text,
+                fill_origin,
+            );
             plan.search(frame, true);
             plan.ops.push(Op::Viewport(origin));
         }
@@ -2231,6 +2474,26 @@ impl Renderer {
                 fill_origin,
                 free,
             )?;
+        }
+        // The pictures over the text, the grid's and then the band's, still
+        // inside the top fade.
+        self.picture_draws(
+            plan,
+            images,
+            frame,
+            PictureSurface::Grid,
+            PictureLayer::Over,
+            origin,
+        );
+        if band {
+            self.picture_draws(
+                plan,
+                images,
+                frame,
+                PictureSurface::Band,
+                PictureLayer::Over,
+                fill_origin,
+            );
         }
         // The content ends here: the bar and the dock do not fade. Pushed
         // unconditionally, so the dock's exemption does not hang on the bar
@@ -2377,7 +2640,51 @@ impl Renderer {
                 plan.ops.push(open);
             }
         }
+        // What this plan did not draw is let go.
+        images.end();
         Ok(())
+    }
+
+    /// The pictures of one layer on one surface, in the order the list gives
+    /// (by `z`, then age). `viewport` is the surface's viewport: it is set
+    /// once, before the first picture, and only if there is one, so a frame
+    /// with no pictures plans exactly what it did without them.
+    ///
+    /// The quad is cut to the surface in [`Frame::picture_quad`], not by a
+    /// scissor: a picture may start above the surface's top or run past its
+    /// last row and column, the grid's own origin is a fraction while the
+    /// scissor is whole pixels, and the cut is where the picture's uv is
+    /// known.
+    fn picture_draws(
+        &self,
+        plan: &mut Plan,
+        images: &mut ImageCache,
+        frame: &Frame,
+        surface: PictureSurface,
+        layer: PictureLayer,
+        viewport: f32,
+    ) {
+        let mut set = false;
+        for picture in frame.pictures(surface) {
+            if picture.layer() != layer {
+                continue;
+            }
+            let Some(quad) = frame.picture_quad(surface, picture) else {
+                continue;
+            };
+            if !images.ensure(self.gpu, picture) {
+                continue;
+            }
+            if !set {
+                plan.ops.push(Op::Viewport(viewport));
+                set = true;
+            }
+            plan.ops.push(Op::Image {
+                key: picture.image,
+                rect: quad.rect,
+                uv: quad.uv,
+            });
+        }
     }
 
     /// Draws the frame into `target` and **submits** it: one render pass, the
@@ -2413,7 +2720,13 @@ impl Renderer {
         let mut state = self.state.borrow_mut();
         let state = &mut *state;
         let plan = &mut state.plan;
-        self.plan_with_room(frame, viewport_px, &mut state.atlas, plan)?;
+        self.plan_with_room(
+            frame,
+            viewport_px,
+            &mut state.atlas,
+            &mut state.images,
+            plan,
+        )?;
         #[cfg(test)]
         if self.poison.take() {
             // Outside the target: validation rejects the pass.
@@ -2549,6 +2862,24 @@ impl Renderer {
                         pass.set_vertex_buffer(0, buffer.slice(..));
                         pass.set_immediates(0, bytes_of(std::slice::from_ref(&selection)));
                         pass.draw(0..4, range.clone());
+                    }
+                    Op::Image { key, rect, uv } => {
+                        // A picture the plan drew has its texture; one that
+                        // could not be made was never put in the plan.
+                        let Some(texture) = state.images.textures.get(key) else {
+                            continue;
+                        };
+                        let picture = ImageImmediates {
+                            rect: *rect,
+                            uv: *uv,
+                            viewport_px,
+                            edge_px: imm.edge_px,
+                            pad: 0.0,
+                        };
+                        pass.set_pipeline(&self.gpu.image);
+                        pass.set_bind_group(0, &texture.bind, &[]);
+                        pass.set_immediates(0, bytes_of(std::slice::from_ref(&picture)));
+                        pass.draw(0..4, 0..1);
                     }
                     Op::Glyphs {
                         plane,
@@ -2835,6 +3166,26 @@ fn pipeline(
     fs_name: &'static str,
 ) -> wgpu::RenderPipeline {
     let (layout, module, buffer) = parts;
+    pipeline_over(
+        device,
+        layout,
+        module,
+        &[Some(buffer.clone())],
+        vs_name,
+        fs_name,
+    )
+}
+
+/// [`pipeline`] with the vertex buffers spelled out: the `image` pipeline
+/// has none, its quad is derived in the vertex stage from the immediates.
+fn pipeline_over(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    module: &wgpu::ShaderModule,
+    buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
+    vs_name: &'static str,
+    fs_name: &'static str,
+) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(fs_name),
         layout: Some(layout),
@@ -2842,7 +3193,7 @@ fn pipeline(
             module,
             entry_point: Some(vs_name),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[Some(buffer.clone())],
+            buffers,
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleStrip,
@@ -2876,6 +3227,8 @@ fn pipeline(
     })
 }
 
+#[cfg(test)]
+mod picture_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 #[cfg(test)]

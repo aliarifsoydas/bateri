@@ -35,7 +35,8 @@ use std::mem::offset_of;
 use bt_atlas::{Face, RuleKind, SizeClass};
 use bt_core::{
     Block, ButtonState, CaretShape, CaretStyle, Cell, ClusterId, Clusters, ContentEdge, DockButton,
-    LinearRgba, SearchRun, SelectionRun, TrackBlock, TrackMark, UnderlineStyle, UnfocusedCaret,
+    LinearRgba, Picture, Pictures, SearchRun, SelectionRun, TrackBlock, TrackMark, UnderlineStyle,
+    UnfocusedCaret,
 };
 
 use crate::arrival::dust::{self, HOT_LENGTH_PT, Zone};
@@ -1122,6 +1123,24 @@ fn is_powerline(c: char) -> bool {
     )
 }
 
+/// Which surface's pictures ([`Frame::pictures`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PictureSurface {
+    /// The grid's rows.
+    Grid,
+    /// The fill band's rows (the history above the grid), counted from its top.
+    Band,
+}
+
+/// A picture's place in its surface's viewport ([`Frame::picture_quad`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PictureQuad {
+    /// x, y, width, height, pixels.
+    pub(crate) rect: [f32; 4],
+    /// u0, v0, u1, v1: the part of the texture shown, normalised.
+    pub(crate) uv: [f32; 4],
+}
+
 #[derive(Default)]
 pub(crate) struct Frame {
     /// The command blocks' stripes in the left margin; through the **same**
@@ -1454,6 +1473,12 @@ pub(crate) struct Frame {
     clusters: Clusters,
     dock_clusters: Clusters,
     fx_clusters: Clusters,
+    /// The pictures the screen shows, for the grid and for the fill band
+    /// ([`Frame::pictures`]). Filled by `frame()` like the cluster table
+    /// ([`Frame::take_pictures`]) and positioned only when a plan is made
+    /// ([`Frame::picture_quad`]): a motion frame keeps the list and moves the
+    /// viewport, and the pictures ride with the text.
+    pictures: Pictures,
     /// The dock's typing effects: the ghosts of deleted glyphs and the
     /// arriving glyphs. Two lists, because their draw orders are separate —
     /// ghosts **before** the dock glyphs, arrivals **after**
@@ -1625,6 +1650,9 @@ impl Frame {
         self.dock_rules.clear();
         self.clusters.clear();
         self.dock_clusters.clear();
+        // The pictures are restated by every content frame too: one that does
+        // not (a screen without any) must not keep the last frame's.
+        self.pictures = Pictures::default();
         // The effects too: in a frame with no dock (alternate screen) the
         // previous frame's ghost must not hang on.
         self.dock_ghosts.clear();
@@ -4082,6 +4110,75 @@ impl Frame {
 
     pub(crate) fn put_clusters(&mut self, clusters: Clusters) {
         self.clusters = clusters;
+    }
+
+    /// Takes the pictures' list **out** for `frame()` to fill, for
+    /// [`Frame::take_clusters`]'s reason; [`Frame::put_pictures`] puts it
+    /// back. [`Frame::clear`] emptied it, so the list taken is empty.
+    pub(crate) fn take_pictures(&mut self) -> Pictures {
+        std::mem::take(&mut self.pictures)
+    }
+
+    pub(crate) fn put_pictures(&mut self, pictures: Pictures) {
+        self.pictures = pictures;
+    }
+
+    /// The pictures that touch a surface's rows, in drawing order (by layer,
+    /// then by age). Their rows are the surface's own.
+    pub(crate) fn pictures(&self, surface: PictureSurface) -> &[Picture] {
+        match surface {
+            PictureSurface::Grid => self.pictures.grid(),
+            PictureSurface::Band => self.pictures.band(),
+        }
+    }
+
+    /// Where a picture is drawn: its rectangle and the part of its texture
+    /// that shows, in the pixels of the surface's own viewport (the grid's or
+    /// the fill band's — the viewport carries the scroll offset, as it does
+    /// for the cells), or `None` when none of it is inside the surface.
+    ///
+    /// The position is [`Frame::pos_at`]'s, the cell's corner, so a picture
+    /// stands where the text of its cells stands. It is **cut to the
+    /// surface**: its columns (the grid's left edge to its last column) and
+    /// its rows (the top row to the last). A picture may start above the
+    /// first row — it began in history, or the band's rows above — or run
+    /// past the last row or column; the part outside is another surface's or
+    /// nobody's, and the texture's uv is trimmed by the same fraction so the
+    /// part inside is not stretched.
+    pub(crate) fn picture_quad(
+        &self,
+        surface: PictureSurface,
+        picture: &Picture,
+    ) -> Option<PictureQuad> {
+        let (width, height) = (picture.width as f32, picture.height as f32);
+        let [sx, sy, sw, sh] = picture.source.map(|v| v as f32);
+        let (iw, ih) = (picture.size.0 as f32, picture.size.1 as f32);
+        if width <= 0.0 || height <= 0.0 || sw <= 0.0 || sh <= 0.0 || iw <= 0.0 || ih <= 0.0 {
+            return None;
+        }
+        let rows = match surface {
+            PictureSurface::Grid => self.grid_rows,
+            PictureSurface::Band => self.fill_rows,
+        };
+        let [x, y] = self.pos_at([f32::from(picture.col), picture.row as f32]);
+        let (x0, y0) = (x + picture.x_offset as f32, y + picture.y_offset as f32);
+        let (x1, y1) = (x0 + width, y0 + height);
+        let left = self.grid_left_px;
+        let right = left + f32::from(self.grid_cols) * self.cell_px.0;
+        let bottom = f32::from(rows) * self.cell_px.1;
+        let (cx0, cx1) = (x0.max(left), x1.min(right));
+        let (cy0, cy1) = (y0.max(0.0), y1.min(bottom));
+        if cx1 <= cx0 || cy1 <= cy0 {
+            return None;
+        }
+        // The share of the picture each cut edge leaves, in the texture's own
+        // pixels.
+        let u = |at: f32| (sx + sw * (at - x0) / width) / iw;
+        let v = |at: f32| (sy + sh * (at - y0) / height) / ih;
+        Some(PictureQuad {
+            rect: [cx0, cy0, cx1 - cx0, cy1 - cy0],
+            uv: [u(cx0), v(cy0), u(cx1), v(cy1)],
+        })
     }
 
     /// The twin of [`Frame::take_clusters`] for the dock's table.
