@@ -279,9 +279,10 @@ impl Default for Cell {
 /// `row` is always clamped to the visible window. While looking at the
 /// scrollback ([`Session::scroll_wheel`]) the cursor goes off screen; in that
 /// case `visible` turns off and `row` carries the clamped value, not the real
-/// row. Scrolling itself does not read the cursor position; the first
-/// consumer that relies on the position (IME) must widen this contract before
-/// shipping.
+/// row. A consumer that reads the position of a cursor that is not drawn
+/// tells the two apart with [`Cursor::display_offset`]: at zero the cursor is
+/// in the window and the position is real (the program hid it, or the dock
+/// took it over) — the text input system's insertion point reads it so.
 ///
 /// **The decision is here, the painting there.** The cursor block is opaque
 /// and covers the letter under it; had the letter stayed in its own
@@ -399,9 +400,9 @@ pub struct Cursor {
     /// does **not** slide — the finger must see what it is dragging. The
     /// rule stayed the same, its consumers went to two.
     ///
-    /// This field is the counterpart of the sentence above, "the first
-    /// consumer that relies on the position must widen the contract"; the
-    /// consumer that widened it was motion, not IME.
+    /// This field is what tells a clamped cursor row from a real one (the
+    /// type's header); motion was the first to need it, the text input
+    /// system's insertion point the second.
     pub display_offset: i32,
     /// How many rows the content holds from the top: something to draw in
     /// the range `0..content_rows`, blank below. Always `1..=rows`.

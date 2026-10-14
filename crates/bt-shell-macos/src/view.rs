@@ -1444,24 +1444,22 @@ define_class!(
             NSArray::new()
         }
 
-        /// The rectangle where the composition surface (the accent popover,
-        /// the candidate window) will be positioned on screen - **in screen
-        /// coordinates**.
+        /// The rectangle the text input system anchors its surfaces to - the
+        /// input source indicator (🌐/fn, a layout change), the accent
+        /// popover, a candidate window - **in screen coordinates**.
         ///
-        /// The answer is the view's own rectangle, not cell-precise, and this is
-        /// **deliberate**: there is no consumer within scope (the dead-key
-        /// preview is marked text, not a popover, and the candidate window
-        /// belongs to CJK, i.e. the full IME debt). Carrying the caret cell
-        /// across the crate boundary (the `bt_gpu::Origin` precedent) would be
-        /// the first step when that work comes. The approach's direction is
-        /// right anyway: the content is stuck to the window's **bottom**, so
-        /// the caret is near the view rectangle's bottom left corner and the
-        /// surface opens from there.
+        /// It is the **caret's**: the drawn frame's insertion point
+        /// ([`bt_gpu::Origin::caret`]) - the caret's painted rectangle in the
+        /// grid or the dock, or the cell of a cursor the program hid, which
+        /// is where a program drawing its own caret leaves it. The view's own
+        /// rectangle is not an answer: the indicator stood at the pane's
+        /// top-left corner, far from where one types.
         ///
-        /// The reason for not returning a zero rectangle stands: the surface
-        /// would then appear at the screen's corner. For a view without a
-        /// window (not yet attached) there is no space to convert to, the
-        /// answer is zero.
+        /// With no insertion point (the cursor scrolled out of the window, no
+        /// frame drawn yet) the answer is a cell-high, zero-width line at the
+        /// view's bottom-left: the content sits on the window's bottom, so the
+        /// caret is there or below. For a view without a window (not yet
+        /// attached) there is no space to convert to, the answer is zero.
         #[unsafe(method(firstRectForCharacterRange:actualRange:))]
         fn first_rect_for_character_range(
             &self,
@@ -1480,7 +1478,12 @@ define_class!(
             let Some(window) = self.window() else {
                 return NSRect::ZERO;
             };
-            window.convertRectToScreen(self.convertRect_toView(self.bounds(), None))
+            let caret = self
+                .origin()
+                .and_then(Origin::caret)
+                .and_then(|caret| self.px_rect(caret))
+                .unwrap_or_else(|| self.bottom_left_line());
+            window.convertRectToScreen(self.convertRect_toView(caret, None))
         }
 
         /// Which character a point on screen corresponds to: **we have no
@@ -2078,6 +2081,26 @@ impl BateriView {
             NSPoint::new(point(x0), point(y0)),
             NSSize::new(point(x1 - x0), point(y1 - y0)),
         ))
+    }
+
+    /// A cell-high, zero-width line at the view's bottom-left, in its points:
+    /// where the caret is when the drawn frame gives none
+    /// (`firstRectForCharacterRange:`). The height is the cell's, or nothing
+    /// before the metrics.
+    fn bottom_left_line(&self) -> NSRect {
+        let height = self
+            .ivars()
+            .metrics
+            .get()
+            .zip(self.window())
+            .map_or(0.0, |((metrics, _), window)| {
+                f64::from(metrics.cell_px().1) / window.backingScaleFactor()
+            });
+        let bottom = self.bounds().size.height;
+        NSRect::new(
+            NSPoint::new(0.0, (bottom - height).max(0.0)),
+            NSSize::new(0.0, height.min(bottom)),
+        )
     }
 
     /// The pointer moved on the scroll bar's strip (`inside`) or left it: the

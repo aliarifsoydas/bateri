@@ -433,6 +433,9 @@ struct Drawn {
     dock: Option<(f32, u16)>,
     /// The scroll bar's layout the frame was drawn with.
     scrollbar: ScrollbarLayout,
+    /// The insertion point (`Frame::insertion_px`), physical pixels from
+    /// the top-left; `None` → none in this frame.
+    caret: Option<[f32; 4]>,
 }
 
 impl Origin {
@@ -491,6 +494,18 @@ impl Origin {
         self.0.drawn.get().scrollbar
     }
 
+    /// The drawn frame's insertion point, `[x0, y0, x1, y1]` in physical
+    /// pixels from the top-left: the caret's painted rectangle, or the cell
+    /// of a cursor the program hid; `None` → none, or never drawn yet.
+    ///
+    /// The text input system anchors its surfaces to it — the input source
+    /// indicator, the accent popover, a candidate window. **In the same body
+    /// as the origin**: the caret's rectangle bakes the origin in, and the
+    /// two are one frame's picture.
+    pub fn caret(&self) -> Option<[f32; 4]> {
+        self.0.drawn.get().caret
+    }
+
     /// The drawn block mark under a point — physical pixels from the
     /// window's top-left — as its handle, for `bt_core::Session::block_info`,
     /// and its target ([`ScrollbarLayout::block_target`]); `None` off every
@@ -523,25 +538,11 @@ impl Origin {
     /// the drawn block marks, or empty. `true` when where the pointer takes
     /// a mark changed — other marks, or the same ones on another layout
     /// (the track grew, the thumb they may lie on moved).
-    fn set(
-        &self,
-        px: f32,
-        fill_rows: u16,
-        edge_px: f32,
-        dock: Option<(f32, u16)>,
-        scrollbar: ScrollbarLayout,
-        blocks: &[TrackBlock],
-    ) -> bool {
-        let before = self.0.drawn.replace(Drawn {
-            px,
-            fill_rows,
-            edge_px,
-            dock,
-            scrollbar,
-        });
+    fn set(&self, drawn: Drawn, blocks: &[TrackBlock]) -> bool {
+        let before = self.0.drawn.replace(drawn);
         let mut kept = self.0.blocks.borrow_mut();
-        let changed =
-            kept.as_slice() != blocks || (!blocks.is_empty() && before.scrollbar != scrollbar);
+        let changed = kept.as_slice() != blocks
+            || (!blocks.is_empty() && before.scrollbar != drawn.scrollbar);
         kept.clear();
         kept.extend_from_slice(blocks);
         changed
@@ -1626,6 +1627,21 @@ impl Core {
                 })
             });
         self.last_caret_text.set(caret.map(|(_, text)| text));
+        // **The hidden cursor keeps its place for the text input system**
+        // ([`Frame::set_hidden_caret`]): only the one a program hid. One the
+        // dock took over has its caret there, and one scrolled out of the
+        // window has no real row — `Cursor` clamps it to the window's edge.
+        if caret.is_none() && !cursor.caret_in_dock && cursor.display_offset == 0 {
+            let at = grid_caret_at(
+                cursor.col,
+                cursor.row,
+                origin_target(cursor),
+                band_target,
+                frame.edge_px(),
+                self.cell.get(),
+            );
+            frame.set_hidden_caret(at);
+        }
         // **Blink AFTER the caret** and the order is required: "is the user
         // typing" is answered by the caret's target moving, and that target
         // is only known here.
@@ -2146,7 +2162,8 @@ impl Core {
     }
 
     /// Publishes the drawn offset, **the fill band's height and the top
-    /// fade's** to the mouse mapping — only when `draw` returns `Ok`.
+    /// fade's** to the mouse mapping, and the caret's insertion point to the
+    /// text input system — only when `draw` returns `Ok`.
     ///
     /// A separate step, because [`Origin`]'s contract speaks of the
     /// **encoded** frame: in the `Err` arm the previous frame stays on screen
@@ -2169,17 +2186,21 @@ impl Core {
             .any(|(marks, _)| !marks.is_empty());
         let marks = self.marks.borrow();
         let moved = self.origin.set(
-            frame.origin_px(),
-            frame.fill_rows(),
-            frame.edge_px(),
-            frame.dock_hit(),
-            // The mouse's region follows the form: none in `Never`. A change
-            // of form draws one frame ([`Scrollbar::set_mode`]), so it is
-            // published here too.
-            self.scrollbar
-                .get()
-                .mode()
-                .region(self.scrollbar_layout.get()),
+            Drawn {
+                px: frame.origin_px(),
+                fill_rows: frame.fill_rows(),
+                edge_px: frame.edge_px(),
+                dock: frame.dock_hit(),
+                // The mouse's region follows the form: none in `Never`. A
+                // change of form draws one frame ([`Scrollbar::set_mode`]),
+                // so it is published here too.
+                scrollbar: self
+                    .scrollbar
+                    .get()
+                    .mode()
+                    .region(self.scrollbar_layout.get()),
+                caret: frame.insertion_px(),
+            },
             if drawn { marks.blocks() } else { &[] },
         );
         drop(marks);
@@ -3456,11 +3477,23 @@ mod tests {
         });
         let origin = Origin::default();
         assert!(
-            origin.set(0.0, 0, 0.0, None, layout, &marks),
+            origin.set(
+                Drawn {
+                    scrollbar: layout,
+                    ..Drawn::default()
+                },
+                &marks
+            ),
             "new marks, no news"
         );
         assert!(
-            !origin.set(0.0, 0, 0.0, None, layout, &marks),
+            !origin.set(
+                Drawn {
+                    scrollbar: layout,
+                    ..Drawn::default()
+                },
+                &marks
+            ),
             "the same marks told"
         );
         let target = layout.block_target(50.0);
@@ -3476,7 +3509,13 @@ mod tests {
             "the grid's point took a mark"
         );
         assert!(
-            origin.set(0.0, 0, 0.0, None, layout, &[]),
+            origin.set(
+                Drawn {
+                    scrollbar: layout,
+                    ..Drawn::default()
+                },
+                &[]
+            ),
             "gone marks, no news"
         );
         assert_eq!(origin.block_at(x, y), None, "a mark the frame did not draw");

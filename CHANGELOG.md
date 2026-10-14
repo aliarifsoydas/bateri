@@ -12,6 +12,14 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The input source balloon appears at the cursor.** Pressing fn (🌐) or
+  switching keyboard layouts showed macOS's input source indicator in the
+  pane's top-left corner, far from where you type; it now opens at the
+  cursor, in the prompt and in programs that hide the cursor to draw their
+  own.
+
 ## [0.15.0] - 2026-10-13
 
 ### Added

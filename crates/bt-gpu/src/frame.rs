@@ -1422,6 +1422,11 @@ pub(crate) struct Frame {
     /// condition of the hollow caret: on a hollow caret there is paint but no opaque
     /// interior. Degenerate (all zero) = no caret to draw.
     caret_core: [f32; 4],
+    /// Where a cursor this frame does **not** draw stands, in screen cells
+    /// ([`Frame::set_hidden_caret`]); `None` when the caret is drawn or has
+    /// no real place. Only the insertion point reads it
+    /// ([`Frame::insertion_px`]): nothing is painted there.
+    hidden_caret: Option<[f32; 2]>,
     /// The SDF uniform's **test override**; always `None` in production.
     ///
     /// **A half override**: it only flips the fragment
@@ -2440,6 +2445,42 @@ impl Frame {
         self.dock_caret = None;
         self.cursor = CursorBlock::default();
         self.caret_core = [0.0; 4];
+        self.hidden_caret = None;
+    }
+
+    /// Records where the grid's cursor stands while the frame does not draw
+    /// it — the program hid it (`\e[?25l`) — in screen cells, the same space
+    /// as [`Frame::push_caret`]'s `at`.
+    ///
+    /// Programs that draw their own caret hide the terminal's and leave it on
+    /// their input line, and the text input system anchors its surfaces to
+    /// that cell, as other terminals do. The caller passes only a real
+    /// place: a cursor scrolled out of the window has none (its row is
+    /// clamped to the window's edge).
+    pub(crate) fn set_hidden_caret(&mut self, at: [f32; 2]) {
+        self.hidden_caret = Some(at);
+    }
+
+    /// The insertion point the text input system anchors its surfaces to —
+    /// the input source indicator, the accent popover, a candidate window —
+    /// `[x0, y0, x1, y1]` in window space, physical pixels from the top-left;
+    /// `None` when the frame has none.
+    ///
+    /// **The drawn caret's own rectangle** ([`Frame::caret_core`]), so the
+    /// surface stands where the eye sees the caret, in either surface (grid
+    /// or dock) and through its glide. A hidden cursor gives its cell, placed
+    /// as [`Frame::push_caret`] places a grid caret: lowered by the scroll
+    /// fraction.
+    pub(crate) fn insertion_px(&self) -> Option<[f32; 4]> {
+        let [x0, y0, x1, y1] = self.caret_core;
+        if x1 > x0 && y1 > y0 {
+            return Some(self.caret_core);
+        }
+        self.hidden_caret.map(|at| {
+            let [x, y] = self.pos_at(at);
+            let y = y + self.frac_px;
+            [x, y, x + self.cell_px.0, y + self.cell_px.1]
+        })
     }
 
     /// Overrides the SDF uniform — test only; its limit is in the field's doc.
@@ -4655,6 +4696,41 @@ mod tests {
         assert_eq!(hollow.pos, solid.pos, "footprint moved when hollowed");
         assert_eq!(hollow.size, solid.size);
         assert_eq!(lit.caret_sdf()[1], 0.0, "focused caret is hollow");
+    }
+
+    #[test]
+    fn the_insertion_point_is_the_drawn_caret_or_the_hidden_cursors_cell() {
+        // The text input system anchors its surfaces (the input source
+        // indicator, the accent popover) to this rectangle; the view's own
+        // rectangle put the indicator in the pane's corner.
+        let mut frame = Frame::default();
+        frame.clear(gutted(), CaretStyle::default());
+        assert_eq!(frame.insertion_px(), None, "no cursor, yet a point");
+
+        // A drawn caret gives its painted rectangle — a beam's, not a cell.
+        frame.push_caret([2.0, 3.0], TEXT, CURSOR, OPAQUE, CaretShape::Beam, true);
+        let beam = frame.caret_core();
+        assert_eq!(frame.insertion_px(), Some(beam));
+        assert!(beam[2] - beam[0] < 10.0, "the beam's point is a whole cell");
+
+        // A cursor the program hid gives the cell a block caret would cover
+        // there, scroll fraction included.
+        let mut drawn = Frame::default();
+        drawn.clear(gutted(), CaretStyle::default());
+        drawn.set_scroll_frac(0.25);
+        drawn.push_caret([2.0, 3.0], TEXT, CURSOR, OPAQUE, CaretShape::Block, true);
+        frame.clear(gutted(), CaretStyle::default());
+        frame.set_scroll_frac(0.25);
+        frame.set_hidden_caret([2.0, 3.0]);
+        assert_eq!(frame.insertion_px(), Some(drawn.caret_core()));
+
+        // A new frame says it again or has none.
+        frame.clear(gutted(), CaretStyle::default());
+        assert_eq!(
+            frame.insertion_px(),
+            None,
+            "a hidden cursor outlived its frame"
+        );
     }
 
     #[test]
