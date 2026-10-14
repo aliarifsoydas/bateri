@@ -9,10 +9,6 @@ members = [
     "crates/bt-embed",
     "crates/bateri",
 ]
-# The fork of the terminal parser (`[patch.crates-io]` below) is upstream's code
-# in upstream's style: not a member, so `fmt` and `clippy` leave it alone. Its
-# tests run from the Makefile (`make test`); `exclude` lets cargo be run inside it.
-exclude = ["vendor/vte"]
 
 [workspace.package]
 version = "0.15.0"
@@ -202,15 +198,18 @@ bt-gpu = { path = "crates/bt-gpu" }
 bt-shell-common = { path = "crates/bt-shell-common" }
 bt-shell-macos = { path = "crates/bt-shell-macos" }
 
-# `vte`, the parser inside `alacritty_terminal`, is a fork kept in `vendor/vte`: upstream
-# 0.15.0 plus the changes listed in its `FORK.md`. User-approved dependency decision
-# (2026-10-13): vte 0.15.0 drops the byte after a character that a read cut in two and
-# swallows application program commands (`ESC _ … ESC \`) without telling the handler;
-# the fork fixes the first and passes the second on, with a way to halt the parser right
-# after a command. It also hands the pointer shape request (OSC 22) on as written: upstream
-# reads a single name, and kitty's protocol (reset, push/pop, query) is more. Same name and version, so `alacritty_terminal` resolves to it unchanged; when it
-# asks for a newer vte the fork is carried over by hand (`FORK.md` says how), and
-# `make audit` fails if the patch stops applying — cargo only warns, then quietly
-# builds the registry's vte.
+# `vte`, the parser inside `alacritty_terminal`, is a fork: upstream 0.15.0 plus the changes
+# listed in its `FORK.md`. It lives in kablo's repository (`vendor/vte`), because the relay
+# there parses with the same source; bateri takes it by a pinned commit (`rev`), and moving
+# `rev` is the one way a change to the fork reaches bateri — the commit has to be pushed
+# first. User-approved dependency decision (2026-10-13): vte 0.15.0 drops the byte after a
+# character that a read cut in two and swallows application program commands
+# (`ESC _ … ESC \`) without telling the handler; the fork fixes the first and passes the
+# second on, with a way to halt the parser right after a command. It also hands the pointer
+# shape request (OSC 22) on as written: upstream reads a single name, and kitty's protocol
+# (reset, push/pop, query) is more. Same name and version, so `alacritty_terminal` resolves
+# to it unchanged; when it asks for a newer vte the fork is carried over by hand
+# (`FORK.md` says how), and `make audit` fails if the patch stops applying — cargo only
+# warns, then quietly builds the registry's vte.
 [patch.crates-io]
-vte = { path = "vendor/vte" }
+vte = { git = "https://github.com/bateri/kablo", rev = "991577adbdeab4ad78aa4c3d91925620dceaa613" }

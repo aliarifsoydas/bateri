@@ -908,9 +908,9 @@ mod tests {
     }
 
     /// A read that ends inside `·` (`C2` | `B7 20 C2 B7`) keeps the space
-    /// after it. The parser stock `vte` drops it; the fork in `vendor/vte`
-    /// keeps it and has the sweep of its own — this is the witness on this
-    /// side, red the day the patch stops applying.
+    /// after it. The parser stock `vte` drops it; the fork (kept in kablo's
+    /// repository) keeps it and has the sweep of its own — this is the witness
+    /// on this side, red the day the patch stops applying.
     #[test]
     fn a_character_cut_by_a_read_keeps_the_byte_after_it() {
         let mut t = term(10, 1);
