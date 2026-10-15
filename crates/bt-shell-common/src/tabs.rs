@@ -24,10 +24,15 @@
 //! because it was emptied and which one stays selected. Across windows a tab leaves and joins
 //! whole ([`Tabs::close`], [`Tabs::insert_at`]); what each move comes to is `moves`'.
 //!
-//! Coordinates are points in the **bar's** space (the layout is horizontal only; the other axis
-//! appears only in how far a dragged pointer is from the bar): the bar spans the window's
+//! Coordinates are points in the **bar's** space (the strip is laid out horizontally; the other
+//! axis appears only in how far a dragged pointer is from the bar): the bar spans the window's
 //! full width and its origin is the window's left edge. The title row's height is not here — it
 //! is whatever AppKit reports for the window's title row, a single copy read from the window.
+//!
+//! **The side column** ([`Side::layout`]) is the same list stood upright, in the window's own
+//! space (its origin is the window's top-left corner). Its tabs are laid along y instead of x by
+//! the same arithmetic: what a point is over, how far a held tab goes, what scrolls a tab into
+//! view is [`Run`]'s, called by the strip and the column alike, so the two cannot drift apart.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -397,6 +402,9 @@ pub const EDGE: f64 = 8.0;
 /// ([`Fit::of`]).
 pub const TAB_RADIUS: f64 = 7.0;
 
+/// A tab's height: a chip in the strip and a row in the side column are both this high.
+pub const TAB_HEIGHT: f64 = 28.0;
+
 /// Space between two neighbouring buttons on the right.
 pub const BUTTON_GAP: f64 = 4.0;
 
@@ -493,10 +501,17 @@ pub fn title_row(inner: f64, text: f64, lead: Option<f64>) -> (Option<f64>, f64,
     let Some(lead) = lead else {
         return (None, 0.0, inner);
     };
-    let room = (inner - lead - ICON_GAP).max(0.0);
+    let room = title_room(inner, Some(lead));
     let width = text.ceil().min(room);
     let start = ((inner - (lead + ICON_GAP + width)) / 2.0).max(0.0).round();
     (Some(start), start + lead + ICON_GAP, width)
+}
+
+/// What a title may take of the `inner` width after the leading element (`lead` wide, with its
+/// [`ICON_GAP`]) — the one rule for the strip's centred title and the side column's left-aligned
+/// one.
+fn title_room(inner: f64, lead: Option<f64>) -> f64 {
+    lead.map_or(inner, |lead| (inner - lead - ICON_GAP).max(0.0))
 }
 
 /// Width of the fade at a scrolled strip's edge, where tabs run under the edge.
@@ -515,7 +530,9 @@ fn beside(x: f64) -> f64 {
     x - BUTTON_GAP - BUTTON
 }
 
-/// A horizontal extent in the bar's space.
+/// An extent along an axis: where it starts and how far it goes. In the strip the axis is the
+/// bar's x; in the side column ([`Column`]) it is y, and `x` is then the place on that axis —
+/// [`Run`] reads either the same.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Span {
     pub x: f64,
@@ -732,11 +749,84 @@ impl Strip {
     /// The scroll that brings tab `index` into view, [`REVEAL_MARGIN`] from the edge it was
     /// beyond; the current scroll if it is already in view (or nothing scrolls).
     pub fn revealing(&self, index: usize) -> f64 {
-        let Some(chip) = self.chips.get(index).filter(|_| self.overflow) else {
+        self.run().revealing(index)
+    }
+
+    /// The scroll after a wheel or trackpad step: the dominant axis moves the strip, positive
+    /// towards the later tabs, clamped to the ends — a vertical wheel scrolls a horizontal strip
+    /// too, as nothing else in the bar takes it.
+    pub fn wheeled(&self, dx: f64, dy: f64) -> f64 {
+        let step = if dx.abs() > dy.abs() { dx } else { dy };
+        self.run().scrolled(step)
+    }
+}
+
+/// A layout whose tabs a held tab can be dragged along ([`Grip`]) and a point can be read over:
+/// the strip and the side column.
+pub trait Laid {
+    /// The layout's tabs as a [`Run`] along its axis.
+    fn run(&self) -> Run<'_>;
+}
+
+impl Laid for Strip {
+    /// The strip's tabs along x, laid from its leading edge.
+    fn run(&self) -> Run<'_> {
+        Run {
+            span: self.span,
+            places: &self.chips,
+            overflow: self.overflow,
+            scroll: self.scroll,
+            max_scroll: self.max_scroll,
+            pad: 0.0,
+            slot: self.slot,
+            narrowest: MIN_WIDTH,
+        }
+    }
+}
+
+/// Tabs laid one after another along one axis, and the arithmetic of reading them: the place under
+/// a point, what a carried pane is over, the scroll that brings a tab into view, how far a held
+/// tab may go. **One copy for both lists** — the strip lays its tabs along x ([`Strip`]) and the
+/// side column along y ([`Column`]) — so a rule changed here changes both. A run knows positions
+/// along its axis only; what lies across it (the strip's row, the column's width) is the layout's,
+/// and a pointer is read across it only for how far a held tab is pulled away ([`Grip::track`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Run<'a> {
+    /// The visible extent along the axis; places outside it are clipped.
+    span: Span,
+    /// Every place, scrolled: where it starts along the axis and how far it goes.
+    places: &'a [Span],
+    /// The places no longer fit: the run scrolls.
+    overflow: bool,
+    /// The scroll applied, within `0..=max_scroll`.
+    scroll: f64,
+    max_scroll: f64,
+    /// Space before the first place, in the scrolled content: the column keeps its rows off its
+    /// ends, the strip's tabs start at its edge (0).
+    pad: f64,
+    /// A place's extent plus [`GAP`]: the step from one place to the next; 0 for a run that is
+    /// not a list of tabs (the lone tab's title).
+    slot: f64,
+    /// The least a place goes along the axis: what stands in for a held tab that has gone from
+    /// the list since the press.
+    narrowest: f64,
+}
+
+impl Run<'_> {
+    /// The scroll after a step along the axis, positive towards the later tabs, clamped to the
+    /// ends.
+    pub fn scrolled(&self, step: f64) -> f64 {
+        (self.scroll + step).clamp(0.0, self.max_scroll)
+    }
+
+    /// The scroll that brings tab `index` into view, [`REVEAL_MARGIN`] from the edge it was
+    /// beyond; the current scroll if it is already in view (or nothing scrolls).
+    pub fn revealing(&self, index: usize) -> f64 {
+        let Some(place) = self.places.get(index).filter(|_| self.overflow) else {
             return self.scroll;
         };
-        let left = index as f64 * self.slot;
-        let right = left + chip.width;
+        let left = self.pad + index as f64 * self.slot;
+        let right = left + place.width;
         let target = if left < self.scroll + REVEAL_MARGIN {
             left - REVEAL_MARGIN
         } else if right > self.scroll + self.span.width - REVEAL_MARGIN {
@@ -747,16 +837,66 @@ impl Strip {
         target.clamp(0.0, self.max_scroll)
     }
 
-    /// The scroll after a wheel or trackpad step: the dominant axis moves the strip, positive
-    /// towards the later tabs, clamped to the ends — a vertical wheel scrolls a horizontal strip
-    /// too, as nothing else in the bar takes it.
-    pub fn wheeled(&self, dx: f64, dy: f64) -> f64 {
-        let step = if dx.abs() > dy.abs() { dx } else { dy };
-        (self.scroll + step).clamp(0.0, self.max_scroll)
+    /// The place under `at`: the slot of the run that holds that point, among `0..places.len()` —
+    /// the first for a point before the run, the last from its visible end on (over the strip's
+    /// buttons, in the drag margin, below the column's last row). It is a function of the layout
+    /// and `at` alone, so a tab carried over a run can be placed by it while the run is laid out
+    /// **with room made** at the answer: the room opens where the pointer is, and moves nothing
+    /// the answer depends on.
+    pub fn slot_at(&self, at: f64) -> usize {
+        let last = self.places.len().saturating_sub(1);
+        if self.slot <= 0.0 || at < self.span.x {
+            return 0;
+        }
+        if at >= self.span.end() {
+            // Past the run's visible end, over the buttons or the drag margin: the end of the
+            // tabs, whichever of them are scrolled in view.
+            return last;
+        }
+        let place = ((at - self.span.x - self.pad + self.scroll) / self.slot).floor();
+        (place.max(0.0) as usize).min(last)
+    }
+
+    /// What a carried pane at `at` is over: the middle of a tab ([`TAB_CORE_FROM`] to
+    /// [`TAB_CORE_TO`] of its extent, both ends in) means that tab; the edge of a tab, the gap
+    /// between two tabs and anywhere else along the run mean a new tab, at the place of the tabs'
+    /// centres the point stands between. Before the run's visible extent is the first place and
+    /// past it the end, as for [`Run::slot_at`]. A lone tab's title is a tab like the rest.
+    pub fn pane_over(&self, at: f64) -> PaneOver {
+        if at < self.span.x {
+            return PaneOver::Between { gap: 0 };
+        }
+        if at >= self.span.end() {
+            return PaneOver::Between {
+                gap: self.places.len(),
+            };
+        }
+        let held = self
+            .places
+            .iter()
+            .position(|place| place.width > 0.0 && at >= place.x && at < place.end());
+        if let Some(index) = held {
+            let place = self.places[index];
+            let within = (at - place.x) / place.width;
+            return if within < TAB_CORE_FROM {
+                PaneOver::Between { gap: index }
+            } else if within > TAB_CORE_TO {
+                PaneOver::Between { gap: index + 1 }
+            } else {
+                PaneOver::OnTab { index }
+            };
+        }
+        PaneOver::Between {
+            gap: self
+                .places
+                .iter()
+                .filter(|place| place.x + place.width / 2.0 < at)
+                .count(),
+        }
     }
 }
 
-/// How far along the strip the pointer travels from a press before the press is a drag: a click
+/// How far along the list the pointer travels from a press before the press is a drag: a click
 /// that slides a pixel or two is still a click, and its tab stays where it is.
 pub const DRAG_SLOP: f64 = 4.0;
 
@@ -780,67 +920,79 @@ pub fn distance_outside(x: f64, y: f64, width: f64, height: f64) -> f64 {
 pub enum Drag {
     /// Not far enough yet: still a click.
     Press,
-    /// The tab follows the pointer along the strip. `left` is where its left edge is drawn (the
-    /// bar's space), `to` the place it would take if let go now.
+    /// The tab follows the pointer along the list. `left` is where its leading edge is drawn
+    /// along the axis (the left edge in the strip, the top in the side column), `to` the place it
+    /// would take if let go now.
     Reorder { left: f64, to: usize },
-    /// The pointer left the bar: the tab comes away from the strip.
+    /// The pointer left the bar (or the column): the tab comes away from the list.
     TearOff,
 }
 
 /// A press on a tab, until the pointer is let go or the tab comes away: where in the tab it was
 /// held and whether it has become a drag. Once a drag, a press is one for good — moving back to
 /// where it began does not take the tab out of the pointer's hand.
+///
+/// It reads a [`Laid`] layout along its axis — x for a [`Strip`], y for a [`Column`]: a pointer is
+/// given as `(along, across)`, so the column is read with `(y, x)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Grip {
     from: usize,
-    /// Where along the bar the pointer went down.
+    /// Where along the list the pointer went down.
     press: f64,
-    /// How far into the tab it was held: the tab's left edge is the pointer less this.
+    /// How far into the tab it was held: the tab's leading edge is the pointer less this.
     grab: f64,
     moving: bool,
 }
 
 impl Grip {
-    /// The grip of a press at `x` (the bar's space) on tab `from` of `strip`; `None` for a tab
-    /// that is not there and for a lone tab, whose title is not a tab to carry.
-    pub fn new(strip: &Strip, from: usize, x: f64) -> Option<Self> {
-        let chip = strip.chips.get(from).filter(|_| strip.slot > 0.0)?;
+    /// The grip of a press at `at` (along the list's axis) on tab `from` of `laid`; `None` for a
+    /// tab that is not there and for a lone tab, whose title is not a tab to carry.
+    pub fn new(laid: &impl Laid, from: usize, at: f64) -> Option<Self> {
+        let run = laid.run();
+        let place = run.places.get(from).filter(|_| run.slot > 0.0)?;
         Some(Self {
             from,
-            press: x,
-            grab: x - chip.x,
+            press: at,
+            grab: at - place.x,
             moving: false,
         })
     }
 
-    /// The tab pressed: its place in the strip when the press began.
+    /// The tab pressed: its place in the list when the press began.
     pub fn from(&self) -> usize {
         self.from
     }
 
-    /// Reads the pointer at `(x, y)` in a `bar` of `(width, height)`. The tab is held where it was
-    /// grabbed, kept within what the strip shows (a scrolled-away place cannot be dropped on) and
-    /// among the places that exist; `strip` is the layout now, so a strip the wheel has moved
-    /// since the press is read where it is.
-    pub fn track(&mut self, strip: &Strip, (x, y): (f64, f64), bar: (f64, f64)) -> Drag {
-        if distance_outside(x, y, bar.0, bar.1) > TEAR_DISTANCE {
+    /// Reads the pointer at `(at, across)` — along the list's axis and across it — in a bar (or
+    /// column) of `extent` `(along, across)`. The tab is held where it was grabbed, kept within
+    /// what the list shows (a scrolled-away place cannot be dropped on) and among the places that
+    /// exist; `laid` is the layout now, so a list the wheel has moved since the press is read
+    /// where it is.
+    pub fn track(
+        &mut self,
+        laid: &impl Laid,
+        (at, across): (f64, f64),
+        extent: (f64, f64),
+    ) -> Drag {
+        let run = laid.run();
+        if distance_outside(at, across, extent.0, extent.1) > TEAR_DISTANCE {
             return Drag::TearOff;
         }
-        if !self.moving && (x - self.press).abs() < DRAG_SLOP {
+        if !self.moving && (at - self.press).abs() < DRAG_SLOP {
             return Drag::Press;
         }
         self.moving = true;
-        let last = strip.chips.len().saturating_sub(1);
-        let width = strip
-            .chips
+        let last = run.places.len().saturating_sub(1);
+        let width = run
+            .places
             .get(self.from)
-            .map_or(MIN_WIDTH, |chip| chip.width);
-        let least = strip.span.x;
-        let most = (strip.span.end() - width)
-            .min(strip.span.x - strip.scroll + last as f64 * strip.slot)
+            .map_or(run.narrowest, |place| place.width);
+        let least = run.span.x;
+        let most = (run.span.end() - width)
+            .min(run.span.x - run.scroll + run.pad + last as f64 * run.slot)
             .max(least);
-        let left = (x - self.grab).clamp(least, most);
-        let place = (left - strip.span.x + strip.scroll) / strip.slot;
+        let left = (at - self.grab).clamp(least, most);
+        let place = (left - run.span.x + run.scroll - run.pad) / run.slot;
         Drag::Reorder {
             left,
             to: (place.round().max(0.0) as usize).min(last),
@@ -851,21 +1003,11 @@ impl Grip {
 impl Strip {
     /// The place under `x`: the slot of the strip that holds that point, among `0..chips.len()`
     /// — the first for a point left of the strip, the last from its visible end on (over the
-    /// buttons, in the drag margin). It is a function of the layout and `x` alone, so a tab carried over a
-    /// strip can be placed by it while the strip is laid out **with room made** at the answer: the
-    /// room opens where the pointer is, and moves nothing the answer depends on.
+    /// buttons, in the drag margin). It is a function of the layout and `x` alone, so a tab
+    /// carried over a strip can be placed by it while the strip is laid out **with room made** at
+    /// the answer ([`Run::slot_at`]).
     pub fn slot_at(&self, x: f64) -> usize {
-        let last = self.chips.len().saturating_sub(1);
-        if self.slot <= 0.0 || x < self.span.x {
-            return 0;
-        }
-        if x >= self.span.end() {
-            // Past the strip's visible end, over the buttons or the drag margin: the end of the
-            // tabs, whichever of them are scrolled in view.
-            return last;
-        }
-        let place = ((x - self.span.x + self.scroll) / self.slot).floor();
-        (place.max(0.0) as usize).min(last)
+        self.run().slot_at(x)
     }
 }
 
@@ -895,41 +1037,10 @@ pub enum PaneOver {
 impl Strip {
     /// What a carried pane at `x` (the bar's space) is over: the middle of a tab
     /// ([`TAB_CORE_FROM`] to [`TAB_CORE_TO`] of its width, both ends in) means that tab; the
-    /// edge of a tab, the gap between two tabs and anywhere else along the strip mean a new tab,
-    /// at the place of the tabs' centres the point stands between. Left of the strip's visible
-    /// extent is the first place and right of it the end, as for [`Strip::slot_at`]. A lone
-    /// tab's title is a tab like the rest.
+    /// edge of a tab, the gap between two tabs and anywhere else along the strip mean a new tab
+    /// ([`Run::pane_over`]).
     pub fn pane_over(&self, x: f64) -> PaneOver {
-        if x < self.span.x {
-            return PaneOver::Between { gap: 0 };
-        }
-        if x >= self.span.end() {
-            return PaneOver::Between {
-                gap: self.chips.len(),
-            };
-        }
-        let held = self
-            .chips
-            .iter()
-            .position(|chip| chip.width > 0.0 && x >= chip.x && x < chip.end());
-        if let Some(index) = held {
-            let chip = self.chips[index];
-            let at = (x - chip.x) / chip.width;
-            return if at < TAB_CORE_FROM {
-                PaneOver::Between { gap: index }
-            } else if at > TAB_CORE_TO {
-                PaneOver::Between { gap: index + 1 }
-            } else {
-                PaneOver::OnTab { index }
-            };
-        }
-        PaneOver::Between {
-            gap: self
-                .chips
-                .iter()
-                .filter(|chip| chip.x + chip.width / 2.0 < x)
-                .count(),
-        }
+        self.run().pane_over(x)
     }
 }
 
@@ -995,6 +1106,230 @@ pub fn landing(over: Option<Over>) -> Landing {
         Some(Over::Own { place }) => Landing::Reorder(place),
         Some(Over::Other { gap }) => Landing::Join(gap),
         None => Landing::Detach,
+    }
+}
+
+/// The side column's width: a row at its widest ([`MAX_WIDTH`]) and [`EDGE`] on both sides. Fixed
+/// — it does not narrow, hide or follow a drag.
+pub const SIDE_WIDTH: f64 = MAX_WIDTH + 2.0 * EDGE;
+
+/// A row's width: the column less its edge on both sides.
+pub const ROW_WIDTH: f64 = SIDE_WIDTH - 2.0 * EDGE;
+
+/// Space above the first row and below the last, in the scrolled content: the rows keep off the
+/// title row's foot and off New Tab.
+pub const LIST_PAD: f64 = 6.0;
+
+/// Space between New Tab and the settings warning beside it on the column's foot.
+pub const FOOT_GAP: f64 = 6.0;
+
+/// Where a row's leading element (its icon with the deck, or the indicator) starts, from the row's
+/// left edge.
+pub const ROW_LEAD: f64 = 8.0;
+
+/// What a row keeps free at its right end while neither `×` nor the ⌘ hint shows.
+pub const ROW_END: f64 = 8.0;
+
+/// What a row keeps free at its right end while `×` or the ⌘ hint shows: the title gives way to it.
+pub const ROW_CROWDED: f64 = 30.0;
+
+/// Side of the `×` that closes a row, and its space from the row's right edge.
+pub const CLOSE_SIDE: f64 = 20.0;
+pub const CLOSE_INSET: f64 = 4.0;
+
+/// What the side column is laid out from ([`Side::layout`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Side {
+    /// The column's height — the window's, full: there is no title row above it.
+    pub height: f64,
+    /// Where the list starts: the height of the window's title row, the traffic lights' row. The
+    /// caller reads it from the window, as for the strip's `leading`, and it is the same in full
+    /// screen — the rows do not move as the window enters or leaves it.
+    pub top: f64,
+    /// How many tabs. A single tab is a row like the rest: there is no title to centre.
+    pub count: usize,
+    /// The list's scroll, as last stored; clamped here.
+    pub scroll: f64,
+    /// A settings diagnostic is showing: its warning button joins New Tab on the foot.
+    pub warning: bool,
+    /// The radius of the window's bottom-left corner, the one New Tab sits in; 0 where the corner
+    /// is square (full screen). The caller gives what it measured for its window
+    /// ([`Fit::of`]).
+    pub corner: f64,
+}
+
+impl Side {
+    /// Lays the column out: the list from `top` down to [`EDGE`] above New Tab, New Tab in the
+    /// window's bottom-left corner with the warning right of it. Rows are [`TAB_HEIGHT`] high with
+    /// [`GAP`] between them and [`EDGE`] in from the column's sides, and the list scrolls when
+    /// they do not fit.
+    ///
+    /// New Tab's corner towards the window's shares the window corner's centre ([`Fit::of`]: the
+    /// inset and the radius add up to the corner, so the space round the corner does not pinch at
+    /// the diagonal) and its other three are [`TAB_RADIUS`], the rows'. Its [`Fit::inset`] is its
+    /// space from the column's left edge and from the window's foot alike.
+    pub fn layout(&self) -> Column {
+        let fit = Fit::of(self.corner);
+        let foot = self.height - fit.inset - BUTTON;
+        let list = Rect::new(0.0, self.top, SIDE_WIDTH, (foot - EDGE - self.top).max(0.0));
+        let warning = self
+            .warning
+            .then(|| Rect::new(SIDE_WIDTH - EDGE - BUTTON, foot, BUTTON, BUTTON));
+        let new_tab_end = warning.map_or(SIDE_WIDTH - EDGE, |button| button.x - FOOT_GAP);
+        let new_tab = Rect::new(fit.inset, foot, (new_tab_end - fit.inset).max(0.0), BUTTON);
+
+        let slot = TAB_HEIGHT + GAP;
+        let count = self.count as f64;
+        let content = if self.count == 0 {
+            0.0
+        } else {
+            2.0 * LIST_PAD + count * slot - GAP
+        };
+        let max_scroll = (content - list.height).max(0.0);
+        let scroll = self.scroll.clamp(0.0, max_scroll);
+        let overflow = max_scroll > 0.0;
+        let along: Vec<Span> = (0..self.count)
+            .map(|index| Span::new(list.y + LIST_PAD + index as f64 * slot - scroll, TAB_HEIGHT))
+            .collect();
+        let rows = along
+            .iter()
+            .map(|row| Rect::new(EDGE, row.x, ROW_WIDTH, row.width))
+            .collect();
+        Column {
+            width: SIDE_WIDTH,
+            list,
+            rows,
+            overflow,
+            scroll,
+            max_scroll,
+            fade_top: overflow && scroll > SCROLL_SLACK,
+            fade_bottom: overflow && scroll < max_scroll - SCROLL_SLACK,
+            new_tab,
+            warning,
+            fit,
+            along,
+            slot,
+        }
+    }
+}
+
+/// Where everything in the side column sits ([`Side::layout`]), in the window's space.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Column {
+    /// The column's width, [`SIDE_WIDTH`]; it spans the window's full height.
+    pub width: f64,
+    /// The list's visible extent; rows outside it are clipped, and the ends where rows run under
+    /// fade.
+    pub list: Rect,
+    /// Every row, scrolled.
+    pub rows: Vec<Rect>,
+    /// The rows no longer fit: the list scrolls.
+    pub overflow: bool,
+    /// The scroll actually applied, within `0..=max_scroll`.
+    pub scroll: f64,
+    pub max_scroll: f64,
+    /// The fades at the list's top and bottom ([`FADE`] high): lit only where rows run under the
+    /// edge. They are a mask on the rows, not a colour painted over them.
+    pub fade_top: bool,
+    pub fade_bottom: bool,
+    /// New Tab, in the window's bottom-left corner. Its bottom-left radius is
+    /// [`Fit::radius`] of [`Column::fit`], the other three [`TAB_RADIUS`].
+    pub new_tab: Rect,
+    /// The settings warning, right of New Tab.
+    pub warning: Option<Rect>,
+    /// How New Tab meets the window's corner.
+    pub fit: Fit,
+    /// The rows' extents along y, which [`Run`] reads.
+    along: Vec<Span>,
+    /// A row's height plus [`GAP`]: the step from one row to the next.
+    slot: f64,
+}
+
+impl Laid for Column {
+    /// The rows along y, laid [`LIST_PAD`] in from the list's top.
+    fn run(&self) -> Run<'_> {
+        Run {
+            span: Span::new(self.list.y, self.list.height),
+            places: &self.along,
+            overflow: self.overflow,
+            scroll: self.scroll,
+            max_scroll: self.max_scroll,
+            pad: LIST_PAD,
+            slot: self.slot,
+            narrowest: TAB_HEIGHT,
+        }
+    }
+}
+
+impl Column {
+    /// The scroll that brings row `index` into view, [`REVEAL_MARGIN`] from the edge it was
+    /// beyond ([`Run::revealing`]).
+    pub fn revealing(&self, index: usize) -> f64 {
+        self.run().revealing(index)
+    }
+
+    /// The scroll after a wheel or trackpad step `dy`, positive towards the later tabs, clamped to
+    /// the ends. Only the vertical axis scrolls an upright list.
+    pub fn wheeled(&self, dy: f64) -> f64 {
+        self.run().scrolled(dy)
+    }
+
+    /// The row under `y` (the window's space): the first above the list, the last from its
+    /// visible end on ([`Run::slot_at`]).
+    pub fn slot_at(&self, y: f64) -> usize {
+        self.run().slot_at(y)
+    }
+
+    /// What a carried pane at `y` is over: the middle of a row means that tab, anywhere else a
+    /// new tab at the place the point stands between ([`Run::pane_over`]).
+    pub fn pane_over(&self, y: f64) -> PaneOver {
+        self.run().pane_over(y)
+    }
+}
+
+/// Where the parts of a row sit, from the row's own top-left corner ([`Row::of`]). A row is
+/// [`ROW_WIDTH`] wide and [`TAB_HEIGHT`] high; the parts that are centred up and down (the
+/// leading element, the title) have no y here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Row {
+    /// The leading element — the icon with its deck, or the indicator — from [`ROW_LEAD`], as wide
+    /// as it was said to be; `None` for a row with none.
+    pub lead: Option<Span>,
+    /// The title's box: after the leading element, as wide as the text wants within what the
+    /// row's end leaves it.
+    pub title: Span,
+    /// The `×`, at the row's right end, centred up and down.
+    pub close: Rect,
+    /// The ⌘ hint's box: it is right-aligned in it, and the title ends where it starts while the
+    /// hint (or the `×`) shows.
+    pub key: Span,
+    /// The vertical stripe of a marked host, on the row's left edge.
+    pub host_mark: Rect,
+}
+
+impl Row {
+    /// The row for a leading element `lead` wide (the front tile and its deck edges —
+    /// [`lead_width`]; the indicator's side where icons are off; `None` for nothing, so a title
+    /// does not move as an indicator comes and goes, the shell gives the indicator's room while it
+    /// shows nothing) and a title `text` wide. `crowded` while `×` or the ⌘ hint shows: the title
+    /// gives way to it.
+    pub fn of(lead: Option<f64>, text: f64, crowded: bool) -> Self {
+        let reserve = if crowded { ROW_CROWDED } else { ROW_END };
+        let inner = ROW_WIDTH - ROW_LEAD - reserve;
+        let start = lead.map_or(ROW_LEAD, |lead| ROW_LEAD + lead + ICON_GAP);
+        let width = text.ceil().min(title_room(inner, lead));
+        Self {
+            lead: lead.map(|lead| Span::new(ROW_LEAD, lead)),
+            title: Span::new(start, width),
+            close: Rect::new(
+                ROW_WIDTH - CLOSE_INSET - CLOSE_SIDE,
+                (TAB_HEIGHT - CLOSE_SIDE) / 2.0,
+                CLOSE_SIDE,
+                CLOSE_SIDE,
+            ),
+            key: Span::new(ROW_WIDTH - ROW_CROWDED, ROW_CROWDED - ROW_END),
+            host_mark: Rect::new(2.0, 7.0, 2.5, TAB_HEIGHT - 14.0),
+        }
     }
 }
 
@@ -3877,5 +4212,415 @@ mod tests {
         assert_eq!(below.y - (right.y + right.height), MAP_GAP, "stacked");
         assert_eq!(right.x + right.width, MAP_WIDTH, "at the far edge");
         assert_eq!(below.y + below.height, height);
+    }
+
+    // --- The side column ---
+
+    fn side(height: f64, count: usize) -> Side {
+        Side {
+            height,
+            top: 40.0,
+            count,
+            scroll: 0.0,
+            warning: false,
+            corner: 20.5,
+        }
+    }
+
+    #[test]
+    fn the_columns_rows_stand_in_a_list_between_the_title_row_and_new_tab() {
+        let column = side(600.0, 3).layout();
+        assert_eq!(column.width, 200.0);
+        assert_eq!((SIDE_WIDTH, ROW_WIDTH), (MAX_WIDTH + 16.0, MAX_WIDTH));
+        // New Tab is 8 from the window's foot and left edge; the list ends 8 above it.
+        assert_eq!(column.new_tab, Rect::new(8.0, 564.0, 184.0, 28.0));
+        assert_eq!(column.list, Rect::new(0.0, 40.0, 200.0, 516.0));
+        assert_eq!(
+            column.rows,
+            [
+                Rect::new(8.0, 46.0, 184.0, 28.0),
+                Rect::new(8.0, 76.0, 184.0, 28.0),
+                Rect::new(8.0, 106.0, 184.0, 28.0),
+            ],
+            "28 high, 2 apart, 8 in from the sides, 6 under the title row"
+        );
+        assert!(!column.overflow && !column.fade_top && !column.fade_bottom);
+        assert_eq!(column.warning, None);
+
+        let warned = Side {
+            warning: true,
+            ..side(600.0, 3)
+        }
+        .layout();
+        assert_eq!(
+            warned.warning,
+            Some(Rect::new(164.0, 564.0, 28.0, 28.0)),
+            "8 from the right edge, level with New Tab"
+        );
+        assert_eq!(
+            warned.new_tab,
+            Rect::new(8.0, 564.0, 150.0, 28.0),
+            "New Tab gives it its width and a gap"
+        );
+        assert_eq!(warned.list, column.list, "the list does not move for it");
+        assert_eq!(warned.rows, column.rows);
+
+        let none = side(600.0, 0).layout();
+        assert!(none.rows.is_empty() && !none.overflow);
+        assert_eq!((none.scroll, none.max_scroll), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_single_tab_is_a_row_like_the_rest() {
+        let column = side(600.0, 1).layout();
+        assert_eq!(column.rows, [Rect::new(8.0, 46.0, 184.0, 28.0)]);
+        assert_eq!(column.slot_at(300.0), 0);
+    }
+
+    #[test]
+    fn new_tab_keeps_the_window_corners_centre() {
+        // macOS 26's 20.5 pt corner: 12.5 + 8.
+        let tall = side(600.0, 3).layout();
+        assert_eq!(
+            tall.fit,
+            Fit {
+                inset: 8.0,
+                radius: 12.5
+            }
+        );
+        assert_eq!(tall.fit.inset + tall.fit.radius, 20.5, "concentric");
+        assert_eq!(tall.new_tab.x, 8.0, "from the column's left edge");
+        assert_eq!(
+            600.0 - (tall.new_tab.y + tall.new_tab.height),
+            8.0,
+            "and from the window's foot"
+        );
+        // A 10 pt corner and full screen: the tabs' 7 and the edge's 8.
+        for corner in [10.0, 0.0] {
+            let column = Side {
+                corner,
+                ..side(600.0, 3)
+            }
+            .layout();
+            assert_eq!(
+                column.fit,
+                Fit {
+                    inset: EDGE,
+                    radius: TAB_RADIUS
+                },
+                "corner {corner}"
+            );
+            assert_eq!(column.new_tab.x, 8.0);
+        }
+    }
+
+    #[test]
+    fn the_list_scrolls_within_its_ends_and_fades_where_rows_run_under() {
+        // 30 rows in a 316 pt list: 6 + 30 × 30 − 2 + 6 = 910 of content.
+        let at = |scroll: f64| {
+            Side {
+                scroll,
+                ..side(400.0, 30)
+            }
+            .layout()
+        };
+        let top = at(0.0);
+        assert_eq!(top.list.height, 316.0);
+        assert!(top.overflow);
+        assert_eq!(top.max_scroll, 594.0);
+        assert!(!top.fade_top && top.fade_bottom);
+        assert!(!at(1.0).fade_top, "a point's remainder lights nothing");
+        assert!(at(1.5).fade_top);
+        let middle = at(100.0);
+        assert!(middle.fade_top && middle.fade_bottom);
+        assert_eq!(middle.rows[1].y, 46.0 + 30.0 - 100.0, "rows move with it");
+        let end = at(1000.0);
+        assert_eq!(end.scroll, 594.0, "clamped to the end");
+        assert!(end.fade_top && !end.fade_bottom);
+        assert!(at(592.5).fade_bottom && !at(593.5).fade_bottom);
+        assert_eq!(at(-5.0).scroll, 0.0);
+        assert_eq!(
+            end.rows[29].y + end.rows[29].height,
+            end.list.y + end.list.height - LIST_PAD,
+            "the last row stops 6 above the list's foot"
+        );
+    }
+
+    #[test]
+    fn a_short_window_still_lays_out() {
+        let column = side(50.0, 3).layout();
+        assert_eq!(column.list.height, 0.0);
+        assert!(column.overflow, "nothing fits, so everything scrolls");
+        assert_eq!(column.slot_at(10.0), 0);
+        assert!((0.0..=column.max_scroll).contains(&column.revealing(2)));
+        assert_eq!(column.wheeled(1e9), column.max_scroll);
+    }
+
+    #[test]
+    fn selecting_a_row_scrolls_it_into_view_with_a_margin() {
+        let column = side(400.0, 30).layout();
+        assert_eq!(column.revealing(29), 594.0, "the last one: the list's end");
+        // Row 10 spans 306..334 of the content; brought to 24 from the foot of 316.
+        assert_eq!(column.revealing(10), 334.0 - 316.0 + REVEAL_MARGIN);
+        assert_eq!(column.revealing(8), 0.0, "in view already");
+        assert_eq!(column.revealing(0), 0.0);
+        let scrolled = Side {
+            scroll: 300.0,
+            ..side(400.0, 30)
+        }
+        .layout();
+        assert_eq!(scrolled.revealing(15), 300.0, "in view");
+        assert_eq!(scrolled.revealing(10), 306.0 - REVEAL_MARGIN);
+        assert_eq!(scrolled.revealing(20), 634.0 - 316.0 + REVEAL_MARGIN);
+        assert_eq!(side(600.0, 3).layout().revealing(2), 0.0, "nothing scrolls");
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_column_within_its_ends() {
+        let column = Side {
+            scroll: 100.0,
+            ..side(400.0, 30)
+        }
+        .layout();
+        assert_eq!(column.wheeled(30.0), 130.0);
+        assert_eq!(column.wheeled(-500.0), 0.0);
+        assert_eq!(column.wheeled(5000.0), 594.0);
+        assert_eq!(side(600.0, 3).layout().wheeled(40.0), 0.0);
+    }
+
+    /// The reading rules every list gives, by its own places: what is under a point, what a
+    /// carried pane is over, where a held tab lands. Run on the strip (along x) and the column
+    /// (along y) alike — they are one function.
+    fn reads_its_places(laid: &impl Laid, across: f64, extent: (f64, f64)) {
+        let run = laid.run();
+        let whole: Vec<usize> = (0..run.places.len())
+            .filter(|&i| {
+                let place = run.places[i];
+                place.x >= run.span.x && place.end() <= run.span.end()
+            })
+            .collect();
+        assert!(whole.len() >= 3, "a list to read");
+        for &i in &whole {
+            let place = run.places[i];
+            let at = |share: f64| place.x + share * place.width;
+            assert_eq!(run.slot_at(at(0.05)), i, "the place holds its own points");
+            assert_eq!(run.slot_at(at(0.95)), i);
+            assert_eq!(run.pane_over(at(0.5)), PaneOver::OnTab { index: i });
+            assert_eq!(run.pane_over(at(0.1)), PaneOver::Between { gap: i });
+            assert_eq!(run.pane_over(at(0.9)), PaneOver::Between { gap: i + 1 });
+            // Held 3 in, carried to the next place: it takes it.
+            if whole.contains(&(i + 1)) {
+                let next = i + 1;
+                let mut grip = Grip::new(laid, i, place.x + 3.0).unwrap();
+                let there = run.places[next].x + 3.0;
+                assert_eq!(
+                    grip.track(laid, (there, across), extent),
+                    Drag::Reorder {
+                        left: run.places[next].x,
+                        to: next
+                    }
+                );
+            }
+        }
+        // The first before the list, the end past it.
+        assert_eq!(run.slot_at(run.span.x - 50.0), 0);
+        assert_eq!(run.slot_at(run.span.end() + 50.0), run.places.len() - 1);
+        assert_eq!(
+            run.pane_over(run.span.x - 50.0),
+            PaneOver::Between { gap: 0 }
+        );
+        assert_eq!(
+            run.pane_over(run.span.end() + 50.0),
+            PaneOver::Between {
+                gap: run.places.len()
+            }
+        );
+        // Pulled off the side by more than the tear distance, it comes away.
+        let first = whole[0];
+        let mut grip = Grip::new(laid, first, run.places[first].x + 3.0).unwrap();
+        let there = run.places[first].x + 3.0;
+        assert!(matches!(
+            grip.track(laid, (there, across), extent),
+            Drag::Press
+        ));
+        assert_eq!(
+            grip.track(laid, (there, extent.1 + TEAR_DISTANCE + 1.0), extent),
+            Drag::TearOff
+        );
+        assert!(matches!(
+            grip.track(laid, (there + 40.0, extent.1 + TEAR_DISTANCE), extent),
+            Drag::Reorder { .. }
+        ));
+    }
+
+    #[test]
+    fn the_column_reads_its_places_by_the_strips_rules_along_y() {
+        reads_its_places(&bar(1000.0, 5).layout(), 20.0, ROW);
+        let scrolled_strip = Bar {
+            scroll: 300.0,
+            ..bar(720.0, 12)
+        }
+        .layout();
+        reads_its_places(&scrolled_strip, 20.0, (720.0, 40.0));
+        reads_its_places(&side(600.0, 5).layout(), 100.0, (600.0, SIDE_WIDTH));
+        let scrolled_column = Side {
+            scroll: 300.0,
+            ..side(400.0, 30)
+        }
+        .layout();
+        reads_its_places(&scrolled_column, 100.0, (400.0, SIDE_WIDTH));
+    }
+
+    #[test]
+    fn the_slot_under_a_y_is_the_row_whose_extent_holds_it() {
+        let column = side(600.0, 4).layout();
+        for y in 0..=600 {
+            let y = f64::from(y);
+            let started = column.rows.iter().filter(|row| row.y <= y).count();
+            let expected = if y >= column.list.y + column.list.height {
+                3
+            } else {
+                started.saturating_sub(1)
+            };
+            assert_eq!(column.slot_at(y), expected, "y = {y}");
+        }
+        // The two points between rows belong to the row above, as in the strip.
+        assert_eq!(column.slot_at(74.5), 0);
+        assert_eq!(column.slot_at(76.0), 1);
+    }
+
+    #[test]
+    fn a_carried_pane_over_a_row_means_that_tab_and_between_rows_a_new_one() {
+        let column = side(600.0, 4).layout();
+        // Row 1 spans 76..104: the middle 64% is 81.04..98.96.
+        assert_eq!(column.pane_over(90.0), PaneOver::OnTab { index: 1 });
+        assert_eq!(column.pane_over(81.0), PaneOver::Between { gap: 1 });
+        assert_eq!(column.pane_over(81.2), PaneOver::OnTab { index: 1 });
+        assert_eq!(column.pane_over(99.1), PaneOver::Between { gap: 2 });
+        assert_eq!(
+            column.pane_over(75.0),
+            PaneOver::Between { gap: 1 },
+            "the gap"
+        );
+        assert_eq!(column.pane_over(20.0), PaneOver::Between { gap: 0 });
+        assert_eq!(
+            column.pane_over(45.0),
+            PaneOver::Between { gap: 0 },
+            "the pad"
+        );
+        assert_eq!(
+            column.pane_over(200.0),
+            PaneOver::Between { gap: 4 },
+            "under the last"
+        );
+        assert_eq!(column.pane_over(590.0), PaneOver::Between { gap: 4 });
+    }
+
+    #[test]
+    fn a_held_row_follows_the_pointer_down_the_list() {
+        let column = side(600.0, 4).layout();
+        let extent = (600.0, SIDE_WIDTH);
+        // Row 1 is at 76; held 10 into it.
+        let mut grip = Grip::new(&column, 1, 86.0).unwrap();
+        assert_eq!(grip.track(&column, (88.0, 100.0), extent), Drag::Press);
+        assert_eq!(
+            grip.track(&column, (96.0, 100.0), extent),
+            Drag::Reorder { left: 86.0, to: 1 }
+        );
+        assert_eq!(
+            grip.track(&column, (120.0, 100.0), extent),
+            Drag::Reorder { left: 110.0, to: 2 },
+            "30 per place: 64 / 30 rounds to 2"
+        );
+        assert_eq!(
+            grip.track(&column, (500.0, 100.0), extent),
+            Drag::Reorder { left: 136.0, to: 3 },
+            "no further than the last place"
+        );
+        assert_eq!(
+            grip.track(&column, (0.0, 100.0), extent),
+            Drag::Reorder { left: 40.0, to: 0 },
+            "no higher than the list"
+        );
+        assert!(Grip::new(&column, 4, 100.0).is_none(), "no such row");
+
+        // A scrolled list is read where it is now: row 12 is at 106 with 300 scrolled.
+        let scrolled = Side {
+            scroll: 300.0,
+            ..side(400.0, 30)
+        }
+        .layout();
+        let mut grip = Grip::new(&scrolled, 12, 116.0).unwrap();
+        assert_eq!(
+            grip.track(&scrolled, (40.0, 100.0), (400.0, SIDE_WIDTH)),
+            Drag::Reorder { left: 40.0, to: 10 },
+            "(300 − 6) / 30 rounds to 10"
+        );
+        assert_eq!(
+            grip.track(&scrolled, (355.0, 100.0), (400.0, SIDE_WIDTH)),
+            Drag::Reorder {
+                left: 328.0,
+                to: 19
+            },
+            "no lower than a row can be seen"
+        );
+    }
+
+    #[test]
+    fn a_row_pulled_out_of_the_column_comes_away() {
+        let column = side(600.0, 4).layout();
+        let extent = (600.0, SIDE_WIDTH);
+        let mut grip = Grip::new(&column, 1, 90.0).unwrap();
+        assert!(matches!(
+            grip.track(&column, (95.0, SIDE_WIDTH + TEAR_DISTANCE), extent),
+            Drag::Reorder { .. }
+        ));
+        assert_eq!(
+            grip.track(&column, (95.0, SIDE_WIDTH + TEAR_DISTANCE + 1.0), extent),
+            Drag::TearOff,
+            "out of the column's side"
+        );
+        assert_eq!(
+            grip.track(&column, (600.0 + TEAR_DISTANCE + 1.0, 100.0), extent),
+            Drag::TearOff,
+            "out of its foot"
+        );
+    }
+
+    #[test]
+    fn a_rows_parts_make_room_for_the_deck_and_for_the_close_button() {
+        // The tile alone, a title of 50.4 pt: 8 + 22 + 6 in, up to the 8 at the row's end.
+        let row = Row::of(Some(TILE_WIDTH), 50.4, false);
+        assert_eq!(row.lead, Some(Span::new(8.0, 22.0)));
+        assert_eq!(row.title, Span::new(36.0, 51.0), "the text, rounded up");
+        let long = Row::of(Some(TILE_WIDTH), 500.0, false);
+        assert_eq!(
+            long.title.end(),
+            ROW_WIDTH - ROW_END,
+            "cut at the row's end"
+        );
+        // × or ⌘ showing: the title ends where the hint's box begins.
+        let crowded = Row::of(Some(TILE_WIDTH), 500.0, true);
+        assert_eq!(crowded.title, Span::new(36.0, 118.0));
+        assert_eq!(crowded.title.end(), crowded.key.x);
+        assert!(crowded.title.end() <= crowded.close.x);
+        assert_eq!(crowded.close, Rect::new(160.0, 4.0, 20.0, 20.0));
+        assert_eq!(crowded.key, Span::new(154.0, 22.0));
+        // A deck of two edges takes its steps from the title.
+        let deck = Row::of(Some(lead_width(TILE_WIDTH, 2)), 500.0, false);
+        assert_eq!(deck.lead, Some(Span::new(8.0, 30.0)));
+        assert_eq!(deck.title, Span::new(44.0, 132.0));
+        assert_eq!(deck.title.end(), long.title.end(), "the same end");
+        // Icons off: the indicator's room, kept while it shows nothing; or no element at all.
+        assert_eq!(Row::of(Some(INDICATOR_SIDE), 500.0, false).title.x, 26.0);
+        let bare = Row::of(None, 500.0, false);
+        assert_eq!((bare.lead, bare.title), (None, Span::new(8.0, 168.0)));
+        // The title's room is the chip's rule: one copy.
+        assert_eq!(
+            title_row(168.0, 500.0, Some(22.0)).2,
+            long.title.width,
+            "the strip's title and the column's take the same room"
+        );
+        assert_eq!(row.host_mark, Rect::new(2.0, 7.0, 2.5, 14.0));
     }
 }

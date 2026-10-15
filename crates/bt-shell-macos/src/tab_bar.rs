@@ -188,8 +188,9 @@ const LIGHTS_GAP: f64 = 12.0;
 const WINDOW_CORNER: f64 = 20.0;
 
 /// A chip's height, points (the design's anatomy); its corner radius is
-/// `tabs::TAB_RADIUS`, shared with the buttons on a square corner.
-const CHIP_HEIGHT: f64 = 28.0;
+/// `tabs::TAB_RADIUS`, shared with the buttons on a square corner. The side column's rows are
+/// this high too, so the height is `tabs`'.
+const CHIP_HEIGHT: f64 = tabs::TAB_HEIGHT;
 
 /// The single tab's title box inset — it has no `×` to make room for.
 const SINGLE_PAD: f64 = 8.0;
