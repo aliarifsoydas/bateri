@@ -2485,8 +2485,8 @@ mod remote_shells {
     use std::sync::Arc;
 
     use bt_core::{
-        Blocks, CaretShape, CursorBlink, Osc52, RemoteSetupFault, Session, SessionOptions,
-        TerminalOptions, Theme,
+        Blocks, CaretShape, CursorBlink, Osc52, RemoteKind, RemoteSetupFault, RemoteTarget,
+        Session, SessionOptions, TerminalOptions, Theme,
     };
 
     use super::{boot, boot_in, remote_command};
@@ -2510,9 +2510,8 @@ mod remote_shells {
 
     /// The remote blocks end to end: the server's `true`,
     /// `false` and `sleep` get their stripes and the counter from our remote
-    /// marks and anchors — drawn with no local block at all, i.e. from the
-    /// remote trail alone (the harness has no local `ssh` block, so nothing
-    /// is "running"; a finished block needs no parent to be open).
+    /// marks and anchors — drawn from the remote trail (the harness's local
+    /// `ssh` block prints no anchor of its own).
     fn draws_remote_blocks(session: &Session, name: &str) {
         let stripes = |session: &Session| -> Vec<bt_core::LinearRgba> {
             let mut blocks = Blocks::default();
@@ -2543,6 +2542,15 @@ mod remote_shells {
     /// sshd's call: `shell -c '<the wrapped remote command>'`, `HOME` and
     /// `SHELL` as sshd sets them, `XDG_DATA_HOME` pinned under the home (the
     /// test machine's must not leak in), `extra` on top.
+    ///
+    /// It runs where the pane would see it: under the local shell's `ssh`
+    /// command (block [`PARENT`]: our identified `A`, then `C`) with the
+    /// remote probe's answer in (`set_remote`). Only then do the server's own
+    /// identity-less marks — fish 4 prints OSC 133 around every prompt — fall
+    /// outside the local trail; without the remote state its `A` ends the
+    /// command and clears the remote folder a moment after our OSC 7 set it.
+    /// The stand-in for `ssh` holds the server's shell on a `read` until the
+    /// probe is in, so its first prompt cannot beat it.
     fn sshd(shell: &Path, home: &Path, extra: &[(&str, String)]) -> Session {
         let mut env = HashMap::from([
             ("HOME".to_owned(), home.display().to_string()),
@@ -2555,11 +2563,18 @@ mod remote_shells {
         for (key, value) in extra {
             env.insert((*key).to_owned(), value.clone());
         }
-        Session::spawn(
+        let ssh = format!(
+            "printf '\\033]133;A;bt_block={PARENT}\\007\\033]133;C\\007'; \
+             read -r _; exec \"$0\" \"$@\""
+        );
+        let session = Session::spawn(
             SessionOptions {
                 command: Some((
-                    shell.display().to_string(),
+                    "/bin/sh".to_owned(),
                     vec![
+                        "-c".to_owned(),
+                        ssh,
+                        shell.display().to_string(),
                         "-c".to_owned(),
                         remote_command(boot(), Some(PARENT), NONCE, None),
                     ],
@@ -2588,7 +2603,23 @@ mod remote_shells {
             },
             Arc::new(SilentWake),
         )
-        .expect("session did not open")
+        .expect("session did not open");
+        wait_until("the local `ssh` did not start", || {
+            session.running_command().is_some()
+        });
+        let command = session.running_command().expect("a running command");
+        let target = RemoteTarget {
+            host: "server".to_owned(),
+            kind: RemoteKind::Ssh,
+            argv: vec!["ssh".to_owned(), "server".to_owned()],
+            line: "ssh server".to_owned(),
+        };
+        assert!(
+            session.set_remote(command, Some(&target)),
+            "the probe's answer was not taken"
+        );
+        session.write(b"\n");
+        session
     }
 
     fn screen_has(session: &Session, text: &str) -> bool {
