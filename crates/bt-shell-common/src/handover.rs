@@ -884,21 +884,19 @@ pub fn open(socket: &Path, uid: u32) -> Result<Opened, HandoverError> {
         return Err(HandoverError::Peer);
     }
     let wire = Wire::new(&stream, None);
-    wire.write_all(&[TAKE])?;
-    let mut magic = [0u8; 4];
-    match wire.read_exact(&mut magic[..1]) {
-        Ok(()) => {}
-        // Linux resets a connection closed with our `TAKE` unread.
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-            ) =>
-        {
-            return Err(HandoverError::Declined);
+    // Closed without a byte, wherever the close meets us: before our `TAKE`
+    // (its write is refused), or after it (Linux resets a connection closed
+    // with the `TAKE` unread).
+    let declined = |error: io::Error| {
+        if gone(&error) {
+            HandoverError::Declined
+        } else {
+            error.into()
         }
-        Err(error) => return Err(error.into()),
-    }
+    };
+    wire.write_all(&[TAKE]).map_err(declined)?;
+    let mut magic = [0u8; 4];
+    wire.read_exact(&mut magic[..1]).map_err(declined)?;
     wire.read_exact(&mut magic[1..])?;
     if magic != MAGIC {
         return Err(HandoverError::NotAFrame);
@@ -4394,14 +4392,8 @@ mod tests {
         assert!(matches!(take(&dir, uid() ^ 1), Err(HandoverError::Peer)));
         match take(&dir, uid()) {
             Err(HandoverError::Io(error)) => {
-                // Closed unanswered; Linux resets, the `TAKE` being unread.
-                assert!(
-                    matches!(
-                        error.kind(),
-                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-                    ),
-                    "{error:?}"
-                );
+                // Closed unanswered: `take` reads a declined holder as the end.
+                assert!(gone(&error), "{error:?}");
             }
             other => panic!("the holder answered a stranger: {other:?}"),
         }
