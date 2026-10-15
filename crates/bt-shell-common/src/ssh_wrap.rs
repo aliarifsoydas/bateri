@@ -2962,14 +2962,11 @@ mod remote_shells {
             std::fs::create_dir_all(home.join(".local/share")).expect("home");
             std::fs::create_dir_all(&bin).expect("bin");
             let shell = bin.join(name);
-            std::fs::write(
+            crate::child::tests::write_program(
                 &shell,
                 "#!/bin/sh\nprintf 'id=%s|%s|%s.' \"${LC_TERMINAL-unset}\" \
                  \"${LC_TERMINAL_VERSION-unset}\" \"${LC_BATERI_TAB_URL-unset}\"\n",
-            )
-            .expect("stand-in");
-            std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .expect("chmod");
+            );
             let run = |command: &str| {
                 let out = std::process::Command::new(&sh)
                     .arg("-c")
@@ -3017,13 +3014,10 @@ mod remote_shells {
             std::os::unix::fs::symlink(&odd, &link).expect("link");
             std::fs::create_dir_all(&bin).expect("bin");
             let shell = bin.join(name);
-            std::fs::write(
+            crate::child::tests::write_program(
                 &shell,
                 "#!/bin/sh\nprintf 'pwd=%s|%s.' \"$PWD\" \"$(pwd -P)\"\n",
-            )
-            .expect("stand-in");
-            std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .expect("chmod");
+            );
             let real = |path: &Path| path.canonicalize().expect("real").display().to_string();
             let run = |cwd: Option<&str>| {
                 let out = std::process::Command::new(&sh)

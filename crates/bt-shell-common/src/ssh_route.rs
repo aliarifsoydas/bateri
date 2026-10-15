@@ -2687,9 +2687,7 @@ exit $code
     }
 
     fn executable(path: &Path, script: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, script).expect("script");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        crate::child::tests::write_program(path, script);
         path.to_owned()
     }
 

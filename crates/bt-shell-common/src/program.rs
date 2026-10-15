@@ -1788,13 +1788,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         let exec = dir.join("python3");
-        std::fs::write(
+        crate::child::tests::write_program(
             &exec,
             "#!/bin/sh\necho 'Python 3.99.2'\nexec >&-\nexec sleep 30\n",
-        )
-        .expect("script");
-        std::fs::set_permissions(&exec, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .expect("chmod");
+        );
         let started = std::time::Instant::now();
         assert_eq!(
             run_version(&exec, Duration::from_secs(20)).as_deref(),
@@ -2374,9 +2371,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("bin")).expect("dir");
         // A stand-in interpreter: a script that prints a version line.
         let exec = dir.join("bin/python3");
-        std::fs::write(&exec, "#!/bin/sh\necho \"Python 3.99.1\"\n").expect("script");
-        std::fs::set_permissions(&exec, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .expect("chmod");
+        crate::child::tests::write_program(&exec, "#!/bin/sh\necho \"Python 3.99.1\"\n");
         std::fs::write(dir.join("pyvenv.cfg"), "home = /usr/bin\n").expect("cfg");
         // macOS looks a file over the first time it runs, before it starts —
         // measured at up to 1.7 s on a loaded machine, against the job's 2 s.
@@ -2418,9 +2413,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         let exec = dir.join("slow");
-        std::fs::write(&exec, "#!/bin/sh\nexec sleep 30\n").expect("script");
-        std::fs::set_permissions(&exec, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .expect("chmod");
+        crate::child::tests::write_program(&exec, "#!/bin/sh\nexec sleep 30\n");
         let started = std::time::Instant::now();
         assert_eq!(run_version(&exec, Duration::from_millis(200)), None);
         assert!(

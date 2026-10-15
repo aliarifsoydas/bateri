@@ -666,6 +666,28 @@ pub(crate) mod tests {
     use super::*;
     use crate::settings::TempRoot;
 
+    /// Writes `body` to `path` as a program (mode 755) that a test is about to run — through
+    /// `cp`, not from this process. The tests fork from many threads at once, and a child
+    /// forked while this process held the file open for writing keeps that handle until it
+    /// execs; Linux refuses to run a file anyone holds open for writing (`ETXTBSY`). Written
+    /// by a `cp` that has exited, the file has no writer to hand on (measured in the Linux
+    /// image with four threads forking: 86 refusals in 3000 runs written in-process, none
+    /// through `cp`).
+    pub(crate) fn write_program(path: &Path, body: &str) {
+        let name = path.file_name().expect("a file name").to_string_lossy();
+        let source = path.with_file_name(format!(".{name}.source"));
+        std::fs::write(&source, body).expect("the program's source");
+        let copied = std::process::Command::new("cp")
+            .arg(&source)
+            .arg(path)
+            .status()
+            .expect("cp");
+        assert!(copied.success(), "cp {}", path.display());
+        std::fs::remove_file(&source).expect("the program's source");
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+    }
+
     /// A reader that reads the environment from a fixed list; anything not in the list is
     /// undefined.
     fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
@@ -909,9 +931,7 @@ pub(crate) mod tests {
     /// A stand-in "bash" in `dir`: an executable script with `body`.
     fn stand_in(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("stand-in");
-        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .expect("chmod");
+        write_program(&path, &format!("#!/bin/sh\n{body}"));
         path
     }
 
@@ -1623,11 +1643,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&home).expect("home");
         std::fs::create_dir_all(&bin).expect("bin");
         let log = root.0.join("asked");
-        let script = |path: PathBuf, body: String| {
-            std::fs::write(&path, body).expect("script");
-            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .expect("chmod");
-        };
+        let script = |path: PathBuf, body: String| write_program(&path, &body);
         // The stand-in binary records how it was asked; `ssh-argv --tty`
         // answers a wrapped argv, `ssh-fell-back` a plain rerun while `fall`
         // exists.
@@ -3091,11 +3107,7 @@ pub(crate) mod tests {
         let bin = root.0.join("bin");
         std::fs::create_dir_all(&bin).expect("bin");
         let log = root.0.join("asked");
-        let script = |path: PathBuf, body: String| {
-            std::fs::write(&path, body).expect("script");
-            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .expect("chmod");
-        };
+        let script = |path: PathBuf, body: String| write_program(&path, &body);
         let fall = root.0.join("fall");
         script(
             bin.join("bateri"),
@@ -3200,13 +3212,10 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&bin).expect("bin");
         let log = root.0.join("git_asked");
         let git = bin.join("git");
-        std::fs::write(
+        write_program(
             &git,
-            format!("#!/bin/sh\necho \"$*\" >> '{}'\necho main\n", log.display()),
-        )
-        .expect("git");
-        std::fs::set_permissions(&git, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .expect("chmod");
+            &format!("#!/bin/sh\necho \"$*\" >> '{}'\necho main\n", log.display()),
+        );
         for (dock, extra) in [(false, "off"), (true, "")] {
             let _ = std::fs::remove_file(&log);
             write_fish_config(
