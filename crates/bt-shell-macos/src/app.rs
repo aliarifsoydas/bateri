@@ -3692,9 +3692,8 @@ impl AppDelegate {
         let source = from.ns_window().frame();
         let frame = match at {
             Some(at) => {
-                // The pointer lands in the middle of the title row: the bar's height, which is
-                // the window's one copy of it.
-                let row = from.bar().frame().size.height;
+                // The pointer lands in the middle of the title row, the window's one copy of it.
+                let row = from.title_row();
                 let wanted = Frame {
                     x: at.x - source.size.width / 2.0,
                     y: at.y + row / 2.0 - source.size.height,
@@ -5032,6 +5031,12 @@ impl AppDelegate {
             if changes.split_style {
                 for window in &windows {
                     window.apply_split_style();
+                }
+            }
+            // The tabs in the title row or in the side column: every window places them again.
+            if changes.tab_position {
+                for window in &windows {
+                    window.apply_tab_position();
                 }
             }
             // Turned on, every window takes the step its next drag would:

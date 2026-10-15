@@ -609,6 +609,33 @@ impl IconColors {
     }
 }
 
+/// `[appearance] tab_position`: where a window's tabs sit.
+///
+/// Only the platform shell reads it (the window's layout and the tab list's
+/// look); the session and the drawing never see it. Its own field in
+/// [`Changes`], for [`Scrollbar`]'s reason. An ordinary key: a value that
+/// isn't accepted is the default at launch and leaves the value in effect at
+/// save time. One position for every window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TabPosition {
+    /// A bar in the title row, above the panes.
+    #[default]
+    Top,
+    /// A full-height column at the window's left edge; the title row goes.
+    Side,
+}
+
+impl TabPosition {
+    /// The single list of spellings in the settings file (the same rationale as
+    /// [`UnfocusedCaret::NAMES`]).
+    pub const NAMES: &'static [(&'static str, Self)] = &[("top", Self::Top), ("side", Self::Side)];
+
+    /// The spelling in the settings file.
+    pub fn name(self) -> &'static str {
+        name_in(Self::NAMES, self)
+    }
+}
+
 /// `[terminal] cursor_radius` and `cursor_glow`: the cursor's **drawing**
 /// numbers.
 ///
@@ -1442,6 +1469,9 @@ pub struct Settings {
     /// `[appearance] tab_icon_colors`: theme colors or brand colors for the
     /// icon ([`IconColors`]). Doesn't enter `TerminalOptions`.
     pub tab_icon_colors: IconColors,
+    /// `[appearance] tab_position`: the tabs in a bar at the top or in a column
+    /// at the left ([`TabPosition`]). Doesn't enter `TerminalOptions`.
+    pub tab_position: TabPosition,
     /// `[font] family` and `size`.
     pub font: FontOptions,
     /// `[clipboard] osc52`: `"copy"` or `"off"`.
@@ -1523,6 +1553,7 @@ impl Default for Settings {
             resize_in_steps: false,
             tab_icons: true,
             tab_icon_colors: IconColors::default(),
+            tab_position: TabPosition::default(),
             font: FontOptions::default(),
             osc52: Osc52::Copy,
             cursor_motion: CursorMotion::default(),
@@ -1634,6 +1665,9 @@ pub enum SettingsEdit {
     TabIcons(bool),
     /// The settings window's "Icon colors": `[appearance] tab_icon_colors`.
     IconColors(IconColors),
+    /// View ▸ Tabs ▸ and the settings window's "Tabs": `[appearance]
+    /// tab_position`.
+    TabPosition(TabPosition),
     /// Shell ▸ Mark … as ▸: the `[remote] hosts` edit that makes
     /// `host`'s mark `mark`. Not a single key's value but the array's entries —
     /// the rule is in this arm of [`Settings::with_edit`]. `host` is the form the
@@ -1731,6 +1765,7 @@ impl SettingsEdit {
                 "tab_icon_colors",
                 "appearance.tab_icon_colors",
             ),
+            Self::TabPosition(_) => ("appearance", "tab_position", "appearance.tab_position"),
             Self::FontFamily(_) => ("font", "family", "font.family"),
             Self::FontSize(_) => ("font", "size", "font.size"),
             Self::LineHeight(_) => ("font", "line_height", "font.line_height"),
@@ -1781,6 +1816,7 @@ impl SettingsEdit {
             Self::ContentEdge(edge) => edge.name().into(),
             Self::SplitStyle(style) => style.name().into(),
             Self::IconColors(colors) => colors.name().into(),
+            Self::TabPosition(position) => position.name().into(),
             Self::Osc52(mode) => mode.name().into(),
             Self::CursorMotion(motion) => motion.name().into(),
             Self::ReduceMotion(reduce) => reduce.name().into(),
@@ -1949,6 +1985,11 @@ tab_icons = true
 # own where it has a colored brand (Claude, Antigravity, Gemini, Qwen); the
 # single-color ones and the kinds bateri draws itself stay as they are.
 tab_icon_colors = "theme"
+# "top" | "side". Where a window's tabs sit: a bar along the top, in the title
+# row, or a full-height column at the window's left edge, where the title row
+# goes and the traffic lights sit at the column's head. One place for every
+# window.
+tab_position = "top"
 
 [font]
 # A family name as shown in Font Book. Without it bateri uses SF Mono, or
@@ -2387,6 +2428,16 @@ stats_interval = 3
                         &mut parsed.diagnostics,
                     );
                 }
+                if let Some(item) = appearance.get("tab_position") {
+                    parsed.settings.tab_position = named_enum(
+                        text,
+                        item,
+                        "appearance.tab_position",
+                        TabPosition::NAMES,
+                        fallback.tab_position,
+                        &mut parsed.diagnostics,
+                    );
+                }
             }
             None if root.contains_key("appearance") => {
                 for (_, _, slot, kept) in names {
@@ -2399,6 +2450,7 @@ stats_interval = 3
                 parsed.settings.resize_in_steps = fallback.resize_in_steps;
                 parsed.settings.tab_icons = fallback.tab_icons;
                 parsed.settings.tab_icon_colors = fallback.tab_icon_colors;
+                parsed.settings.tab_position = fallback.tab_position;
             }
             None => {}
         }
@@ -2683,6 +2735,7 @@ stats_interval = 3
             resize_in_steps: self.resize_in_steps != new.resize_in_steps,
             tab_icons: self.tab_icons != new.tab_icons
                 || self.tab_icon_colors != new.tab_icon_colors,
+            tab_position: self.tab_position != new.tab_position,
             ports: self.shell_ports != new.shell_ports,
         }
     }
@@ -3387,6 +3440,10 @@ pub struct Changes {
     /// split tab out again, as cards or divided by a line. A field of its
     /// own, for [`Self::caret`]'s reason.
     pub split_style: bool,
+    /// [`Settings::tab_position`] changed: the platform shell moves every
+    /// window's tabs between the bar and the column in place. A field of its
+    /// own, for [`Self::caret`]'s reason.
+    pub tab_position: bool,
     /// [`Settings::resize_in_steps`] changed: turned on, the platform shell
     /// fits every window to its lone pane's cells at once instead of at the
     /// next drag. A field of its own, for [`Self::caret`]'s reason.
@@ -4220,6 +4277,7 @@ mod tests {
             ("appearance", "resize_in_steps"),
             ("appearance", "tab_icons"),
             ("appearance", "tab_icon_colors"),
+            ("appearance", "tab_position"),
             ("font", "size"),
             ("font", "line_height"),
             ("font", "letter_spacing"),
@@ -4400,6 +4458,7 @@ mod tests {
                 split_style: false,
                 resize_in_steps: false,
                 tab_icons: false,
+                tab_position: false,
                 ports: false,
             }
         );
@@ -4441,6 +4500,7 @@ mod tests {
             resize_in_steps: true,
             tab_icons: false,
             tab_icon_colors: IconColors::Brand,
+            tab_position: TabPosition::Side,
             font: FontOptions::default(),
             osc52: Osc52::Copy,
             cursor_motion: CursorMotion::Spring,
@@ -4635,6 +4695,7 @@ mod tests {
             split_style: false,
             resize_in_steps: false,
             tab_icons: false,
+            tab_position: false,
             ports: false,
         };
         assert_eq!(before.changes(&clean("[font]\nsize = 14\n")), font_only);
@@ -4833,6 +4894,7 @@ mod tests {
                 split_style: false,
                 resize_in_steps: false,
                 tab_icons: false,
+                tab_position: false,
                 ports: false,
             }
         );
@@ -4989,6 +5051,7 @@ found {found}; using \"spring\""
                 split_style: false,
                 resize_in_steps: false,
                 tab_icons: false,
+                tab_position: false,
                 ports: false,
             }
         );
@@ -5085,6 +5148,7 @@ found {found}; using \"system\""
                 split_style: false,
                 resize_in_steps: false,
                 tab_icons: false,
+                tab_position: false,
                 ports: false,
             }
         );
@@ -5713,6 +5777,39 @@ found 1.5; using 0.1"
     }
 
     #[test]
+    fn tab_position_is_read_and_defaults_to_top() {
+        assert_eq!(clean("").tab_position, TabPosition::Top);
+        for (value, expected) in [("top", TabPosition::Top), ("side", TabPosition::Side)] {
+            let text = format!("[appearance]\ntab_position = \"{value}\"\n");
+            assert_eq!(clean(&text).tab_position, expected, "{value}");
+            assert_eq!(expected.name(), value);
+        }
+        // A change is its own: only the window's layout moves.
+        let side = clean("[appearance]\ntab_position = \"side\"\n");
+        let changes = clean("").changes(&side);
+        assert!(changes.tab_position);
+        assert!(!changes.split_style && !changes.tab_icons);
+        assert!(!clean("").changes(&clean("")).tab_position);
+        // An ordinary key: at launch a value that isn't accepted is the default
+        // and only this key is named; at save time the value in effect stands in.
+        let (settings, diagnostic) = rejected("[appearance]\ntab_position = \"left\"\n");
+        assert_eq!(settings.tab_position, TabPosition::Top);
+        assert_eq!(diagnostic.key, Some("appearance.tab_position"));
+        let current = Settings {
+            tab_position: TabPosition::Side,
+            ..Settings::default()
+        };
+        for text in [
+            "[appearance]\ntab_position = 1\n",
+            "[appearance]\ntab_position = \"left\"\n",
+            "appearance = 5\n",
+        ] {
+            let parsed = Settings::parse_keeping(text, &current).expect("parseable text");
+            assert_eq!(parsed.settings.tab_position, TabPosition::Side, "{text}");
+        }
+    }
+
+    #[test]
     fn tab_icons_and_their_colors_are_read() {
         assert!(clean("").tab_icons, "icons are on by default");
         assert_eq!(clean("").tab_icon_colors, IconColors::Theme);
@@ -5835,6 +5932,31 @@ found 1.5; using 0.1"
         assert_eq!(
             SettingsEdit::ContentEdge(ContentEdge::Cut).path(),
             "appearance.content_edge"
+        );
+    }
+
+    #[test]
+    fn tab_position_write_keeps_comments_and_unknown_keys() {
+        let text = "[appearance]\ntab_position = \"top\" # keep\nglass = true\n";
+        let written = Settings::with_edit(text, &SettingsEdit::TabPosition(TabPosition::Side))
+            .expect("editable text");
+        assert!(
+            written.contains("tab_position = \"side\" # keep"),
+            "{written}"
+        );
+        assert!(written.contains("glass = true"), "{written}");
+        assert_eq!(clean(&written).tab_position, TabPosition::Side);
+        // A file without the key gets it in its section, the rest untouched.
+        let written = Settings::with_edit(
+            "[appearance]\ndark_theme = \"ink\"\n",
+            &SettingsEdit::TabPosition(TabPosition::Side),
+        )
+        .expect("editable text");
+        assert_eq!(clean(&written).tab_position, TabPosition::Side);
+        assert_eq!(clean(&written).dark_theme, "ink");
+        assert_eq!(
+            SettingsEdit::TabPosition(TabPosition::Side).path(),
+            "appearance.tab_position"
         );
     }
 
@@ -6215,6 +6337,7 @@ found 1.5; using 0.1"
                     split_style: false,
                     resize_in_steps: false,
                     tab_icons: false,
+                    tab_position: false,
                     ports: false,
                 },
                 "{text}"
@@ -6320,6 +6443,7 @@ found 1.5; using 0.1"
                 split_style: false,
                 resize_in_steps: false,
                 tab_icons: false,
+                tab_position: false,
                 ports: false,
             }
         );
@@ -6429,6 +6553,7 @@ found 1.5; using 0.1"
                 split_style: false,
                 resize_in_steps: false,
                 tab_icons: false,
+                tab_position: false,
                 ports: false,
             }
         );
@@ -6966,6 +7091,7 @@ cursor = \"spring\"
             SettingsEdit::ResizeInSteps(on) => settings.resize_in_steps = on,
             SettingsEdit::TabIcons(on) => settings.tab_icons = on,
             SettingsEdit::IconColors(colors) => settings.tab_icon_colors = colors,
+            SettingsEdit::TabPosition(position) => settings.tab_position = position,
             SettingsEdit::FontFamily(name) => {
                 settings.font.family = (!name.is_empty()).then_some(name);
             }
@@ -7048,6 +7174,7 @@ cursor = \"spring\"
             SettingsEdit::ResizeInSteps(true),
             SettingsEdit::TabIcons(false),
             SettingsEdit::IconColors(IconColors::Brand),
+            SettingsEdit::TabPosition(TabPosition::Side),
             SettingsEdit::FontFamily("Menlo".to_owned()),
             SettingsEdit::FontFamily(String::new()),
             SettingsEdit::FontSize(14.5),

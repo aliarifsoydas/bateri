@@ -1,0 +1,400 @@
+//! The tabs in a column down the window's left edge (`[appearance] tab_position = "side"`): the
+//! bar's other mode.
+//!
+//! **One bar, two places.** The column is not a second view with its own copy of the bar's
+//! doings: it is the same [`TabBar`] — the tabs it was given, its chips, the transfers' ends, the
+//! ⌘ keys, the clock, the name field, the menus — put in the window's full height at the left
+//! instead of in the title row ([`TabBar::set_side`], told by the window's root view with every
+//! placement). What changes is where things stand, and that is the pure model's: the rows from
+//! `tabs::Side::layout`, the parts of a row from `tabs::Row` ([`Chip::set`] reads it), so the
+//! Linux shell can lay the same list out. This file is a child of `tab_bar` for the bar's
+//! private state, which a sibling could not reach without every field going public.
+//!
+//! **Where it sits.** The column is [`tabs::SIDE_WIDTH`] wide and the window's height tall, the
+//! traffic lights at its head: the list starts a title row down (`top`, read from the window, the
+//! same in full screen so the rows do not move as it comes and goes) and ends above New Tab,
+//! which sits in the window's bottom-left corner and keeps that corner's centre
+//! ([`tabs::Fit`]). The rows scroll by the wheel when they do not fit, run under the list's ends
+//! and dissolve there by a mask on the list ([`Mask`]) — not a band of the ground's colour
+//! painted over them, which would lighten a card's shadow falling under the column.
+//!
+//! **A press on the column's empty part moves the window** (the bar's `mouseDown:`,
+//! `performWindowDragWithEvent:`), as it does on the bar's. The band of the title row over the
+//! content is claimed by a [`RowClaim`] of the root view, so a press there is the pane's.
+//!
+//! **Not yet in the column**: dragging a row (a press only selects), the summary card (hovering
+//! shows the hover fill alone) and the dropping of a tab or a pane on it.
+
+use std::cell::{Cell, RefCell};
+
+use objc2::rc::Retained;
+use objc2::{DefinedClass, MainThreadOnly};
+use objc2_app_kit::{NSAccessibility, NSBezierPath, NSColor, NSTextAlignment, NSView};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_quartz_core::{CALayer, CATransaction};
+
+use super::{Chip, IconStyle, Motion, Palette, Seen, Shown, Standing, TabBar, Tint, paint_in};
+use crate::card;
+use crate::split::Rect;
+use crate::tabs::{self, Column, FADE, Side, TAB_RADIUS};
+
+/// A model rectangle as the view's: both are top-down, in points.
+pub(super) fn ns_rect(rect: Rect) -> NSRect {
+    NSRect::new(
+        NSPoint::new(rect.x, rect.y),
+        NSSize::new(rect.width, rect.height),
+    )
+}
+
+/// A rectangle with its own radius at each corner — top-left, top-right, bottom-right,
+/// bottom-left, as a top-down view draws them — filled, and its inside edge stroked with `line` if
+/// any. [`super::rounded`] for a shape whose corners differ: New Tab in the column keeps the
+/// window's corner at its foot.
+pub(super) fn rounded_corners(rect: NSRect, radii: [f64; 4], fill: Tint, line: Option<Tint>) {
+    let path = corners_path(rect, radii);
+    fill.color().setFill();
+    path.fill();
+    if let Some(line) = line {
+        let inner = NSRect::new(
+            NSPoint::new(rect.origin.x + 0.5, rect.origin.y + 0.5),
+            NSSize::new(rect.size.width - 1.0, rect.size.height - 1.0),
+        );
+        let path = corners_path(inner, radii.map(|radius| (radius - 0.5).max(0.0)));
+        path.setLineWidth(1.0);
+        line.color().setStroke();
+        path.stroke();
+    }
+}
+
+/// The outline of [`rounded_corners`]: each corner an arc tangent to its two sides.
+fn corners_path(
+    rect: NSRect,
+    [top_left, top_right, bottom_right, bottom_left]: [f64; 4],
+) -> Retained<NSBezierPath> {
+    let (left, top) = (rect.origin.x, rect.origin.y);
+    let (right, bottom) = (left + rect.size.width, top + rect.size.height);
+    let path = NSBezierPath::bezierPath();
+    path.moveToPoint(NSPoint::new(left + top_left, top));
+    path.lineToPoint(NSPoint::new(right - top_right, top));
+    for (corner, towards, radius) in [
+        (
+            NSPoint::new(right, top),
+            NSPoint::new(right, top + top_right),
+            top_right,
+        ),
+        (
+            NSPoint::new(right, bottom),
+            NSPoint::new(right - bottom_right, bottom),
+            bottom_right,
+        ),
+        (
+            NSPoint::new(left, bottom),
+            NSPoint::new(left, bottom - bottom_left),
+            bottom_left,
+        ),
+        (
+            NSPoint::new(left, top),
+            NSPoint::new(left + top_left, top),
+            top_left,
+        ),
+    ] {
+        // The line from where the last arc ended is this arc's own tangent line.
+        path.appendBezierPathWithArcFromPoint_toPoint_radius(corner, towards, radius);
+    }
+    path.closePath();
+    path
+}
+
+/// The mask that fades the column's list where rows run under its ends, and what it was painted
+/// for: a picture is made only when the list's size or its ends change.
+#[derive(Default)]
+pub(super) struct Mask {
+    layer: RefCell<Option<Retained<CALayer>>>,
+    painted: Cell<Option<Painted>>,
+}
+
+/// What a mask's picture was painted for.
+#[derive(Clone, Copy, PartialEq)]
+struct Painted {
+    size: (f64, f64),
+    top: bool,
+    bottom: bool,
+    scale: f64,
+}
+
+impl Mask {
+    /// The list's mask for `column` at `scale`: opaque where rows show, running out to nothing
+    /// over [`FADE`] at an end where more lies beyond (`Column::fade_top`/`fade_bottom`); no mask
+    /// where nothing runs under an end.
+    fn set(&self, list: &NSView, column: &Column, scale: f64) {
+        let (top, bottom) = (column.fade_top, column.fade_bottom);
+        if !top && !bottom {
+            self.clear(list);
+            return;
+        }
+        list.setWantsLayer(true);
+        let Some(host) = list.layer() else {
+            return;
+        };
+        let size = NSSize::new(column.list.width, column.list.height);
+        let state = Painted {
+            size: (size.width, size.height),
+            top,
+            bottom,
+            scale,
+        };
+        let mut slot = self.layer.borrow_mut();
+        let fresh = slot.is_none();
+        let layer = slot.get_or_insert_with(CALayer::new);
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        layer.setFrame(NSRect::new(NSPoint::ZERO, size));
+        if self.painted.replace(Some(state)) != Some(state) {
+            paint_in(layer, size, scale, move |rect| {
+                fade_picture(rect, top, bottom)
+            });
+        }
+        if fresh {
+            // SAFETY: a mask is any layer; this one is the host's alone and lives as long as
+            // the mask slot holds it.
+            unsafe { host.setMask(Some(layer)) };
+        }
+        CATransaction::commit();
+    }
+
+    /// Takes the mask off: every row shows to the list's ends.
+    pub(super) fn clear(&self, list: &NSView) {
+        if self.layer.take().is_none() {
+            return;
+        }
+        self.painted.set(None);
+        if let Some(host) = list.layer() {
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
+            // SAFETY: taking a mask off, which any layer allows.
+            unsafe { host.setMask(None) };
+            CATransaction::commit();
+        }
+    }
+}
+
+/// The mask's picture in `rect` (top-down): black — its alpha is what shows — from end to end,
+/// less [`FADE`] at the ends that fade, where the alpha runs from 0 at the edge to 1 inside along
+/// a smooth step.
+fn fade_picture(rect: NSRect, top: bool, bottom: bool) {
+    let (width, height) = (rect.size.width, rect.size.height);
+    let fade = FADE.min(height / 2.0);
+    let step = |t: f64| t * t * (3.0 - 2.0 * t);
+    let black = |alpha: f64| NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, alpha);
+    let from = if top { fade } else { 0.0 };
+    let to = if bottom { height - fade } else { height };
+    black(1.0).setFill();
+    NSBezierPath::bezierPathWithRect(NSRect::new(
+        NSPoint::new(0.0, from),
+        NSSize::new(width, (to - from).max(0.0)),
+    ))
+    .fill();
+    // A line each: the picture is painted when the list's size changes, not per frame.
+    let lines = fade.ceil() as usize;
+    for line in 0..lines {
+        let y = line as f64;
+        let alpha = step(((y + 0.5) / fade).min(1.0));
+        black(alpha).setFill();
+        if top {
+            NSBezierPath::bezierPathWithRect(NSRect::new(
+                NSPoint::new(0.0, y),
+                NSSize::new(width, 1.0),
+            ))
+            .fill();
+        }
+        if bottom {
+            NSBezierPath::bezierPathWithRect(NSRect::new(
+                NSPoint::new(0.0, height - y - 1.0),
+                NSSize::new(width, 1.0),
+            ))
+            .fill();
+        }
+    }
+}
+
+impl TabBar {
+    /// Puts the bar in the side column (`Some(top)`: the title row's height, where the list
+    /// starts) or back in the title row (`None`). A change of place forgets what belonged to the
+    /// other: the scroll, the layout, a drag, a gap, the card.
+    pub(crate) fn set_side(&self, top: Option<f64>) {
+        let iv = self.ivars();
+        let before = iv.side.replace(top);
+        if before.is_some() == top.is_some() {
+            return;
+        }
+        self.close_card();
+        iv.scroll.set(0.0);
+        iv.revealed.set(None);
+        iv.overflowed.set(false);
+        iv.width.set(0.0);
+        iv.laid.replace(None);
+        iv.column.replace(None);
+        iv.drag.set(None);
+        iv.gap.set(None);
+        iv.target.set(None);
+        iv.dwelling.set(None);
+        if top.is_some() {
+            iv.fade_leading.setHidden(true);
+            iv.fade_trailing.setHidden(true);
+            iv.list.setHidden(true);
+        } else {
+            // The bar's own: the list had no mask and New Tab a square foot.
+            iv.mask.clear(&iv.strip);
+            iv.new_tab.set_foot(None);
+            iv.strip.setNeedsDisplay(true);
+        }
+    }
+
+    /// Places every part from the pure column ([`Side::layout`]) and gives the chips their tabs
+    /// as rows. [`TabBar::lay_out`]'s other half: the same things in the same order, a list that
+    /// scrolls to the selection and slides there when the applier changed the list, and the
+    /// clock set again after it.
+    pub(super) fn lay_out_column(
+        &self,
+        top: f64,
+        shown: &Shown,
+        chips: &[Retained<Chip>],
+        glowing: &[bool],
+        reflow: bool,
+    ) {
+        let iv = self.ivars();
+        let (Some(palette), Some(theme)) = (iv.palette.get(), iv.theme.get()) else {
+            return;
+        };
+        let count = shown.tabs.len();
+        let bounds = self.bounds();
+        let hovered = iv
+            .hovered
+            .get()
+            .and_then(|tab| shown.tabs.iter().position(|label| label.tab == tab));
+        let corner = card::window_corner_pt(self.window().as_deref());
+        let side = Side {
+            height: bounds.size.height,
+            top,
+            count,
+            scroll: iv.scroll.get(),
+            warning: !shown.notice.is_empty(),
+            corner,
+        };
+        let mut column = side.layout();
+        let selected_tab = shown.tabs.get(shown.selected).map(|label| label.tab);
+        let was_overflowing = iv.overflowed.replace(column.overflow);
+        let resized = (iv.width.replace(bounds.size.height) - bounds.size.height).abs() > 0.5;
+        let selection_changed = iv.revealed.replace(selected_tab) != selected_tab;
+        // The selection comes into sight when it changes, and when the rows stop fitting or the
+        // room they scroll in changes while they do not: only a change of the selection slides.
+        let kept_in_sight = column.overflow && (!was_overflowing || resized);
+        let mut revealed = false;
+        if selection_changed || kept_in_sight {
+            let target = column.revealing(shown.selected);
+            if target != column.scroll {
+                column = Side {
+                    scroll: target,
+                    ..side
+                }
+                .layout();
+                revealed = selection_changed;
+            }
+        }
+        iv.scroll.set(column.scroll);
+
+        let reduce = self.reduce_motion();
+        let motion = Motion::of(reduce);
+        let glide = iv.glide.take();
+        let slide = ((reflow || revealed || glide) && motion.reflow > 0.0).then_some(motion.reflow);
+        let visible = self
+            .terminal_window()
+            .is_some_and(|window| window.window_visible());
+        let seen = Seen {
+            theme,
+            count,
+            visible,
+            reduce,
+            style: IconStyle::current(self.mtm()),
+            hints: iv.hints.get(),
+        };
+        // The rows live in the list's space: its top-left corner is theirs.
+        iv.strip.setFrame(ns_rect(column.list));
+        for (index, chip) in chips.iter().enumerate() {
+            let label = &shown.tabs[index];
+            let naming = iv.renaming.get() == Some(label.tab);
+            let title = if naming {
+                String::new()
+            } else {
+                label.title.clone()
+            };
+            let row = column.rows[index];
+            let frame = NSRect::new(
+                NSPoint::new(row.x - column.list.x, row.y - column.list.y),
+                NSSize::new(row.width, row.height),
+            );
+            let look = seen.look(
+                label,
+                &title,
+                Standing {
+                    index,
+                    naming,
+                    selected: index == shown.selected,
+                    hovered: hovered == Some(index) && !naming,
+                    glowing: glowing[index],
+                    single: false,
+                    lifted: false,
+                    ghost: false,
+                    side: true,
+                },
+            );
+            chip.set(frame, &look, palette, motion, slide);
+            if naming {
+                self.place_row_field(row, palette);
+            }
+        }
+        iv.strip.set_separators(Vec::new(), palette);
+        let scale = self
+            .window()
+            .map_or(2.0, |window| window.backingScaleFactor());
+        iv.mask.set(&iv.strip, &column, scale);
+
+        iv.new_tab.setFrame(ns_rect(column.new_tab));
+        iv.new_tab.set_look(palette, TAB_RADIUS);
+        iv.new_tab.set_foot(Some(column.fit.radius));
+        iv.list.setHidden(true);
+        match column.warning {
+            Some(button) => {
+                iv.warning.setFrame(ns_rect(button));
+                iv.warning.set_look(palette, TAB_RADIUS);
+                let text = NSString::from_str(&shown.notice);
+                iv.warning.setToolTip(Some(&text));
+                iv.warning.setAccessibilityLabel(Some(&text));
+                iv.warning.setHidden(false);
+            }
+            None => iv.warning.setHidden(true),
+        }
+        iv.column.replace(Some(column));
+        self.arm_clock();
+    }
+
+    /// Puts the name field over `row` (the bar's space), in the type the selected row's title
+    /// wears, left-aligned where the row's leading element starts: the field covers icon and
+    /// title alike.
+    fn place_row_field(&self, row: Rect, palette: Palette) {
+        let field = &self.ivars().field;
+        field.setAlignment(NSTextAlignment::Left);
+        self.dress_field(palette, false);
+        let height = field.intrinsicContentSize().height;
+        field.setFrame(NSRect::new(
+            NSPoint::new(
+                row.x + tabs::ROW_LEAD,
+                row.y + ((row.height - height) / 2.0).max(0.0),
+            ),
+            NSSize::new(
+                (tabs::ROW_WIDTH - tabs::ROW_LEAD - tabs::ROW_END).max(0.0),
+                height,
+            ),
+        ));
+    }
+}

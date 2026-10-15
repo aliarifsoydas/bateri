@@ -92,7 +92,7 @@ use std::ffi::c_void;
 use std::time::Duration;
 
 use block2::RcBlock;
-use bt_core::{ConfirmClose, ContentEdge, Settings, Theme};
+use bt_core::{ConfirmClose, ContentEdge, Settings, TabPosition, Theme};
 use bt_gpu::GpuError;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
@@ -105,8 +105,8 @@ use objc2_app_kit::{
     NSAppearanceNameDarkAqua, NSApplication, NSBackingStoreType, NSColor, NSControlStateValueOff,
     NSControlStateValueOn, NSFloatingWindowLevel, NSFont, NSFontAttributeName, NSMenuItem,
     NSModalResponse, NSModalResponseCancel, NSStringDrawing, NSTitlebarSeparatorStyle, NSToolbar,
-    NSView, NSWindow, NSWindowDelegate, NSWindowOcclusionState, NSWindowStyleMask,
-    NSWindowTabbingMode, NSWindowTitleVisibility, NSWindowToolbarStyle,
+    NSView, NSWindow, NSWindowDelegate, NSWindowOcclusionState, NSWindowOrderingMode,
+    NSWindowStyleMask, NSWindowTabbingMode, NSWindowTitleVisibility, NSWindowToolbarStyle,
 };
 use objc2_foundation::{
     NSAttributedStringKey, NSDictionary, NSKeyValueObservingOptions, NSNotification, NSObject,
@@ -129,7 +129,7 @@ use crate::sheets::{self, Asker};
 use crate::split::{Axis, Direction, Tree};
 use crate::split_view::SplitView;
 use crate::tab::{self, TerminalTab};
-use crate::tab_bar::{Label, TabBar};
+use crate::tab_bar::{Label, RowClaim, TabBar};
 use crate::tabs::{self, Card, Finish, Tabs};
 use crate::undo::{Record, Scene, Shape};
 
@@ -1208,8 +1208,18 @@ pub(crate) struct RootIvars {
     /// The cards' shadows and cuts (`card::Shade`): over the ground, under
     /// the containers.
     shade: Retained<Shade>,
+    /// With the tabs in the side column, the title row's band over the content: a claim on it,
+    /// so a press there is the pane's and the window server does not move the window
+    /// ([`RowClaim`]). Hidden while the bar is in the row. Above every container.
+    claim: Retained<RowClaim>,
     /// The title row's last measured height; `0` until the window reports one.
     row: Cell<f64>,
+}
+
+/// Whether `[appearance] tab_position` puts the tabs in the side column. One answer for every
+/// window; without an application (a pane embedded in another one) the bar in the title row.
+fn tabs_at_side(mtm: MainThreadMarker) -> bool {
+    app::delegate(mtm).is_some_and(|app| app.settings().tab_position == TabPosition::Side)
 }
 
 define_class!(
@@ -1254,10 +1264,13 @@ impl RootView {
     fn new(mtm: MainThreadMarker, frame: NSRect, bar: &TabBar) -> Retained<Self> {
         let ground = Ground::new(mtm, NSRect::new(NSPoint::ZERO, frame.size));
         let shade = Shade::new(mtm, NSRect::new(NSPoint::ZERO, frame.size));
+        let claim = RowClaim::new(mtm);
+        claim.setHidden(true);
         let this = Self::alloc(mtm).set_ivars(RootIvars {
             bar: bar.retain(),
             ground: ground.clone(),
             shade: shade.clone(),
+            claim: claim.clone(),
             row: Cell::new(0.0),
         });
         // SAFETY: `initWithFrame:` is NSView's designated initializer and the
@@ -1269,6 +1282,7 @@ impl RootView {
         this.addSubview(&ground);
         this.addSubview(&shade);
         this.addSubview(bar);
+        this.addSubview(&claim);
         this
     }
 
@@ -1327,14 +1341,29 @@ impl RootView {
         self.ivars().row.get()
     }
 
-    /// Measures the title row and puts the bar in it, every container under
-    /// it.
+    /// What the tabs keep of the window: the width of the side column, or the height of the
+    /// title row the bar stands in. The content is the rest.
+    pub(crate) fn tabs_inset(&self) -> NSSize {
+        if tabs_at_side(self.mtm()) {
+            NSSize::new(tabs::SIDE_WIDTH, 0.0)
+        } else {
+            NSSize::new(0.0, self.title_row())
+        }
+    }
+
+    /// Measures the title row and puts the bar where the tabs are, every container beside or
+    /// under it.
     pub(crate) fn lay_out(&self) {
         self.place(self.title_row());
     }
 
-    /// Puts the bar in a `row` tall title row and every container under it;
+    /// Puts the tabs where `[appearance] tab_position` says and every container in the rest;
     /// a question up in a tab follows its container (`sheets::fit_owner`).
+    ///
+    /// In the title row (`row` tall) the bar is the row's width and the containers are under it.
+    /// In the side column it is the window's height and [`tabs::SIDE_WIDTH`] wide at the left,
+    /// the containers beside it from the window's top — there is no title row over the content —
+    /// and the row's band over them is claimed, so a press there is the pane's.
     fn place(&self, row: f64) {
         let bounds = self.bounds();
         let row = row.min(bounds.size.height);
@@ -1343,14 +1372,33 @@ impl RootView {
         self.ivars().ground.setFrame(bounds);
         self.ivars().shade.setFrame(bounds);
         let bar = &self.ivars().bar;
-        bar.setFrame(NSRect::new(
-            NSPoint::ZERO,
-            NSSize::new(bounds.size.width, row),
-        ));
-        let below = NSRect::new(
-            NSPoint::new(0.0, row),
-            NSSize::new(bounds.size.width, bounds.size.height - row),
-        );
+        let claim = &self.ivars().claim;
+        let side = tabs_at_side(self.mtm());
+        let (bar_frame, below) = if side {
+            let column = tabs::SIDE_WIDTH.min(bounds.size.width);
+            claim.setFrame(NSRect::new(
+                NSPoint::new(column, 0.0),
+                NSSize::new(bounds.size.width - column, row),
+            ));
+            (
+                NSRect::new(NSPoint::ZERO, NSSize::new(column, bounds.size.height)),
+                NSRect::new(
+                    NSPoint::new(column, 0.0),
+                    NSSize::new(bounds.size.width - column, bounds.size.height),
+                ),
+            )
+        } else {
+            (
+                NSRect::new(NSPoint::ZERO, NSSize::new(bounds.size.width, row)),
+                NSRect::new(
+                    NSPoint::new(0.0, row),
+                    NSSize::new(bounds.size.width, bounds.size.height - row),
+                ),
+            )
+        };
+        claim.setHidden(!side);
+        bar.set_side(side.then_some(row));
+        bar.setFrame(bar_frame);
         for view in self.subviews() {
             if let Ok(container) = view.downcast::<SplitView>() {
                 container.setFrame(below);
@@ -1360,9 +1408,11 @@ impl RootView {
         bar.lay_out();
     }
 
-    /// A tab's container joins under the bar, at the content's frame.
+    /// A tab's container joins under the bar, at the content's frame; under the title row's
+    /// claim too, which stays the top of the stack.
     fn add_container(&self, container: &SplitView) {
-        self.addSubview(container);
+        let claim: &NSView = &self.ivars().claim;
+        self.addSubview_positioned_relativeTo(container, NSWindowOrderingMode::Below, Some(claim));
         self.lay_out();
     }
 }
@@ -2847,14 +2897,17 @@ impl TerminalWindow {
             return None;
         }
         let pane = self.try_selected_tab()?.filling_pane()?;
-        // The tab's area is the content below the title row, and the filling
-        // pane is all of it.
-        let row = self.ivars().root.title_row();
+        // The tab's area is the content beside the side column or below the title row, and the
+        // filling pane is all of it.
+        let inset = self.ivars().root.tabs_inset();
         let content = window
             .contentRectForFrameRect(NSRect::new(NSPoint::ZERO, size))
             .size;
-        let fitted = pane.fitted_size(NSSize::new(content.width, content.height - row))?;
-        let content = NSSize::new(fitted.width, fitted.height + row);
+        let fitted = pane.fitted_size(NSSize::new(
+            content.width - inset.width,
+            content.height - inset.height,
+        ))?;
+        let content = NSSize::new(fitted.width + inset.width, fitted.height + inset.height);
         Some(
             window
                 .frameRectForContentRect(NSRect::new(NSPoint::ZERO, content))
@@ -3048,6 +3101,18 @@ impl TerminalWindow {
             tab.container().layout_panes();
             tab.refresh_look();
         }
+    }
+
+    /// The title row's height: the strip the traffic lights stand in, whether the bar is in it
+    /// or the side column stands under it.
+    pub(crate) fn title_row(&self) -> f64 {
+        self.ivars().root.title_row()
+    }
+
+    /// `[appearance] tab_position` changed: the tabs move between the title row and the side
+    /// column in place, and the content takes the rest — its container's frame changes once.
+    pub(crate) fn apply_tab_position(&self) {
+        self.ivars().root.lay_out();
     }
 
     /// Paints the window chrome with the theme: the

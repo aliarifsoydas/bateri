@@ -9,6 +9,12 @@
 //! the zoom button ([`LIGHTS_GAP`] past its right edge); in full screen the
 //! lights leave the row and the strip starts at the gap alone.
 //!
+//! **The bar has a second place**, a column down the window's left edge
+//! (`[appearance] tab_position = "side"`): the same bar, its tabs, chips and doings, laid out
+//! from `tabs::Side::layout` and `tabs::Row` instead ([`TabBar::set_side`]; `tab_side.rs`,
+//! which says what is and is not in the column yet). Where this file says "the strip", "the
+//! chip" or "the title row", it means the bar's own place.
+//!
 //! **What is where** comes from the pure model (`tabs::Bar::layout`): every
 //! chip's span, the separators, `+` and the settings warning, and how `+`
 //! meets the window's rounded corner — given here as measured, square in
@@ -166,10 +172,15 @@ use crate::program::identity::Kind as ProgramKind;
 use crate::search_bar::mix;
 use crate::tab_drag;
 use crate::tabs::{
-    self, BUTTON, Bar, CHIP_PAD, Card, CardCommand, CardPane, Clock, Drag, Ending, FADE, Finish,
-    Grip, Indicator, Over, Stir, Strip, TAB_RADIUS, Tide, Tone, Turn,
+    self, BUTTON, Bar, CHIP_PAD, Card, CardCommand, CardPane, Clock, Column, Drag, Ending, FADE,
+    Finish, Grip, Indicator, Over, Stir, Strip, TAB_RADIUS, Tide, Tone, Turn,
 };
 use crate::window::{TerminalWindow, is_dark_background};
+
+// The bar's other mode, the tabs in a column down the window's left edge. A child module, not a
+// sibling, for the bar's private state it works on.
+#[path = "tab_side.rs"]
+mod tab_side;
 
 /// Space between the zoom button's right edge and the strip — the design's
 /// strip starts at 84 pt beside lights ending at 72 pt. In full screen the
@@ -2571,6 +2582,8 @@ fn paint_in(layer: &CALayer, size: NSSize, scale: f64, draw: impl Fn(NSRect) + '
 struct Lines {
     /// A marked host's colour along the top; `None` for an unmarked host.
     top: Option<u32>,
+    /// The same colour as a vertical stripe on the left edge, which is where a side row wears it.
+    left: Option<u32>,
 }
 
 /// Where a 2 pt line runs along a `width` chip: inside its rounded corners.
@@ -2604,16 +2617,28 @@ define_class!(
             None
         }
 
-        /// The host's line along the top — above the chip's faces, so a
-        /// light theme's white face does not cover it.
+        /// The host's line along the top, or its stripe down the left edge in a side row — above
+        /// the chip's faces, so a light theme's white face does not cover it.
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
-            let Lines { top } = self.ivars().lines.get();
+            let Lines { top, left } = self.ivars().lines.get();
             let (x, width) = line_span(self.bounds().size.width);
             if let Some(rgb) = top {
                 rounded(
                     NSRect::new(NSPoint::new(x, 0.0), NSSize::new(width, LINE)),
                     LINE / 2.0,
+                    Tint::of(rgb, 1.0),
+                    None,
+                );
+            }
+            if let Some(rgb) = left {
+                let stripe = tabs::Row::of(None, 0.0, false).host_mark;
+                rounded(
+                    NSRect::new(
+                        NSPoint::new(stripe.x, stripe.y),
+                        NSSize::new(stripe.width, stripe.height),
+                    ),
+                    stripe.width / 2.0,
                     Tint::of(rgb, 1.0),
                     None,
                 );
@@ -3345,8 +3370,9 @@ impl Chip {
             single,
             lifted,
             ghost,
+            side,
         } = look;
-        let style = *style;
+        let (style, side) = (*style, *side);
         let (selected, hovered, single) = (*selected, *hovered, *single);
         let (lifted, ghost) = (*lifted && !single, *ghost && !single);
         let glowing = *glowing && !single;
@@ -3461,12 +3487,27 @@ impl Chip {
         // Without icons the small indicator takes the place, and only while the tab reports
         // something; with them the icon is always there (a deck widens it).
         let bare = !style.icons;
-        let lead = if bare {
+        let lead = if bare && side {
+            // A row keeps the indicator's room whether it shows or not, so the title stays put
+            // as the indicator comes and goes.
+            Some(tabs::INDICATOR_SIDE)
+        } else if bare {
             indicator.map(|_| tabs::INDICATOR_SIDE)
         } else {
             emblem.map(|emblem| tabs::lead_width(tabs::TILE_WIDTH, emblem.edges))
         };
-        let (glyph_x, text_x, text_width) = tabs::title_row(inner, natural.width, lead);
+        // Where the parts stand: a chip's in the strip's arithmetic (`×` at the left, a title
+        // centred in what the padding leaves), a side row's in `tabs::Row`'s (`×` and the ⌘ key at
+        // the right end, the title after the icon).
+        let row = side.then(|| {
+            // The title gives way to the `×` while it shows and to the key while that does.
+            tabs::Row::of(lead, natural.width, hovered || hint.is_some())
+        });
+        let (glyph_x, text_x, text_width) = match &row {
+            Some(row) => (row.lead.map(|lead| lead.x), row.title.x, row.title.width),
+            None => tabs::title_row(inner, natural.width, lead),
+        };
+        let pad = if row.is_some() { 0.0 } else { pad };
         text.setFrame(NSRect::new(
             NSPoint::new(
                 pad + text_x,
@@ -3490,8 +3531,19 @@ impl Chip {
                 down: *down,
             });
         iv.glyph.set(look, *turn, palette, *reduce);
-        self.set_hint(hint, size, palette);
-        iv.close.set(!single && hovered, palette, motion.close);
+        self.set_hint(hint, size, palette, row.as_ref().map(|row| row.key));
+        // The ×'s place: the chip's left corner, or a row's right end — where the ⌘ key takes
+        // its room, so while the key shows the × does not.
+        iv.close.setFrame(match &row {
+            Some(row) => tab_side::ns_rect(row.close),
+            None => NSRect::new(
+                NSPoint::new(CLOSE_INSET, CLOSE_INSET),
+                NSSize::new(CLOSE_SIDE, CLOSE_SIDE),
+            ),
+        });
+        let keyed = row.is_some() && hint.is_some();
+        iv.close
+            .set(!single && hovered && !keyed, palette, motion.close);
         iv.close.setHidden(single);
         self.setAccessibilityLabel(Some(&NSString::from_str(spoken)));
         let value = NSNumber::numberWithBool(selected);
@@ -3501,8 +3553,15 @@ impl Chip {
     }
 
     /// The ⌘ key that reaches the tab, right-aligned in the chip's right
-    /// padding while ⌘ is held; hidden otherwise.
-    fn set_hint(&self, hint: Option<&str>, size: NSSize, palette: Palette) {
+    /// padding while ⌘ is held; hidden otherwise. A side row gives the box it is aligned in
+    /// (`key`, from the row's left edge).
+    fn set_hint(
+        &self,
+        hint: Option<&str>,
+        size: NSSize,
+        palette: Palette,
+        key: Option<tabs::Span>,
+    ) {
         let field = &self.ivars().hint;
         let Some(hint) = hint else {
             field.setHidden(true);
@@ -3518,10 +3577,14 @@ impl Chip {
         // The drawing frame, as the title's (an alignment-rect width cut
         // "⌘1" to "…").
         let natural = field.fittingSize();
-        let width = natural.width.ceil().min(CHIP_PAD);
+        let (room, end) = match key {
+            Some(key) => (key.width, key.end()),
+            None => (CHIP_PAD, size.width - CLOSE_INSET),
+        };
+        let width = natural.width.ceil().min(room);
         field.setFrame(NSRect::new(
             NSPoint::new(
-                (size.width - CLOSE_INSET - width).max(0.0),
+                (end - width).max(0.0),
                 ((size.height - natural.height) / 2.0).max(0.0),
             ),
             NSSize::new(width, natural.height),
@@ -3563,6 +3626,97 @@ struct Look<'a> {
     lifted: bool,
     /// Its tab is carried away from the strip in a drag session.
     ghost: bool,
+    /// The chip is a row of the side column: its parts sit where `tabs::Row` puts them, the `×`
+    /// and the ⌘ hint at the right end.
+    side: bool,
+}
+
+/// What a layout knows that is the same for every chip: the part of a [`Look`] that comes from
+/// the window and the settings, not from the chip's place.
+struct Seen {
+    theme: Theme,
+    count: usize,
+    /// The window is on screen: a ring turns only then.
+    visible: bool,
+    reduce: bool,
+    style: IconStyle,
+    /// ⌘ is held: the chips show their keys.
+    hints: bool,
+}
+
+/// How one chip stands in the layout ([`Seen::look`]).
+struct Standing {
+    index: usize,
+    /// Its tab is being named: the field takes the place of icon and title.
+    naming: bool,
+    selected: bool,
+    hovered: bool,
+    glowing: bool,
+    single: bool,
+    lifted: bool,
+    ghost: bool,
+    /// A row of the side column ([`Look::side`]).
+    side: bool,
+}
+
+impl Seen {
+    /// Chip `standing.index`'s look: its tab's `label`, shown with `title`. The one place a
+    /// bar's chip and a column's row are given theirs.
+    fn look<'a>(&self, label: &'a Label, title: &'a str, standing: Standing) -> Look<'a> {
+        let Standing {
+            index,
+            naming,
+            selected,
+            hovered,
+            glowing,
+            single,
+            lifted,
+            ghost,
+            side,
+        } = standing;
+        let mark = (label.mark != HostMark::None).then(|| self.theme.mark_rgb(label.mark));
+        Look {
+            title,
+            emblem: Some(label.emblem).filter(|_| !naming),
+            indicator: label.indicator.filter(|_| !naming),
+            turn: label
+                .running
+                .filter(|_| self.visible)
+                .and_then(|elapsed| tabs::ring_turn(elapsed, self.reduce)),
+            down: label.upload.is_some_and(|upload| upload.down),
+            style: self.style,
+            lines: if side {
+                Lines {
+                    top: None,
+                    left: mark,
+                }
+            } else {
+                Lines {
+                    top: mark,
+                    left: None,
+                }
+            },
+            fill: label.upload.map(|upload| upload.fraction),
+            glowing,
+            reduce: self.reduce,
+            hint: self
+                .hints
+                .then(|| tabs::shortcut_hint(index, self.count))
+                .flatten(),
+            spoken: tabs::spoken(
+                &label.title,
+                label.indicator,
+                label.upload.map(|upload| upload.percent),
+                label.mark,
+            ),
+            selected,
+            hovered,
+            single,
+            lifted,
+            ghost,
+            side,
+        }
+    }
 }
 
 /// Which fill a chip's face view draws: the hover's, which fades in and
@@ -4119,6 +4273,9 @@ pub(crate) struct ButtonIvars {
     palette: Cell<Option<Palette>>,
     /// The corner radius, from how the bar meets the window's corner.
     radius: Cell<f64>,
+    /// The bottom-left corner's own radius where it differs from the others: the side column's
+    /// New Tab sits in the window's bottom-left corner and keeps its centre.
+    foot: Cell<Option<f64>>,
 }
 
 define_class!(
@@ -4146,7 +4303,18 @@ define_class!(
             };
             let hot = iv.hot.get();
             let fill = if hot { palette.button_hover } else { palette.button };
-            rounded(self.bounds(), iv.radius.get(), fill, Some(palette.button_line));
+            match iv.foot.get() {
+                Some(foot) => {
+                    let radius = iv.radius.get();
+                    tab_side::rounded_corners(
+                        self.bounds(),
+                        [radius, radius, radius, foot],
+                        fill,
+                        Some(palette.button_line),
+                    );
+                }
+                None => rounded(self.bounds(), iv.radius.get(), fill, Some(palette.button_line)),
+            }
             let at = centre(self.bounds());
             let path = NSBezierPath::bezierPath();
             match iv.kind {
@@ -4237,6 +4405,7 @@ impl BarButton {
             pressed: Cell::new(false),
             palette: Cell::new(None),
             radius: Cell::new(TAB_RADIUS),
+            foot: Cell::new(None),
         });
         // SAFETY: `initWithFrame:` is NSView's designated initializer and the
         // ivars are set.
@@ -4263,6 +4432,13 @@ impl BarButton {
         let iv = self.ivars();
         let repaint = iv.palette.replace(Some(palette)) != Some(palette);
         if iv.radius.replace(radius) != radius || repaint {
+            self.setNeedsDisplay(true);
+        }
+    }
+
+    /// The bottom-left corner's radius where it is not the others' (`None`: it is).
+    fn set_foot(&self, foot: Option<f64>) {
+        if self.ivars().foot.replace(foot) != foot {
             self.setNeedsDisplay(true);
         }
     }
@@ -4546,7 +4722,7 @@ define_class!(
 
 impl RowClaim {
     /// The claim, following the size of the view it is put in.
-    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+    pub(crate) fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(());
         // SAFETY: `initWithFrame:` is NSView's designated initializer; the
         // subclass has no ivar.
@@ -4686,6 +4862,15 @@ pub(crate) struct BarIvars {
     target: Cell<Option<u64>>,
     /// The tab a carried pane waits on to open it (the line under its chip).
     dwelling: Cell<Option<u64>>,
+    /// The side column's mode: `Some(top)` — the title row's height, where the list starts —
+    /// puts the tabs in a column the window's height at its left edge, `None` in the bar in
+    /// the title row ([`TabBar::set_side`]; `tab_side.rs`).
+    side: Cell<Option<f64>>,
+    /// The column as last laid out, in the side mode: the wheel, the list and the name field work
+    /// from it.
+    column: RefCell<Option<Column>>,
+    /// The mask that fades the column's list where rows run under its ends.
+    mask: tab_side::Mask,
     /// The tab on screen when the last press on a chip began — a press selects, so
     /// the tab a chip was pulled from is the one before it ([`TabBar::selected_before`]).
     before: Cell<Option<u64>>,
@@ -4944,6 +5129,9 @@ impl TabBar {
             hint_pending: Cell::new(false),
             target: Cell::new(None),
             dwelling: Cell::new(None),
+            side: Cell::new(None),
+            column: RefCell::new(None),
+            mask: tab_side::Mask::default(),
             before: Cell::new(None),
         });
         // SAFETY: `initWithFrame:` is NSView's designated initializer and the
@@ -5164,10 +5352,12 @@ impl TabBar {
             self.end_rename(false);
             return;
         }
+        // The side column has no drag yet: no press is held for one, no tab opens a gap.
+        let side = iv.side.get();
         let drag = iv
             .drag
             .get()
-            .filter(|drag| shown.tabs.iter().any(|label| label.tab == drag.tab));
+            .filter(|drag| side.is_none() && shown.tabs.iter().any(|label| label.tab == drag.tab));
         iv.drag.set(drag);
         // The tabs in the order the strip shows them now: the dragged one at its place.
         if let Some(Dragging {
@@ -5190,9 +5380,14 @@ impl TabBar {
         let position = |tab: u64| shown.tabs.iter().position(|label| label.tab == tab);
         let dragged = drag.and_then(|drag| position(drag.tab));
         let hovered = iv.hovered.get().and_then(position);
-        let gap = iv.gap.get().map(|gap| gap.min(count));
-        // The lone tab is today's title bar; with a tab on its way in it is the first chip.
-        let single = count == 1 && gap.is_none();
+        let gap = iv
+            .gap
+            .get()
+            .filter(|_| side.is_none())
+            .map(|gap| gap.min(count));
+        // The lone tab is today's title bar; with a tab on its way in it is the first chip. A
+        // column has no title bar: a lone tab is a row like the rest.
+        let single = side.is_none() && count == 1 && gap.is_none();
         // The layout's place for the tab at `index`: past the gap, one on.
         let seat = |index: usize| tabs::seat(index, gap);
         let (chips, reflow) = self.chips_for(&shown.tabs);
@@ -5240,6 +5435,10 @@ impl TabBar {
             }
             seats
         };
+        if let Some(top) = side {
+            self.lay_out_column(top, &shown, &chips, &glowing, reflow);
+            return;
+        }
         let lit_at = |place: usize| seats.get(place).copied().unwrap_or(false);
         let bar = self.bar_for(
             count + usize::from(gap.is_some()),
@@ -5288,7 +5487,14 @@ impl TabBar {
         let style = IconStyle::current(self.mtm());
         let glide = iv.glide.take();
         let slide = ((reflow || revealed || glide) && motion.reflow > 0.0).then_some(motion.reflow);
-        let hints = iv.hints.get();
+        let seen = Seen {
+            theme,
+            count,
+            visible,
+            reduce,
+            style,
+            hints: iv.hints.get(),
+        };
         for (index, chip) in chips.iter().enumerate() {
             let label = &shown.tabs[index];
             let span = strip.chips[seat(index)];
@@ -5309,37 +5515,24 @@ impl TabBar {
                 NSPoint::new(carried.map_or(span.x, |(left, _)| left) - strip.span.x, top),
                 NSSize::new(span.width, CHIP_HEIGHT),
             );
-            let mark = (label.mark != HostMark::None).then(|| theme.mark_rgb(label.mark));
-            let look = Look {
-                title: &title,
-                emblem: Some(label.emblem).filter(|_| !naming),
-                indicator: label.indicator.filter(|_| !naming),
-                turn: label
-                    .running
-                    .filter(|_| visible)
-                    .and_then(|elapsed| tabs::ring_turn(elapsed, reduce)),
-                down: label.upload.is_some_and(|upload| upload.down),
-                style,
-                lines: Lines { top: mark },
-                fill: label.upload.map(|upload| upload.fraction),
-                glowing: glowing[index],
-                reduce,
-                hint: hints.then(|| tabs::shortcut_hint(index, count)).flatten(),
-                spoken: tabs::spoken(
-                    &label.title,
-                    label.indicator,
-                    label.upload.map(|upload| upload.percent),
-                    label.mark,
-                ),
-                selected: index == shown.selected,
-                hovered: (hovered == Some(index)
-                    || carried.is_some()
-                    || iv.target.get() == Some(label.tab))
-                    && !naming,
-                single,
-                lifted: carried.is_some(),
-                ghost: drag.is_some_and(|drag| drag.torn && dragged == Some(index)),
-            };
+            let look = seen.look(
+                label,
+                &title,
+                Standing {
+                    index,
+                    naming,
+                    selected: index == shown.selected,
+                    hovered: (hovered == Some(index)
+                        || carried.is_some()
+                        || iv.target.get() == Some(label.tab))
+                        && !naming,
+                    glowing: glowing[index],
+                    single,
+                    lifted: carried.is_some(),
+                    ghost: drag.is_some_and(|drag| drag.torn && dragged == Some(index)),
+                    side: false,
+                },
+            );
             chip.set(
                 frame,
                 &look,
@@ -5409,7 +5602,15 @@ impl TabBar {
         } else {
             WHEEL_STEP
         };
-        let step = {
+        let step = if iv.side.get().is_some() {
+            // An upright list scrolls on the vertical axis alone.
+            let column = iv.column.borrow();
+            let Some(column) = column.as_ref().filter(|column| column.overflow) else {
+                return false;
+            };
+            let to = column.wheeled(-event.scrollingDeltaY() * unit);
+            (to != column.scroll).then_some(to)
+        } else {
             let laid = iv.laid.borrow();
             let Some(laid) = laid.as_ref().filter(|laid| laid.overflow) else {
                 return false;
@@ -5452,12 +5653,18 @@ impl TabBar {
         }
         self.end_rename(true);
         self.pressed(tab);
-        let to = iv
-            .laid
-            .borrow()
-            .as_ref()
-            .map(|laid| laid.revealing(index))
-            .filter(|_| iv.shown.borrow().tabs.len() > 1);
+        let to = if iv.side.get().is_some() {
+            iv.column
+                .borrow()
+                .as_ref()
+                .map(|column| column.revealing(index))
+        } else {
+            iv.laid
+                .borrow()
+                .as_ref()
+                .map(|laid| laid.revealing(index))
+                .filter(|_| iv.shown.borrow().tabs.len() > 1)
+        };
         if let Some(to) = to {
             iv.scroll.set(to);
         }
@@ -5501,6 +5708,19 @@ impl TabBar {
     /// title wears there: the selected chip's, or the lone tab's.
     fn place_field(&self, chip: tabs::Span, top: f64, palette: Palette, single: bool) {
         let field = &self.ivars().field;
+        field.setAlignment(NSTextAlignment::Center);
+        let pad = self.dress_field(palette, single);
+        let height = field.intrinsicContentSize().height;
+        field.setFrame(NSRect::new(
+            NSPoint::new(chip.x + pad, top + ((CHIP_HEIGHT - height) / 2.0).max(0.0)),
+            NSSize::new((chip.width - 2.0 * pad).max(0.0), height),
+        ));
+    }
+
+    /// The type the name field wears — the title's, selected or lone — and the padding the
+    /// title keeps from a chip's sides.
+    fn dress_field(&self, palette: Palette, single: bool) -> f64 {
+        let field = &self.ivars().field;
         // SAFETY: AppKit's constant font weight.
         let weight = unsafe { NSFontWeightSemibold };
         let (size, color, pad) = if single {
@@ -5510,11 +5730,7 @@ impl TabBar {
         };
         field.setFont(Some(&NSFont::systemFontOfSize_weight(size, weight)));
         field.setTextColor(Some(&Tint::of(color, 1.0).color()));
-        let height = field.intrinsicContentSize().height;
-        field.setFrame(NSRect::new(
-            NSPoint::new(chip.x + pad, top + ((CHIP_HEIGHT - height) / 2.0).max(0.0)),
-            NSSize::new((chip.width - 2.0 * pad).max(0.0), height),
-        ));
+        pad
     }
 
     // ─── The menus ───────────────────────────────────────────────────────
@@ -5565,11 +5781,16 @@ impl TabBar {
     /// it. Among several tabs only.
     pub(crate) fn show_list(&self) {
         let iv = self.ivars();
-        let (shown, slot, palette) = (
-            iv.shown.borrow().clone(),
-            iv.laid.borrow().as_ref().map(Strip::list_slot),
-            iv.palette.get(),
-        );
+        // The list opens under its button; the column has none, and it opens at the list's head.
+        let slot = if iv.side.get().is_some() {
+            iv.column
+                .borrow()
+                .as_ref()
+                .map(|column| column.list.x + tabs::EDGE)
+        } else {
+            iv.laid.borrow().as_ref().map(Strip::list_slot)
+        };
+        let (shown, palette) = (iv.shown.borrow().clone(), iv.palette.get());
         let (Some(window), Some(slot), Some(palette)) = (self.terminal_window(), slot, palette)
         else {
             return;
@@ -5602,7 +5823,12 @@ impl TabBar {
             }
             menu.addItem(&item);
         }
-        let height = self.bounds().size.height;
+        let height = iv
+            .column
+            .borrow()
+            .as_ref()
+            .filter(|_| iv.side.get().is_some())
+            .map_or(self.bounds().size.height, |column| column.list.y);
         let at = NSPoint::new(slot, height);
         menu.popUpMenuPositioningItem_atLocation_inView(None, at, Some(self));
     }
@@ -5612,7 +5838,10 @@ impl TabBar {
     fn hover(&self, tab: Option<u64>) {
         if self.ivars().hovered.replace(tab) != tab {
             self.lay_out();
-            self.hover_card(tab);
+            // The column's summary card is the next phase's.
+            if self.ivars().side.get().is_none() {
+                self.hover_card(tab);
+            }
         }
     }
 
@@ -5675,7 +5904,8 @@ impl TabBar {
         let free = self
             .terminal_window()
             .is_some_and(|window| window.selection_free());
-        if iv.renaming.get().is_some() || !free {
+        // A column's rows are not dragged yet: the press only selects.
+        if iv.renaming.get().is_some() || !free || iv.side.get().is_some() {
             return;
         }
         let press = self.convertPoint_fromView(event.locationInWindow(), None);
@@ -5843,7 +6073,7 @@ impl TabBar {
     /// the answer does not depend on it ([`tabs::Strip::pane_over`]).
     pub(crate) fn pane_target(&self, at: NSPoint) -> Option<PaneTarget> {
         let point = self.convertPoint_fromView(at, None);
-        if !contains(self.bounds(), point) {
+        if self.ivars().side.get().is_some() || !contains(self.bounds(), point) {
             return None;
         }
         let strip = self.strip_with_room(0)?;
@@ -5861,7 +6091,8 @@ impl TabBar {
 
     /// Whether `at` (window coordinates) is in the bar: a drop there is the bar's.
     pub(crate) fn holds(&self, at: NSPoint) -> bool {
-        contains(self.bounds(), self.convertPoint_fromView(at, None))
+        self.ivars().side.get().is_none()
+            && contains(self.bounds(), self.convertPoint_fromView(at, None))
     }
 
     /// The strip's answer to a carried pane: the chip it is over the middle of is lit,
@@ -5937,7 +6168,8 @@ impl TabBar {
     /// is not a tab of this process, or that this window cannot take now (it holds a question
     /// of its own), is not taken: the drop is then on nothing, and the tab becomes a window.
     fn carried_over(&self, info: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
-        let Some(tab) = tab_drag::carried(info) else {
+        let Some(tab) = tab_drag::carried(info).filter(|_| self.ivars().side.get().is_none())
+        else {
             return NSDragOperation::None;
         };
         let Some(window) = self
@@ -5962,7 +6194,8 @@ impl TabBar {
     /// accepted if it is a tab this window takes: a refusal would read as a drop on nothing and
     /// make a window.
     fn accept_drop(&self, info: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
-        let Some(tab) = tab_drag::carried(info) else {
+        let Some(tab) = tab_drag::carried(info).filter(|_| self.ivars().side.get().is_none())
+        else {
             return false;
         };
         let (Some(window), Some(app)) = (self.terminal_window(), app::delegate(self.mtm())) else {

@@ -251,6 +251,11 @@ tab_icons = true
 # own where it has a colored brand (Claude, Antigravity, Gemini, Qwen); the
 # single-color ones and the kinds bateri draws itself stay as they are.
 tab_icon_colors = "theme"
+# "top" | "side". Where a window's tabs sit: a bar along the top, in the title
+# row, or a full-height column at the window's left edge, where the title row
+# goes and the traffic lights sit at the column's head. One place for every
+# window.
+tab_position = "top"
 
 [font]
 # A family name as shown in Font Book. Without it bateri uses SF Mono, or
@@ -836,6 +841,7 @@ split_style = "cards"
 resize_in_steps = false
 tab_icons = true
 tab_icon_colors = "theme"
+tab_position = "top"
 ```
 
 | key | type | default | meaning |
@@ -850,6 +856,7 @@ tab_icon_colors = "theme"
 | `resize_in_steps` | `true` \| `false` | `false` | resize a window a whole cell at a time while its edge is dragged |
 | `tab_icons` | `true` \| `false` | `true` | show the program a tab runs as an icon on a tile before its title |
 | `tab_icon_colors` | `"theme"` \| `"brand"` | `"theme"` | whether the icon uses the theme's colors only, or keeps the program's own color where it has one |
+| `tab_position` | `"top"` \| `"side"` | `"top"` | where a window's tabs sit: a bar along the top, or a column at the left edge |
 
 - `theme = "system"` leaves the theme to the macOS appearance: `light_theme`
   in light, `dark_theme` in dark. When the appearance changes, the theme
