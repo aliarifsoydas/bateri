@@ -158,18 +158,21 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     NSAffineTransform, NSArray, NSData, NSNotification, NSNumber, NSObjectProtocol, NSPoint,
-    NSRect, NSSize, NSString, NSUserDefaults, ns_string,
+    NSRect, NSSize, NSString, NSUserDefaults, NSValue, ns_string,
 };
 use objc2_quartz_core::{
     CAAnimation, CABasicAnimation, CACurrentMediaTime, CAKeyframeAnimation, CALayer, CAMediaTiming,
-    CAMediaTimingFunction, CATransaction, CATransform3D, kCAFillModeBackwards,
+    CAMediaTimingFunction, CATransaction, CATransform3D, NSValueCATransform3DAdditions,
+    kCAFillModeBackwards,
 };
 
 use crate::app;
 use crate::arrange;
+use crate::card::{IDENTITY, fitted};
 use crate::icon;
 use crate::program::identity::Kind as ProgramKind;
 use crate::search_bar::mix;
+use crate::split::Rect;
 use crate::tab_drag;
 use crate::tabs::{
     self, BUTTON, Bar, CHIP_PAD, Card, CardCommand, CardPane, Clock, Column, Drag, Ending, FADE,
@@ -258,6 +261,21 @@ const CARD_PAD_X: f64 = 12.0;
 const CARD_PAD_Y: f64 = 10.0;
 const CARD_LINE_GAP: f64 = 3.0;
 const CARD_DROP: f64 = 8.0;
+/// How a card comes and goes. It arrives over [`CARD_IN`] at [`CARD_SCALE`] of its size, a
+/// [`CARD_SLIDE`] nearer its chip, and fading in; it goes by fading over [`CARD_OUT`] (and is
+/// taken down only when that is over); when it turns to another chip it glides there over
+/// [`CARD_MOVE`] while its lines change at once, and does not arrive again.
+const CARD_IN: f64 = 0.2;
+const CARD_OUT: f64 = 0.12;
+const CARD_MOVE: f64 = 0.15;
+const CARD_SCALE: f64 = 0.96;
+const CARD_SLIDE: f64 = 4.0;
+/// What a card's going waits beyond its fade before taking the view down: the fade is Core
+/// Animation's, begins with the next commit and is not timed by this clock.
+const CARD_SLACK: f64 = 0.05;
+/// The way from a card to the chip it opened under, as a step in the card's superview's own
+/// (top-down) axes: the chip is above it. A card beside its row has the row to its left.
+const CHIP_ABOVE: (f64, f64) = (0.0, -1.0);
 /// A card with a map is as wide as the map and its margins, and the map sits under the lines:
 /// their own gap and 7 pt more, as the design has it.
 const CARD_MAP_WIDTH: f64 = tabs::MAP_WIDTH + 2.0 * CARD_PAD_X;
@@ -544,24 +562,27 @@ impl Motion {
 /// Runs `change` as an AppKit animation of `secs` on the design's curve
 /// (`cubic-bezier(0.2, 0.8, 0.2, 1)`: quick out, slow to rest).
 fn animate(secs: f64, change: impl Fn() + 'static) {
-    let changes = RcBlock::new(move |context: NonNull<NSAnimationContext>| {
-        // SAFETY: AppKit gives the block a live context, for the block's duration.
-        let context = unsafe { context.as_ref() };
-        context.setDuration(secs);
-        let curve = CAMediaTimingFunction::functionWithControlPoints(0.2, 0.8, 0.2, 1.0);
-        context.setTimingFunction(Some(&curve));
-        change();
-    });
-    NSAnimationContext::runAnimationGroup(&changes);
+    let curve = CAMediaTimingFunction::functionWithControlPoints(0.2, 0.8, 0.2, 1.0);
+    run_group(secs, curve, change);
 }
 
 /// Like [`animate`], at a constant pace: a line filling to tell how long a wait has left.
 fn animate_linear(secs: f64, change: impl Fn() + 'static) {
+    let curve = CAMediaTimingFunction::functionWithControlPoints(0.0, 0.0, 1.0, 1.0);
+    run_group(secs, curve, change);
+}
+
+/// Like [`animate`], on one of the two curves of the comings and goings ([`Ease`]).
+fn animate_eased(ease: Ease, secs: f64, change: impl Fn() + 'static) {
+    run_group(secs, curve(ease), change);
+}
+
+/// Runs `change` as an AppKit animation of `secs` on `curve`.
+fn run_group(secs: f64, curve: Retained<CAMediaTimingFunction>, change: impl Fn() + 'static) {
     let changes = RcBlock::new(move |context: NonNull<NSAnimationContext>| {
         // SAFETY: AppKit gives the block a live context, for the block's duration.
         let context = unsafe { context.as_ref() };
         context.setDuration(secs);
-        let curve = CAMediaTimingFunction::functionWithControlPoints(0.0, 0.0, 1.0, 1.0);
         context.setTimingFunction(Some(&curve));
         change();
     });
@@ -2519,6 +2540,20 @@ fn play(layer: &CALayer, path: &str, from: f64, to: f64, secs: f64, ease: Ease, 
     layer.addAnimation_forKey(&animation, Some(&NSString::from_str(path)));
 }
 
+/// Plays `layer` from the look `from` (a matrix that [`fitted`] checked) to rest over `secs`.
+/// The layer's own transform is already the rest, and the animation removes itself on completion.
+fn play_look(layer: &CALayer, from: CATransform3D, secs: f64, ease: Ease) {
+    let animation = CABasicAnimation::animationWithKeyPath(Some(ns_string!("transform")));
+    // SAFETY: plain `NSValue`s around `CATransform3D` values, what this key path takes.
+    unsafe {
+        animation.setFromValue(Some(&NSValue::valueWithCATransform3D(from)));
+        animation.setToValue(Some(&NSValue::valueWithCATransform3D(IDENTITY)));
+    }
+    animation.setDuration(secs);
+    animation.setTimingFunction(Some(&curve(ease)));
+    layer.addAnimation_forKey(&animation, Some(ns_string!("transform")));
+}
+
 /// Keeps `layer` showing `value` for `secs`, whatever its own opacity is: what the model has
 /// returns when it is over. This is how a layer that goes is held up for the length of the going.
 fn hold(layer: &CALayer, value: f64, secs: f64) {
@@ -3832,6 +3867,9 @@ pub(crate) struct CardIvars {
     /// where a press on a pane of the map goes.
     window: Cell<u64>,
     tab: Cell<u64>,
+    /// The card is fading away ([`TabBar::close_card`]): still on screen, no longer there for the
+    /// pointer.
+    leaving: Cell<bool>,
 }
 
 define_class!(
@@ -3873,7 +3911,7 @@ define_class!(
         /// The pointer came onto the card: its bar keeps it open.
         #[unsafe(method(mouseEntered:))]
         fn mouse_entered(&self, _event: &NSEvent) {
-            if !self.ivars().tiles.borrow().is_empty() {
+            if !self.ivars().tiles.borrow().is_empty() && !self.leaving() {
                 self.on_bar(|bar, _| bar.card_entered());
             }
         }
@@ -3881,7 +3919,7 @@ define_class!(
         /// The pointer left the card: its bar closes it, unless the pointer is back on the chip.
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, _event: &NSEvent) {
-            if !self.ivars().tiles.borrow().is_empty() {
+            if !self.ivars().tiles.borrow().is_empty() && !self.leaving() {
                 self.on_bar(|bar, _| bar.card_left());
             }
         }
@@ -3903,20 +3941,37 @@ impl SummaryCard {
             palette: Cell::new(None),
             window: Cell::new(0),
             tab: Cell::new(0),
+            leaving: Cell::new(false),
         });
         // SAFETY: `initWithFrame:` is NSView's designated initializer and the
         // ivars are set.
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        // Its own layer from the start (a view under a layer-backed root has none until its
+        // first display): the card's coming and going play on it, with its shadow and lines,
+        // which fade as one picture (the lines over the fill do not show through it).
+        this.setWantsLayer(true);
+        if let Some(layer) = this.layer() {
+            layer.setAllowsGroupOpacity(true);
+        }
         this.setAccessibilityElement(false);
         // For the pointer's coming and going once there is a map; the events do nothing before.
         track_hover(&this);
         this
     }
 
+    /// The card is fading away.
+    fn leaving(&self) -> bool {
+        self.ivars().leaving.get()
+    }
+
+    fn set_leaving(&self, leaving: bool) {
+        self.ivars().leaving.set(leaving);
+    }
+
     /// `hitTest:`'s body: `point` is in the card's superview's space.
     fn hit(&self, point: NSPoint) -> Option<Retained<NSView>> {
         let tiles = self.ivars().tiles.borrow();
-        if tiles.is_empty() || !contains(self.frame(), point) {
+        if tiles.is_empty() || self.leaving() || !contains(self.frame(), point) {
             return None;
         }
         // SAFETY: reading the superview; we are on the main thread.
@@ -4253,6 +4308,27 @@ fn card_x(chip_x: f64, bar_width: f64, card_width: f64) -> f64 {
     chip_x
         .min(bar_width - card_width - CARD_PAD_X)
         .max(CARD_PAD_X)
+}
+
+/// What a card at `frame` looks like when it begins to arrive: [`CARD_SCALE`] of its size about
+/// the middle of the edge that faces its chip (`toward` is the step from the card to the chip,
+/// so which edge that is), and [`CARD_SLIDE`] farther along it. A rectangle in the same space
+/// as `frame`, for [`fitted`] to turn into the layer's transform.
+fn card_arrival(frame: Rect, toward: (f64, f64)) -> Rect {
+    let (dx, dy) = toward;
+    let (cx, cy) = frame.center();
+    let pivot = (cx + dx * frame.width / 2.0, cy + dy * frame.height / 2.0);
+    let (width, height) = (frame.width * CARD_SCALE, frame.height * CARD_SCALE);
+    let middle = (
+        pivot.0 + (cx - pivot.0) * CARD_SCALE + dx * CARD_SLIDE,
+        pivot.1 + (cy - pivot.1) * CARD_SCALE + dy * CARD_SLIDE,
+    );
+    Rect::new(
+        middle.0 - width / 2.0,
+        middle.1 - height / 2.0,
+        width,
+        height,
+    )
 }
 
 // ─── `+` and the settings warning ────────────────────────────────────────
@@ -4930,6 +5006,12 @@ pub(crate) struct BarIvars {
     card_quiet: Cell<Option<u64>>,
     /// The pointer is on the open card (one with a map): it stays while it is.
     card_inside: Cell<bool>,
+    /// Where the card view was last put, while it is on screen (fading away included): a new
+    /// place that differs makes it glide there, the same one nothing — a layout asks again.
+    card_at: Cell<Option<NSPoint>>,
+    /// The card's going: a going's removal counts only while this is the generation it was
+    /// scheduled for (a card that came back, or went again, makes it stale).
+    card_out: Cell<u64>,
     /// ⌘ is held (past [`HINT_DELAY`]): the tabs show their keys.
     hints: Cell<bool>,
     /// A pending hint — ⌘'s release or a chord makes it stale.
@@ -5124,6 +5206,8 @@ impl TabBar {
             card_closed: Cell::new(None),
             card_quiet: Cell::new(None),
             card_inside: Cell::new(false),
+            card_at: Cell::new(None),
+            card_out: Cell::new(0),
             hints: Cell::new(false),
             hint_wait: Cell::new(0),
             hint_pending: Cell::new(false),
@@ -6460,13 +6544,23 @@ impl TabBar {
         });
         iv.card_view.aim(iv.window, open.tab);
         let size = iv.card_view.write(&lines, map.as_ref(), palette);
+        // Only a change of size sets the frame: a card gliding to its place is not touched again.
         let mut frame = iv.card_view.frame();
-        frame.size = size;
-        iv.card_view.setFrame(frame);
+        if frame.size != size {
+            frame.size = size;
+            iv.card_view.setFrame(frame);
+        }
     }
 
     /// Puts the open card under its chip, over the content (the root view's
     /// top subview); closes it when its tab is no longer a chip.
+    ///
+    /// Where the card plays is decided here, by what it was doing: not on screen, it arrives
+    /// ([`Self::card_arrives`]); fading away, it comes back from where the fade stands;
+    /// standing at another place, it glides there (only its origin: the lines it was just given
+    /// are already the new ones, at the new size); standing where it is asked to, nothing —
+    /// layouts ask often, and a motion begun again on each would never get anywhere. Reduce
+    /// Motion keeps the fades and drops the slide.
     fn place_card(&self) {
         let iv = self.ivars();
         let Some(tab) = iv.card.borrow().as_ref().map(|open| open.tab) else {
@@ -6496,7 +6590,28 @@ impl TabBar {
             self.frame().origin.y + at.origin.y + at.size.height + CARD_DROP,
         );
         let card = &iv.card_view;
-        card.setFrame(NSRect::new(origin, size));
+        let reduce = self.reduce_motion();
+        // SAFETY: reading the superview; we are on the main thread.
+        let up = unsafe { card.superview() }.is_some();
+        let was = iv.card_at.replace(Some(origin));
+        let moved =
+            was.is_some_and(|was| (was.x - origin.x).abs() > 0.5 || (was.y - origin.y).abs() > 0.5);
+        if up {
+            if card.leaving() {
+                self.card_returns(reduce);
+            }
+            if moved && !reduce {
+                let gliding = card.clone();
+                animate_eased(Ease::Out, CARD_MOVE, move || {
+                    gliding.animator().setFrameOrigin(origin);
+                });
+            } else if card.frame() != NSRect::new(origin, size) {
+                card.setFrame(NSRect::new(origin, size));
+            }
+        } else {
+            still(|| card.setAlphaValue(1.0));
+            card.setFrame(NSRect::new(origin, size));
+        }
         // Over every container — a tab added since joined above it.
         let card_ptr: *const NSView = &***card;
         let on_top = root
@@ -6507,16 +6622,106 @@ impl TabBar {
             card.removeFromSuperview();
             root.addSubview_positioned_relativeTo(card, NSWindowOrderingMode::Above, None);
         }
+        if !up {
+            self.card_arrives(NSRect::new(origin, size), reduce);
+        }
     }
 
-    /// Takes the card away; the warm window starts.
+    /// The card, just put on screen and standing at `frame`, comes in: it fades in; and, unless
+    /// Reduce Motion asks for the fade alone, grows from [`CARD_SCALE`] of its size about the
+    /// middle of the edge that faces its chip, and slides [`CARD_SLIDE`] from the chip's side to
+    /// its place. It all plays on the card's layer — the shadow and the lines with it — and is
+    /// begun here once; the layer's own values are the rest.
+    fn card_arrives(&self, frame: NSRect, reduce: bool) {
+        let Some(layer) = self.ivars().card_view.layer() else {
+            return;
+        };
+        layer.removeAllAnimations();
+        let secs = if reduce { tabs::REDUCED_FADE } else { CARD_IN };
+        play(&layer, OPACITY, 0.0, 1.0, secs, Ease::Out, 0.0);
+        if reduce {
+            return;
+        }
+        let to = Rect::new(
+            frame.origin.x,
+            frame.origin.y,
+            frame.size.width,
+            frame.size.height,
+        );
+        let look = card_arrival(to, CHIP_ABOVE);
+        if let Some(from) = fitted(&layer, look, to) {
+            play_look(&layer, from, secs, Ease::Out);
+        }
+    }
+
+    /// A card that was fading away is wanted again: it fades back in from the opacity it shows
+    /// now (not from none, and not as an arrival), and its going is called off.
+    fn card_returns(&self, reduce: bool) {
+        let iv = self.ivars();
+        let card = &iv.card_view;
+        card.set_leaving(false);
+        iv.card_out.set(iv.card_out.get().wrapping_add(1));
+        let Some(layer) = card.layer() else {
+            return;
+        };
+        let light = shown_opacity(&layer);
+        still(|| card.setAlphaValue(1.0));
+        let secs = if reduce { tabs::REDUCED_FADE } else { CARD_OUT };
+        play(&layer, OPACITY, light, 1.0, secs, Ease::Out, 0.0);
+    }
+
+    /// Takes the card away; the warm window starts. The card fades out over [`CARD_OUT`] and is
+    /// taken off the screen only then; until then it takes no part in the pointer's business,
+    /// and a card asked for in the meantime comes back from the fade ([`Self::card_returns`]).
     fn close_card(&self) {
         let iv = self.ivars();
         if iv.card.take().is_some() {
             iv.card_closed.set(Some(Instant::now()));
         }
         iv.card_inside.set(false);
-        iv.card_view.removeFromSuperview();
+        let card = &iv.card_view;
+        // SAFETY: reading the superview; we are on the main thread.
+        if unsafe { card.superview() }.is_none() || card.leaving() {
+            return;
+        }
+        let Some(layer) = card.layer() else {
+            self.take_card_down();
+            return;
+        };
+        let secs = if self.reduce_motion() {
+            tabs::REDUCED_FADE
+        } else {
+            CARD_OUT
+        };
+        let generation = iv.card_out.get().wrapping_add(1);
+        iv.card_out.set(generation);
+        card.set_leaving(true);
+        // The layer's own opacity is the end of the fade, so nothing flashes back when it is over.
+        let light = shown_opacity(&layer);
+        still(|| card.setAlphaValue(0.0));
+        play(&layer, OPACITY, light, 0.0, secs, Ease::In, 0.0);
+        let delay = Duration::from_secs_f64(secs + CARD_SLACK);
+        let scheduled = after(delay, iv.window, move |bar| {
+            let iv = bar.ivars();
+            if iv.card_out.get() == generation && iv.card_view.leaving() {
+                bar.take_card_down();
+            }
+        });
+        if !scheduled {
+            self.take_card_down();
+        }
+    }
+
+    /// The card view leaves the screen at once, with whatever it was playing.
+    fn take_card_down(&self) {
+        let iv = self.ivars();
+        let card = &iv.card_view;
+        card.set_leaving(false);
+        iv.card_at.set(None);
+        if let Some(layer) = card.layer() {
+            layer.removeAllAnimations();
+        }
+        card.removeFromSuperview();
     }
 
     /// The pointer came onto the open card (one with a map): it stays open while the pointer
@@ -6643,14 +6848,15 @@ pub(crate) fn watch_command_key() -> Option<Retained<AnyObject>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BADGE_DOT, BADGE_HALO, BADGE_SIDE, Badge, CARD_MAP_WIDTH, CARD_PAD_X, CARD_WIDTH,
-        CHIP_HEIGHT, DISCS, Emblem, GLYPH_OVERHANG, GlyphLook, HOLLOW_ROOM, IconStyle, Motion,
-        Palette, Spin, TAB_RADIUS, TILE_BADGE_INSET, TILE_ROOM, Tint, TitleAction, badge_centre,
-        card_x, command_alone, contains, disc_side, glyph_slot, inks, line_span, single_label,
-        spin_of, title_double_click,
+        BADGE_DOT, BADGE_HALO, BADGE_SIDE, Badge, CARD_MAP_WIDTH, CARD_PAD_X, CARD_SCALE,
+        CARD_SLIDE, CARD_WIDTH, CHIP_ABOVE, CHIP_HEIGHT, DISCS, Emblem, GLYPH_OVERHANG, GlyphLook,
+        HOLLOW_ROOM, IconStyle, Motion, Palette, Spin, TAB_RADIUS, TILE_BADGE_INSET, TILE_ROOM,
+        Tint, TitleAction, badge_centre, card_arrival, card_x, command_alone, contains, disc_side,
+        glyph_slot, inks, line_span, single_label, spin_of, title_double_click,
     };
     use crate::icon;
     use crate::program::identity::{Agent, Kind as ProgramKind};
+    use crate::split::Rect;
     use crate::tabs::{self, Indicator, Tone};
     use bt_core::{IconColors, Theme};
     use objc2_app_kit::NSEventModifierFlags;
@@ -7070,6 +7276,26 @@ mod tests {
             (0.08, 0.12, 0.2),
             "the design's 80, 120 and 200 ms"
         );
+    }
+
+    /// A card arrives from the middle of the edge that faces its chip: that point stays where it
+    /// is, the rest of the card is [`CARD_SCALE`] of its size round it, and all of it starts a
+    /// [`CARD_SLIDE`] nearer the chip.
+    #[test]
+    fn a_card_arrives_about_the_edge_facing_its_chip() {
+        let near = |got: f64, want: f64| assert!((got - want).abs() < 1e-9, "{got} is not {want}");
+        let frame = Rect::new(100.0, 50.0, 272.0, 120.0);
+        // Under its chip, in the top bar: the top edge's middle, 4 pt up.
+        let look = card_arrival(frame, CHIP_ABOVE);
+        near(look.width, 272.0 * CARD_SCALE);
+        near(look.height, 120.0 * CARD_SCALE);
+        near(look.x + look.width / 2.0, 100.0 + 136.0);
+        near(look.y, 50.0 - CARD_SLIDE);
+        // Beside its row, on the row's right: the left edge's middle, 4 pt left.
+        let look = card_arrival(frame, (-1.0, 0.0));
+        near(look.x, 100.0 - CARD_SLIDE);
+        near(look.y + look.height / 2.0, 50.0 + 60.0);
+        near(look.width, 272.0 * CARD_SCALE);
     }
 
     /// ⌘ alone shows the hints, Caps Lock or not; a chord's other modifier

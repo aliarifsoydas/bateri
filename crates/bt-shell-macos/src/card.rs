@@ -343,7 +343,7 @@ fn matrix(slide: Slide, layer: &CALayer, to: Rect, mirrored: bool) -> CATransfor
 /// commits) and the frame Core Animation derives from it is compared with
 /// `from`. `None` if no reading of the axes lands on `from` — then there is
 /// no slide, which beats a slide that jumps.
-fn fitted(layer: &CALayer, from: Rect, to: Rect) -> Option<CATransform3D> {
+pub(crate) fn fitted(layer: &CALayer, from: Rect, to: Rect) -> Option<CATransform3D> {
     let slide = split::slide(from, to);
     let lands = |frame: CGRect| {
         (frame.origin.x - from.x).abs() < 0.5
@@ -363,7 +363,7 @@ fn fitted(layer: &CALayer, from: Rect, to: Rect) -> Option<CATransform3D> {
     found
 }
 
-const IDENTITY: CATransform3D = CATransform3D {
+pub(crate) const IDENTITY: CATransform3D = CATransform3D {
     m11: 1.0,
     m12: 0.0,
     m13: 0.0,
