@@ -1062,6 +1062,111 @@ pub fn indicator(signals: Signals) -> Option<Indicator> {
     .find_map(|(on, indicator)| on.then_some(indicator))
 }
 
+// ─── How an icon's indicator comes and goes ──────────────────────────────
+
+/// The badge on a tile's corner (a question, a tick, a dot, an arrow) comes by growing from
+/// [`BADGE_FROM`] of its size past its own to [`BADGE_PEAK`] of it and settling, in
+/// [`BADGE_COME`] seconds; it is clear of transparency [`BADGE_OPAQUE_AT`] of the way in and
+/// peaks [`BADGE_PEAK_AT`] of the way in. It goes by shrinking to [`BADGE_GO_TO`] of its size
+/// as it fades, in [`BADGE_GO`] seconds: shorter than the way in, but not much, or on a real
+/// window it reads as gone at once.
+pub const BADGE_COME: f64 = 0.32;
+pub const BADGE_FROM: f64 = 0.3;
+pub const BADGE_PEAK: f64 = 1.14;
+pub const BADGE_PEAK_AT: f64 = 0.7;
+pub const BADGE_OPAQUE_AT: f64 = 0.35;
+pub const BADGE_GO: f64 = 0.24;
+pub const BADGE_GO_TO: f64 = 0.4;
+/// A badge that turns into another keeps its circle: the colour passes and the size slides
+/// (the failure's dot is smaller than the rest) in this many seconds, and the new sign grows
+/// from [`SIGN_FROM`] of its size in [`SIGN_GROW`] seconds.
+pub const BADGE_TURN: f64 = 0.24;
+pub const SIGN_FROM: f64 = 0.4;
+pub const SIGN_GROW: f64 = 0.24;
+/// The line round a tile (a command runs) fades in over [`LINE_COME`] seconds and out over
+/// [`LINE_GO`].
+pub const LINE_COME: f64 = 0.28;
+pub const LINE_GO: f64 = 0.24;
+/// A tick or a dot stays this long after the tab is looked at, so the user sees what they
+/// looked at before it goes.
+pub const LOOKED_HOLD: f64 = 0.6;
+/// Under Reduce Motion nothing grows, slides or springs: whatever comes or goes does it in
+/// this one short fade.
+pub const REDUCED_FADE: f64 = 0.15;
+
+// The motion's numbers keep their order: it comes up from small past its size and settles, it goes
+// down to less than its size, and it is opaque before it peaks.
+const _: () = assert!(BADGE_FROM < BADGE_GO_TO && BADGE_GO_TO < 1.0 && 1.0 < BADGE_PEAK);
+const _: () = assert!(BADGE_OPAQUE_AT < BADGE_PEAK_AT && BADGE_PEAK_AT < 1.0);
+
+/// What happens to the line round a tile while a command runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tide {
+    /// It stands as it is, shown or not.
+    Still,
+    /// It fades in: a command began.
+    Comes,
+    /// It fades out: the command is over.
+    Goes,
+}
+
+/// What happens to the badge on a tile's corner.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Stir {
+    /// It stands as it is, shown or not.
+    Still,
+    /// A badge comes where there was none.
+    Comes,
+    /// The badge goes, after `wait` seconds.
+    Goes { wait: f64 },
+    /// One badge becomes another: the circle stays.
+    Turns,
+}
+
+/// What an icon plays when its indicator changes from `from` to `to` ([`passage`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Passage {
+    pub line: Tide,
+    pub badge: Stir,
+}
+
+/// Whether `indicator` is a badge on the tile's corner: all of them but a running command,
+/// which is the line round the tile.
+pub fn is_badge(indicator: Indicator) -> bool {
+    indicator != Indicator::Running
+}
+
+/// What an icon plays when its indicator changes from `from` to `to`. One rule for every
+/// shell, so the comings and goings of a tile are the same wherever it is drawn.
+///
+/// A change plays once: the same indicator again plays nothing. A badge that goes because the
+/// tab was looked at — the only way a tick or a dot goes with nothing else coming — waits
+/// [`LOOKED_HOLD`] seconds first, so that the user sees what they looked at; a question does
+/// not wait, because it is up in the pane in front of them already, and a badge that goes for
+/// something else (a command began, a transfer's arrow gives way to its end) goes at once.
+pub fn passage(from: Option<Indicator>, to: Option<Indicator>) -> Passage {
+    let running = |indicator: Option<Indicator>| indicator == Some(Indicator::Running);
+    let badge = |indicator: Option<Indicator>| indicator.filter(|&indicator| is_badge(indicator));
+    let line = match (running(from), running(to)) {
+        (false, true) => Tide::Comes,
+        (true, false) => Tide::Goes,
+        _ => Tide::Still,
+    };
+    let badge = match (badge(from), badge(to)) {
+        (None, Some(_)) => Stir::Comes,
+        (Some(was), None) => Stir::Goes {
+            wait: if to.is_none() && matches!(was, Indicator::Finished | Indicator::Failed) {
+                LOOKED_HOLD
+            } else {
+                0.0
+            },
+        },
+        (Some(was), Some(now)) if was != now => Stir::Turns,
+        _ => Stir::Still,
+    };
+    Passage { line, badge }
+}
+
 /// A marked host's kind as the bar says it — the summary card's line and VoiceOver; `None` for an
 /// unmarked host, which shows no line either (the top line's rule: an unmarked host must not
 /// water down Production's red).
@@ -2754,6 +2859,138 @@ mod tests {
         ] {
             assert!(!indicator.spoken().is_empty());
         }
+    }
+
+    const EVERY: [Option<Indicator>; 6] = [
+        None,
+        Some(Indicator::Question),
+        Some(Indicator::Running),
+        Some(Indicator::Failed),
+        Some(Indicator::Finished),
+        Some(Indicator::Uploading),
+    ];
+
+    /// A change plays once: the same indicator again plays nothing, whatever it is.
+    #[test]
+    fn the_same_indicator_plays_nothing() {
+        for indicator in EVERY {
+            assert_eq!(
+                passage(indicator, indicator),
+                Passage {
+                    line: Tide::Still,
+                    badge: Stir::Still
+                },
+                "{indicator:?}"
+            );
+        }
+    }
+
+    /// A command's line and the badges are two halves: a running command is only the line, every
+    /// other indicator only a badge, so a change touches each half by what it moves in and out of.
+    #[test]
+    fn a_change_moves_the_line_and_the_badge_apart() {
+        let badges = [
+            Indicator::Question,
+            Indicator::Failed,
+            Indicator::Finished,
+            Indicator::Uploading,
+        ];
+        let running = Some(Indicator::Running);
+        // Nothing to the line, a badge arriving; and the way back.
+        for badge in badges {
+            let come = passage(None, Some(badge));
+            assert_eq!((come.line, come.badge), (Tide::Still, Stir::Comes));
+            assert_eq!(passage(None, Some(badge)).line, Tide::Still);
+            // The command's line coming in sends the badge out at once, whatever it was.
+            let give_way = passage(Some(badge), running);
+            assert_eq!(give_way.line, Tide::Comes, "{badge:?}");
+            assert_eq!(give_way.badge, Stir::Goes { wait: 0.0 }, "{badge:?}");
+            // The line going out lets the badge in at once.
+            let end = passage(running, Some(badge));
+            assert_eq!(
+                (end.line, end.badge),
+                (Tide::Goes, Stir::Comes),
+                "{badge:?}"
+            );
+        }
+        // A command alone is the line alone.
+        assert_eq!(
+            passage(None, running),
+            Passage {
+                line: Tide::Comes,
+                badge: Stir::Still
+            }
+        );
+        assert_eq!(
+            passage(running, None),
+            Passage {
+                line: Tide::Goes,
+                badge: Stir::Still
+            }
+        );
+    }
+
+    /// A badge that becomes another one keeps its circle, whichever two they are.
+    #[test]
+    fn one_badge_becoming_another_turns() {
+        let badges = [
+            Indicator::Question,
+            Indicator::Failed,
+            Indicator::Finished,
+            Indicator::Uploading,
+        ];
+        for was in badges {
+            for now in badges {
+                let expected = if was == now { Stir::Still } else { Stir::Turns };
+                let moved = passage(Some(was), Some(now));
+                assert_eq!(moved.badge, expected, "{was:?} → {now:?}");
+                assert_eq!(moved.line, Tide::Still, "{was:?} → {now:?}");
+            }
+        }
+    }
+
+    /// Looking at a tab ends its tick or its dot after a rest, so the user sees what they looked
+    /// at; a question is up in the pane in front of them already and does not wait, nor does a
+    /// transfer's arrow, which the user watched go.
+    #[test]
+    fn a_tick_and_a_dot_stay_a_moment_after_the_look_and_a_question_does_not() {
+        let after = |was: Indicator| passage(Some(was), None).badge;
+        assert_eq!(after(Indicator::Finished), Stir::Goes { wait: LOOKED_HOLD });
+        assert_eq!(after(Indicator::Failed), Stir::Goes { wait: LOOKED_HOLD });
+        assert_eq!(after(Indicator::Question), Stir::Goes { wait: 0.0 });
+        assert_eq!(after(Indicator::Uploading), Stir::Goes { wait: 0.0 });
+        assert_eq!(LOOKED_HOLD, 0.6);
+    }
+
+    /// A tick or a dot that goes for another reason — a command began — does not wait.
+    #[test]
+    fn a_tick_that_gives_way_to_a_command_does_not_wait() {
+        for was in [Indicator::Finished, Indicator::Failed] {
+            assert_eq!(
+                passage(Some(was), Some(Indicator::Running)).badge,
+                Stir::Goes { wait: 0.0 },
+                "{was:?}"
+            );
+        }
+    }
+
+    /// Only a running command is a line; everything else is a badge.
+    #[test]
+    fn only_a_running_command_is_not_a_badge() {
+        for indicator in EVERY.into_iter().flatten() {
+            assert_eq!(is_badge(indicator), indicator != Indicator::Running);
+        }
+    }
+
+    /// The motion's numbers are the design's.
+    #[test]
+    fn the_motion_follows_the_design() {
+        assert_eq!(BADGE_COME, 0.32);
+        assert_eq!(BADGE_PEAK, 1.14);
+        assert_eq!(BADGE_GO, 0.24);
+        assert_eq!(BADGE_GO_TO, 0.4);
+        assert_eq!(LINE_COME, 0.28);
+        assert_eq!(LINE_GO, 0.24);
     }
 
     /// What ends while the tab is in the background marks it, by outcome; what ends while it is

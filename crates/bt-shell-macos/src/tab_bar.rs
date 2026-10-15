@@ -55,6 +55,15 @@
 //! [`CARD_DELAY`] the tab's summary card opens below it (`tabs::card_lines`);
 //! with a card open, the next chip's comes at once.
 //!
+//! **The indicator comes and goes** (`tabs::passage` says how, one rule for every shell): the
+//! badge on the tile's corner grows from small past its size and settles, and goes by
+//! shrinking as it fades; a badge that turns into another keeps its circle, the colour passes
+//! and the new sign grows; the line round a running tile fades in and out; a tick or a dot stays
+//! [`tabs::LOOKED_HOLD`] after the tab was looked at, a question does not. All of it is Core
+//! Animation, set up when the indicator changes and never again — a layout that asks for what
+//! the glyph already shows plays nothing, and the app draws no frame ([`Glyph`] has how). Under
+//! Reduce Motion nothing grows or springs: what comes or goes fades, briefly.
+//!
 //! **The clock.** A running ring turns by itself — a Core Animation turn on
 //! the window server's side, set once and left to run ([`Glyph`]) — so the
 //! app is not woken to move it. The bar's one delayed wake
@@ -89,7 +98,9 @@
 //! **Drawing** is `drawRect:` with `NSBezierPath` and `NSShadow` — no layer
 //! colours, which would want `CGColor` and with it an
 //! `objc2-core-graphics` edge. What Core Animation moves (the running ring,
-//! the transfer's fill) holds a picture painted once, not a colour. The
+//! the transfer's fill, the tile and its badge) holds a picture painted once,
+//! not a colour; so does a mask, which is why the ring cut round a badge is a
+//! picture too ([`Glyph`]). The
 //! colours are the theme's own roles at fixed strengths, so no theme role is
 //! added; the strengths are the design's.
 //!
@@ -138,8 +149,8 @@ use objc2_foundation::{
     NSRect, NSSize, NSString, NSUserDefaults, ns_string,
 };
 use objc2_quartz_core::{
-    CABasicAnimation, CAKeyframeAnimation, CALayer, CAMediaTiming, CAMediaTimingFunction,
-    CATransaction,
+    CAAnimation, CABasicAnimation, CACurrentMediaTime, CAKeyframeAnimation, CALayer, CAMediaTiming,
+    CAMediaTimingFunction, CATransaction, CATransform3D, kCAFillModeBackwards,
 };
 
 use crate::app;
@@ -150,7 +161,7 @@ use crate::search_bar::mix;
 use crate::tab_drag;
 use crate::tabs::{
     self, BUTTON, Bar, CHIP_PAD, Card, CardCommand, Clock, Drag, Ending, FADE, Finish, Grip,
-    Indicator, Over, Strip, TAB_RADIUS, Tone, Turn,
+    Indicator, Over, Stir, Strip, TAB_RADIUS, Tide, Tone, Turn,
 };
 use crate::window::{TerminalWindow, is_dark_background};
 
@@ -785,8 +796,8 @@ impl CloseButton {
 // ─── A chip's icon ────────────────────────────────────────────────────────
 
 /// Room the glyph's view keeps round the icon's square, above, below and to the right, for what
-/// overhangs it: the badge on its corner, which a view cannot draw outside its own frame. The
-/// view is as high as a chip.
+/// overhangs it: the badge on its corner (and while it comes it grows past its size). The view
+/// is as high as a chip.
 const GLYPH_OVERHANG: f64 = 6.0;
 
 /// Room it keeps to the left: the line that runs round a tile's edge stands a little outside it.
@@ -804,6 +815,20 @@ const EDGE_STROKE: f64 = 1.4;
 const BADGE_SIDE: f64 = 10.0;
 const BADGE_DOT: f64 = 7.0;
 const BADGE_HALO: f64 = 1.5;
+
+/// The ring cut clear round the biggest badge, as a radius: the picture of the hollow is drawn
+/// for it, and scaled for the smaller dot ([`Badge::hollow_share`]).
+const HOLLOW_RADIUS: f64 = BADGE_SIDE / 2.0 + BADGE_HALO;
+
+/// Half the side of the square the tile and its deck are painted in, about the badge's middle:
+/// room for the tile's far corner, its shadow and a deck's cards to either side of it.
+const TILE_ROOM: f64 = 24.0;
+
+/// Half the side of the hollow's picture: opaque to this far from the badge in every direction.
+/// The hollow is scaled down with the badge as it comes and goes, to [`tabs::BADGE_FROM`] of its
+/// size and the dot's smaller share, and the opaque part must still reach the tile's far
+/// corner ([`TILE_ROOM`]) then, or the tile loses its corner while the badge comes.
+const HOLLOW_ROOM: f64 = 110.0;
 
 /// The corner radius of a menu row's tile, and the hairline round every tile.
 const TILE_RADIUS: f64 = 4.8;
@@ -913,15 +938,117 @@ pub(crate) struct Emblem {
 struct GlyphLook {
     emblem: Emblem,
     style: IconStyle,
-    /// What the tab reports, on the icon: the ring round it while a command runs, a badge on its
+    /// What the tab reports, on the icon: the line round it while a command runs, a badge on its
     /// corner for the rest.
     indicator: Option<Indicator>,
     /// A transfer is a download: the badge's arrow points down.
     down: bool,
 }
 
+/// A badge on a tile's corner: what the tab reports other than a command running, and for a
+/// transfer which way it flows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Badge {
+    indicator: Indicator,
+    down: bool,
+}
+
+/// The circles a badge can be, one per colour: a badge that becomes another one keeps its circle
+/// and the colour passes from one picture to the other.
+const DISCS: [Indicator; 4] = [
+    Indicator::Question,
+    Indicator::Finished,
+    Indicator::Failed,
+    Indicator::Uploading,
+];
+
+/// The side of the circle `disc` is: the failure's dot is smaller than the rest.
+fn disc_side(disc: usize) -> f64 {
+    if DISCS[disc] == Indicator::Failed {
+        BADGE_DOT
+    } else {
+        BADGE_SIDE
+    }
+}
+
+impl Badge {
+    /// The badge `look` wears, if it wears one.
+    fn of(look: Option<GlyphLook>) -> Option<Self> {
+        let look = look?;
+        let indicator = look
+            .indicator
+            .filter(|&indicator| tabs::is_badge(indicator))?;
+        Some(Self {
+            indicator,
+            down: look.down && indicator == Indicator::Uploading,
+        })
+    }
+
+    /// Which of the [`DISCS`] it is.
+    fn disc(self) -> usize {
+        match self.indicator {
+            Indicator::Question => 0,
+            Indicator::Finished => 1,
+            Indicator::Failed => 2,
+            Indicator::Running | Indicator::Uploading => 3,
+        }
+    }
+
+    /// Which of the four signs is on it — a question, a tick, an arrow up or down; the failure's
+    /// dot has none.
+    fn sign(self) -> Option<usize> {
+        match self.indicator {
+            Indicator::Question => Some(0),
+            Indicator::Finished => Some(1),
+            Indicator::Uploading => Some(if self.down { 3 } else { 2 }),
+            Indicator::Running | Indicator::Failed => None,
+        }
+    }
+
+    /// How large the hollow round it is, as a share of the hollow's picture (drawn for the
+    /// full circle): the ring cut clear round a badge is [`BADGE_HALO`] wide whatever its size.
+    fn hollow_share(self) -> f64 {
+        (disc_side(self.disc()) / 2.0 + BADGE_HALO) / HOLLOW_RADIUS
+    }
+}
+
+/// A badge that is on the tile, and when it will be gone if it is on its way out.
+#[derive(Clone, Copy, Debug)]
+struct Worn {
+    badge: Badge,
+    gone: Option<Instant>,
+}
+
 pub(crate) struct GlyphIvars {
     look: Cell<Option<GlyphLook>>,
+    /// The tile with its deck, a picture, laid out twice over the same place: `plain` is what
+    /// shows while the tile wears no badge, `notched` what shows while it does — the same picture
+    /// seen through the `hollow`, the ring cut clear round the badge, which comes and goes with it.
+    /// A layer's mask cannot take a shape out of a layer, only a picture with the shape gone from
+    /// it, and the ring must not be the chip's colour (a chip is lit differently selected,
+    /// hovered and not).
+    plain: Retained<CALayer>,
+    notched: Retained<CALayer>,
+    /// The notched tile's mask: opaque all round, clear in the middle. It stands at the middle
+    /// of the badge and is scaled with it.
+    hollow: Retained<CALayer>,
+    /// The badge: its circles and its signs, all in place and all but the ones that show clear, so
+    /// that what changes is opacity and size. It comes and goes as one.
+    pop: Retained<CALayer>,
+    discs: [Retained<CALayer>; 4],
+    signs: [Retained<CALayer>; 4],
+    /// The badge on the tile now, with its way out if it is on one. A badge on its way out is
+    /// still on the tile until it is gone, and one that comes meanwhile becomes it.
+    shown: Cell<Option<Worn>>,
+    /// The tile has been shown: what changes from here plays, what a glyph is born with or comes
+    /// back to from being hidden (a tab being named) is laid out at rest.
+    seen: Cell<bool>,
+    /// The number of cards behind the tile the layers stand for (they lean the badge's place).
+    placed: Cell<Option<usize>>,
+    /// What the tile's and the badge's pictures were drawn in: the style, the colours, the scale
+    /// of the screen and the deck.
+    tile_ink: Cell<Option<(Emblem, IconStyle, Palette, f64)>>,
+    badge_ink: Cell<Option<(Palette, f64, usize)>>,
     /// The running ring's arc, a layer of its own that the turn is played on: the glyph's
     /// own backing layer is AppKit's (its anchor is a corner, and AppKit resets what it sets).
     arc: Retained<CALayer>,
@@ -986,20 +1113,27 @@ define_class!(
         }
 
         /// The glyph moved to a screen of another scale (or into a window): the pictures of what
-        /// turns are drawn again at it.
+        /// is a layer are drawn again at it.
         #[unsafe(method(viewDidChangeBackingProperties))]
         fn view_did_change_backing_properties(&self) {
             self.ink();
         }
 
-        /// The icon in its square, with its deck, its ring or its badge.
+        /// The small indicator of a tab without icons. Everything else the glyph shows — the
+        /// tile, the badge, the line round it — is a layer of its own, which is what lets it come
+        /// and go.
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
             let iv = self.ivars();
             let (Some(look), Some(palette)) = (iv.look.get(), iv.palette.get()) else {
                 return;
             };
-            draw_glyph(look, palette);
+            if look.style.icons {
+                return;
+            }
+            if let Some(indicator) = look.indicator {
+                draw_bare(indicator, look.down, indicator_slot().origin, palette);
+            }
         }
     }
 );
@@ -1037,24 +1171,12 @@ fn centred_square(rect: NSRect, side: f64) -> NSRect {
     )
 }
 
-/// The glyph: the program's tile, behind it the deck if the tab holds more panes (its cards
-/// smaller and less turned the further back, `tabs::deck_card`), the program's mark on the tile,
-/// and a badge on its corner for what the tab reports — a command running is the line round the
-/// tile's edge, a layer of its own. With no icons (`tab_icons = false`) it is the small indicator
-/// alone.
-fn draw_glyph(look: GlyphLook, palette: Palette) {
-    let GlyphLook {
-        emblem,
-        style,
-        indicator,
-        down,
-    } = look;
-    if !style.icons {
-        if let Some(indicator) = indicator {
-            draw_bare(indicator, down, indicator_slot().origin, palette);
-        }
-        return;
-    }
+/// The glyph's tile: behind it the deck if the tab holds more panes (its cards smaller and less
+/// turned the further back, `tabs::deck_card`), and on it the program's mark. What the tab
+/// reports is not in it: the badge on its corner and the line round its edge are layers of their
+/// own, which is what lets them come and go. With no icons (`tab_icons = false`) there is no
+/// tile, only the small indicator.
+fn draw_tile(emblem: Emblem, style: IconStyle, palette: Palette) {
     let slot = glyph_slot();
     let Emblem { kind, edges } = emblem;
     let inks = inks(icon::of(kind), style, palette);
@@ -1071,10 +1193,42 @@ fn draw_glyph(look: GlyphLook, palette: Palette) {
     turn(slot, tabs::deck_card(slot.size.width, 0, edges).turn);
     draw_face(slot, TILE_ROUND, inks.tile.rgb, palette);
     draw_mark(kind, centred_square(slot, MARK_TILED), &inks.mark.color());
-    if let Some(indicator) = indicator.filter(|&indicator| indicator != Indicator::Running) {
-        draw_badge(indicator, down, slot, palette);
-    }
     NSGraphicsContext::restoreGraphicsState_class();
+}
+
+/// [`draw_tile`] in a picture [`TILE_ROOM`] to each side of the badge's middle, which is the
+/// middle of the layers the picture is laid in: the badge, its hollow and the tile all turn and
+/// scale about the same point.
+fn draw_tile_about(emblem: Emblem, style: IconStyle, palette: Palette) {
+    let at = badge_centre(emblem.edges);
+    NSGraphicsContext::saveGraphicsState_class();
+    let shift = NSAffineTransform::transform();
+    shift.translateXBy_yBy(TILE_ROOM - at.x, TILE_ROOM - at.y);
+    shift.concat();
+    draw_tile(emblem, style, palette);
+    NSGraphicsContext::restoreGraphicsState_class();
+}
+
+/// Where the badge's middle is in the glyph's space: the tile's corner, [`TILE_BADGE_INSET`] in
+/// from it, turned with the front card of the deck (the badge sits on the card, which leans).
+fn badge_centre(edges: usize) -> NSPoint {
+    let slot = glyph_slot();
+    let corner = NSPoint::new(
+        slot.origin.x + slot.size.width - TILE_BADGE_INSET,
+        slot.origin.y + TILE_BADGE_INSET,
+    );
+    let middle = NSPoint::new(
+        slot.origin.x + slot.size.width / 2.0,
+        slot.origin.y + slot.size.height / 2.0,
+    );
+    // The card is drawn with `turn`, which turns counter-clockwise on screen: in the glyph's
+    // flipped space that is the negative angle.
+    let angle = -tabs::deck_card(slot.size.width, 0, edges).turn.to_radians();
+    let (dx, dy) = (corner.x - middle.x, corner.y - middle.y);
+    NSPoint::new(
+        middle.x + dx * angle.cos() - dy * angle.sin(),
+        middle.y + dx * angle.sin() + dy * angle.cos(),
+    )
 }
 
 /// Where a deck's `card` stands, from the front card's `slot`: its size a share of the front
@@ -1408,42 +1562,73 @@ fn draw_corner_dot(indicator: Indicator, slot: NSRect, palette: Palette) {
     circle(LIST_DOT).fill();
 }
 
-/// What the tab reports, other than a command running, as a badge on the icon's corner: a
-/// question, a tick, a dot or an arrow in the role of its meaning, with a ring cut clear round it
-/// so the icon does not run into it.
-fn draw_badge(indicator: Indicator, down: bool, slot: NSRect, palette: Palette) {
-    let role = palette.tone(tabs::list_dot(indicator), 0);
-    let centre = NSPoint::new(
-        slot.origin.x + slot.size.width - TILE_BADGE_INSET,
-        slot.origin.y + TILE_BADGE_INSET,
-    );
-    let side = if indicator == Indicator::Failed {
-        BADGE_DOT
-    } else {
-        BADGE_SIDE
-    };
-    let circle = |side: f64| {
-        NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-            NSPoint::new(centre.x - side / 2.0, centre.y - side / 2.0),
-            NSSize::new(side, side),
-        ))
-    };
-    // Transparent, not the chip's colour: the chip is lit differently selected, hovered and not.
+/// A badge's circle, `side` across, filled in the colour of its meaning (`tabs::list_dot`).
+fn draw_disc(color: u32, side: f64) {
+    let circle =
+        NSBezierPath::bezierPathWithOvalInRect(NSRect::new(NSPoint::ZERO, NSSize::new(side, side)));
+    Tint::of(color, 1.0).color().setFill();
+    circle.fill();
+}
+
+/// One of a badge's four signs — a question, a tick, an arrow up, an arrow down — in a
+/// [`BADGE_SIDE`] square, leaning as far as the front card of the deck does.
+fn draw_sign(sign: usize, lean: f64, ink: Tint) {
+    let square = NSRect::new(NSPoint::ZERO, NSSize::new(BADGE_SIDE, BADGE_SIDE));
+    let centre = NSPoint::new(BADGE_SIDE / 2.0, BADGE_SIDE / 2.0);
+    NSGraphicsContext::saveGraphicsState_class();
+    turn(square, lean);
+    match sign {
+        0 => draw_query(centre, ink),
+        1 => draw_check(centre, ink),
+        2 => draw_arrow(centre, false, ink),
+        _ => draw_arrow(centre, true, ink),
+    }
+    NSGraphicsContext::restoreGraphicsState_class();
+}
+
+/// The hollow: opaque all round, and clear in a circle at the middle that is the biggest badge
+/// with the ring cut round it. Only its alpha counts, as the notched tile's mask.
+fn draw_hollow() {
+    let side = 2.0 * HOLLOW_ROOM;
+    NSColor::blackColor().setFill();
+    NSBezierPath::fillRect(NSRect::new(NSPoint::ZERO, NSSize::new(side, side)));
     NSGraphicsContext::saveGraphicsState_class();
     if let Some(context) = NSGraphicsContext::currentContext() {
         context.setCompositingOperation(NSCompositingOperation::Clear);
     }
-    circle(side + 2.0 * BADGE_HALO).fill();
+    NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+        NSPoint::new(HOLLOW_ROOM - HOLLOW_RADIUS, HOLLOW_ROOM - HOLLOW_RADIUS),
+        NSSize::new(2.0 * HOLLOW_RADIUS, 2.0 * HOLLOW_RADIUS),
+    ))
+    .fill();
     NSGraphicsContext::restoreGraphicsState_class();
-    Tint::of(role, 1.0).color().setFill();
-    circle(side).fill();
-    let ink = Tint::of(palette.ground, 1.0);
-    match indicator {
-        Indicator::Question => draw_query(centre, ink),
-        Indicator::Finished => draw_check(centre, ink),
-        Indicator::Uploading => draw_arrow(centre, down, ink),
-        Indicator::Running | Indicator::Failed => {}
-    }
+}
+
+thread_local! {
+    /// The hollow's picture and the scale it was drawn at: one for every glyph (it is big, for
+    /// the reason in [`HOLLOW_ROOM`], and the same for all).
+    static HOLLOW: RefCell<Option<(f64, Retained<AnyObject>)>> = const { RefCell::new(None) };
+}
+
+/// The hollow's picture at `scale`, drawn once and shared.
+fn hollow_picture(scale: f64) -> Retained<AnyObject> {
+    HOLLOW.with(|shared| {
+        if let Some((at, picture)) = shared.borrow().as_ref()
+            && *at == scale
+        {
+            return picture.clone();
+        }
+        let block = RcBlock::new(|_rect: NSRect| -> Bool {
+            draw_hollow();
+            Bool::YES
+        });
+        let side = 2.0 * HOLLOW_ROOM;
+        let image =
+            NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(side, side), true, &block);
+        let picture = image.layerContentsForContentsScale(scale);
+        *shared.borrow_mut() = Some((scale, picture.clone()));
+        picture
+    })
 }
 
 /// A point of the 12-unit grid the marks below are drawn in, placed at `scale` about `centre`.
@@ -1501,6 +1686,24 @@ fn turn_key() -> &'static NSString {
     ns_string!("turn")
 }
 
+/// A tab's icon: the tile and its deck, the badge on its corner and the line round its edge — each a
+/// layer of its own holding a picture painted when its colours change, so that each can come and
+/// go (the module's note on the indicator).
+///
+/// **The model is always the end of what plays; the animation shows the way.** A badge that goes
+/// is the plain tile in the model at once and Core Animation shows the rest: the notched tile
+/// held up for the going and the badge's own shrink, both after a delay when the tab was
+/// looked at ([`tabs::LOOKED_HOLD`]) — Core Animation's own `beginTime`, with the layer showing
+/// its first value until then, so no timer, no later undoing and no wake of the app. Whatever
+/// comes next while it plays finds the badge still on the tile ([`Worn::gone`]) and turns it
+/// into the new one, or brings it back, from where it stands. A glyph born with what it shows,
+/// or back from being hidden (a tab being named), is laid out at rest and plays nothing.
+///
+/// **The ring cut clear round the badge is the tile's mask.** A mask only keeps what it covers,
+/// so the notched tile (the same picture as the plain one) is seen through a picture that is
+/// opaque but for a circle at the badge's middle, scaled about that middle with the badge: the
+/// ring is cut out of the tile and the chip's own ground shows through it whatever its colour
+/// (selected, hovered, lifted). The picture is shared by every glyph.
 impl Glyph {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         // The layers' own anchors are the middle (a view's backing layer's is a corner), so a turn
@@ -1531,10 +1734,49 @@ impl Glyph {
         // SAFETY: the wedge is a plain layer of its own; the edge holds the one reference a mask
         // takes.
         unsafe { edge.setMask(Some(&wedge)) };
-        arc.setHidden(true);
-        edge.setHidden(true);
+        // The tile, the badge and the hollow all have the badge's middle for theirs; the layers
+        // are put there ([`Self::place`]) once the deck is known. The hollow lies in the notched
+        // tile's own space, and the tile's middle is the badge's, so it stands at the middle.
+        let plain = layer(2.0 * TILE_ROOM, NSPoint::ZERO);
+        let notched = layer(2.0 * TILE_ROOM, NSPoint::ZERO);
+        let hollow = layer(2.0 * HOLLOW_ROOM, NSPoint::new(TILE_ROOM, TILE_ROOM));
+        // SAFETY: as the wedge: a plain layer of its own, held by the one it masks.
+        unsafe { notched.setMask(Some(&hollow)) };
+        let pop = layer(BADGE_SIDE, NSPoint::ZERO);
+        // The circles and their signs in the badge's square, one over another; the sign over its
+        // circle, and all but the one that shows clear.
+        let in_pop = |side: f64| {
+            let one = layer(side, NSPoint::new(BADGE_SIDE / 2.0, BADGE_SIDE / 2.0));
+            one.setOpacity(0.0);
+            pop.addSublayer(&one);
+            one
+        };
+        let discs: [Retained<CALayer>; 4] = std::array::from_fn(|disc| in_pop(disc_side(disc)));
+        let signs: [Retained<CALayer>; 4] = std::array::from_fn(|_| {
+            let sign = in_pop(BADGE_SIDE);
+            // Over every circle, whichever one is raised while it comes over the old (`morph`).
+            sign.setZPosition(2.0);
+            sign
+        });
+        for hidden in [&plain, &notched, &pop, &edge, &arc] {
+            hidden.setHidden(true);
+        }
+        for clear in [&notched, &pop, &edge] {
+            clear.setOpacity(0.0);
+        }
         let this = Self::alloc(mtm).set_ivars(GlyphIvars {
             look: Cell::new(None),
+            plain,
+            notched,
+            hollow,
+            pop,
+            discs,
+            signs,
+            shown: Cell::new(None),
+            seen: Cell::new(false),
+            placed: Cell::new(None),
+            tile_ink: Cell::new(None),
+            badge_ink: Cell::new(None),
             arc,
             edge,
             wedge,
@@ -1553,14 +1795,15 @@ impl Glyph {
         this
     }
 
-    /// Hangs the turning layers in the glyph's backing layer, if they are not there: AppKit makes
-    /// that layer itself and may make it anew, and a ring whose arc hangs nowhere shows no arc.
+    /// Hangs the layers in the glyph's backing layer, if they are not there: AppKit makes that
+    /// layer itself and may make it anew, and a ring whose arc hangs nowhere shows no arc. In
+    /// the order they lie: the tile, the line round it, the badge.
     fn hang(&self) {
         let iv = self.ivars();
         let Some(layer) = self.layer() else {
             return;
         };
-        for hung in [&iv.arc, &iv.edge] {
+        for hung in [&iv.plain, &iv.notched, &iv.edge, &iv.pop, &iv.arc] {
             if hung.superlayer().is_none() {
                 layer.addSublayer(hung);
             }
@@ -1569,41 +1812,150 @@ impl Glyph {
 
     /// Shows `look` (nothing, for `None`). `turn` is how what runs goes round
     /// (`tabs::ring_turn`) and is read only for a running glyph: `None` for one that stands still
-    /// — Reduce Motion, a window nobody sees.
-    fn set(&self, look: Option<GlyphLook>, turn: Option<Turn>, palette: Palette) {
+    /// — Reduce Motion, a window nobody sees. `reduce`: Reduce Motion, where what comes and goes
+    /// does it in one short fade.
+    ///
+    /// **A change of what the tab reports plays once, and only then** (`tabs::passage`): a glyph
+    /// set again to what it shows is left alone, as at every layout.
+    fn set(&self, look: Option<GlyphLook>, turn: Option<Turn>, palette: Palette, reduce: bool) {
         let iv = self.ivars();
-        let looked = iv.look.replace(look) != look;
+        let before = iv.look.replace(look);
         let repainted = iv.palette.replace(Some(palette)) != Some(palette);
-        if looked || repainted {
+        if before != look || repainted {
             self.setNeedsDisplay(true);
         }
         self.setHidden(look.is_none());
         let spin = spin_of(look);
-        // The layers' own properties move without Core Animation's 0.25 s of implicit fading.
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        iv.arc.setHidden(spin != Some(Spin::Ring));
-        iv.edge.setHidden(!matches!(spin, Some(Spin::Edge(_))));
-        CATransaction::commit();
-        if spin.is_some() {
-            self.hang();
-            self.ink();
-        }
-        self.turn(turn.zip(spin));
-    }
-
-    /// The pictures of what turns, in the colour `accent` has in the bar and at the scale of the
-    /// screen the glyph is on; drawn again only when one of the two changed.
-    fn ink(&self) {
-        let iv = self.ivars();
-        let look = iv.look.get();
-        let (Some(palette), Some(spin)) = (iv.palette.get(), spin_of(look)) else {
+        let Some(look) = look.filter(|look| look.style.icons) else {
+            // Nothing, or the small indicator of a tab without icons: it is drawn, its ring a
+            // layer that turns, and it comes and goes at once.
+            self.untile();
+            // The layers' own properties move without Core Animation's 0.25 s of implicit fading.
+            still(|| iv.arc.setHidden(spin != Some(Spin::Ring)));
+            if spin.is_some() {
+                self.hang();
+                self.ink();
+            }
+            self.turn(turn.zip(spin));
             return;
         };
-        let color = palette.tone(tabs::list_dot(Indicator::Running), 0);
+        still(|| {
+            for shown in [&iv.plain, &iv.notched, &iv.pop] {
+                shown.setHidden(false);
+            }
+            iv.arc.setHidden(true);
+        });
+        self.hang();
+        self.place(look.emblem.edges);
+        self.ink();
+        let badge = Badge::of(Some(look));
+        let moved = if iv.seen.replace(true) {
+            before.map(|before| tabs::passage(before.indicator, look.indicator))
+        } else {
+            None
+        };
+        let Some(moved) = moved else {
+            // Born with what it shows, or back from being hidden: at rest, nothing plays.
+            self.rest(badge);
+            still(|| {
+                iv.wedge.setTransform(scaled(1.0));
+                iv.edge.removeAllAnimations();
+                iv.edge.setHidden(spin.is_none());
+                iv.edge.setOpacity(if spin.is_some() { 1.0 } else { 0.0 });
+            });
+            self.turn(turn.zip(spin));
+            return;
+        };
+        self.stir(badge, moved, reduce);
+        // The line going out is seen going round until it is gone: where the turn stands now is
+        // read before the turn is taken off.
+        let frozen = (moved.line == Tide::Goes).then(|| self.wedge_angle());
+        self.turn(turn.zip(spin));
+        match moved.line {
+            Tide::Comes => self.line_in(reduce),
+            Tide::Goes => self.line_out(frozen.flatten(), reduce),
+            Tide::Still => {}
+        }
+    }
+
+    /// The glyph shows no tile now (hidden, or the small indicator of a tab without icons): the
+    /// tile's layers are out of sight and what plays is over, and what comes next is laid out at
+    /// rest.
+    fn untile(&self) {
+        let iv = self.ivars();
+        if !iv.seen.replace(false) {
+            return;
+        }
+        still(|| {
+            for out in [&iv.plain, &iv.notched, &iv.pop, &iv.edge] {
+                out.removeAllAnimations();
+                out.setHidden(true);
+            }
+        });
+        iv.shown.set(None);
+    }
+
+    /// Puts the tile's, the badge's and the hollow's layers on the badge's middle for a deck of
+    /// `edges` cards behind the front tile; it leans with the deck.
+    fn place(&self, edges: usize) {
+        let iv = self.ivars();
+        if iv.placed.replace(Some(edges)) == Some(edges) {
+            return;
+        }
+        let at = badge_centre(edges);
+        still(|| {
+            for layer in [&iv.plain, &iv.notched, &iv.pop] {
+                layer.setPosition(at);
+            }
+        });
+    }
+
+    /// The pictures of what is a layer, in the colours the bar has now and at the scale of the
+    /// screen the glyph is on; drawn again only when one of them changed.
+    fn ink(&self) {
+        let iv = self.ivars();
+        let (Some(look), Some(palette)) = (iv.look.get(), iv.palette.get()) else {
+            return;
+        };
         let scale = self
             .window()
             .map_or(2.0, |window| window.backingScaleFactor());
+        if look.style.icons {
+            let (emblem, style) = (look.emblem, look.style);
+            let key = (emblem, style, palette, scale);
+            if iv.tile_ink.replace(Some(key)) != Some(key) {
+                let side = NSSize::new(2.0 * TILE_ROOM, 2.0 * TILE_ROOM);
+                for tile in [&iv.plain, &iv.notched] {
+                    paint_in(tile, side, scale, move |_| {
+                        draw_tile_about(emblem, style, palette);
+                    });
+                }
+            }
+            let edges = emblem.edges;
+            let key = (palette, scale, edges);
+            if iv.badge_ink.replace(Some(key)) != Some(key) {
+                let lean = tabs::deck_card(tabs::TILE_WIDTH, 0, edges).turn;
+                for (disc, layer) in iv.discs.iter().enumerate() {
+                    let color = palette.tone(tabs::list_dot(DISCS[disc]), 0);
+                    let side = disc_side(disc);
+                    paint(layer, side, scale, move || draw_disc(color, side));
+                }
+                let ink = Tint::of(palette.ground, 1.0);
+                for (sign, layer) in iv.signs.iter().enumerate() {
+                    paint(layer, BADGE_SIDE, scale, move || draw_sign(sign, lean, ink));
+                }
+                still(|| {
+                    iv.hollow.setContentsScale(scale);
+                    // SAFETY: what `layerContentsForContentsScale` returns is what `contents`
+                    // takes.
+                    unsafe { iv.hollow.setContents(Some(&hollow_picture(scale))) };
+                });
+            }
+        }
+        let Some(spin) = spin_of(Some(look)) else {
+            return;
+        };
+        let color = palette.tone(tabs::list_dot(Indicator::Running), 0);
         match spin {
             Spin::Ring => {
                 if iv.arc_ink.replace(Some((color, scale))) == Some((color, scale)) {
@@ -1622,6 +1974,305 @@ impl Glyph {
                 paint(&iv.wedge, WEDGE_ROOM, scale, draw_wedge);
             }
         }
+    }
+
+    /// Lays the badge out at rest, with none for `None`: the plain tile or the notched one, the
+    /// badge whole with its one circle and sign showing, the hollow at its size. Whatever played
+    /// is dropped.
+    fn rest(&self, badge: Option<Badge>) {
+        let iv = self.ivars();
+        let level = |on: bool| if on { 1.0 } else { 0.0 };
+        for layer in [&iv.plain, &iv.notched, &iv.pop, &iv.hollow] {
+            layer.removeAllAnimations();
+        }
+        still(|| {
+            iv.plain.setOpacity(level(badge.is_none()));
+            iv.notched.setOpacity(level(badge.is_some()));
+            iv.pop.setOpacity(level(badge.is_some()));
+            iv.pop.setTransform(scaled(1.0));
+            iv.hollow
+                .setTransform(scaled(badge.map_or(1.0, Badge::hollow_share)));
+            for (disc, layer) in iv.discs.iter().enumerate() {
+                layer.removeAllAnimations();
+                layer.setOpacity(level(badge.is_some_and(|badge| badge.disc() == disc)));
+                layer.setTransform(scaled(1.0));
+                layer.setZPosition(0.0);
+            }
+            for (sign, layer) in iv.signs.iter().enumerate() {
+                layer.removeAllAnimations();
+                layer.setOpacity(level(badge.is_some_and(|badge| badge.sign() == Some(sign))));
+                layer.setTransform(scaled(1.0));
+            }
+        });
+        iv.shown.set(badge.map(|badge| Worn { badge, gone: None }));
+    }
+
+    /// Plays what the tab's change of indicator does to the badge (`moved`, from
+    /// `tabs::passage`): the badge comes, goes or becomes another. `to`: the badge it shows now.
+    fn stir(&self, to: Option<Badge>, moved: tabs::Passage, reduce: bool) {
+        let iv = self.ivars();
+        // A badge on its way out is on the tile until it is gone.
+        let on = iv
+            .shown
+            .get()
+            .filter(|shown| shown.gone.is_none_or(|gone| Instant::now() < gone));
+        match (moved.badge, to, on) {
+            (Stir::Comes | Stir::Turns, Some(to), None) => self.arrive(to, reduce),
+            (Stir::Comes | Stir::Turns, Some(to), Some(on)) => self.morph(on.badge, to, reduce),
+            (Stir::Goes { wait }, _, Some(on)) if on.gone.is_none() => {
+                self.depart(on.badge, wait, reduce);
+            }
+            // A badge that waits to go and a command begins: it goes now.
+            (Stir::Still, _, Some(on)) if on.gone.is_some() && moved.line == Tide::Comes => {
+                self.depart(on.badge, 0.0, reduce);
+            }
+            // The same indicator — a transfer's arrow turns round, or the badge on its way out
+            // is wanted again.
+            (Stir::Still, Some(to), Some(on)) if on.gone.is_some() || on.badge != to => {
+                self.morph(on.badge, to, reduce);
+            }
+            _ => {}
+        }
+    }
+
+    /// A badge comes where there was none: it grows from [`tabs::BADGE_FROM`] of its size past
+    /// its own and settles, coming into view as it goes, the sign inside it growing too, and the
+    /// ring cut round it grows with it. Reduce Motion: it fades in.
+    fn arrive(&self, to: Badge, reduce: bool) {
+        let iv = self.ivars();
+        self.rest(Some(to));
+        if reduce {
+            play(
+                &iv.pop,
+                OPACITY,
+                0.0,
+                1.0,
+                tabs::REDUCED_FADE,
+                Ease::Out,
+                0.0,
+            );
+            return;
+        }
+        let grow = [tabs::BADGE_FROM, tabs::BADGE_PEAK, 1.0];
+        let at = [0.0, tabs::BADGE_PEAK_AT, 1.0];
+        play_keys(&iv.pop, SCALE, &grow, &at, tabs::BADGE_COME, Ease::Out);
+        play_keys(
+            &iv.pop,
+            OPACITY,
+            &[0.0, 1.0, 1.0],
+            &[0.0, tabs::BADGE_OPAQUE_AT, 1.0],
+            tabs::BADGE_COME,
+            Ease::Out,
+        );
+        let hollow = grow.map(|size| size * to.hollow_share());
+        play_keys(&iv.hollow, SCALE, &hollow, &at, tabs::BADGE_COME, Ease::Out);
+        if let Some(sign) = to.sign() {
+            self.grow(sign);
+        }
+    }
+
+    /// The sign comes into its circle: it grows from [`tabs::SIGN_FROM`] of its size.
+    fn grow(&self, sign: usize) {
+        let layer = &self.ivars().signs[sign];
+        play(
+            layer,
+            SCALE,
+            tabs::SIGN_FROM,
+            1.0,
+            tabs::SIGN_GROW,
+            Ease::Out,
+            0.0,
+        );
+        play(layer, OPACITY, 0.0, 1.0, tabs::SIGN_GROW, Ease::Out, 0.0);
+    }
+
+    /// The badge `was` goes after `wait` seconds (the tab was looked at: a tick or a dot rests
+    /// first): it shrinks to [`tabs::BADGE_GO_TO`] of its size as it fades, the ring cut round it
+    /// with it. Reduce Motion: it fades.
+    ///
+    /// The model is the plain tile at once, and the animation shows the rest of it: the notched
+    /// tile is held up for as long as the badge is on the way out, and falls back to the model
+    /// when it is over — nothing has to be undone afterwards, nothing wakes the app.
+    fn depart(&self, was: Badge, wait: f64, reduce: bool) {
+        let iv = self.ivars();
+        let secs = if reduce {
+            tabs::REDUCED_FADE
+        } else {
+            tabs::BADGE_GO
+        };
+        let (size, light) = (shown_scale(&iv.pop), shown_opacity(&iv.pop));
+        let hollow = shown_scale(&iv.hollow);
+        still(|| {
+            iv.plain.setOpacity(1.0);
+            iv.notched.setOpacity(0.0);
+            iv.pop.setOpacity(0.0);
+            if !reduce {
+                iv.pop.setTransform(scaled(tabs::BADGE_GO_TO));
+            }
+        });
+        play(&iv.pop, OPACITY, light, 0.0, secs, Ease::In, wait);
+        if !reduce {
+            play(
+                &iv.pop,
+                SCALE,
+                size,
+                tabs::BADGE_GO_TO,
+                secs,
+                Ease::In,
+                wait,
+            );
+            let to = was.hollow_share() * tabs::BADGE_GO_TO;
+            play(&iv.hollow, SCALE, hollow, to, secs, Ease::In, wait);
+        }
+        hold(&iv.plain, 0.0, wait + secs);
+        hold(&iv.notched, 1.0, wait + secs);
+        iv.shown.set(Some(Worn {
+            badge: was,
+            gone: Some(Instant::now() + Duration::from_secs_f64(wait + secs)),
+        }));
+    }
+
+    /// The badge `was` becomes `to`, which may be the badge itself coming back from the way out.
+    /// The circle stays: the colour passes (the new circle comes over the old, which stays whole
+    /// beneath it, so there is no dip between), the size slides when the two differ (the failure's
+    /// dot is smaller), the old sign fades and the new one grows. Reduce Motion: a fade.
+    fn morph(&self, was: Badge, to: Badge, reduce: bool) {
+        let iv = self.ivars();
+        let leaving = iv.shown.get().is_some_and(|shown| shown.gone.is_some());
+        let (size, light) = (shown_scale(&iv.pop), shown_opacity(&iv.pop));
+        let hollow = shown_scale(&iv.hollow);
+        let level = |on: bool| if on { 1.0 } else { 0.0 };
+        if leaving {
+            // Wanted again: what plays of the way out is dropped, and the badge goes back to
+            // whole from where it stands.
+            for layer in [&iv.plain, &iv.notched] {
+                layer.removeAnimationForKey(ns_string!("hold"));
+            }
+            for layer in [&iv.pop, &iv.hollow] {
+                layer.removeAnimationForKey(&NSString::from_str(OPACITY));
+                layer.removeAnimationForKey(&NSString::from_str(SCALE));
+            }
+        }
+        still(|| {
+            iv.plain.setOpacity(0.0);
+            iv.notched.setOpacity(1.0);
+            iv.pop.setOpacity(1.0);
+            iv.pop.setTransform(scaled(1.0));
+            iv.hollow.setTransform(scaled(to.hollow_share()));
+            for (disc, layer) in iv.discs.iter().enumerate() {
+                layer.setOpacity(level(disc == to.disc()));
+                layer.setZPosition(if disc == to.disc() { 1.0 } else { 0.0 });
+            }
+            for (sign, layer) in iv.signs.iter().enumerate() {
+                layer.setOpacity(level(to.sign() == Some(sign)));
+            }
+        });
+        if leaving {
+            let back = if reduce { tabs::REDUCED_FADE } else { 0.15 };
+            play(&iv.pop, OPACITY, light, 1.0, back, Ease::Out, 0.0);
+            if !reduce {
+                play(&iv.pop, SCALE, size, 1.0, back, Ease::Out, 0.0);
+                play(
+                    &iv.hollow,
+                    SCALE,
+                    hollow,
+                    to.hollow_share(),
+                    back,
+                    Ease::Out,
+                    0.0,
+                );
+            }
+        }
+        if was.disc() != to.disc() {
+            let (old, new) = (&iv.discs[was.disc()], &iv.discs[to.disc()]);
+            if reduce {
+                play(old, OPACITY, 1.0, 0.0, tabs::REDUCED_FADE, Ease::Out, 0.0);
+                play(new, OPACITY, 0.0, 1.0, tabs::REDUCED_FADE, Ease::Out, 0.0);
+            } else {
+                let (from, to_side) = (disc_side(was.disc()), disc_side(to.disc()));
+                let secs = tabs::BADGE_TURN;
+                hold(old, 1.0, secs);
+                play(old, SCALE, 1.0, to_side / from, secs, Ease::Out, 0.0);
+                play(new, OPACITY, 0.0, 1.0, secs, Ease::Out, 0.0);
+                play(new, SCALE, from / to_side, 1.0, secs, Ease::Out, 0.0);
+                if !leaving {
+                    let (was, to) = (was.hollow_share(), to.hollow_share());
+                    play(&iv.hollow, SCALE, was, to, secs, Ease::Out, 0.0);
+                }
+            }
+        }
+        if was.sign() != to.sign() {
+            if let Some(old) = was.sign() {
+                let secs = if reduce { tabs::REDUCED_FADE } else { SIGN_OUT };
+                play(&iv.signs[old], OPACITY, 1.0, 0.0, secs, Ease::In, 0.0);
+            }
+            if let Some(new) = to.sign() {
+                if reduce {
+                    play(
+                        &iv.signs[new],
+                        OPACITY,
+                        0.0,
+                        1.0,
+                        tabs::REDUCED_FADE,
+                        Ease::Out,
+                        0.0,
+                    );
+                } else {
+                    self.grow(new);
+                }
+            }
+        }
+        iv.shown.set(Some(Worn {
+            badge: to,
+            gone: None,
+        }));
+    }
+
+    /// The line round the tile comes: it fades in from where it stands.
+    fn line_in(&self, reduce: bool) {
+        let iv = self.ivars();
+        let light = shown_opacity(&iv.edge);
+        still(|| {
+            iv.wedge.setTransform(scaled(1.0));
+            iv.edge.setHidden(false);
+            iv.edge.setOpacity(1.0);
+        });
+        let secs = if reduce {
+            tabs::REDUCED_FADE
+        } else {
+            tabs::LINE_COME
+        };
+        play(&iv.edge, OPACITY, light, 1.0, secs, Ease::Out, 0.0);
+    }
+
+    /// The line round the tile goes: it fades out, standing where it stood (`angle`, if it went
+    /// round) rather than snapping to the top.
+    fn line_out(&self, angle: Option<f64>, reduce: bool) {
+        let iv = self.ivars();
+        let light = shown_opacity(&iv.edge);
+        still(|| {
+            if let Some(angle) = angle {
+                iv.wedge.setTransform(rotated(angle));
+            }
+            iv.edge.setOpacity(0.0);
+        });
+        let secs = if reduce {
+            tabs::REDUCED_FADE
+        } else {
+            tabs::LINE_GO
+        };
+        play(&iv.edge, OPACITY, light, 0.0, secs, Ease::In, 0.0);
+    }
+
+    /// How far round the line's turn stands now, on screen, if it goes round.
+    fn wedge_angle(&self) -> Option<f64> {
+        let iv = self.ivars();
+        // SAFETY: reading the presentation copy of a layer we hold, on the main thread.
+        let shown = unsafe { iv.wedge.presentationLayer() }?;
+        // SAFETY: reading the animation a layer holds, on the main thread.
+        unsafe { iv.wedge.animationForKey(turn_key()) }?;
+        let turned = shown.transform();
+        Some(turned.m12.atan2(turned.m11))
     }
 
     /// Plays the turn on what runs, or takes it off. The window server carries it round at an
@@ -1704,7 +2355,8 @@ impl Glyph {
         iv.turning.set(Some((turn.period, spin)));
     }
 
-    /// Takes the turn off whatever it plays on; both rest at the top.
+    /// Takes the turn off whatever it plays on; both rest at the top (or where the line going
+    /// out stands: [`Self::line_out`] sets that after).
     fn stop(&self) {
         let iv = self.ivars();
         if iv.turning.take().is_some() {
@@ -1712,6 +2364,145 @@ impl Glyph {
             iv.wedge.removeAnimationForKey(turn_key());
         }
     }
+}
+
+// ─── What a glyph's layers play ───────────────────────────────────────────
+
+/// The key paths the animations are played on, which are also the keys they are played under: a
+/// layer's size and its opacity.
+const SCALE: &str = "transform.scale";
+const OPACITY: &str = "opacity";
+
+/// How long a sign that gives way to another takes to fade.
+const SIGN_OUT: f64 = 0.12;
+
+/// The curves of the comings (out: quick, then slow to rest) and goings (in: slow, then quick):
+/// the design's CSS `ease-out` and `ease-in`.
+#[derive(Clone, Copy)]
+enum Ease {
+    Out,
+    In,
+}
+
+fn curve(ease: Ease) -> Retained<CAMediaTimingFunction> {
+    match ease {
+        Ease::Out => CAMediaTimingFunction::functionWithControlPoints(0.0, 0.0, 0.58, 1.0),
+        Ease::In => CAMediaTimingFunction::functionWithControlPoints(0.42, 0.0, 1.0, 1.0),
+    }
+}
+
+/// Runs `change` without Core Animation's implicit 0.25 s of fading of whatever it sets.
+fn still(change: impl FnOnce()) {
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    change();
+    CATransaction::commit();
+}
+
+/// `by` times the size, about the middle.
+fn scaled(by: f64) -> CATransform3D {
+    CATransform3D {
+        m11: by,
+        m12: 0.0,
+        m13: 0.0,
+        m14: 0.0,
+        m21: 0.0,
+        m22: by,
+        m23: 0.0,
+        m24: 0.0,
+        m31: 0.0,
+        m32: 0.0,
+        m33: 1.0,
+        m34: 0.0,
+        m41: 0.0,
+        m42: 0.0,
+        m43: 0.0,
+        m44: 1.0,
+    }
+}
+
+/// Turned by `angle` radians about the middle, the way a layer's `transform.rotation.z` turns.
+fn rotated(angle: f64) -> CATransform3D {
+    CATransform3D {
+        m11: angle.cos(),
+        m12: angle.sin(),
+        m21: -angle.sin(),
+        m22: angle.cos(),
+        ..scaled(1.0)
+    }
+}
+
+/// How big `layer` shows now, and how opaque: where an animation under way stands, or the layer's
+/// own value.
+fn shown_scale(layer: &CALayer) -> f64 {
+    // SAFETY: reading the presentation copy of a layer we hold, on the main thread.
+    let shown = unsafe { layer.presentationLayer() };
+    shown.map_or_else(|| layer.transform().m11, |shown| shown.transform().m11)
+}
+
+fn shown_opacity(layer: &CALayer) -> f64 {
+    // SAFETY: as above.
+    let shown = unsafe { layer.presentationLayer() };
+    f64::from(shown.map_or_else(|| layer.opacity(), |shown| shown.opacity()))
+}
+
+/// Delays `animation` by `wait` seconds, `layer` showing its first value until then.
+fn delayed(animation: &CAAnimation, layer: &CALayer, wait: f64) {
+    if wait > 0.0 {
+        animation.setBeginTime(layer.convertTime_fromLayer(CACurrentMediaTime(), None) + wait);
+        // SAFETY: a constant `NSString` Core Animation exposes, only read.
+        animation.setFillMode(unsafe { kCAFillModeBackwards });
+    }
+}
+
+/// Plays `from` to `to` of `path` on `layer` over `secs`, after `wait`. The layer's model value
+/// is already the end of it, and the animation removes itself on completion: nothing is left to
+/// clean up.
+fn play(layer: &CALayer, path: &str, from: f64, to: f64, secs: f64, ease: Ease, wait: f64) {
+    let animation = CABasicAnimation::animationWithKeyPath(Some(&NSString::from_str(path)));
+    // SAFETY: plain `NSNumber`s, what these key paths take.
+    unsafe {
+        animation.setFromValue(Some(&NSNumber::numberWithDouble(from)));
+        animation.setToValue(Some(&NSNumber::numberWithDouble(to)));
+    }
+    animation.setDuration(secs);
+    animation.setTimingFunction(Some(&curve(ease)));
+    delayed(&animation, layer, wait);
+    layer.addAnimation_forKey(&animation, Some(&NSString::from_str(path)));
+}
+
+/// Keeps `layer` showing `value` for `secs`, whatever its own opacity is: what the model has
+/// returns when it is over. This is how a layer that goes is held up for the length of the going.
+fn hold(layer: &CALayer, value: f64, secs: f64) {
+    let animation = CABasicAnimation::animationWithKeyPath(Some(ns_string!("opacity")));
+    // SAFETY: plain `NSNumber`s, what opacity takes.
+    unsafe {
+        animation.setFromValue(Some(&NSNumber::numberWithDouble(value)));
+        animation.setToValue(Some(&NSNumber::numberWithDouble(value)));
+    }
+    animation.setDuration(secs);
+    layer.addAnimation_forKey(&animation, Some(ns_string!("hold")));
+}
+
+/// [`play`] through several `values` at the shares `times` of `secs`, each leg on the same curve.
+fn play_keys(layer: &CALayer, path: &str, values: &[f64], times: &[f64], secs: f64, ease: Ease) {
+    let animation = CAKeyframeAnimation::animationWithKeyPath(Some(&NSString::from_str(path)));
+    let number = |value: &f64| NSNumber::numberWithDouble(*value);
+    let values: Vec<Retained<AnyObject>> = values
+        .iter()
+        .map(|value| {
+            Retained::into_super(Retained::into_super(Retained::into_super(number(value))))
+        })
+        .collect();
+    let times: Vec<Retained<NSNumber>> = times.iter().map(number).collect();
+    let curves: Vec<Retained<CAMediaTimingFunction>> =
+        (1..values.len()).map(|_| curve(ease)).collect();
+    // SAFETY: plain `NSNumber`s, what these key paths take.
+    unsafe { animation.setValues(Some(&NSArray::from_retained_slice(&values))) };
+    animation.setKeyTimes(Some(&NSArray::from_retained_slice(&times)));
+    animation.setTimingFunctions(Some(&NSArray::from_retained_slice(&curves)));
+    animation.setDuration(secs);
+    layer.addAnimation_forKey(&animation, Some(&NSString::from_str(path)));
 }
 
 /// `layer`'s picture: what `draw` draws in a `side` square (a flipped one, like the glyph's own),
@@ -2661,7 +3452,7 @@ impl Chip {
                 indicator,
                 down: *down,
             });
-        iv.glyph.set(look, *turn, palette);
+        iv.glyph.set(look, *turn, palette, *reduce);
         self.set_hint(hint, size, palette);
         iv.close.set(!single && hovered, palette, motion.close);
         iv.close.setHidden(single);
@@ -5177,9 +5968,10 @@ pub(crate) fn watch_command_key() -> Option<Retained<AnyObject>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BADGE_HALO, BADGE_SIDE, CARD_PAD_X, CARD_WIDTH, CHIP_HEIGHT, Emblem, GLYPH_OVERHANG,
-        GlyphLook, IconStyle, Motion, Palette, Spin, TAB_RADIUS, TILE_BADGE_INSET, Tint,
-        TitleAction, card_x, command_alone, contains, inks, line_span, single_label, spin_of,
+        BADGE_DOT, BADGE_HALO, BADGE_SIDE, Badge, CARD_PAD_X, CARD_WIDTH, CHIP_HEIGHT, DISCS,
+        Emblem, GLYPH_OVERHANG, GlyphLook, HOLLOW_ROOM, IconStyle, Motion, Palette, Spin,
+        TAB_RADIUS, TILE_BADGE_INSET, TILE_ROOM, Tint, TitleAction, badge_centre, card_x,
+        command_alone, contains, disc_side, glyph_slot, inks, line_span, single_label, spin_of,
         title_double_click,
     };
     use crate::icon;
@@ -5401,6 +6193,133 @@ mod tests {
         assert_eq!(spin_of(look(true, Some(Indicator::Finished))), None);
         assert_eq!(spin_of(look(true, None)), None);
         assert_eq!(spin_of(None), None);
+    }
+
+    /// A badge is whatever the tab reports but a running command, which is the line round the
+    /// tile; an arrow points down only for a download.
+    #[test]
+    fn a_badge_is_what_the_tab_reports_but_a_running_command() {
+        let look = |indicator, down| {
+            Some(GlyphLook {
+                emblem: Emblem {
+                    kind: ProgramKind::Shell,
+                    edges: 0,
+                },
+                style: IconStyle::default(),
+                indicator,
+                down,
+            })
+        };
+        assert_eq!(Badge::of(look(Some(Indicator::Running), false)), None);
+        assert_eq!(Badge::of(look(None, false)), None);
+        assert_eq!(Badge::of(None), None);
+        let arrow = |down| Badge::of(look(Some(Indicator::Uploading), down));
+        assert_eq!(arrow(false).map(|badge| badge.down), Some(false));
+        assert_eq!(arrow(true).map(|badge| badge.down), Some(true));
+        // Only a transfer has a direction: a tick is the same tick on a download's tab.
+        let tick = Badge::of(look(Some(Indicator::Finished), true));
+        assert_eq!(tick.map(|badge| badge.down), Some(false));
+    }
+
+    /// Every badge sits on its own circle, and signs are shared out by what they say; the
+    /// failure is a dot without a sign, and smaller.
+    #[test]
+    fn each_badge_has_its_circle_and_its_sign() {
+        let badge = |indicator, down| Badge { indicator, down };
+        let mut discs: Vec<usize> = [
+            Indicator::Question,
+            Indicator::Finished,
+            Indicator::Failed,
+            Indicator::Uploading,
+        ]
+        .map(|indicator| badge(indicator, false).disc())
+        .into();
+        discs.sort_unstable();
+        assert_eq!(discs, [0, 1, 2, 3]);
+        for (disc, indicator) in DISCS.into_iter().enumerate() {
+            assert_eq!(badge(indicator, false).disc(), disc);
+        }
+        assert_eq!(badge(Indicator::Failed, false).sign(), None);
+        let signs = [
+            badge(Indicator::Question, false).sign(),
+            badge(Indicator::Finished, false).sign(),
+            badge(Indicator::Uploading, false).sign(),
+            badge(Indicator::Uploading, true).sign(),
+        ];
+        assert_eq!(signs, [Some(0), Some(1), Some(2), Some(3)]);
+        assert_eq!(disc_side(badge(Indicator::Failed, false).disc()), BADGE_DOT);
+        assert_eq!(
+            disc_side(badge(Indicator::Finished, false).disc()),
+            BADGE_SIDE
+        );
+    }
+
+    /// The ring cut clear is the same width round a dot as round the bigger circle, so the dot's
+    /// hollow is the smaller share of the picture's, and the biggest badge fills it.
+    #[test]
+    fn the_hollow_is_a_ring_of_the_same_width_round_every_badge() {
+        let badge = |indicator| Badge {
+            indicator,
+            down: false,
+        };
+        assert_eq!(badge(Indicator::Finished).hollow_share(), 1.0);
+        let dot = badge(Indicator::Failed).hollow_share();
+        assert!(dot > BADGE_DOT / BADGE_SIDE && dot < 1.0, "{dot}");
+        let radius = (BADGE_DOT / 2.0 + BADGE_HALO) / dot;
+        assert!((radius - (BADGE_SIDE / 2.0 + BADGE_HALO)).abs() < 1e-9);
+    }
+
+    /// The tile's picture reaches all round the badge's middle as far as the tile, its shadow and
+    /// its deck do, and the hollow's opaque part still reaches the tile's far corner when it is
+    /// scaled to its smallest (a dot's, as it comes): otherwise the badge comes with a piece of the
+    /// tile gone.
+    #[test]
+    fn the_pictures_reach_as_far_as_the_tile_does() {
+        let slot = glyph_slot();
+        let shadow = super::TILE_BLUR + super::TILE_DROP + 1.0;
+        for edges in 0..=tabs::DECK_EDGES {
+            let at = badge_centre(edges);
+            let reach = |x: f64, y: f64| (x - at.x).abs().max((y - at.y).abs());
+            let (left, right) = (slot.origin.x, slot.origin.x + slot.size.width);
+            let (top, bottom) = (slot.origin.y, slot.origin.y + slot.size.height);
+            // The deck's cards peek out to the right of the front tile.
+            let deck = right + tabs::lead_width(tabs::TILE_WIDTH, edges) - tabs::TILE_WIDTH;
+            let far = reach(left, bottom)
+                .max(reach(deck, bottom))
+                .max(reach(left, top))
+                .max(reach(deck, top))
+                + shadow;
+            assert!(far <= TILE_ROOM, "{edges} cards: {far} > {TILE_ROOM}");
+            let smallest = tabs::BADGE_FROM
+                * Badge {
+                    indicator: Indicator::Failed,
+                    down: false,
+                }
+                .hollow_share();
+            assert!(HOLLOW_ROOM * smallest >= far, "{edges} cards");
+        }
+    }
+
+    /// The badge stands on the tile's corner, and on a deck leans with the front card about the
+    /// tile's middle: it keeps its distance from it.
+    #[test]
+    fn the_badge_stands_on_the_front_cards_corner() {
+        let slot = glyph_slot();
+        let flat = badge_centre(0);
+        assert!((flat.x - (slot.origin.x + slot.size.width - TILE_BADGE_INSET)).abs() < 1e-9);
+        assert!((flat.y - (slot.origin.y + TILE_BADGE_INSET)).abs() < 1e-9);
+        let middle = (
+            slot.origin.x + slot.size.width / 2.0,
+            slot.origin.y + slot.size.height / 2.0,
+        );
+        let away = |at: NSPoint| ((at.x - middle.0).powi(2) + (at.y - middle.1).powi(2)).sqrt();
+        let leaning = badge_centre(tabs::DECK_EDGES);
+        assert!((away(leaning) - away(flat)).abs() < 1e-9);
+        // Counter-clockwise on screen: the corner at the top right moves up and left.
+        assert!(
+            leaning.y < flat.y && leaning.x < flat.x,
+            "{leaning:?} {flat:?}"
+        );
     }
 
     /// The lines run inside a chip's rounded corners and never go negative.
