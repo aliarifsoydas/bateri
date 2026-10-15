@@ -53,7 +53,12 @@
 //! (a tab filling with a transfer is lit, like a hovered one). While ⌘ is held
 //! ([`HINT_DELAY`]) each tab ⌘1…⌘9 reaches shows its key. Over a chip for
 //! [`CARD_DELAY`] the tab's summary card opens below it (`tabs::card_lines`);
-//! with a card open, the next chip's comes at once.
+//! with a card open, the next chip's comes at once. A split tab's card holds a **map** of its
+//! panes under its lines, each where it stands in the tab, with its program's tile, its name and
+//! what it reports (`tabs::CardPane`, `tabs::map_tile`); that card takes the pointer: it stays
+//! open while the pointer is on it and for [`CARD_BRIDGE`] after the pointer left the chip, so
+//! the way across the gap is free, and a press on a pane of the map shows the tab with that
+//! pane focused ([`TabBar::pick_pane`]).
 //!
 //! **The indicator comes and goes** (`tabs::passage` says how, one rule for every shell): the
 //! badge on the tile's corner grows from small past its size and settles, and goes by
@@ -137,12 +142,13 @@ use objc2_app_kit::{
     NSAffineTransformNSAppKitAdditions, NSAnimatablePropertyContainer, NSAnimationContext,
     NSApplication, NSAutoresizingMaskOptions, NSBezierPath, NSBox, NSBoxType, NSColor,
     NSCompositingOperation, NSControl, NSControlStateValueOn, NSControlTextEditingDelegate,
-    NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSEvent, NSEventMask,
+    NSCursor, NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSEvent, NSEventMask,
     NSEventModifierFlags, NSEventType, NSFocusRingType, NSFont, NSFontWeightMedium,
     NSFontWeightRegular, NSFontWeightSemibold, NSGradient, NSGraphicsContext, NSImage,
-    NSLineBreakMode, NSLineCapStyle, NSLineJoinStyle, NSMenu, NSMenuItem, NSShadow,
-    NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTitlePosition, NSTrackingArea,
-    NSTrackingAreaOptions, NSView, NSWindowButton, NSWindowOrderingMode, NSWindowStyleMask,
+    NSImageScaling, NSImageView, NSLineBreakMode, NSLineCapStyle, NSLineJoinStyle, NSMenu,
+    NSMenuItem, NSShadow, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTitlePosition,
+    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindowButton, NSWindowOrderingMode,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSAffineTransform, NSArray, NSData, NSNotification, NSNumber, NSObjectProtocol, NSPoint,
@@ -160,8 +166,8 @@ use crate::program::identity::Kind as ProgramKind;
 use crate::search_bar::mix;
 use crate::tab_drag;
 use crate::tabs::{
-    self, BUTTON, Bar, CHIP_PAD, Card, CardCommand, Clock, Drag, Ending, FADE, Finish, Grip,
-    Indicator, Over, Stir, Strip, TAB_RADIUS, Tide, Tone, Turn,
+    self, BUTTON, Bar, CHIP_PAD, Card, CardCommand, CardPane, Clock, Drag, Ending, FADE, Finish,
+    Grip, Indicator, Over, Stir, Strip, TAB_RADIUS, Tide, Tone, Turn,
 };
 use crate::window::{TerminalWindow, is_dark_background};
 
@@ -228,6 +234,9 @@ const GHOST_ALPHA: f64 = 0.35;
 /// with a card open does not wait again.
 const CARD_DELAY: Duration = Duration::from_millis(450);
 const CARD_WARM: Duration = Duration::from_millis(300);
+/// How long a card with a map outlives the pointer's leaving its chip, so the pointer can cross
+/// the gap to the card (the design's 0.18 s).
+const CARD_BRIDGE: Duration = Duration::from_millis(180);
 
 /// The summary card: its width (the design's), corner, inner margins, the
 /// space between its lines and its gap below the chip.
@@ -237,6 +246,24 @@ const CARD_PAD_X: f64 = 12.0;
 const CARD_PAD_Y: f64 = 10.0;
 const CARD_LINE_GAP: f64 = 3.0;
 const CARD_DROP: f64 = 8.0;
+/// A card with a map is as wide as the map and its margins, and the map sits under the lines:
+/// their own gap and 7 pt more, as the design has it.
+const CARD_MAP_WIDTH: f64 = tabs::MAP_WIDTH + 2.0 * CARD_PAD_X;
+const CARD_MAP_GAP: f64 = CARD_LINE_GAP + 7.0;
+
+/// A pane on the card's map: where its program's tile, its name and its state stand in it, the
+/// type sizes, and the strengths of the foreground its face, its hovered face and its ring wear —
+/// on a dark theme and on a light one (the design's).
+const MAP_TILE_AT: f64 = 7.0;
+const MAP_TEXT_AT: f64 = 29.0;
+const MAP_TEXT_RIGHT: f64 = 7.0;
+const MAP_NAME_HEIGHT: f64 = 16.0;
+const MAP_STATE_AT: f64 = 23.0;
+const MAP_STATE_HEIGHT: f64 = 14.0;
+const MAP_STATE_TEXT: f64 = 11.0;
+const MAP_FACE: (f64, f64) = (0.08, 0.035);
+const MAP_FACE_HOT: (f64, f64) = (0.14, 0.08);
+const MAP_RING: (f64, f64) = (0.32, 0.28);
 
 /// How far a notch of a mouse wheel scrolls the strip, points: a wheel reports
 /// lines where a trackpad reports points.
@@ -1509,12 +1536,21 @@ fn draw_bare_arrow(at: NSPoint, down: bool, color: u32) {
 /// The icon of tab `label` for a menu row (Show All Tabs): its mark on its tile, as the chip wears
 /// it, and what the tab reports as a dot on the corner.
 fn list_image(label: &Label, style: IconStyle, palette: Palette) -> Retained<NSImage> {
-    let indicator = label.indicator;
+    listed_image(label.emblem.kind, label.indicator, style, palette)
+}
+
+/// A program's mark on its tile with what it reports as a dot on the corner, [`LIST_SIDE`]
+/// across: the menu row's icon, and a pane's on the card's map.
+fn listed_image(
+    kind: ProgramKind,
+    indicator: Option<Indicator>,
+    style: IconStyle,
+    palette: Palette,
+) -> Retained<NSImage> {
     if !style.icons {
         let dot = indicator.map(|indicator| palette.tone(tabs::list_dot(indicator), 0));
         return dot_image(dot);
     }
-    let kind = label.emblem.kind;
     let draw = RcBlock::new(move |_rect: NSRect| -> Bool {
         draw_listed(kind, indicator, style, palette);
         Bool::YES
@@ -3623,9 +3659,24 @@ impl ChipFace {
 
 // ─── The summary card ─────────────────────────────────────────────────────
 
+/// What a card's map is drawn from: the panes, the shape of the tab's area, how icons are worn
+/// and the colour of a marked host (no pane's state wears it, the lines' roles want it).
+pub(crate) struct MapDraw<'a> {
+    panes: &'a [CardPane],
+    aspect: f64,
+    style: IconStyle,
+    mark: u32,
+}
+
 pub(crate) struct CardIvars {
     labels: RefCell<Vec<Retained<NSTextField>>>,
+    /// The map's panes, in the card's order; empty without a map.
+    tiles: RefCell<Vec<Retained<MapTile>>>,
     palette: Cell<Option<Palette>>,
+    /// The window whose bar the card belongs to and the tab it tells ([`SummaryCard::aim`]):
+    /// where a press on a pane of the map goes.
+    window: Cell<u64>,
+    tab: Cell<u64>,
 }
 
 define_class!(
@@ -3645,10 +3696,39 @@ define_class!(
             true
         }
 
-        /// It only tells: the pointer and its clicks go to what is under it.
+        /// Without a map it only tells: the pointer and its clicks go to what is under it. With
+        /// one, a pane of the map takes them and the rest of the card holds them (a press on
+        /// its margin does nothing, and does not reach the content under it); `point` is in
+        /// the card's superview's space.
         #[unsafe(method_id(hitTest:))]
-        fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> {
-            None
+        fn hit_test(&self, point: NSPoint) -> Option<Retained<NSView>> {
+            self.hit(point)
+        }
+
+        /// A press on the margin of a card with a map is held, not passed on: it neither moves
+        /// the window nor reaches the content under the card.
+        #[unsafe(method(mouseDownCanMoveWindow))]
+        fn can_move_window(&self) -> bool {
+            false
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, _event: &NSEvent) {}
+
+        /// The pointer came onto the card: its bar keeps it open.
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, _event: &NSEvent) {
+            if !self.ivars().tiles.borrow().is_empty() {
+                self.on_bar(|bar, _| bar.card_entered());
+            }
+        }
+
+        /// The pointer left the card: its bar closes it, unless the pointer is back on the chip.
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            if !self.ivars().tiles.borrow().is_empty() {
+                self.on_bar(|bar, _| bar.card_left());
+            }
         }
 
         #[unsafe(method(drawRect:))]
@@ -3664,18 +3744,65 @@ impl SummaryCard {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(CardIvars {
             labels: RefCell::new(Vec::new()),
+            tiles: RefCell::new(Vec::new()),
             palette: Cell::new(None),
+            window: Cell::new(0),
+            tab: Cell::new(0),
         });
         // SAFETY: `initWithFrame:` is NSView's designated initializer and the
         // ivars are set.
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
         this.setAccessibilityElement(false);
+        // For the pointer's coming and going once there is a map; the events do nothing before.
+        track_hover(&this);
         this
     }
 
-    /// Writes `lines` (text and colour) top to bottom and sizes the card to
-    /// them, [`CARD_WIDTH`] wide; returns its height.
-    fn write(&self, lines: &[(String, u32)], palette: Palette) -> f64 {
+    /// `hitTest:`'s body: `point` is in the card's superview's space.
+    fn hit(&self, point: NSPoint) -> Option<Retained<NSView>> {
+        let tiles = self.ivars().tiles.borrow();
+        if tiles.is_empty() || !contains(self.frame(), point) {
+            return None;
+        }
+        // SAFETY: reading the superview; we are on the main thread.
+        let local = self.convertPoint_fromView(point, unsafe { self.superview() }.as_deref());
+        let tile = tiles.iter().find(|tile| contains(tile.frame(), local));
+        Some(match tile {
+            Some(tile) => Retained::into_super(tile.clone()),
+            None => Retained::into_super(self.retain()),
+        })
+    }
+
+    /// The card belongs to the bar of window `window` and tells tab `tab`.
+    fn aim(&self, window: u64, tab: u64) {
+        let iv = self.ivars();
+        iv.window.set(window);
+        iv.tab.set(tab);
+    }
+
+    /// Runs `job` with the card's bar and tab, if the window is still there.
+    fn on_bar(&self, job: impl FnOnce(&TabBar, u64)) {
+        let iv = self.ivars();
+        let window = app::delegate(self.mtm()).and_then(|app| app.window(iv.window.get()));
+        if let Some(window) = window {
+            job(window.bar(), iv.tab.get());
+        }
+    }
+
+    /// A press on the map's pane `pane`: the bar shows its tab with that pane focused.
+    fn press(&self, pane: u64) {
+        self.on_bar(|bar, tab| bar.pick_pane(tab, pane));
+    }
+
+    /// Writes `lines` (text and colour) top to bottom and the `map` of the tab's panes under
+    /// them, and sizes the card to them: [`CARD_WIDTH`] wide, or [`CARD_MAP_WIDTH`] with a map;
+    /// returns its size.
+    fn write(
+        &self,
+        lines: &[(String, u32)],
+        map: Option<&MapDraw<'_>>,
+        palette: Palette,
+    ) -> NSSize {
         let iv = self.ivars();
         if iv.palette.replace(Some(palette)) != Some(palette) {
             let shadow = NSShadow::new();
@@ -3685,6 +3812,11 @@ impl SummaryCard {
             self.setShadow(Some(&shadow));
             self.setNeedsDisplay(true);
         }
+        let width = if map.is_some() {
+            CARD_MAP_WIDTH
+        } else {
+            CARD_WIDTH
+        };
         let mut labels = iv.labels.borrow_mut();
         while labels.len() > lines.len() {
             if let Some(gone) = labels.pop() {
@@ -3711,20 +3843,260 @@ impl SummaryCard {
             let height = field.intrinsicContentSize().height;
             field.setFrame(NSRect::new(
                 NSPoint::new(CARD_PAD_X, y),
-                NSSize::new(CARD_WIDTH - 2.0 * CARD_PAD_X, height),
+                NSSize::new(width - 2.0 * CARD_PAD_X, height),
             ));
             y += height + CARD_LINE_GAP;
         }
-        y - CARD_LINE_GAP + CARD_PAD_Y
+        let bottom = y - CARD_LINE_GAP;
+        let Some(map) = map else {
+            self.set_tiles(None, 0.0, palette);
+            return NSSize::new(width, bottom + CARD_PAD_Y);
+        };
+        let top = bottom + CARD_MAP_GAP;
+        let height = tabs::map_height(map.aspect);
+        self.set_tiles(Some(map), top, palette);
+        NSSize::new(width, top + height + CARD_PAD_Y)
+    }
+
+    /// The map's panes at `top` in the card, in place if they are the same panes as before (the
+    /// pointer may be on one of them), new otherwise; none without a `map`.
+    fn set_tiles(&self, map: Option<&MapDraw<'_>>, top: f64, palette: Palette) {
+        let iv = self.ivars();
+        let mut tiles = iv.tiles.borrow_mut();
+        let panes = map.map_or(&[][..], |map| map.panes);
+        let same = tiles.len() == panes.len()
+            && tiles
+                .iter()
+                .zip(panes)
+                .all(|(tile, pane)| tile.ivars().pane.get() == pane.id);
+        if !same {
+            for gone in tiles.drain(..) {
+                gone.removeFromSuperview();
+            }
+            for _ in panes {
+                let tile = MapTile::new(self.mtm());
+                self.addSubview(&tile);
+                tiles.push(tile);
+            }
+        }
+        let Some(map) = map else {
+            return;
+        };
+        let height = tabs::map_height(map.aspect);
+        for (tile, pane) in tiles.iter().zip(panes) {
+            let at = tabs::map_tile(pane.place, height);
+            let frame = NSRect::new(
+                NSPoint::new(CARD_PAD_X + at.x, top + at.y),
+                NSSize::new(at.width, at.height),
+            );
+            tile.set(pane, frame, map, palette);
+        }
     }
 }
 
-/// Where the summary card of a chip spanning `chip_x`…`chip_x + chip_width`
-/// sits in a `bar_width` bar: under the chip's left edge, kept
-/// [`CARD_PAD_X`] inside both window edges.
-fn card_x(chip_x: f64, bar_width: f64) -> f64 {
+pub(crate) struct TileIvars {
+    pane: Cell<u64>,
+    /// The pointer is over it.
+    hot: Cell<bool>,
+    focused: Cell<bool>,
+    palette: Cell<Option<Palette>>,
+    icon: Retained<NSImageView>,
+    name: Retained<NSTextField>,
+    state: Retained<NSTextField>,
+}
+
+define_class!(
+    // SAFETY: NSView is designed for subclassing; MapTile implements no
+    // `Drop` and is born with `initWithFrame:`.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "BateriTabCardPane"]
+    #[ivars = TileIvars]
+    pub(crate) struct MapTile;
+
+    unsafe impl NSObjectProtocol for MapTile {}
+
+    impl MapTile {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+            true
+        }
+
+        #[unsafe(method(mouseDownCanMoveWindow))]
+        fn can_move_window(&self) -> bool {
+            false
+        }
+
+        #[unsafe(method(resetCursorRects))]
+        fn reset_cursor_rects(&self) {
+            self.addCursorRect_cursor(self.bounds(), &NSCursor::pointingHandCursor());
+        }
+
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, _event: &NSEvent) {
+            self.ivars().hot.set(true);
+            self.setNeedsDisplay(true);
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            self.ivars().hot.set(false);
+            self.setNeedsDisplay(true);
+        }
+
+        /// A press on the pane: its tab is shown with the pane focused.
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, _event: &NSEvent) {
+            self.press();
+        }
+
+        #[unsafe(method(accessibilityPerformPress))]
+        fn accessibility_press(&self) -> bool {
+            self.press();
+            true
+        }
+
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let iv = self.ivars();
+            let Some(palette) = iv.palette.get() else {
+                return;
+            };
+            let (face, hot, ring) = (MAP_FACE, MAP_FACE_HOT, MAP_RING);
+            let pick = |(dark, light): (f64, f64)| if palette.dark { dark } else { light };
+            let strength = if iv.hot.get() { pick(hot) } else { pick(face) };
+            let line = iv
+                .focused
+                .get()
+                .then(|| Tint::of(palette.title, pick(ring)));
+            rounded(
+                self.bounds(),
+                tabs::MAP_RADIUS,
+                Tint::of(palette.title, strength),
+                line,
+            );
+        }
+    }
+);
+
+impl MapTile {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let icon = NSImageView::new(mtm);
+        icon.setImageScaling(NSImageScaling::ScaleNone);
+        let name = label(mtm);
+        let state = label(mtm);
+        for field in [&name, &state] {
+            field.setAlignment(NSTextAlignment::Left);
+        }
+        let this = Self::alloc(mtm).set_ivars(TileIvars {
+            pane: Cell::new(0),
+            hot: Cell::new(false),
+            focused: Cell::new(false),
+            palette: Cell::new(None),
+            icon: icon.clone(),
+            name: name.clone(),
+            state: state.clone(),
+        });
+        // SAFETY: `initWithFrame:` is NSView's designated initializer and the
+        // ivars are set.
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        this.addSubview(&icon);
+        this.addSubview(&name);
+        this.addSubview(&state);
+        track_hover(&this);
+        this.setAccessibilityElement(true);
+        // SAFETY: AppKit's constant role string, alive for the process.
+        this.setAccessibilityRole(Some(unsafe { NSAccessibilityButtonRole }));
+        this
+    }
+
+    /// The card this pane is on.
+    fn card(&self) -> Option<Retained<SummaryCard>> {
+        // SAFETY: reading the superview; we are on the main thread.
+        unsafe { self.superview() }?.downcast::<SummaryCard>().ok()
+    }
+
+    fn press(&self) {
+        if let Some(card) = self.card() {
+            card.press(self.ivars().pane.get());
+        }
+    }
+
+    /// Shows `pane` at `frame` (in the card's space): its program's tile and what it reports,
+    /// its name, and under it the word for its state in the role's colour. What does not fit the
+    /// pane's height is left out rather than cut: the name needs the tile's mark beside it, the
+    /// state a line under the name.
+    fn set(&self, pane: &CardPane, frame: NSRect, map: &MapDraw<'_>, palette: Palette) {
+        let iv = self.ivars();
+        iv.pane.set(pane.id);
+        iv.focused.set(pane.focused);
+        iv.palette.set(Some(palette));
+        self.setFrame(frame);
+        let (width, height) = (frame.size.width, frame.size.height);
+        let image = listed_image(pane.kind, pane.indicator, map.style, palette);
+        iv.icon.setImage(Some(&image));
+        iv.icon.setFrame(NSRect::new(
+            NSPoint::new(MAP_TILE_AT, MAP_TILE_AT),
+            NSSize::new(LIST_SIDE, LIST_SIDE),
+        ));
+        iv.icon
+            .setHidden(height < MAP_TILE_AT + LIST_SIDE || width < MAP_TILE_AT + LIST_SIDE);
+        let room = width - MAP_TEXT_AT - MAP_TEXT_RIGHT;
+        let text_ink = if pane.focused {
+            palette.title
+        } else {
+            mix(palette.title, palette.dim, 0.5)
+        };
+        // SAFETY: AppKit's constant font weights.
+        let weight = if pane.focused {
+            unsafe { NSFontWeightSemibold }
+        } else {
+            unsafe { NSFontWeightMedium }
+        };
+        let name = &iv.name;
+        name.setFont(Some(&NSFont::systemFontOfSize_weight(CARD_TEXT, weight)));
+        name.setTextColor(Some(&Tint::of(text_ink, 1.0).color()));
+        name.setStringValue(&NSString::from_str(&pane.name));
+        name.setFrame(NSRect::new(
+            NSPoint::new(MAP_TEXT_AT, MAP_TILE_AT),
+            NSSize::new(room.max(0.0), MAP_NAME_HEIGHT),
+        ));
+        name.setHidden(height < MAP_TILE_AT + MAP_NAME_HEIGHT || room < 12.0);
+        let state = &iv.state;
+        let word = pane.state();
+        if let Some((text, tone)) = &word {
+            state.setFont(Some(&NSFont::systemFontOfSize_weight(
+                MAP_STATE_TEXT,
+                unsafe { NSFontWeightRegular },
+            )));
+            state.setTextColor(Some(&Tint::of(palette.tone(*tone, map.mark), 1.0).color()));
+            state.setStringValue(&NSString::from_str(text));
+        }
+        state.setFrame(NSRect::new(
+            NSPoint::new(MAP_TEXT_AT, MAP_STATE_AT),
+            NSSize::new(room.max(0.0), MAP_STATE_HEIGHT),
+        ));
+        state.setHidden(word.is_none() || height < MAP_STATE_AT + MAP_STATE_HEIGHT || room < 12.0);
+        let said = match &word {
+            Some((text, _)) => format!("{}, {text}", pane.name),
+            None => pane.name.clone(),
+        };
+        self.setAccessibilityLabel(Some(&NSString::from_str(&said)));
+        self.setNeedsDisplay(true);
+    }
+}
+
+/// Where the summary card, `card_width` wide, of a chip spanning
+/// `chip_x`…`chip_x + chip_width` sits in a `bar_width` bar: under the
+/// chip's left edge, kept [`CARD_PAD_X`] inside both window edges.
+fn card_x(chip_x: f64, bar_width: f64, card_width: f64) -> f64 {
     chip_x
-        .min(bar_width - CARD_WIDTH - CARD_PAD_X)
+        .min(bar_width - card_width - CARD_PAD_X)
         .max(CARD_PAD_X)
 }
 
@@ -4245,14 +4617,21 @@ struct OpenCard {
 }
 
 impl OpenCard {
-    /// How long the card's command has run now; `None` unless it runs.
+    /// How long the card's command has run now; `None` unless it runs — and, with a map, the
+    /// card tells no time (each pane says only that it runs), so the clock has nothing to wake
+    /// for.
     fn running(&self) -> Option<Duration> {
         match &self.card.command {
-            Some(CardCommand::Running { elapsed, .. }) => {
+            Some(CardCommand::Running { elapsed, .. }) if !self.mapped() => {
                 Some(elapsed.saturating_add(self.read_at.elapsed()))
             }
             _ => None,
         }
+    }
+
+    /// The card carries a map of its tab's panes.
+    fn mapped(&self) -> bool {
+        self.card.panes.len() > 1
     }
 
     /// The card as it reads now: its running time moved on.
@@ -4363,6 +4742,8 @@ pub(crate) struct BarIvars {
     card_closed: Cell<Option<Instant>>,
     /// The tab a press put its card away for, until the pointer leaves it.
     card_quiet: Cell<Option<u64>>,
+    /// The pointer is on the open card (one with a map): it stays while it is.
+    card_inside: Cell<bool>,
     /// ⌘ is held (past [`HINT_DELAY`]): the tabs show their keys.
     hints: Cell<bool>,
     /// A pending hint — ⌘'s release or a chord makes it stale.
@@ -4556,6 +4937,7 @@ impl TabBar {
             card_wait: Cell::new(0),
             card_closed: Cell::new(None),
             card_quiet: Cell::new(None),
+            card_inside: Cell::new(false),
             hints: Cell::new(false),
             hint_wait: Cell::new(0),
             hint_pending: Cell::new(false),
@@ -4604,7 +4986,9 @@ impl TabBar {
     /// again (`TerminalTab::card`) when what its chip shows changed — a
     /// command started or ended, a title, a transfer's percent, a mark: the
     /// read is a `Term` round, and a title news can come often while output
-    /// streams. Lays out.
+    /// streams. A card with a map reads at every news: what a pane reports
+    /// can change while the chip, which shows the most urgent of them, does
+    /// not. Lays out.
     pub(crate) fn show(&self, tabs: Vec<Label>, selected: usize, notice: String) {
         let iv = self.ivars();
         let open = iv.card.borrow().as_ref().map(|open| open.tab);
@@ -4629,8 +5013,9 @@ impl TabBar {
             selected,
             notice,
         });
+        let mapped = iv.card.borrow().as_ref().is_some_and(OpenCard::mapped);
         if let Some(tab) = open
-            && before != told(&iv.shown.borrow(), tab)
+            && (mapped || before != told(&iv.shown.borrow(), tab))
         {
             self.read_card(tab);
             self.draw_card();
@@ -5722,6 +6107,20 @@ impl TabBar {
             iv.card_quiet.set(None);
         }
         let Some(tab) = tab else {
+            // A card with a map is where the pointer is heading: it gets a moment to arrive.
+            let mapped = iv.card.borrow().as_ref().is_some_and(OpenCard::mapped);
+            if mapped && iv.card_inside.get() {
+                return;
+            }
+            if mapped {
+                after(CARD_BRIDGE, iv.window, move |bar| {
+                    let iv = bar.ivars();
+                    if iv.card_wait.get() == generation && !iv.card_inside.get() {
+                        bar.close_card();
+                    }
+                });
+                return;
+            }
             self.close_card();
             return;
         };
@@ -5819,9 +6218,16 @@ impl TabBar {
             .into_iter()
             .map(|(text, tone)| (text, palette.tone(tone, mark)))
             .collect();
-        let height = iv.card_view.write(&lines, palette);
+        let map = open.mapped().then(|| MapDraw {
+            panes: &open.card.panes,
+            aspect: open.card.aspect,
+            style: IconStyle::current(self.mtm()),
+            mark,
+        });
+        iv.card_view.aim(iv.window, open.tab);
+        let size = iv.card_view.write(&lines, map.as_ref(), palette);
         let mut frame = iv.card_view.frame();
-        frame.size = NSSize::new(CARD_WIDTH, height);
+        frame.size = size;
         iv.card_view.setFrame(frame);
     }
 
@@ -5851,6 +6257,7 @@ impl TabBar {
             card_x(
                 iv.strip.frame().origin.x + at.origin.x,
                 self.bounds().size.width,
+                size.width,
             ),
             self.frame().origin.y + at.origin.y + at.size.height + CARD_DROP,
         );
@@ -5874,7 +6281,41 @@ impl TabBar {
         if iv.card.take().is_some() {
             iv.card_closed.set(Some(Instant::now()));
         }
+        iv.card_inside.set(false);
         iv.card_view.removeFromSuperview();
+    }
+
+    /// The pointer came onto the open card (one with a map): it stays open while the pointer
+    /// is on it, and a close that was waiting for the pointer to arrive is off.
+    fn card_entered(&self) {
+        let iv = self.ivars();
+        iv.card_inside.set(true);
+        iv.card_wait.set(iv.card_wait.get().wrapping_add(1));
+    }
+
+    /// The pointer left the open card: it goes, unless the pointer is back on the chip of its tab.
+    fn card_left(&self) {
+        let iv = self.ivars();
+        iv.card_inside.set(false);
+        let tab = iv.card.borrow().as_ref().map(|open| open.tab);
+        if tab.is_some() && iv.hovered.get() == tab {
+            return;
+        }
+        iv.card_wait.set(iv.card_wait.get().wrapping_add(1));
+        self.close_card();
+    }
+
+    /// A press on pane `pane` of the open card's map: the card goes, the window's applier selects
+    /// `tab` and gives the keyboard to the pane (its chip's tile turns to the pane's program
+    /// with it). Done now, not a turn later: the card is only put away, kept by the bar, and the
+    /// chips are not rebuilt by a selection.
+    fn pick_pane(&self, tab: u64, pane: u64) {
+        let iv = self.ivars();
+        iv.card_wait.set(iv.card_wait.get().wrapping_add(1));
+        self.close_card();
+        if let Some(window) = self.terminal_window() {
+            window.show_pane(tab, pane);
+        }
     }
 
     /// The window stopped being key: the key hints and the card go — the
@@ -5968,11 +6409,11 @@ pub(crate) fn watch_command_key() -> Option<Retained<AnyObject>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BADGE_DOT, BADGE_HALO, BADGE_SIDE, Badge, CARD_PAD_X, CARD_WIDTH, CHIP_HEIGHT, DISCS,
-        Emblem, GLYPH_OVERHANG, GlyphLook, HOLLOW_ROOM, IconStyle, Motion, Palette, Spin,
-        TAB_RADIUS, TILE_BADGE_INSET, TILE_ROOM, Tint, TitleAction, badge_centre, card_x,
-        command_alone, contains, disc_side, glyph_slot, inks, line_span, single_label, spin_of,
-        title_double_click,
+        BADGE_DOT, BADGE_HALO, BADGE_SIDE, Badge, CARD_MAP_WIDTH, CARD_PAD_X, CARD_WIDTH,
+        CHIP_HEIGHT, DISCS, Emblem, GLYPH_OVERHANG, GlyphLook, HOLLOW_ROOM, IconStyle, Motion,
+        Palette, Spin, TAB_RADIUS, TILE_BADGE_INSET, TILE_ROOM, Tint, TitleAction, badge_centre,
+        card_x, command_alone, contains, disc_side, glyph_slot, inks, line_span, single_label,
+        spin_of, title_double_click,
     };
     use crate::icon;
     use crate::program::identity::{Agent, Kind as ProgramKind};
@@ -6332,11 +6773,23 @@ mod tests {
     /// The card hangs under its chip and stays inside the window.
     #[test]
     fn the_card_stays_inside_the_window() {
-        assert_eq!(card_x(270.0, 1000.0), 270.0);
-        assert_eq!(card_x(900.0, 1000.0), 1000.0 - CARD_WIDTH - CARD_PAD_X);
-        assert_eq!(card_x(-40.0, 1000.0), CARD_PAD_X, "a strip scrolled off");
+        assert_eq!(card_x(270.0, 1000.0, CARD_WIDTH), 270.0);
         assert_eq!(
-            card_x(100.0, 200.0),
+            card_x(900.0, 1000.0, CARD_WIDTH),
+            1000.0 - CARD_WIDTH - CARD_PAD_X
+        );
+        assert_eq!(
+            card_x(900.0, 1000.0, CARD_MAP_WIDTH),
+            1000.0 - CARD_MAP_WIDTH - CARD_PAD_X,
+            "the wider card with a map"
+        );
+        assert_eq!(
+            card_x(-40.0, 1000.0, CARD_WIDTH),
+            CARD_PAD_X,
+            "a strip scrolled off"
+        );
+        assert_eq!(
+            card_x(100.0, 200.0, CARD_WIDTH),
             CARD_PAD_X,
             "a window narrower than the card"
         );

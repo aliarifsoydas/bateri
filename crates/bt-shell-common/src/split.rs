@@ -147,6 +147,11 @@ impl Rect {
 /// divider is one pixel"); the same weight as the dock's hairlines.
 const DIVIDER_PX: f64 = 1.0;
 
+/// The side of the square [`Tree::fractions`] lays the tree out in, in pixels: edges snap to
+/// whole pixels, so the fractions come out in steps of its reciprocal — far finer than a picture
+/// a few hundred points across can show.
+const FRACTION_EDGE: f64 = 4096.0;
+
 /// The space the frame computation leaves between panes and around them, in **device pixels**
 /// (every boundary is computed in pixels, so a gap given in points is rounded to whole pixels
 /// once, by [`Spacing::gapped`], and never again).
@@ -516,6 +521,24 @@ impl Tree {
             divider.rect = divider.rect.scaled(points);
         }
         out
+    }
+
+    /// Where each pane stands in the area as fractions of it (0 to 1, top-down, in tree order),
+    /// with no divider and no margin: the tree's own proportions, for a picture of the tab (the
+    /// summary card's map). The tree is laid out the way the real one is, so a picture and the
+    /// window never disagree on which pane is where; a zoomed pane changes nothing, the tree is
+    /// the same.
+    pub fn fractions(&self) -> Vec<(u64, Rect)> {
+        let layout = self.layout_spaced(
+            Rect::new(0.0, 0.0, FRACTION_EDGE, FRACTION_EDGE),
+            1.0,
+            Spacing::gapped(0.0, 0.0, 1.0),
+        );
+        layout
+            .panes
+            .into_iter()
+            .map(|(id, rect)| (id, rect.scaled(1.0 / FRACTION_EDGE)))
+            .collect()
     }
 
     /// [`Tree::layout`] with a zoomed leaf (⇧⌘↩): if `zoomed` is in the tree, only it, covering
@@ -1503,6 +1526,36 @@ mod tests {
         assert!(tree.split(1, Axis::Horizontal, 2));
         assert!(tree.split(2, Axis::Vertical, 3));
         tree
+    }
+
+    #[test]
+    fn the_fractions_are_the_trees_proportions_with_no_gap_in_them() {
+        let one = Tree::Leaf(1).fractions();
+        assert_eq!(one, vec![(1, Rect::new(0.0, 0.0, 1.0, 1.0))]);
+
+        let fractions = three().fractions();
+        assert_eq!(
+            fractions,
+            vec![
+                (1, Rect::new(0.0, 0.0, 0.5, 1.0)),
+                (2, Rect::new(0.5, 0.0, 0.5, 0.5)),
+                (3, Rect::new(0.5, 0.5, 0.5, 0.5)),
+            ],
+            "left half, right half split in two: tree order, edges meeting"
+        );
+
+        let unequal = pair(Axis::Vertical, 0.25, 1, 2);
+        let [(_, top), (_, bottom)] = unequal.fractions()[..] else {
+            panic!("two panes");
+        };
+        assert!(
+            (top.height - 0.25).abs() < 1e-3,
+            "a dragged divider shows: {top:?}"
+        );
+        assert!(
+            (top.height + bottom.height - 1.0).abs() < 1e-9,
+            "no gap left"
+        );
     }
 
     #[test]

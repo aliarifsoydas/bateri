@@ -35,6 +35,7 @@ use std::time::Duration;
 use bt_core::{HostMark, ProgramActivity};
 
 use crate::program::identity::Kind;
+use crate::split::Rect;
 use crate::upload::End;
 
 /// A window's tabs in strip order, and the selected one.
@@ -1039,6 +1040,23 @@ pub struct Signals {
     pub uploading: bool,
 }
 
+impl Signals {
+    /// What a tab reports from what each of its panes does: a signal is on when it is on in any
+    /// pane. The chip's indicator and the states on the summary card's map ([`CardPane`]) are
+    /// both read from the panes' signals, so the chip never says what none of the panes does.
+    pub fn union(panes: impl IntoIterator<Item = Signals>) -> Signals {
+        panes
+            .into_iter()
+            .fold(Signals::default(), |all, pane| Signals {
+                question: all.question || pane.question,
+                running: all.running || pane.running,
+                failed: all.failed || pane.failed,
+                finished: all.finished || pane.finished,
+                uploading: all.uploading || pane.uploading,
+            })
+    }
+}
+
 /// The tab's one indicator: question > running > failed > finished > uploading; `None` when
 /// nothing is going on. A question outranks everything because the tab is stuck until it is
 /// answered; a failure outranks a success because it is the one the user must not miss; an
@@ -1221,7 +1239,8 @@ pub enum CardCommand {
 }
 
 /// What a tab's summary card tells ([`card_lines`]); the platform shell reads each from the tab's
-/// focused pane.
+/// focused pane. A split tab's card also holds the map of its panes ([`Card::panes`]), which
+/// takes over what the lines say about a command and a transfer: each pane tells its own.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Card {
     pub title: String,
@@ -1234,7 +1253,98 @@ pub struct Card {
     /// A transfer flowing: the item's name, the percentage, and `true` when it is a download.
     pub upload: Option<(String, u8, bool)>,
     pub mark: HostMark,
-    pub panes: usize,
+    /// The tab's panes in tree order; empty for a tab of one pane, whose card is just its lines.
+    pub panes: Vec<CardPane>,
+    /// The tab's content area, its height over its width: the map takes the area's shape
+    /// ([`map_height`]).
+    pub aspect: f64,
+}
+
+/// One pane on a split tab's summary card: where it stands, the program it runs, its name and
+/// what it is doing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CardPane {
+    /// The pane's identity in its window — what a press on the map names.
+    pub id: u64,
+    /// Where it stands in the tab, as fractions of the content area (0 to 1, top-down): the
+    /// split tree's own proportions even while one pane is zoomed.
+    pub place: Rect,
+    /// The program it shows; while it reports an ended command, the one that ended.
+    pub kind: Kind,
+    pub name: String,
+    /// What it reports, by the rule that picks the tab's own ([`indicator`], over this pane's
+    /// signals alone).
+    pub indicator: Option<Indicator>,
+    /// The exit code of the failed command, when known.
+    pub exit: Option<i32>,
+    /// The tab's focused pane.
+    pub focused: bool,
+}
+
+impl CardPane {
+    /// The word under its name and the role it is drawn in: "Running", "Asking" (a question
+    /// waits), "Finished", "Exit 2" (or "Failed" where the code is not known) and "Uploading";
+    /// `None` for a pane with nothing to report.
+    pub fn state(&self) -> Option<(String, Tone)> {
+        let indicator = self.indicator?;
+        let word = match (indicator, self.exit) {
+            (Indicator::Running, _) => "Running".to_owned(),
+            (Indicator::Question, _) => "Asking".to_owned(),
+            (Indicator::Finished, _) => "Finished".to_owned(),
+            (Indicator::Failed, Some(exit)) => format!("Exit {exit}"),
+            (Indicator::Failed, None) => "Failed".to_owned(),
+            (Indicator::Uploading, _) => "Uploading".to_owned(),
+        };
+        Some((word, list_dot(indicator)))
+    }
+}
+
+/// The map's width on the summary card, in points.
+pub const MAP_WIDTH: f64 = 276.0;
+/// The map's height stays between these, whatever shape the tab's area has: a wide window's map
+/// would be a sliver and a tall one's would push the card off the screen.
+pub const MAP_MIN_HEIGHT: f64 = 120.0;
+pub const MAP_MAX_HEIGHT: f64 = 180.0;
+/// The space between two panes on the map, which each pane takes half of at an inner edge.
+const MAP_GAP: f64 = 3.0;
+/// The corner of a pane on the map.
+pub const MAP_RADIUS: f64 = 6.0;
+
+/// The map's height for a tab area whose height over width is `aspect`: [`MAP_WIDTH`] times it,
+/// kept within [`MAP_MIN_HEIGHT`] and [`MAP_MAX_HEIGHT`], in whole points.
+pub fn map_height(aspect: f64) -> f64 {
+    if !aspect.is_finite() {
+        return MAP_MIN_HEIGHT;
+    }
+    (MAP_WIDTH * aspect)
+        .clamp(MAP_MIN_HEIGHT, MAP_MAX_HEIGHT)
+        .round()
+}
+
+/// Where a pane standing at `place` (fractions of the area) is drawn on a map [`MAP_WIDTH`] wide
+/// and `height` tall: its share of the map less half of [`MAP_GAP`] at each inner edge, so two
+/// neighbours are a gap apart and a pane at the map's edge reaches it.
+pub fn map_tile(place: Rect, height: f64) -> Rect {
+    const EDGE: f64 = 0.001;
+    let half = MAP_GAP / 2.0;
+    let left = if place.x > EDGE { half } else { 0.0 };
+    let top = if place.y > EDGE { half } else { 0.0 };
+    let right = if place.x + place.width < 1.0 - EDGE {
+        half
+    } else {
+        0.0
+    };
+    let bottom = if place.y + place.height < 1.0 - EDGE {
+        half
+    } else {
+        0.0
+    };
+    Rect::new(
+        place.x * MAP_WIDTH + left,
+        place.y * height + top,
+        place.width * MAP_WIDTH - left - right,
+        place.height * height - top - bottom,
+    )
 }
 
 /// The theme role a card line is drawn in.
@@ -1253,8 +1363,9 @@ pub enum Tone {
 
 /// The card's lines, top to bottom: the title; the directory (`host:path` in a remote session);
 /// what the newest command did — "Running · {command} · {time}", "Finished · {command} · {time}",
-/// "Exit {n} · {command}"; a flowing transfer; a marked host's kind; how many panes, past one.
-/// A part nobody knows is left out rather than shown empty.
+/// "Exit {n} · {command}"; a flowing transfer; a marked host's kind. A split tab's card keeps only
+/// the title, the directory and the host's kind: what each pane is doing is on its map. A part
+/// nobody knows is left out rather than shown empty.
 pub fn card_lines(card: &Card) -> Vec<(String, Tone)> {
     let mut lines = vec![(card.title.clone(), Tone::Title)];
     let directory = match &card.remote {
@@ -1276,7 +1387,8 @@ pub fn card_lines(card: &Card) -> Vec<(String, Tone)> {
             .collect::<Vec<_>>()
             .join(" · ")
     };
-    match &card.command {
+    let mapped = card.panes.len() > 1;
+    match card.command.as_ref().filter(|_| !mapped) {
         Some(CardCommand::Running { command, elapsed }) => {
             let time = bt_core::running_counter(*elapsed).unwrap_or_default();
             lines.push((joined(&["Running", command, &time]), Tone::Accent));
@@ -1290,7 +1402,7 @@ pub fn card_lines(card: &Card) -> Vec<(String, Tone)> {
         }
         None => {}
     }
-    if let Some((name, percent, down)) = &card.upload {
+    if let Some((name, percent, down)) = card.upload.as_ref().filter(|_| !mapped) {
         let verb = if *down {
             "↓ Downloading"
         } else {
@@ -1303,9 +1415,6 @@ pub fn card_lines(card: &Card) -> Vec<(String, Tone)> {
     }
     if let Some(name) = host_name(card.mark) {
         lines.push((format!("{name} host"), Tone::Mark));
-    }
-    if card.panes > 1 {
-        lines.push((format!("{} panes", card.panes), Tone::Dim));
     }
     lines
 }
@@ -3535,7 +3644,6 @@ mod tests {
             }),
             upload: Some(("logs.tgz".into(), 42, false)),
             mark: HostMark::Staging,
-            panes: 2,
             ..Card::default()
         };
         assert_eq!(
@@ -3546,7 +3654,6 @@ mod tests {
                 ("Running · $ make test · 1m 05s".to_owned(), Tone::Accent),
                 ("↑ Uploading logs.tgz · 42%".to_owned(), Tone::Accent),
                 ("Staging host".to_owned(), Tone::Mark),
-                ("2 panes".to_owned(), Tone::Dim),
             ]
         );
         let remote = Card {
@@ -3557,7 +3664,6 @@ mod tests {
                 command: "r$ false".into(),
                 exit: 1,
             }),
-            panes: 1,
             ..Card::default()
         };
         assert_eq!(
@@ -3600,5 +3706,176 @@ mod tests {
             card_lines(&done)[1],
             ("Finished · $ ls · 0.2s".to_owned(), Tone::Success)
         );
+    }
+
+    fn pane_on_the_map(id: u64, place: Rect, indicator: Option<Indicator>) -> CardPane {
+        CardPane {
+            id,
+            place,
+            kind: Kind::Shell,
+            name: format!("pane {id}"),
+            indicator,
+            exit: None,
+            focused: id == 1,
+        }
+    }
+
+    /// A split tab's card keeps its name, its folder and its host's kind; what each pane does is
+    /// on the map, so the command and the transfer lines are gone — and no "N panes" line.
+    #[test]
+    fn a_split_tabs_card_has_no_command_no_transfer_and_no_pane_count() {
+        let card = Card {
+            title: "api".into(),
+            directory: Some("/Users/me/src/api".into()),
+            home: Some("/Users/me".into()),
+            command: Some(CardCommand::Running {
+                command: "$ make test".into(),
+                elapsed: Duration::from_secs(65),
+            }),
+            upload: Some(("logs.tgz".into(), 42, false)),
+            mark: HostMark::Production,
+            panes: vec![
+                pane_on_the_map(1, Rect::new(0.0, 0.0, 0.5, 1.0), None),
+                pane_on_the_map(2, Rect::new(0.5, 0.0, 0.5, 1.0), None),
+            ],
+            aspect: 0.6,
+            ..Card::default()
+        };
+        assert_eq!(
+            card_lines(&card),
+            [
+                ("api".to_owned(), Tone::Title),
+                ("~/src/api".to_owned(), Tone::Dim),
+                ("Production host".to_owned(), Tone::Mark),
+            ]
+        );
+        let one = Card {
+            panes: vec![pane_on_the_map(1, Rect::new(0.0, 0.0, 1.0, 1.0), None)],
+            ..card
+        };
+        assert_eq!(
+            card_lines(&one).len(),
+            5,
+            "a map of one pane is no map: the lines tell"
+        );
+    }
+
+    /// The tab says what its panes say, and nothing they do not: the union's indicator is the
+    /// most urgent of the panes' own, whichever panes they are.
+    #[test]
+    fn a_tabs_signals_are_its_panes_signals_together() {
+        let on = |question, running, failed, finished, uploading| Signals {
+            question,
+            running,
+            failed,
+            finished,
+            uploading,
+        };
+        let rank = |indicator: Option<Indicator>| match indicator {
+            Some(Indicator::Question) => 5,
+            Some(Indicator::Running) => 4,
+            Some(Indicator::Failed) => 3,
+            Some(Indicator::Finished) => 2,
+            Some(Indicator::Uploading) => 1,
+            None => 0,
+        };
+        let every: Vec<Signals> = (0..32)
+            .map(|bits: u32| {
+                on(
+                    bits & 1 != 0,
+                    bits & 2 != 0,
+                    bits & 4 != 0,
+                    bits & 8 != 0,
+                    bits & 16 != 0,
+                )
+            })
+            .collect();
+        for a in &every {
+            for b in &every {
+                let together = indicator(Signals::union([*a, *b]));
+                let most = rank(indicator(*a)).max(rank(indicator(*b)));
+                assert_eq!(rank(together), most, "{a:?} with {b:?}");
+            }
+        }
+        assert_eq!(Signals::union([]), Signals::default(), "no pane, no signal");
+        assert_eq!(
+            indicator(Signals::union([
+                Signals {
+                    finished: true,
+                    ..Signals::default()
+                },
+                Signals {
+                    running: true,
+                    ..Signals::default()
+                },
+            ])),
+            Some(Indicator::Running),
+            "a command running in one pane outranks a tick in another"
+        );
+    }
+
+    /// What a pane's word says and in which role it is drawn: the roles of the chip's own
+    /// indicators.
+    #[test]
+    fn a_pane_on_the_map_says_what_it_is_doing() {
+        let state = |indicator, exit| {
+            CardPane {
+                indicator,
+                exit,
+                ..pane_on_the_map(1, Rect::new(0.0, 0.0, 1.0, 1.0), None)
+            }
+            .state()
+        };
+        assert_eq!(state(None, None), None, "a quiet pane says nothing");
+        assert_eq!(
+            state(Some(Indicator::Running), None),
+            Some(("Running".to_owned(), Tone::Accent))
+        );
+        assert_eq!(
+            state(Some(Indicator::Question), None),
+            Some(("Asking".to_owned(), Tone::Warning))
+        );
+        assert_eq!(
+            state(Some(Indicator::Finished), None),
+            Some(("Finished".to_owned(), Tone::Success))
+        );
+        assert_eq!(
+            state(Some(Indicator::Failed), Some(2)),
+            Some(("Exit 2".to_owned(), Tone::Error))
+        );
+        assert_eq!(
+            state(Some(Indicator::Failed), None),
+            Some(("Failed".to_owned(), Tone::Error)),
+            "no code known, no made-up one"
+        );
+        assert_eq!(
+            state(Some(Indicator::Uploading), None),
+            Some(("Uploading".to_owned(), Tone::Accent))
+        );
+    }
+
+    /// The map takes the area's shape within its limits, and its panes are a gap apart with no
+    /// gap at the map's own edge.
+    #[test]
+    fn the_map_takes_the_areas_shape_and_its_panes_stand_a_gap_apart() {
+        assert_eq!(map_height(0.2), MAP_MIN_HEIGHT, "a wide window");
+        assert_eq!(map_height(2.0), MAP_MAX_HEIGHT, "a tall one");
+        assert_eq!(map_height(0.5), 138.0, "276 × 0.5");
+        assert_eq!(map_height(f64::NAN), MAP_MIN_HEIGHT);
+        assert_eq!(map_height(f64::INFINITY), MAP_MIN_HEIGHT);
+
+        let height = 140.0;
+        let whole = map_tile(Rect::new(0.0, 0.0, 1.0, 1.0), height);
+        assert_eq!(whole, Rect::new(0.0, 0.0, MAP_WIDTH, height));
+
+        let left = map_tile(Rect::new(0.0, 0.0, 0.5, 1.0), height);
+        let right = map_tile(Rect::new(0.5, 0.0, 0.5, 0.5), height);
+        let below = map_tile(Rect::new(0.5, 0.5, 0.5, 0.5), height);
+        assert_eq!(left.x, 0.0, "at the map's edge");
+        assert_eq!(left.y, 0.0);
+        assert_eq!(right.x - (left.x + left.width), MAP_GAP, "side by side");
+        assert_eq!(below.y - (right.y + right.height), MAP_GAP, "stacked");
+        assert_eq!(right.x + right.width, MAP_WIDTH, "at the far edge");
+        assert_eq!(below.y + below.height, height);
     }
 }

@@ -1857,6 +1857,25 @@ impl TerminalWindow {
         true
     }
 
+    /// A press on a pane of the summary card's map: tab `tab` is selected, by the applier's rules
+    /// (a question of the window's own refuses it, with a beep), and pane `pane` of it gets the
+    /// keyboard — so the tab's chip turns to that pane's program. `false` if the tab was not
+    /// selected.
+    pub(crate) fn show_pane(&self, tab: u64, pane: u64) -> bool {
+        if !self.select_tab(tab) {
+            return false;
+        }
+        if let Some(tab) = self.tab(tab)
+            && let Some(pane) = tab
+                .panes()
+                .into_iter()
+                .find(|candidate| candidate.id() == pane)
+        {
+            tab.focus_pane(&pane);
+        }
+        true
+    }
+
     /// **The applier: a new tab.** `tab` (its first pane born, not started)
     /// joins right of the selected one and is selected; its container goes
     /// under the bar at the content's size, so its shell's first

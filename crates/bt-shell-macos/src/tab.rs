@@ -64,7 +64,7 @@ use crate::sheets;
 use crate::split::{Axis, Direction, Placement, Removal, Tree};
 use crate::split_view::SplitView;
 use crate::tab_bar::{Emblem, Upload};
-use crate::tabs::{self, Card, CardCommand, Finish, Indicator, Signals, Tally, Unseen};
+use crate::tabs::{self, Card, CardCommand, CardPane, Finish, Indicator, Signals, Tally, Unseen};
 use crate::upload;
 use crate::uploader;
 use crate::window::{TerminalWindow, initial_rect};
@@ -288,6 +288,10 @@ pub(crate) struct TabIvars {
     /// Each pane's ended-command counts as last looked at (pane id, counts):
     /// the difference to `Session::activity`'s is what ended since.
     tallies: RefCell<Vec<(u64, Tally)>>,
+    /// What each pane's own ends have left on it (pane id, marks): the same events as `unseen`,
+    /// told apart by pane for the summary card's map. `unseen` is the tab's memory and outlives
+    /// a pane that closes with its tick on it; these go with their pane.
+    ends: RefCell<Vec<(u64, Unseen)>>,
     /// What the arrangement moment lifted, while it is up
     /// ([`TerminalTab::arrange`]).
     raised: RefCell<Option<Raised>>,
@@ -327,6 +331,7 @@ impl TerminalTab {
             focused: Cell::new(pane.id()),
             unseen: Cell::new(Unseen::default()),
             tallies: RefCell::new(Vec::new()),
+            ends: RefCell::new(Vec::new()),
             raised: RefCell::new(None),
         });
         // SAFETY: NSObject's init takes no arguments and the ivars are set.
@@ -1031,23 +1036,61 @@ impl TerminalTab {
     }
 
     /// What the tab's chip shows left of its title — the most urgent of its
-    /// signals (`tabs::indicator`): a question of the tab that waits for an
-    /// answer the user cannot see ([`sheets::question_waiting`], or a program
-    /// that reported itself blocked, [`Self::program_blocked`]), a command
-    /// running in any pane ([`Self::running_for`]), a command that ended
-    /// while the tab was away ([`TabIvars::unseen`]) and a transfer flowing
-    /// ([`Self::upload`]).
+    /// signals (`tabs::indicator`), which are its panes' together
+    /// ([`Signals::union`]; [`Self::signals_of`] says what a pane's are). The
+    /// tab adds its own memory of what ended unseen ([`TabIvars::unseen`]): a
+    /// pane that closed with its tick on it leaves the tick on the tab.
     pub(crate) fn indicator(&self) -> Option<Indicator> {
         let Unseen {
             finished, failed, ..
         } = self.ivars().unseen.get();
-        tabs::indicator(Signals {
-            question: sheets::question_waiting(self.container()) || self.program_blocked(),
-            running: self.running_for().is_some(),
-            failed,
-            finished,
-            uploading: self.upload().is_some(),
-        })
+        let (hidden, away) = (self.hidden(), self.away());
+        let mut all = Signals::union(
+            self.panes()
+                .iter()
+                .map(|pane| self.signals_of(pane, hidden, away)),
+        );
+        all.finished |= finished;
+        all.failed |= failed;
+        tabs::indicator(all)
+    }
+
+    /// Whether the tab is off the screen (its container hidden, or an ancestor's).
+    fn hidden(&self) -> bool {
+        self.container().isHiddenOrHasHiddenAncestor()
+    }
+
+    /// Whether the tab is not the one on screen in its window.
+    fn away(&self) -> bool {
+        self.window()
+            .is_some_and(|window| !window.is_selected(self.id()))
+    }
+
+    /// What one pane of the tab reports (`hidden`: [`Self::hidden`], `away`: [`Self::away`], read
+    /// once for all the panes): a question of its own that waits for an answer the user cannot see
+    /// ([`sheets::pane_waiting`], or a program that reported itself blocked while the tab is
+    /// away, [`Self::program_blocked`]), a command running in it ([`pane_running`]), a command or
+    /// transfer of it that ended while the tab was away ([`TabIvars::ends`]) and a transfer
+    /// flowing in it.
+    fn signals_of(&self, pane: &TerminalPane, hidden: bool, away: bool) -> Signals {
+        let unseen = self.unseen_of(pane.id());
+        Signals {
+            question: sheets::pane_waiting(pane, hidden) || (away && program_blocked(pane)),
+            running: pane_running(pane).is_some(),
+            failed: unseen.failed,
+            finished: unseen.finished,
+            uploading: pane.upload_title_prefix().is_some(),
+        }
+    }
+
+    /// What pane `id`'s own ends have left on it.
+    fn unseen_of(&self, id: u64) -> Unseen {
+        self.ivars()
+            .ends
+            .borrow()
+            .iter()
+            .find(|(pane, _)| *pane == id)
+            .map_or_else(Unseen::default, |(_, unseen)| *unseen)
     }
 
     /// What the tab's chip draws before its title: the program the focused pane runs and, when
@@ -1065,26 +1108,6 @@ impl TerminalTab {
         }
     }
 
-    /// A program in one of the tab's panes reported itself blocked on the user
-    /// (`OSC 7501`) while the tab is **not** the one on screen: the question
-    /// the user cannot see. On screen the program's own prompt is in front of
-    /// them and the chip stays quiet. A leaf lock per pane
-    /// (`Session::activity`).
-    fn program_blocked(&self) -> bool {
-        let Some(window) = self.window() else {
-            return false;
-        };
-        !window.is_selected(self.id())
-            && self.panes().iter().any(|pane| {
-                pane.session().is_some_and(|session| {
-                    session
-                        .activity()
-                        .program
-                        .is_some_and(|program| program.blocked)
-                })
-            })
-    }
-
     /// How long the tab's running command has run — the focused pane's if
     /// one runs there, else the first running pane's in tree order; `None`
     /// when no pane runs one (`Session::activity`). A pane on the alternate
@@ -1094,12 +1117,8 @@ impl TerminalTab {
     /// atomic per pane, no `Term` — the screen is the one the pane last
     /// drew (`Session::alt_screen`).
     pub(crate) fn running_for(&self) -> Option<Duration> {
-        let running = |pane: &TerminalPane| {
-            let session = pane.session()?;
-            let activity = session.activity();
-            tabs::ring_running(activity.running, activity.program, session.alt_screen())
-        };
-        running(&self.focused_pane()).or_else(|| self.panes().iter().find_map(|pane| running(pane)))
+        pane_running(&self.focused_pane())
+            .or_else(|| self.panes().iter().find_map(|pane| pane_running(pane)))
     }
 
     /// A transfer flowing in any of the tab's panes: its direction (the
@@ -1165,9 +1184,20 @@ impl TerminalTab {
             .iter()
             .find(|candidate| candidate.id() == pane)
             .map_or_else(|| self.focused_pane().program_kind(), |p| p.program_kind());
+        let selected = window.is_selected(self.id());
         let mut unseen = self.ivars().unseen.get();
-        unseen.observe_transfer(finish, window.is_selected(self.id()), ran);
+        unseen.observe_transfer(finish, selected, ran);
         self.ivars().unseen.set(unseen);
+        let mut ends = self.ivars().ends.borrow_mut();
+        match ends.iter_mut().find(|(id, _)| *id == pane) {
+            Some((_, mine)) => mine.observe_transfer(finish, selected, ran),
+            None => {
+                let mut mine = Unseen::default();
+                mine.observe_transfer(finish, selected, ran);
+                ends.push((pane, mine));
+            }
+        }
+        drop(ends);
         window.transfer_ended(self.id(), finish);
     }
 
@@ -1180,6 +1210,9 @@ impl TerminalTab {
         let mut unseen = self.ivars().unseen.get();
         unseen.looked();
         self.ivars().unseen.set(unseen);
+        for (_, mine) in self.ivars().ends.borrow_mut().iter_mut() {
+            mine.looked();
+        }
     }
 
     /// Reads every pane's ended-command counts against the ones last seen,
@@ -1188,7 +1221,9 @@ impl TerminalTab {
     fn observe_ends(&self, selected: bool) {
         let mut unseen = self.ivars().unseen.get();
         let mut tallies = self.ivars().tallies.borrow_mut();
+        let mut ends = self.ivars().ends.borrow_mut();
         let mut next = Vec::new();
+        let mut next_ends = Vec::new();
         for pane in self.panes() {
             let Some(activity) = pane.session().map(|session| session.activity()) else {
                 continue;
@@ -1208,15 +1243,23 @@ impl TerminalTab {
                 pane.ended_kind()
             };
             unseen.observe(seen, now, selected, ended);
+            let mut mine = ends
+                .iter()
+                .find(|(id, _)| *id == pane.id())
+                .map_or_else(Unseen::default, |(_, mine)| *mine);
+            mine.observe(seen, now, selected, ended);
             next.push((pane.id(), now));
+            next_ends.push((pane.id(), mine));
         }
         *tallies = next;
+        *ends = next_ends;
         self.ivars().unseen.set(unseen);
     }
 
     /// What the tab's summary card tells, from the focused pane: its title,
-    /// directory (`host:path` remotely), newest command, transfer, marked
-    /// host and the pane count (`tabs::card_lines` lays them out). The
+    /// directory (`host:path` remotely), newest command, transfer and marked
+    /// host (`tabs::card_lines` lays them out) — and, for a tab of several
+    /// panes, the map of them all ([`Self::card_panes`]). The
     /// newest command's row is read from the grid — a `Term` round, never
     /// on the frame path: when the card opens and, while it is open, when
     /// what the tab's chip shows changes (`tab_bar::TabBar::show`;
@@ -1268,8 +1311,60 @@ impl TerminalTab {
             command,
             upload,
             mark: self.host_mark(),
-            panes: self.panes().len(),
+            panes: self.card_panes(),
+            aspect: {
+                let area = self.container().bounds().size;
+                area.height / area.width
+            },
         }
+    }
+
+    /// The card's map: every pane of a split tab where it stands in the tab (the split tree's own
+    /// proportions, so a zoomed pane does not fold the map), with the program it shows, its
+    /// name and what it reports — the tab's indicator rule over the pane's signals alone
+    /// ([`Self::signals_of`]). While a pane shows a tick or a dot the program is the one that
+    /// ended, as the chip's emblem has it ([`Self::emblem`]). Empty for a tab of one pane. A
+    /// failed pane's exit code is read from its newest command's row — a `Term` round, which the
+    /// card's own read allows.
+    fn card_panes(&self) -> Vec<CardPane> {
+        let panes = self.panes();
+        if panes.len() < 2 {
+            return Vec::new();
+        }
+        let (hidden, away) = (self.hidden(), self.away());
+        let focused = self.focused_pane().id();
+        self.container()
+            .tree()
+            .fractions()
+            .into_iter()
+            .filter_map(|(id, place)| {
+                let pane = panes.iter().find(|pane| pane.id() == id)?;
+                let indicator = tabs::indicator(self.signals_of(pane, hidden, away));
+                let ended = matches!(indicator, Some(Indicator::Finished | Indicator::Failed))
+                    .then(|| self.unseen_of(id).kind())
+                    .flatten();
+                let exit = (indicator == Some(Indicator::Failed))
+                    .then(|| {
+                        pane.session()?
+                            .last_block_info()?
+                            .exit
+                            .filter(|exit| *exit != 0)
+                    })
+                    .flatten();
+                Some(CardPane {
+                    id,
+                    place,
+                    kind: ended.unwrap_or_else(|| pane.program_kind()),
+                    name: pane
+                        .session()
+                        .map(|session| session.title())
+                        .unwrap_or_default(),
+                    indicator,
+                    exit,
+                    focused: id == focused,
+                })
+            })
+            .collect()
     }
 
     /// The window became key: a question up in this tab takes the keyboard
@@ -1469,10 +1564,32 @@ fn pane_status(pane: &TerminalPane) -> Status {
     if session.remote_target().is_some() {
         return Status::Remote;
     }
-    let activity = session.activity();
-    if tabs::ring_running(activity.running, activity.program, session.alt_screen()).is_some() {
+    if pane_running(pane).is_some() {
         Status::Running
     } else {
         Status::Shell
     }
+}
+
+/// How long the command running in `pane` has run; `None` when it runs none. A pane on the
+/// alternate screen counts as running none (`tabs::ring_running`): a full-screen program gets no
+/// ring. A leaf lock and an atomic, no `Term` — the screen is the one the pane last drew
+/// (`Session::alt_screen`). The ring, the chip's indicator and the capsule's status all read it.
+fn pane_running(pane: &TerminalPane) -> Option<Duration> {
+    let session = pane.session()?;
+    let activity = session.activity();
+    tabs::ring_running(activity.running, activity.program, session.alt_screen())
+}
+
+/// A program in `pane` reported itself blocked on the user (`OSC 7501`: a permission, a
+/// question, a login). Only a tab that is **not** the one on screen shows it as a question the
+/// user cannot see: on screen the program's own prompt is in front of them and the chip stays
+/// quiet. A leaf lock (`Session::activity`).
+fn program_blocked(pane: &TerminalPane) -> bool {
+    pane.session().is_some_and(|session| {
+        session
+            .activity()
+            .program
+            .is_some_and(|program| program.blocked)
+    })
 }

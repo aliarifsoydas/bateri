@@ -494,12 +494,12 @@ pub(crate) fn window_asks(window: &NSWindow) -> bool {
     window.attachedSheet().is_some()
 }
 
-/// Whether `container`'s tab has a question the user cannot see: one
-/// parked in a pane's slot, or one up on its owner while the tab is off
-/// screen — the tab's "waiting for an answer" mark.
-pub(crate) fn question_waiting(container: &dyn Cover) -> bool {
-    parked_in(container)
-        || (container.view().isHiddenOrHasHiddenAncestor() && owner_busy(container))
+/// Whether `pane` has a question the user cannot see: one parked in its
+/// slot, or one it has up on its tab's owner while the tab is off screen
+/// (`tab_hidden`) — the tab's "waiting for an answer" mark is any of its
+/// panes', and the summary card's map shows it pane by pane.
+pub(crate) fn pane_waiting(pane: &TerminalPane, tab_hidden: bool) -> bool {
+    !pane.parked().borrow().is_empty() || (tab_hidden && !pane.opened().borrow().is_empty())
 }
 
 /// Where the question up on `container`'s tab ends: the sheet's bottom
