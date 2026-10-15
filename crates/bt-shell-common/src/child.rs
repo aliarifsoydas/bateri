@@ -666,14 +666,28 @@ pub(crate) mod tests {
     use super::*;
     use crate::settings::TempRoot;
 
-    /// Writes `body` to `path` as a program (mode 755) that a test is about to run — through
-    /// `cp`, not from this process. The tests fork from many threads at once, and a child
-    /// forked while this process held the file open for writing keeps that handle until it
-    /// execs; Linux refuses to run a file anyone holds open for writing (`ETXTBSY`). Written
-    /// by a `cp` that has exited, the file has no writer to hand on (measured in the Linux
-    /// image with four threads forking: 86 refusals in 3000 runs written in-process, none
-    /// through `cp`).
+    /// Writes `body` (a `#!/bin/sh` script) to `path` as a program (mode 755) that a test is
+    /// about to run, ready to run at once.
+    ///
+    /// **Through `cp`, not from this process.** The tests fork from many threads at once, and
+    /// a child forked while this process held the file open for writing keeps that handle
+    /// until it execs; Linux refuses to run a file anyone holds open for writing (`ETXTBSY`).
+    /// Written by a `cp` that has exited, the file has no writer to hand on (measured in the
+    /// Linux image with four threads forking: 86 refusals in 3000 runs written in-process,
+    /// none through `cp`).
+    ///
+    /// **Run once here, doing nothing.** macOS checks a new file the first time it runs —
+    /// every new file, a copy or a rewrite included — before the program starts (measured:
+    /// a tenth of a second to a second and a half on an idle machine, up to three seconds
+    /// while this crate's tests run; the second run takes milliseconds). Paid inside a test's
+    /// wait, two fresh programs used up most of a ten-second one. The line after the shebang
+    /// ends the warm-up run before the body, so the body's side effects (the logs the tests
+    /// read) count only the test's own runs.
     pub(crate) fn write_program(path: &Path, body: &str) {
+        let rest = body
+            .strip_prefix("#!/bin/sh\n")
+            .expect("a stand-in program is a `#!/bin/sh` script");
+        let body = format!("#!/bin/sh\n[ -n \"${{BT_TEST_WARM_UP-}}\" ] && exit 0\n{rest}");
         let name = path.file_name().expect("a file name").to_string_lossy();
         let source = path.with_file_name(format!(".{name}.source"));
         std::fs::write(&source, body).expect("the program's source");
@@ -686,6 +700,14 @@ pub(crate) mod tests {
         std::fs::remove_file(&source).expect("the program's source");
         std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("chmod");
+        let warmed = std::process::Command::new(path)
+            .env("BT_TEST_WARM_UP", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("the warm-up run");
+        assert!(warmed.success(), "the warm-up run of {}", path.display());
     }
 
     /// A reader that reads the environment from a fixed list; anything not in the list is
@@ -970,10 +992,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// The memory, not the time limit: macOS checks a freshly written program the first
-    /// time it runs (measured at a quarter to a third of a second on an idle machine, a few
-    /// milliseconds for the second run), and a busy test run stretches that past
-    /// [`BASH_QUERY_LIMIT`] — so the stand-ins here are asked with a far longer limit.
+    /// The memory, not the time limit: the stand-ins here are asked with a limit far above
+    /// [`BASH_QUERY_LIMIT`], which a busy test run can stretch a shell's answer past.
     #[test]
     fn a_version_is_asked_once_per_path_failures_included() {
         let limit = std::time::Duration::from_secs(30);

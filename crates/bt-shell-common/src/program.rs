@@ -2373,10 +2373,6 @@ mod tests {
         let exec = dir.join("bin/python3");
         crate::child::tests::write_program(&exec, "#!/bin/sh\necho \"Python 3.99.1\"\n");
         std::fs::write(dir.join("pyvenv.cfg"), "home = /usr/bin\n").expect("cfg");
-        // macOS looks a file over the first time it runs, before it starts —
-        // measured at up to 1.7 s on a loaded machine, against the job's 2 s.
-        // One run with room first, so the job's own is the second.
-        let _ = run_version(&exec, Duration::from_secs(20));
         let program = Program {
             pid: 1,
             family: Family::Python,
