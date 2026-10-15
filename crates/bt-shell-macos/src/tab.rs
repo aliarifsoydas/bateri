@@ -64,7 +64,7 @@ use crate::sheets;
 use crate::split::{Axis, Direction, Placement, Removal, Tree};
 use crate::split_view::SplitView;
 use crate::tab_bar::{Emblem, Upload};
-use crate::tabs::{self, Card, CardCommand, Indicator, Signals, Tally, Unseen};
+use crate::tabs::{self, Card, CardCommand, Finish, Indicator, Signals, Tally, Unseen};
 use crate::upload;
 use crate::uploader;
 use crate::window::{TerminalWindow, initial_rect};
@@ -138,6 +138,12 @@ impl PaneHost for TabHost {
     fn activity_changed(&self, _pane: u64) {
         if let Some(tab) = self.tab() {
             tab.activity_changed();
+        }
+    }
+
+    fn upload_ended(&self, pane: u64, finish: Finish) {
+        if let Some(tab) = self.tab() {
+            tab.upload_ended(pane, finish);
         }
     }
 
@@ -274,8 +280,9 @@ pub(crate) struct TabIvars {
     /// ([`TerminalTab::focused_pane`]). Written by the pane's
     /// `PaneHost::focused` event when `BateriView` becomes first responder.
     focused: Cell<u64>,
-    /// Commands that ended while the tab was not selected — the chip's tick
-    /// and dot until the tab is selected ([`TerminalTab::activity_changed`],
+    /// Commands and transfers that ended while the tab was not selected — the
+    /// chip's tick and dot until the tab is selected
+    /// ([`TerminalTab::activity_changed`], [`TerminalTab::upload_ended`],
     /// [`TerminalTab::look`]).
     unseen: Cell<Unseen>,
     /// Each pane's ended-command counts as last looked at (pane id, counts):
@@ -1143,6 +1150,25 @@ impl TerminalTab {
         };
         self.observe_ends(window.is_selected(self.id()));
         window.refresh_bar();
+    }
+
+    /// A transfer queue of pane `pane` ended ([`PaneHost::upload_ended`]): what ended while the
+    /// tab was not selected marks it like a command's end ([`Unseen::observe_transfer`] — the
+    /// tick or dot is of the program the pane runs now), and the bar plays the end of the tab's
+    /// fill once ([`TerminalWindow::transfer_ended`]), selected or not.
+    pub(crate) fn upload_ended(&self, pane: u64, finish: Finish) {
+        let Some(window) = self.window() else {
+            return;
+        };
+        let ran = self
+            .panes()
+            .iter()
+            .find(|candidate| candidate.id() == pane)
+            .map_or_else(|| self.focused_pane().program_kind(), |p| p.program_kind());
+        let mut unseen = self.ivars().unseen.get();
+        unseen.observe_transfer(finish, window.is_selected(self.id()), ran);
+        self.ivars().unseen.set(unseen);
+        window.transfer_ended(self.id(), finish);
     }
 
     /// The user saw the tab: its ends so far are seen and its tick or dot

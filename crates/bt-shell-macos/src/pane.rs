@@ -140,6 +140,11 @@ pub trait PaneHost {
     /// Nothing for an owner that draws no such icon — the embedding interface has no event for
     /// it, and `activity_changed`'s is a command's or the screen's.
     fn program_changed(&self, _pane: u64) {}
+    /// The pane's transfer queue ended, as `finish` says: what the tab's chip plays out and
+    /// leaves on the tab while the user is elsewhere. Called **before** the pane tells its
+    /// title the transfer is gone, so the tab reads the end together with that news. Nothing for
+    /// an owner that draws no such chip — the embedding interface has no event for it.
+    fn upload_ended(&self, _pane: u64, _finish: crate::tabs::Finish) {}
     /// Notification to the user (upload finished, failed, connection lost).
     fn notify(&self, pane: u64, title: &str, body: &str);
     /// Subtitle notices (today only the font's, `sync_geometry`).

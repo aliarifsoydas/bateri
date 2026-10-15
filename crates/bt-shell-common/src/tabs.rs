@@ -35,6 +35,7 @@ use std::time::Duration;
 use bt_core::{HostMark, ProgramActivity};
 
 use crate::program::identity::Kind;
+use crate::upload::End;
 
 /// A window's tabs in strip order, and the selected one.
 ///
@@ -600,7 +601,8 @@ pub struct Strip {
     pub fade_leading: bool,
     pub fade_trailing: bool,
     /// Centres of the separators that show: only between two tabs neither of which is selected,
-    /// hovered or dragged — a lit tab already has an edge.
+    /// hovered, dragged or filling with a transfer ([`Bar::layout_with`]) — a lit tab already
+    /// has an edge.
     pub separators: Vec<f64>,
     /// `+`, always at the right end.
     pub new_tab: f64,
@@ -623,6 +625,13 @@ impl Bar {
     /// [`MIN_WIDTH`] does not fit, the tabs stay at that width, Show All Tabs joins the buttons
     /// (taking its space from the strip) and the strip scrolls.
     pub fn layout(&self) -> Strip {
+        self.layout_with(|_| false)
+    }
+
+    /// [`Self::layout`], with tabs that are lit by something beside the selection, the pointer
+    /// and a drag: `glowing(index)` for a tab whose ground fills with a transfer — it has an
+    /// edge of its own, so no separator touches it either.
+    pub fn layout_with(&self, glowing: impl Fn(usize) -> bool) -> Strip {
         let fit = Fit::of(self.corner);
         let new_tab = self.width - fit.inset - BUTTON;
         let left_of = beside;
@@ -685,7 +694,10 @@ impl Bar {
             .map(|index| Span::new(span.x + index as f64 * slot - scroll, width))
             .collect();
         let lit = |index: usize| {
-            index == self.selected || self.hovered == Some(index) || self.dragged == Some(index)
+            index == self.selected
+                || self.hovered == Some(index)
+                || self.dragged == Some(index)
+                || glowing(index)
         };
         let separators = (1..self.count)
             .filter(|&right| !lit(right - 1) && !lit(right))
@@ -1238,6 +1250,29 @@ impl Unseen {
         }
     }
 
+    /// A transfer of a pane of the tab ended as `finish` says, and `ended` is what the pane runs
+    /// (the program its tick or dot is of, as for a command's end). Like a command's end, what
+    /// ends while the tab is **not selected** marks it — a success as finished, a failure as
+    /// failed, both kept until the tab is looked at ([`Self::looked`]); a transfer the user
+    /// stopped leaves nothing behind. A second transfer flowing does not take the tick away: the
+    /// indicator ranks a finished tab above an uploading one ([`indicator`]).
+    pub fn observe_transfer(&mut self, finish: Finish, selected: bool, ended: Kind) {
+        if selected {
+            return;
+        }
+        match finish {
+            Finish::Done => {
+                self.finished = true;
+                self.finished_kind = Some(ended);
+            }
+            Finish::Failed => {
+                self.failed = true;
+                self.failed_kind = Some(ended);
+            }
+            Finish::Stopped => {}
+        }
+    }
+
     /// What the mark on the chip is of: the failure's program while one is marked (the dot is
     /// what the chip shows then), else the success's. `None` when nothing is marked.
     pub fn kind(&self) -> Option<Kind> {
@@ -1253,6 +1288,93 @@ impl Unseen {
     /// The tab came on screen: what it showed is seen.
     pub fn looked(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// How a transfer queue ended, as a tab takes it: what its chip's fill plays out ([`Ending`])
+/// and what it leaves on the tab ([`Unseen::observe_transfer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Finish {
+    /// Everything arrived.
+    Done,
+    /// The remote disk filled, the session closed or the stream failed.
+    Failed,
+    /// The user stopped it: nothing went wrong, so nothing is left to see.
+    Stopped,
+}
+
+impl Finish {
+    /// The way a queue ended ([`crate::upload::Ended::end`]) as a tab takes it.
+    pub fn of(end: &End) -> Self {
+        match end {
+            End::Done => Self::Done,
+            End::Cancelled => Self::Stopped,
+            End::DiskFull | End::Closed | End::Failed(_) => Self::Failed,
+        }
+    }
+}
+
+/// The seconds a chip's fill takes to follow a progress report: the reports come every
+/// [`crate::upload::TICK`], so the fill is always on its way and never waits at a step.
+pub const FILL_FLOW: f64 = 0.2;
+
+/// How long a finished transfer's fill rests before it fades: the whole way filled, a failure
+/// turned to the error colour — a failure is read before it goes, so it stays a little longer.
+const FILL_HOLD: f64 = 0.4;
+const FILL_HOLD_FAILED: f64 = 0.7;
+/// How long the fill takes to fade away, and under Reduce Motion the one short fade that is left.
+const FILL_FADE: f64 = 0.4;
+const FILL_FADE_REDUCED: f64 = 0.15;
+
+/// How a chip's fill ends once its transfer has: the run to the far end, the rest, the fade. All
+/// in seconds, from the moment the end is told. Under Reduce Motion there is no run and no rest,
+/// only a short fade.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ending {
+    /// The fill runs to the far end first (a transfer that arrived) before it rests.
+    pub fills_up: bool,
+    /// The fill turns to the error colour (a transfer that failed).
+    pub failed: bool,
+    /// The run to the far end; 0 when the fill stays where it is.
+    pub run: f64,
+    pub hold: f64,
+    pub fade: f64,
+}
+
+impl Ending {
+    pub fn of(finish: Finish, reduce_motion: bool) -> Self {
+        let (fills_up, failed) = (finish == Finish::Done, finish == Finish::Failed);
+        if reduce_motion {
+            return Self {
+                fills_up,
+                failed,
+                run: 0.0,
+                hold: 0.0,
+                fade: FILL_FADE_REDUCED,
+            };
+        }
+        Self {
+            fills_up,
+            failed,
+            run: if fills_up { FILL_FLOW } else { 0.0 },
+            hold: match finish {
+                Finish::Done => FILL_HOLD,
+                Finish::Failed => FILL_HOLD_FAILED,
+                Finish::Stopped => 0.0,
+            },
+            fade: FILL_FADE,
+        }
+    }
+
+    /// How long the fill is still the tab's ground — the run and the rest. The tab is lit until
+    /// then: its title is in full ink and no separator touches it. A fading fill is not a ground.
+    pub fn lit(&self) -> f64 {
+        self.run + self.hold
+    }
+
+    /// How long until the fill is gone.
+    pub fn total(&self) -> f64 {
+        self.lit() + self.fade
     }
 }
 
@@ -2030,6 +2152,18 @@ mod tests {
         }
         .layout();
         assert_eq!(dragged.separators, [dragged.chips[3].end() + GAP / 2.0]);
+        // A tab whose ground fills with a transfer is lit like a hovered one: its two gaps go.
+        let filling = Bar {
+            selected: 0,
+            ..bar(1000.0, 5)
+        }
+        .layout_with(|index| index == 3);
+        assert_eq!(filling.separators, [filling.chips[1].end() + GAP / 2.0]);
+        assert_eq!(
+            bar(1000.0, 5).layout_with(|_| false),
+            bar(1000.0, 5).layout(),
+            "nothing filling is the plain layout"
+        );
     }
 
     #[test]
@@ -2710,6 +2844,120 @@ mod tests {
         );
         assert!(unseen.finished && !unseen.failed);
         assert_eq!(unseen.kind(), Some(Kind::Task));
+    }
+
+    /// The way a queue ended, as a tab takes it: a stop is no news, the rest of the ways it can
+    /// go wrong are one failure.
+    #[test]
+    fn a_queue_ends_as_done_stopped_or_failed() {
+        assert_eq!(Finish::of(&End::Done), Finish::Done);
+        assert_eq!(Finish::of(&End::Cancelled), Finish::Stopped);
+        for end in [
+            End::DiskFull,
+            End::Closed,
+            End::Failed("Connection reset".to_owned()),
+        ] {
+            assert_eq!(Finish::of(&end), Finish::Failed, "{end:?}");
+        }
+    }
+
+    /// A transfer that ends while the tab is in the background leaves a tick (success) or a dot
+    /// (failure) like a command's end; one that ends while the tab is selected leaves nothing,
+    /// and neither does one the user stopped; looking clears the mark.
+    #[test]
+    fn a_transfer_the_user_did_not_see_end_marks_the_tab_until_it_is_selected() {
+        let mut unseen = Unseen::default();
+        unseen.observe_transfer(Finish::Done, true, Kind::Shell);
+        unseen.observe_transfer(Finish::Failed, true, Kind::Shell);
+        assert_eq!(unseen, Unseen::default(), "the selected tab");
+        unseen.observe_transfer(Finish::Stopped, false, Kind::Shell);
+        assert_eq!(unseen, Unseen::default(), "a stop is no news");
+        unseen.observe_transfer(Finish::Done, false, Kind::Task);
+        assert!(unseen.finished && !unseen.failed);
+        assert_eq!(
+            unseen.kind(),
+            Some(Kind::Task),
+            "the tick is of what the pane ran"
+        );
+        unseen.looked();
+        assert_eq!(unseen, Unseen::default(), "looking clears it");
+        unseen.observe_transfer(Finish::Failed, false, Kind::Shell);
+        assert!(unseen.failed && !unseen.finished);
+        assert_eq!(
+            indicator(Signals {
+                failed: unseen.failed,
+                ..Signals::default()
+            }),
+            Some(Indicator::Failed)
+        );
+    }
+
+    /// The tick a transfer left stays while another one flows, and a failure stays above a later
+    /// success: the indicator ranks both above an upload still going.
+    #[test]
+    fn a_second_transfer_does_not_take_the_mark_away() {
+        let mut unseen = Unseen::default();
+        unseen.observe_transfer(Finish::Done, false, Kind::Shell);
+        let flowing = |unseen: Unseen| {
+            indicator(Signals {
+                finished: unseen.finished,
+                failed: unseen.failed,
+                uploading: true,
+                ..Signals::default()
+            })
+        };
+        assert_eq!(flowing(unseen), Some(Indicator::Finished));
+        unseen.observe_transfer(Finish::Failed, false, Kind::Shell);
+        unseen.observe_transfer(Finish::Done, false, Kind::Shell);
+        assert_eq!(flowing(unseen), Some(Indicator::Failed));
+        // A command's end and a transfer's are one mark.
+        let mut mixed = Unseen::default();
+        mixed.observe(
+            Tally::default(),
+            Tally {
+                finished: 1,
+                failed: 0,
+            },
+            false,
+            Kind::Task,
+        );
+        mixed.observe_transfer(Finish::Done, false, Kind::Shell);
+        assert!(mixed.finished && !mixed.failed);
+    }
+
+    /// The fill's end: a success runs to the far end, rests, fades; a failure rests longer where
+    /// it stands; a stop only fades; Reduce Motion leaves one short fade. The tab is lit until the
+    /// fade begins, and the reports' pace is the transfer line's own.
+    #[test]
+    fn a_fill_ends_by_what_the_transfer_came_to() {
+        let done = Ending::of(Finish::Done, false);
+        assert!(done.fills_up && !done.failed);
+        assert_eq!((done.run, done.hold, done.fade), (0.2, 0.4, 0.4));
+        assert!((done.lit() - 0.6).abs() < 1e-9 && (done.total() - 1.0).abs() < 1e-9);
+        let failed = Ending::of(Finish::Failed, false);
+        assert!(!failed.fills_up && failed.failed);
+        assert_eq!((failed.run, failed.hold, failed.fade), (0.0, 0.7, 0.4));
+        let stopped = Ending::of(Finish::Stopped, false);
+        assert!(!stopped.fills_up && !stopped.failed);
+        assert_eq!(
+            (stopped.lit(), stopped.total()),
+            (0.0, 0.4),
+            "lit no longer"
+        );
+        for finish in [Finish::Done, Finish::Failed, Finish::Stopped] {
+            let reduced = Ending::of(finish, true);
+            assert_eq!(
+                (reduced.run, reduced.hold, reduced.lit()),
+                (0.0, 0.0, 0.0),
+                "{finish:?}"
+            );
+            assert!(reduced.fade > 0.0 && reduced.fade < 0.4, "a short fade");
+        }
+        assert_eq!(
+            Duration::from_secs_f64(FILL_FLOW),
+            crate::upload::TICK,
+            "the fill follows one report in the time between two"
+        );
     }
 
     /// The line round a tile's edge keeps an even pace along it: its angle from the centre passes

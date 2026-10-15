@@ -130,7 +130,7 @@ use crate::split::{Axis, Direction, Tree};
 use crate::split_view::SplitView;
 use crate::tab::{self, TerminalTab};
 use crate::tab_bar::{Label, TabBar};
-use crate::tabs::{self, Card, Tabs};
+use crate::tabs::{self, Card, Finish, Tabs};
 use crate::undo::{Record, Scene, Shape};
 
 /// Whether the theme's background is dark — the window chrome's appearance
@@ -2936,6 +2936,13 @@ impl TerminalWindow {
             .collect();
         let notice = self.ivars().notice.borrow().clone();
         self.bar().show(labels, self.selected_index(), notice);
+    }
+
+    /// A transfer of tab `tab` ended as `finish` says (`TerminalTab::upload_ended`): the bar plays
+    /// the end of the tab's fill, once, in the layout this starts.
+    pub(crate) fn transfer_ended(&self, tab: u64, finish: Finish) {
+        self.bar().transfer_ended(tab, finish);
+        self.refresh_bar();
     }
 
     /// The settings diagnostic (`AppDelegate::post_notices`, the only

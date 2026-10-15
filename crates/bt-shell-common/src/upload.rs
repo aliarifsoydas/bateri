@@ -1653,12 +1653,14 @@ pub struct Transfers {
 }
 
 /// The queue ended: the result line, its generation and the notification (title,
-/// body) to show if bateri is in the background.
+/// body) to show if bateri is in the background, and how it ended (what the tab's
+/// chip and its unseen mark say, [`crate::tabs::Finish`]).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Ended {
     pub line: Transfer,
     pub serial: u64,
     pub notice: Option<(String, String)>,
+    pub end: End,
 }
 
 /// The answer to a stop request ([`Transfers::stop_request`]).
@@ -2263,6 +2265,7 @@ impl Transfers {
             },
             serial: self.serial,
             notice,
+            end,
         })
     }
 

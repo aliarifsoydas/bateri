@@ -658,6 +658,11 @@ impl TerminalPane {
     /// restores the title, sends a notification if bateri is in the
     /// background, and removes the line after [`upload::LINGER`].
     fn show_end(&self, ended: Ended) {
+        // The tab hears how it ended first: the queue is gone already, so the refresh this starts
+        // sees both the end and the fill with nothing flowing — and the title's refresh, below,
+        // is not the one to tell the bar the transfer is over without saying why.
+        self.host()
+            .upload_ended(self.id(), crate::tabs::Finish::of(&ended.end));
         self.close_upload_list();
         self.dismiss_stale_stop();
         self.show_transfer(Some(ended.line));
