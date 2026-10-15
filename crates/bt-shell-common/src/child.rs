@@ -463,6 +463,12 @@ const BASH_QUERY_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// `None`: the shell did not answer, answered with something that is not a version, or ran
 /// out of time — the integration is not installed (the terminal works as it did before).
 pub fn bash_version(bash: &Path) -> Option<BashVersion> {
+    remembered_bash_version(bash, BASH_QUERY_LIMIT)
+}
+
+/// [`bash_version`]'s memory with the question's time limit as a parameter, so a test of
+/// the memory does not depend on how fast this machine runs a program.
+fn remembered_bash_version(bash: &Path, limit: std::time::Duration) -> Option<BashVersion> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock, PoisonError};
     static ASKED: OnceLock<Mutex<HashMap<PathBuf, Option<BashVersion>>>> = OnceLock::new();
@@ -474,7 +480,7 @@ pub fn bash_version(bash: &Path) -> Option<BashVersion> {
     {
         return *known;
     }
-    let answer = query_bash_version(bash, BASH_QUERY_LIMIT);
+    let answer = query_bash_version(bash, limit);
     asked
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -944,8 +950,13 @@ pub(crate) mod tests {
         );
     }
 
+    /// The memory, not the time limit: macOS checks a freshly written program the first
+    /// time it runs (measured at a quarter to a third of a second on an idle machine, a few
+    /// milliseconds for the second run), and a busy test run stretches that past
+    /// [`BASH_QUERY_LIMIT`] — so the stand-ins here are asked with a far longer limit.
     #[test]
     fn a_version_is_asked_once_per_path_failures_included() {
+        let limit = std::time::Duration::from_secs(30);
         let root = TempRoot::new("bash-version-cache");
         let log = root.0.join("asked");
         for (name, body) in [("good", "printf 5.3"), ("bad", "exit 1")] {
@@ -954,8 +965,8 @@ pub(crate) mod tests {
                 name,
                 &format!("echo asked >> '{}.{name}'\n{body}", log.display()),
             );
-            let first = bash_version(&path);
-            let second = bash_version(&path);
+            let first = remembered_bash_version(&path, limit);
+            let second = remembered_bash_version(&path, limit);
             assert_eq!(first, second, "{name}");
             assert_eq!(first.is_some(), name == "good", "{name}");
             let asked = std::fs::read_to_string(format!("{}.{name}", log.display()))
