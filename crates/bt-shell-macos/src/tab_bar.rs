@@ -150,12 +150,14 @@ use objc2_app_kit::{
     NSCompositingOperation, NSControl, NSControlStateValueOn, NSControlTextEditingDelegate,
     NSCursor, NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSEvent, NSEventMask,
     NSEventModifierFlags, NSEventType, NSFocusRingType, NSFont, NSFontWeightMedium,
-    NSFontWeightRegular, NSFontWeightSemibold, NSGradient, NSGraphicsContext, NSImage,
-    NSImageScaling, NSImageView, NSLineBreakMode, NSLineCapStyle, NSLineJoinStyle, NSMenu,
-    NSMenuItem, NSShadow, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTitlePosition,
-    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindowButton, NSWindowOrderingMode,
-    NSWindowStyleMask,
+    NSFontWeightRegular, NSFontWeightSemibold, NSGradient, NSGradientDrawingOptions,
+    NSGraphicsContext, NSImage, NSImageScaling, NSImageView, NSLineBreakMode, NSLineCapStyle,
+    NSLineJoinStyle, NSMenu, NSMenuItem, NSShadow, NSTextAlignment, NSTextField,
+    NSTextFieldDelegate, NSTitlePosition, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSWindowButton, NSWindowOrderingMode, NSWindowStyleMask,
 };
+use objc2_core_foundation::CFRetained;
+use objc2_core_graphics::CGImage;
 use objc2_foundation::{
     NSAffineTransform, NSArray, NSData, NSNotification, NSNumber, NSObjectProtocol, NSPoint,
     NSRect, NSSize, NSString, NSUserDefaults, NSValue, ns_string,
@@ -249,17 +251,17 @@ const GHOST_ALPHA: f64 = 0.35;
 /// with a card open does not wait again.
 const CARD_DELAY: Duration = Duration::from_millis(450);
 const CARD_WARM: Duration = Duration::from_millis(300);
-/// How long a card with a map outlives the pointer's leaving its chip, so the pointer can cross
+/// How long a card with a picture outlives the pointer's leaving its chip, so the pointer can cross
 /// the gap to the card (the design's 0.18 s).
 const CARD_BRIDGE: Duration = Duration::from_millis(180);
 
-/// The summary card: its width (the design's), corner, inner margins, the
-/// space between its lines and its gap below the chip.
-const CARD_WIDTH: f64 = 272.0;
+/// The summary card: its corner, inner margins, the space between its lines and its gap below
+/// the chip. The numbers that size the card are `tabs`' (width and height, the picture's
+/// included).
 const CARD_RADIUS: f64 = 10.0;
-const CARD_PAD_X: f64 = 12.0;
-const CARD_PAD_Y: f64 = 10.0;
-const CARD_LINE_GAP: f64 = 3.0;
+const CARD_PAD_X: f64 = tabs::CARD_PAD_X;
+const CARD_PAD_Y: f64 = tabs::CARD_PAD_Y;
+const CARD_LINE_GAP: f64 = tabs::CARD_LINE_GAP;
 const CARD_DROP: f64 = 8.0;
 /// How a card comes and goes. It arrives over [`CARD_IN`] at [`CARD_SCALE`] of its size, a
 /// [`CARD_SLIDE`] nearer its chip, and fading in; it goes by fading over [`CARD_OUT`] (and is
@@ -285,10 +287,6 @@ const ROW_LEFT: (f64, f64) = (-1.0, 0.0);
 const CARD_BESIDE: f64 = 8.0;
 const CARD_RISE: f64 = 4.0;
 const CARD_EDGE: f64 = 8.0;
-/// A card with a map is as wide as the map and its margins, and the map sits under the lines:
-/// their own gap and 7 pt more, as the design has it.
-const CARD_MAP_WIDTH: f64 = tabs::MAP_WIDTH + 2.0 * CARD_PAD_X;
-const CARD_MAP_GAP: f64 = CARD_LINE_GAP + 7.0;
 
 /// A pane on the card's map: where its program's tile, its name and its state stand in it, the
 /// type sizes, and the strengths of the foreground its face, its hovered face and its ring wear —
@@ -303,6 +301,15 @@ const MAP_STATE_TEXT: f64 = 11.0;
 const MAP_FACE: (f64, f64) = (0.08, 0.035);
 const MAP_FACE_HOT: (f64, f64) = (0.14, 0.08);
 const MAP_RING: (f64, f64) = (0.32, 0.28);
+/// A pane's picture on its tile: how strongly it is laid over the tile's face until the pointer is
+/// on the tile (then fully), the scrim of the face's own colour that quiets it under the tile's
+/// mark, name and state — opaque for [`MAP_SCRIM_HOLD`] of its height, then fading to nothing —
+/// and how tall that is, with a state line under the name and without.
+const MAP_SHOT_DIM: f64 = 0.86;
+const MAP_SCRIM_HOLD: f64 = 0.55;
+const MAP_SCRIM_STRENGTH: f64 = 0.94;
+const MAP_SCRIM_WITH_STATE: f64 = 44.0;
+const MAP_SCRIM_NAME_ONLY: f64 = 30.0;
 
 /// How far a notch of a mouse wheel scrolls the strip, points: a wheel reports
 /// lines where a trackpad reports points.
@@ -662,19 +669,22 @@ pub(crate) fn rounded(rect: NSRect, radius: f64, fill: Tint, line: Option<Tint>)
     fill.color().setFill();
     path.fill();
     if let Some(line) = line {
-        let inner = NSRect::new(
-            NSPoint::new(rect.origin.x + 0.5, rect.origin.y + 0.5),
-            NSSize::new(rect.size.width - 1.0, rect.size.height - 1.0),
-        );
-        let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-            inner,
-            radius - 0.5,
-            radius - 0.5,
-        );
-        path.setLineWidth(1.0);
-        line.color().setStroke();
-        path.stroke();
+        inner_line(rect, radius, line);
     }
+}
+
+/// The 1 pt `line` along the inside edge of a rounded `rect` — [`rounded`]'s line, alone, for what
+/// is painted over something else.
+pub(crate) fn inner_line(rect: NSRect, radius: f64, line: Tint) {
+    let inner = NSRect::new(
+        NSPoint::new(rect.origin.x + 0.5, rect.origin.y + 0.5),
+        NSSize::new(rect.size.width - 1.0, rect.size.height - 1.0),
+    );
+    let path =
+        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(inner, radius - 0.5, radius - 0.5);
+    path.setLineWidth(1.0);
+    line.color().setStroke();
+    path.stroke();
 }
 
 /// A glyph's stroked path in `color`, round caps and joins.
@@ -3912,7 +3922,7 @@ define_class!(
             self.hit(point)
         }
 
-        /// A press on the margin of a card with a map is held, not passed on: it neither moves
+        /// A press on the margin of a card with a picture is held, not passed on: it neither moves
         /// the window nor reaches the content under the card.
         #[unsafe(method(mouseDownCanMoveWindow))]
         fn can_move_window(&self) -> bool {
@@ -4018,9 +4028,36 @@ impl SummaryCard {
         self.on_bar(|bar, tab| bar.pick_pane(tab, pane));
     }
 
-    /// Writes `lines` (text and colour) top to bottom and the `map` of the tab's panes under
-    /// them, and sizes the card to them: [`CARD_WIDTH`] wide, or [`CARD_MAP_WIDTH`] with a map;
-    /// returns its size.
+    /// Each pane's new picture to its tile; a pane that gave none this time keeps the one it had.
+    fn set_shots(&self, shots: &[(u64, Option<CFRetained<CGImage>>)]) {
+        let tiles = self.ivars().tiles.borrow();
+        for (pane, image) in shots {
+            let tile = tiles.iter().find(|tile| tile.ivars().pane.get() == *pane);
+            if let (Some(image), Some(tile)) = (image, tile) {
+                tile.set_shot(image);
+            }
+        }
+    }
+
+    /// Some tile of the map has no picture yet (it is new, or its pane was not ready).
+    fn lacks_shots(&self) -> bool {
+        self.ivars()
+            .tiles
+            .borrow()
+            .iter()
+            .any(|tile| !tile.has_shot())
+    }
+
+    /// The tiles let go of their pictures.
+    fn clear_shots(&self) {
+        for tile in self.ivars().tiles.borrow().iter() {
+            tile.clear_shot();
+        }
+    }
+
+    /// Writes `lines` (text and colour) top to bottom and the `map` — the picture of the tab's
+    /// panes, one tile for a tab of one pane — under them, and sizes the card to them
+    /// (`tabs::card_width`, `tabs::card_height`); returns its size.
     fn write(
         &self,
         lines: &[(String, u32)],
@@ -4036,11 +4073,7 @@ impl SummaryCard {
             self.setShadow(Some(&shadow));
             self.setNeedsDisplay(true);
         }
-        let width = if map.is_some() {
-            CARD_MAP_WIDTH
-        } else {
-            CARD_WIDTH
-        };
+        let width = tabs::card_width(map.is_some());
         let mut labels = iv.labels.borrow_mut();
         while labels.len() > lines.len() {
             if let Some(gone) = labels.pop() {
@@ -4074,12 +4107,10 @@ impl SummaryCard {
         let bottom = y - CARD_LINE_GAP;
         let Some(map) = map else {
             self.set_tiles(None, 0.0, palette);
-            return NSSize::new(width, bottom + CARD_PAD_Y);
+            return NSSize::new(width, tabs::card_height(bottom, None));
         };
-        let top = bottom + CARD_MAP_GAP;
-        let height = tabs::map_height(map.aspect);
-        self.set_tiles(Some(map), top, palette);
-        NSSize::new(width, top + height + CARD_PAD_Y)
+        self.set_tiles(Some(map), tabs::map_top(bottom), palette);
+        NSSize::new(width, tabs::card_height(bottom, Some(map.aspect)))
     }
 
     /// The map's panes at `top` in the card, in place if they are the same panes as before (the
@@ -4124,6 +4155,13 @@ pub(crate) struct TileIvars {
     hot: Cell<bool>,
     focused: Cell<bool>,
     palette: Cell<Option<Palette>>,
+    /// The pane's picture, in the tile's size in points; none until the first one is taken.
+    shot: RefCell<Option<Retained<NSImage>>>,
+    /// The scrim's height, points: the tile says a state under its name or does not.
+    scrim: Cell<f64>,
+    /// The tile is the whole picture of a tab of one pane: no mark, name, state, scrim or ring
+    /// over it (the card's lines tell what they would), and a press on it shows the tab.
+    solo: Cell<bool>,
     icon: Retained<NSImageView>,
     name: Retained<NSTextField>,
     state: Retained<NSTextField>,
@@ -4193,15 +4231,25 @@ define_class!(
             };
             let (face, hot, ring) = (MAP_FACE, MAP_FACE_HOT, MAP_RING);
             let pick = |(dark, light): (f64, f64)| if palette.dark { dark } else { light };
-            let strength = if iv.hot.get() { pick(hot) } else { pick(face) };
+            let lit = iv.hot.get();
+            let strength = if lit { pick(hot) } else { pick(face) };
             let line = iv
                 .focused
                 .get()
                 .then(|| Tint::of(palette.title, pick(ring)));
-            rounded(
+            let picture = iv.shot.borrow();
+            paint_tile(
                 self.bounds(),
-                tabs::MAP_RADIUS,
                 Tint::of(palette.title, strength),
+                picture.as_deref().map(|image| TileShot {
+                    image,
+                    fraction: if lit { 1.0 } else { MAP_SHOT_DIM },
+                    // The face as it looks over the card — opaque, for the scrim to hide the
+                    // picture behind. The picture that is a whole tab has none: nothing is
+                    // written over it.
+                    scrim: (!iv.solo.get())
+                        .then(|| (mix(palette.card.rgb, palette.title, strength), iv.scrim.get())),
+                }),
                 line,
             );
         }
@@ -4222,6 +4270,9 @@ impl MapTile {
             hot: Cell::new(false),
             focused: Cell::new(false),
             palette: Cell::new(None),
+            shot: RefCell::new(None),
+            scrim: Cell::new(MAP_SCRIM_NAME_ONLY),
+            solo: Cell::new(false),
             icon: icon.clone(),
             name: name.clone(),
             state: state.clone(),
@@ -4251,6 +4302,23 @@ impl MapTile {
         }
     }
 
+    /// The pane's picture, laid in the tile at the tile's own size.
+    fn set_shot(&self, image: &CGImage) {
+        let picture = NSImage::initWithCGImage_size(NSImage::alloc(), image, self.frame().size);
+        self.ivars().shot.replace(Some(picture));
+        self.setNeedsDisplay(true);
+    }
+
+    fn has_shot(&self) -> bool {
+        self.ivars().shot.borrow().is_some()
+    }
+
+    fn clear_shot(&self) {
+        if self.ivars().shot.take().is_some() {
+            self.setNeedsDisplay(true);
+        }
+    }
+
     /// Shows `pane` at `frame` (in the card's space): its program's tile and what it reports,
     /// its name, and under it the word for its state in the role's colour. What does not fit the
     /// pane's height is left out rather than cut: the name needs the tile's mark beside it, the
@@ -4258,7 +4326,11 @@ impl MapTile {
     fn set(&self, pane: &CardPane, frame: NSRect, map: &MapDraw<'_>, palette: Palette) {
         let iv = self.ivars();
         iv.pane.set(pane.id);
-        iv.focused.set(pane.focused);
+        // A tab of one pane: its card's lines tell what the mark, name and state would, and
+        // there is no other pane to tell it from, so the picture stands alone.
+        let solo = map.panes.len() == 1;
+        iv.solo.set(solo);
+        iv.focused.set(pane.focused && !solo);
         iv.palette.set(Some(palette));
         self.setFrame(frame);
         let (width, height) = (frame.size.width, frame.size.height);
@@ -4269,7 +4341,7 @@ impl MapTile {
             NSSize::new(LIST_SIDE, LIST_SIDE),
         ));
         iv.icon
-            .setHidden(height < MAP_TILE_AT + LIST_SIDE || width < MAP_TILE_AT + LIST_SIDE);
+            .setHidden(solo || height < MAP_TILE_AT + LIST_SIDE || width < MAP_TILE_AT + LIST_SIDE);
         let room = width - MAP_TEXT_AT - MAP_TEXT_RIGHT;
         let text_ink = if pane.focused {
             palette.title
@@ -4290,9 +4362,14 @@ impl MapTile {
             NSPoint::new(MAP_TEXT_AT, MAP_TILE_AT),
             NSSize::new(room.max(0.0), MAP_NAME_HEIGHT),
         ));
-        name.setHidden(height < MAP_TILE_AT + MAP_NAME_HEIGHT || room < 12.0);
+        name.setHidden(solo || height < MAP_TILE_AT + MAP_NAME_HEIGHT || room < 12.0);
         let state = &iv.state;
         let word = pane.state();
+        iv.scrim.set(if word.is_some() {
+            MAP_SCRIM_WITH_STATE
+        } else {
+            MAP_SCRIM_NAME_ONLY
+        });
         if let Some((text, tone)) = &word {
             state.setFont(Some(&NSFont::systemFontOfSize_weight(
                 MAP_STATE_TEXT,
@@ -4305,13 +4382,88 @@ impl MapTile {
             NSPoint::new(MAP_TEXT_AT, MAP_STATE_AT),
             NSSize::new(room.max(0.0), MAP_STATE_HEIGHT),
         ));
-        state.setHidden(word.is_none() || height < MAP_STATE_AT + MAP_STATE_HEIGHT || room < 12.0);
+        state.setHidden(
+            solo || word.is_none() || height < MAP_STATE_AT + MAP_STATE_HEIGHT || room < 12.0,
+        );
         let said = match &word {
+            _ if solo => "Show this tab".to_owned(),
             Some((text, _)) => format!("{}, {text}", pane.name),
             None => pane.name.clone(),
         };
         self.setAccessibilityLabel(Some(&NSString::from_str(&said)));
         self.setNeedsDisplay(true);
+    }
+}
+
+/// What a map tile lays over its face: its pane's picture and how strongly, and — where the tile
+/// has a mark, a name and a state to say — the scrim that quiets the picture's top under them:
+/// the face's own colour, and its height.
+struct TileShot<'a> {
+    image: &'a NSImage,
+    fraction: f64,
+    scrim: Option<(u32, f64)>,
+}
+
+/// A map tile, bottom to top: its face; the pane's picture over it, clipped to the tile's corners;
+/// the scrim, if it has one (opaque for [`MAP_SCRIM_HOLD`] of its height, then fading to nothing);
+/// and the ring
+/// of the focused pane over all of it — drawn under the picture the picture would cover it. The
+/// mark, name and state are the tile's own subviews, over this.
+///
+/// The picture is drawn with the flip of the view respected, so it stands the right way up in a
+/// flipped view (a tile is one) and the picture's top is the tile's top.
+fn paint_tile(bounds: NSRect, face: Tint, shot: Option<TileShot<'_>>, ring: Option<Tint>) {
+    rounded(bounds, tabs::MAP_RADIUS, face, None);
+    if let Some(TileShot {
+        image,
+        fraction,
+        scrim,
+    }) = shot
+    {
+        NSGraphicsContext::saveGraphicsState_class();
+        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+            bounds,
+            tabs::MAP_RADIUS,
+            tabs::MAP_RADIUS,
+        )
+        .addClip();
+        // SAFETY: no hints.
+        unsafe {
+            image.drawInRect_fromRect_operation_fraction_respectFlipped_hints(
+                bounds,
+                NSRect::ZERO,
+                NSCompositingOperation::SourceOver,
+                fraction,
+                true,
+                None,
+            );
+        }
+        if let Some((rgb, height)) = scrim {
+            let top = bounds.origin.y;
+            let solid = height * MAP_SCRIM_HOLD;
+            Tint::of(rgb, MAP_SCRIM_STRENGTH).color().setFill();
+            NSBezierPath::fillRect(NSRect::new(
+                bounds.origin,
+                NSSize::new(bounds.size.width, solid),
+            ));
+            let gradient = NSGradient::initWithStartingColor_endingColor(
+                NSGradient::alloc(),
+                &Tint::of(rgb, MAP_SCRIM_STRENGTH).color(),
+                &Tint::of(rgb, 0.0).color(),
+            );
+            if let Some(gradient) = gradient {
+                // From the end of the solid part to the scrim's foot, down the (flipped) view.
+                gradient.drawFromPoint_toPoint_options(
+                    NSPoint::new(bounds.origin.x, top + solid),
+                    NSPoint::new(bounds.origin.x, top + height),
+                    NSGradientDrawingOptions::empty(),
+                );
+            }
+        }
+        NSGraphicsContext::restoreGraphicsState_class();
+    }
+    if let Some(line) = ring {
+        inner_line(bounds, tabs::MAP_RADIUS, line);
     }
 }
 
@@ -4901,21 +5053,27 @@ struct OpenCard {
 }
 
 impl OpenCard {
-    /// How long the card's command has run now; `None` unless it runs — and, with a map, the
-    /// card tells no time (each pane says only that it runs), so the clock has nothing to wake
-    /// for.
+    /// How long the card's command has run now; `None` unless it runs — and, with a map of
+    /// panes, the card tells no time (each pane says only that it runs), so the clock has nothing
+    /// to wake for; a tab of one pane's card tells it, under its picture, as it always did.
     fn running(&self) -> Option<Duration> {
         match &self.card.command {
-            Some(CardCommand::Running { elapsed, .. }) if !self.mapped() => {
+            Some(CardCommand::Running { elapsed, .. }) if !self.split() => {
                 Some(elapsed.saturating_add(self.read_at.elapsed()))
             }
             _ => None,
         }
     }
 
-    /// The card carries a map of its tab's panes.
-    fn mapped(&self) -> bool {
-        self.card.panes.len() > 1
+    /// The card carries a picture of its tab under its lines: a map of its panes, or the one
+    /// picture of a tab of one pane. Pictured, it is a thing the pointer can cross to and press.
+    fn pictured(&self) -> bool {
+        self.card.pictured()
+    }
+
+    /// The tab is split: its picture is a map that tells each pane, and its lines do not.
+    fn split(&self) -> bool {
+        self.card.split()
     }
 
     /// The card as it reads now: its running time moved on.
@@ -5040,7 +5198,7 @@ pub(crate) struct BarIvars {
     card_closed: Cell<Option<Instant>>,
     /// The tab a press put its card away for, until the pointer leaves it.
     card_quiet: Cell<Option<u64>>,
-    /// The pointer is on the open card (one with a map): it stays while it is.
+    /// The pointer is on the open card (one with a picture): it stays while it is.
     card_inside: Cell<bool>,
     /// Where the card view was last put, while it is on screen (fading away included): a new
     /// place that differs makes it glide there, the same one nothing — a layout asks again.
@@ -5304,7 +5462,7 @@ impl TabBar {
     /// again (`TerminalTab::card`) when what its chip shows changed — a
     /// command started or ended, a title, a transfer's percent, a mark: the
     /// read is a `Term` round, and a title news can come often while output
-    /// streams. A card with a map reads at every news: what a pane reports
+    /// streams. A card with a map of panes reads at every news: what a pane reports
     /// can change while the chip, which shows the most urgent of them, does
     /// not. Lays out.
     pub(crate) fn show(&self, tabs: Vec<Label>, selected: usize, notice: String) {
@@ -5331,12 +5489,13 @@ impl TabBar {
             selected,
             notice,
         });
-        let mapped = iv.card.borrow().as_ref().is_some_and(OpenCard::mapped);
+        let mapped = iv.card.borrow().as_ref().is_some_and(OpenCard::split);
         if let Some(tab) = open
             && (mapped || before != told(&iv.shown.borrow(), tab))
         {
             self.read_card(tab);
             self.draw_card();
+            self.shoot_missing();
         }
         self.lay_out();
     }
@@ -6434,11 +6593,13 @@ impl TabBar {
         };
         drop(shown);
         let card = iv.card.borrow().as_ref().and_then(OpenCard::running);
+        let map = iv.card.borrow().as_ref().is_some_and(OpenCard::pictured);
         let delay = Clock {
             visible,
             reduce_motion: self.reduce_motion(),
             running,
             card,
+            map,
         }
         .delay();
         let Some(delay) = delay else {
@@ -6484,6 +6645,7 @@ impl TabBar {
             }
         }
         self.time_card();
+        self.shoot_card();
         self.lay_out();
     }
 
@@ -6501,8 +6663,8 @@ impl TabBar {
             iv.card_quiet.set(None);
         }
         let Some(tab) = tab else {
-            // A card with a map is where the pointer is heading: it gets a moment to arrive.
-            let mapped = iv.card.borrow().as_ref().is_some_and(OpenCard::mapped);
+            // A card with a picture is where the pointer is heading: it gets a moment to arrive.
+            let mapped = iv.card.borrow().as_ref().is_some_and(OpenCard::pictured);
             if mapped && iv.card_inside.get() {
                 return;
             }
@@ -6560,6 +6722,8 @@ impl TabBar {
         }
         self.read_card(tab);
         self.draw_card();
+        // Before the card is put on screen, so it arrives with its pictures in.
+        self.shoot_card();
         self.place_card();
         self.arm_clock();
     }
@@ -6573,13 +6737,69 @@ impl TabBar {
             .and_then(|window| window.tab_card(tab));
         match card {
             Some(card) => {
-                self.ivars().card.replace(Some(OpenCard {
+                let before = self.ivars().card.replace(Some(OpenCard {
                     tab,
                     card,
                     read_at: Instant::now(),
                 }));
+                // The card turned to another tab: the first one's panes let their pictures go.
+                if let Some(before) = before.filter(|before| before.tab != tab) {
+                    self.release_shots(before.tab);
+                }
             }
             None => self.close_card(),
+        }
+    }
+
+    /// Takes a picture of each pane of the open card's map and gives it to its tile
+    /// (`TerminalPane::snapshot`, through the window and the tab). Called when the card opens and
+    /// by the bar's clock every [`tabs::MAP_REFRESH`] after, and nowhere else: a card without a
+    /// map, a window nobody sees and a card that is gone take none — the clock stops asking with
+    /// them (`Clock::map`), and the panes' textures go with the card ([`Self::release_shots`]).
+    fn shoot_card(&self) {
+        let iv = self.ivars();
+        let (tab, tiles) = {
+            let card = iv.card.borrow();
+            let Some(open) = card.as_ref().filter(|open| open.pictured()) else {
+                return;
+            };
+            let height = tabs::map_height(open.card.aspect);
+            let tiles: Vec<(u64, (f64, f64))> = open
+                .card
+                .panes
+                .iter()
+                .map(|pane| {
+                    let at = tabs::map_tile(pane.place, height);
+                    (pane.id, (at.width, at.height))
+                })
+                .collect();
+            (open.tab, tiles)
+        };
+        let Some(window) = self.terminal_window() else {
+            return;
+        };
+        if !window.window_visible() {
+            return;
+        }
+        let scale = self
+            .window()
+            .map_or(2.0, |window| window.backingScaleFactor());
+        iv.card_view
+            .set_shots(&window.tab_shots(tab, &tiles, scale));
+    }
+
+    /// The map got tiles that have no picture (new panes, or a pane that was not ready): one now,
+    /// not at the clock's next turn.
+    fn shoot_missing(&self) {
+        if self.ivars().card_view.lacks_shots() {
+            self.shoot_card();
+        }
+    }
+
+    /// The panes of tab `tab` let go of what they kept for the card's pictures.
+    fn release_shots(&self, tab: u64) {
+        if let Some(window) = self.terminal_window() {
+            window.release_tab_shots(tab);
         }
     }
 
@@ -6612,7 +6832,7 @@ impl TabBar {
             .into_iter()
             .map(|(text, tone)| (text, palette.tone(tone, mark)))
             .collect();
-        let map = open.mapped().then(|| MapDraw {
+        let map = open.pictured().then(|| MapDraw {
             panes: &open.card.panes,
             aspect: open.card.aspect,
             style: IconStyle::current(self.mtm()),
@@ -6772,8 +6992,10 @@ impl TabBar {
     /// and a card asked for in the meantime comes back from the fade ([`Self::card_returns`]).
     fn close_card(&self) {
         let iv = self.ivars();
-        if iv.card.take().is_some() {
+        if let Some(open) = iv.card.take() {
             iv.card_closed.set(Some(Instant::now()));
+            // The textures go now; the tiles keep their last pictures until the card is down.
+            self.release_shots(open.tab);
         }
         iv.card_inside.set(false);
         let card = &iv.card_view;
@@ -6818,10 +7040,11 @@ impl TabBar {
         if let Some(layer) = card.layer() {
             layer.removeAllAnimations();
         }
+        card.clear_shots();
         card.removeFromSuperview();
     }
 
-    /// The pointer came onto the open card (one with a map): it stays open while the pointer
+    /// The pointer came onto the open card (one with a picture): it stays open while the pointer
     /// is on it, and a close that was waiting for the pointer to arrive is off.
     fn card_entered(&self) {
         let iv = self.ivars();
@@ -6945,13 +7168,14 @@ pub(crate) fn watch_command_key() -> Option<Retained<AnyObject>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BADGE_DOT, BADGE_HALO, BADGE_SIDE, Badge, CARD_BESIDE, CARD_EDGE, CARD_MAP_WIDTH,
-        CARD_PAD_X, CARD_RISE, CARD_SCALE, CARD_SLIDE, CARD_WIDTH, CHIP_ABOVE, CHIP_HEIGHT, DISCS,
-        Emblem, GLYPH_OVERHANG, GlyphLook, HOLLOW_ROOM, IconStyle, Motion, Palette, ROW_LEFT, Spin,
-        TAB_RADIUS, TILE_BADGE_INSET, TILE_ROOM, Tint, TitleAction, badge_centre, card_arrival,
-        card_beside, card_x, command_alone, contains, disc_side, glyph_slot, inks, line_span,
-        single_label, spin_of, title_double_click,
+        BADGE_DOT, BADGE_HALO, BADGE_SIDE, Badge, CARD_BESIDE, CARD_EDGE, CARD_PAD_X, CARD_RISE,
+        CARD_SCALE, CARD_SLIDE, CHIP_ABOVE, CHIP_HEIGHT, DISCS, Emblem, GLYPH_OVERHANG, GlyphLook,
+        HOLLOW_ROOM, IconStyle, Motion, Palette, ROW_LEFT, Spin, TAB_RADIUS, TILE_BADGE_INSET,
+        TILE_ROOM, Tint, TitleAction, badge_centre, card_arrival, card_beside, card_x,
+        command_alone, contains, disc_side, glyph_slot, inks, line_span, single_label, spin_of,
+        title_double_click,
     };
+    use super::{MAP_SCRIM_NAME_ONLY, TileShot, paint_tile};
     use crate::icon;
     use crate::program::identity::{Agent, Kind as ProgramKind};
     use crate::split::Rect;
@@ -7311,23 +7535,23 @@ mod tests {
     /// The card hangs under its chip and stays inside the window.
     #[test]
     fn the_card_stays_inside_the_window() {
-        assert_eq!(card_x(270.0, 1000.0, CARD_WIDTH), 270.0);
+        assert_eq!(card_x(270.0, 1000.0, tabs::CARD_WIDTH), 270.0);
         assert_eq!(
-            card_x(900.0, 1000.0, CARD_WIDTH),
-            1000.0 - CARD_WIDTH - CARD_PAD_X
+            card_x(900.0, 1000.0, tabs::CARD_WIDTH),
+            1000.0 - tabs::CARD_WIDTH - CARD_PAD_X
         );
         assert_eq!(
-            card_x(900.0, 1000.0, CARD_MAP_WIDTH),
-            1000.0 - CARD_MAP_WIDTH - CARD_PAD_X,
-            "the wider card with a map"
+            card_x(900.0, 1000.0, tabs::CARD_MAP_WIDTH),
+            1000.0 - tabs::CARD_MAP_WIDTH - CARD_PAD_X,
+            "the wider card with a picture"
         );
         assert_eq!(
-            card_x(-40.0, 1000.0, CARD_WIDTH),
+            card_x(-40.0, 1000.0, tabs::CARD_WIDTH),
             CARD_PAD_X,
             "a strip scrolled off"
         );
         assert_eq!(
-            card_x(100.0, 200.0, CARD_WIDTH),
+            card_x(100.0, 200.0, tabs::CARD_WIDTH),
             CARD_PAD_X,
             "a window narrower than the card"
         );
@@ -7425,6 +7649,203 @@ mod tests {
         near(look.x, 100.0 - CARD_SLIDE);
         near(look.y + look.height / 2.0, 50.0 + 60.0);
         near(look.width, 272.0 * CARD_SCALE);
+    }
+
+    // ─── a map tile with its pane's picture ──────────────────────────────
+
+    use std::ptr::null_mut;
+
+    use objc2::AnyThread;
+    use objc2::rc::Retained;
+    use objc2_app_kit::{
+        NSBezierPath, NSBitmapImageRep, NSCompositingOperation, NSDeviceRGBColorSpace,
+        NSGraphicsContext, NSImage,
+    };
+    use objc2_core_graphics::CGContext;
+
+    /// The tile the paint is drawn in, points, at 2x.
+    const TILE: (f64, f64) = (100.0, 60.0);
+
+    /// What `draw` leaves in a transparent `TILE` at 2x — in a context flipped as a view's is (the
+    /// origin top left, `y` down), as a tile is drawn in — as `(width, rows from the top,
+    /// premultiplied RGBA)`.
+    fn in_a_flipped_view(draw: impl FnOnce()) -> (usize, Vec<[u8; 4]>) {
+        let (wide, high) = (TILE.0 as usize * 2, TILE.1 as usize * 2);
+        // SAFETY: no planes of our own (the bitmap allocates them), 8-bit RGBA at the size given,
+        // and a constant colour space name AppKit exposes.
+        let rep = unsafe {
+            NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+                NSBitmapImageRep::alloc(),
+                null_mut(),
+                wide as isize,
+                high as isize,
+                8,
+                4,
+                true,
+                false,
+                NSDeviceRGBColorSpace,
+                0,
+                0,
+            )
+        }
+        .expect("a bitmap");
+        rep.setSize(NSSize::new(TILE.0, TILE.1));
+        let upright = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep)
+            .expect("a context on the bitmap");
+        NSGraphicsContext::saveGraphicsState_class();
+        NSGraphicsContext::setCurrentContext(Some(&upright));
+        // Transparent to begin with: a new bitmap holds whatever was in the memory.
+        upright.setCompositingOperation(NSCompositingOperation::Clear);
+        NSBezierPath::fillRect(NSRect::new(NSPoint::ZERO, NSSize::new(TILE.0, TILE.1)));
+        upright.setCompositingOperation(NSCompositingOperation::SourceOver);
+        // What AppKit does for a flipped view: the transform that turns `y` down, and a context
+        // that says so.
+        let cg = upright.CGContext();
+        CGContext::translate_ctm(Some(&cg), 0.0, TILE.1);
+        CGContext::scale_ctm(Some(&cg), 1.0, -1.0);
+        let flipped = NSGraphicsContext::graphicsContextWithCGContext_flipped(&cg, true);
+        NSGraphicsContext::setCurrentContext(Some(&flipped));
+        draw();
+        NSGraphicsContext::restoreGraphicsState_class();
+        let row = rep.bytesPerRow() as usize;
+        // SAFETY: the bitmap owns `row * high` bytes at `bitmapData`, which `rep` keeps alive.
+        let bytes = unsafe { std::slice::from_raw_parts(rep.bitmapData(), row * high) };
+        let pixels = (0..high)
+            .flat_map(|y| (0..wide).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let at = y * row + x * 4;
+                [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]
+            })
+            .collect();
+        (wide, pixels)
+    }
+
+    /// The pixel at `(x, y)` points, `y` down from the top.
+    fn at(picture: &(usize, Vec<[u8; 4]>), x: f64, y: f64) -> [u8; 4] {
+        picture.1[(y * 2.0) as usize * picture.0 + (x * 2.0) as usize]
+    }
+
+    /// A pane's picture, 200 × 120 pixels: red down to 40 pt, blue below.
+    fn a_picture() -> Retained<NSImage> {
+        let rgba: Vec<u8> = (0..120)
+            .flat_map(|y| {
+                (0..200).flat_map(move |_| {
+                    if y < 80 {
+                        [255, 0, 0, 255]
+                    } else {
+                        [0, 0, 255, 255]
+                    }
+                })
+            })
+            .collect();
+        let still = bt_gpu::Snapshot {
+            width: 200,
+            height: 120,
+            rgba,
+        };
+        let image = crate::snapshot::image(&still).expect("an image");
+        NSImage::initWithCGImage_size(NSImage::alloc(), &image, NSSize::new(TILE.0, TILE.1))
+    }
+
+    fn painted(fraction: f64, ring: Option<Tint>) -> (usize, Vec<[u8; 4]>) {
+        painted_with(fraction, Some((0x00ff00, MAP_SCRIM_NAME_ONLY)), ring)
+    }
+
+    fn painted_with(
+        fraction: f64,
+        scrim: Option<(u32, f64)>,
+        ring: Option<Tint>,
+    ) -> (usize, Vec<[u8; 4]>) {
+        let image = a_picture();
+        in_a_flipped_view(|| {
+            paint_tile(
+                NSRect::new(NSPoint::ZERO, NSSize::new(TILE.0, TILE.1)),
+                Tint::of(0xffffff, 0.08),
+                Some(TileShot {
+                    image: &image,
+                    fraction,
+                    scrim,
+                }),
+                ring,
+            )
+        })
+    }
+
+    /// The picture stands the right way up in a flipped view, the scrim of the face's colour
+    /// hides its top under the tile's name, the ring is over the picture, and the picture keeps
+    /// to the tile's rounded corners.
+    #[test]
+    fn a_tile_wears_its_picture_under_a_scrim_and_a_ring() {
+        let picture = painted(1.0, Some(Tint::of(0xffffff, 1.0)));
+        // Below the scrim (30 pt): the picture's top half is red and its bottom blue — the way
+        // up it was made, in a view that is flipped.
+        let (red, blue) = (at(&picture, 50.0, 36.0), at(&picture, 50.0, 55.0));
+        assert!(
+            red[0] > 240 && red[1] < 15 && red[2] < 15,
+            "the top of the picture is not at the top: {red:?}"
+        );
+        assert!(
+            blue[2] > 240 && blue[0] < 15 && blue[1] < 15,
+            "the bottom of the picture is not at the bottom: {blue:?}"
+        );
+        // The scrim's solid part (the first 55 % of 30 pt, 16.5 pt) is the face's colour over the
+        // picture, 94 % of it: a little of the red is still there.
+        let solid = at(&picture, 50.0, 8.0);
+        assert!(
+            solid[1] > 225 && solid[0] > 5 && solid[0] < 40,
+            "the scrim's solid part: {solid:?}"
+        );
+        // Its foot fades to the picture: halfway down the fade is both.
+        let fading = at(&picture, 50.0, 23.0);
+        assert!(
+            fading[0] > 60 && fading[1] > 60 && fading[0] < 220 && fading[1] < 220,
+            "the scrim does not fade out: {fading:?}"
+        );
+        // The ring is over the picture: a white line along the tile's inside edge, where the
+        // picture is blue.
+        let ring = at(&picture, 0.25, 45.0);
+        assert!(
+            ring[0] > 240 && ring[1] > 240 && ring[2] > 240,
+            "the picture covers the ring: {ring:?}"
+        );
+        let inside = at(&picture, 3.0, 45.0);
+        assert!(inside[2] > 240 && inside[0] < 15, "{inside:?}");
+        // The corner is rounded: nothing is painted in the tile's very corner.
+        assert_eq!(
+            at(&picture, 0.0, 0.0)[3],
+            0,
+            "the picture is square at the corner"
+        );
+        assert_eq!(at(&picture, 99.5, 59.5)[3], 0);
+    }
+
+    /// The picture that is a whole tab (a tab of one pane) has nothing written over it: no scrim
+    /// at its top, no ring — the card's lines say what they would — and is still rounded at the
+    /// corners.
+    #[test]
+    fn a_tile_that_is_a_whole_tab_has_no_scrim_and_no_ring() {
+        let picture = painted_with(1.0, None, None);
+        let top = at(&picture, 50.0, 3.0);
+        assert!(
+            top[0] > 240 && top[1] < 15 && top[2] < 15,
+            "something is over the top of the picture: {top:?}"
+        );
+        let edge = at(&picture, 0.25, 45.0);
+        assert!(
+            edge[2] > 240 && edge[0] < 15,
+            "a ring is drawn on the picture: {edge:?}"
+        );
+        assert_eq!(at(&picture, 0.0, 0.0)[3], 0, "the corner is square");
+    }
+
+    /// The picture lies over the face at 86 % until the pointer is on the tile, then all of it.
+    #[test]
+    fn a_tile_wears_its_picture_dimmed_until_the_pointer_is_on_it() {
+        let alpha = |fraction| at(&painted(fraction, None), 50.0, 55.0)[3];
+        let (dim, lit) = (alpha(0.86), alpha(1.0));
+        assert!(lit >= 253, "the lit picture is not whole: {lit}");
+        // The face (8 %) shows through the rest: 1 − 0.92 · 0.14 of full.
+        assert!((215..=230).contains(&dim), "the dimmed picture is at {dim}");
     }
 
     /// ⌘ alone shows the hints, Caps Lock or not; a chord's other modifier

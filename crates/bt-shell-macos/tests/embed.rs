@@ -18,6 +18,7 @@ use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSWindow, NSWindowStyleMask,
 };
+use objc2_core_graphics::CGImage;
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSRunLoop, NSSize};
 
 /// What a host heard, in order: the event's name and the pane's id.
@@ -159,6 +160,24 @@ fn main() {
         heard.contains(&("exit".to_owned(), PANE)),
         "the shell's exit reached the host with the pane's id; heard {heard:?}"
     );
+
+    // A still of the pane, as a card over a split tab's chip asks for one: the whole of its
+    // frame drawn at its own size, shrunk on the GPU to a tile of 120 × 80 points at 2x. It
+    // needs no application object either, and its textures are the asker's to give back.
+    let tile = pane
+        .snapshot((120.0, 80.0), 2.0)
+        .expect("a laid-out pane gives a still");
+    assert_eq!(
+        (CGImage::width(Some(&tile)), CGImage::height(Some(&tile))),
+        (240, 160),
+        "the still is the tile's pixels"
+    );
+    pane.release_snapshot();
+    assert!(
+        pane.snapshot((120.0, 80.0), 2.0).is_some(),
+        "a still after the textures were given back makes them again"
+    );
+    pane.release_snapshot();
 
     pane.close();
     assert!(

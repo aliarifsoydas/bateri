@@ -49,6 +49,12 @@
 //! The shaders are WGSL (`shaders/*.wgsl`), embedded with `include_str!`;
 //! there is no shader build step.
 //!
+//! **A still of a pane** ([`DisplayLink::snapshot`]) is the frame's other
+//! target, not another frame: the pane's whole frame composed again from the
+//! session and drawn into textures the caller's [`Shot`] owns, shrunk on the GPU
+//! so that only the tile crosses to the CPU ([`Snapshot`]). It asks for no
+//! frame, takes no damage and counts in none of the frame path's tokens.
+//!
 //! The frame path's **measurement book** is here too ([`Stats`]): whoever
 //! produces the time collects the sample — the CPU spans from the tick, the
 //! GPU delta from the renderer's completion poll. This crate **prints**
@@ -76,7 +82,7 @@ pub use frame::{
     ContextStrip, ContextTrailing, DOCK_ROWS, context_col_under, context_row_offset,
     context_shift_px, dock_px, edge_ceiling_rows, edge_drawn_px, edge_fades, edge_reserve_px,
 };
-pub use link::{DisplayLink, Layout, Origin, Pacer, TickTarget, Ticker, Waker};
+pub use link::{DisplayLink, Layout, Origin, Pacer, Shot, Snapshot, TickTarget, Ticker, Waker};
 pub use metrics::{CellMetrics, FontNotice, GridInset, family_notice};
 pub use renderer::Renderer;
 pub use scrollbar::{Mode as ScrollbarMode, ScrollbarLayout, strip_px as scrollbar_strip_px};

@@ -6,9 +6,10 @@
 //! `caret` (background quads; the caret's SDF, also used by the dock's
 //! buttons), `cell` and `emoji` (glyphs and rules from the atlas's two
 //! planes), `selection` (the mouse selection and the search highlights),
-//! `image` (the pictures programs send, one texture each) and
-//! `glyph_fx` (the dock's typing effects). Why each pipeline exists is
-//! written on [`Gpu`]'s fields; why the draws come in the
+//! `image` (the pictures programs send, one texture each),
+//! `glyph_fx` (the dock's typing effects) and `shrink` (the reduction a still
+//! of the pane is brought to a tile by, `shrink.rs`). Why each pipeline exists
+//! is written on [`Gpu`]'s fields; why the draws come in the
 //! order they do, per surface, is written in [`Renderer::plan`].
 //!
 //! Slot resolution, the wide glyph's fan-out, uv baking and the effects'
@@ -202,6 +203,22 @@ const _: () = assert!(std::mem::offset_of!(ImageImmediates, edge_px) == 40);
 // 48 ≤ 128: immediates.
 const _: () = assert!(size_of::<ImageImmediates>() as u32 <= IMMEDIATE_BUDGET);
 
+/// `shrink.wgsl`'s `Immediates`: one pass of a still's reduction chain. src@0
+/// (the part of the source shown, u0 v0 u1 v1), tap@16 (where the four taps
+/// stand from a pixel's centre, in uv); 24 bytes round up to the struct's
+/// 16-byte alignment and the trailing 8 bytes are the explicit `pad`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ShrinkImmediates {
+    src: [f32; 4],
+    tap: [f32; 2],
+    pad: [f32; 2],
+}
+
+const _: () = assert!(size_of::<ShrinkImmediates>() == 32);
+const _: () = assert!(std::mem::offset_of!(ShrinkImmediates, tap) == 16);
+const _: () = assert!(size_of::<ShrinkImmediates>() as u32 <= IMMEDIATE_BUDGET);
+
 /// `Instance`'s vertex buffer layout: the three `@location`s of
 /// `cell_bg.wgsl` → `Instance`; offsets come from `frame.rs`'s `offset_of!`
 /// (`INSTANCE_OFFSETS`), not from hand-written numbers.
@@ -317,6 +334,9 @@ unsafe impl GpuBytes for FxImmediates {}
 // SAFETY: `repr(C)`, `f32` fields only; WGSL's trailing padding is the
 // explicit `pad`, size 48 is asserted.
 unsafe impl GpuBytes for ImageImmediates {}
+// SAFETY: `repr(C)`, `f32` fields only; WGSL's trailing padding is the
+// explicit `pad`, size 32 is asserted.
+unsafe impl GpuBytes for ShrinkImmediates {}
 
 /// The bytes of a slice; the element type is bounded by [`GpuBytes`].
 fn bytes_of<T: GpuBytes>(values: &[T]) -> &[u8] {
@@ -1002,6 +1022,11 @@ pub(crate) struct Gpu {
     /// layout is the atlas planes' (a texture and a filtering sampler), the
     /// sampler the linear one: a picture is scaled, a glyph is not.
     image: wgpu::RenderPipeline,
+    /// One pass of a still's reduction chain (`shrink_fragment`): a triangle
+    /// over the target, each pixel the average of four taps of the source.
+    /// The atlas planes' bind group layout and the linear sampler again — it
+    /// is a picture being scaled — and no vertex buffer.
+    shrink: wgpu::RenderPipeline,
     /// The atlas planes' bind group layout: texture @0, sampler @1.
     plane_layout: wgpu::BindGroupLayout,
     /// The effects' layout: mask @0, colour @1, nearest @2, linear @3.
@@ -1241,6 +1266,24 @@ impl Gpu {
             "image_vertex",
             "image_fragment",
         );
+        // Reductions: no vertex buffer, the plane layout's bind group.
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shrink.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shrink.wgsl").into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shrink"),
+            bind_group_layouts: &[Some(&plane_layout)],
+            immediate_size: size_of::<ShrinkImmediates>() as u32,
+        });
+        let shrink = pipeline_over(
+            &device,
+            &layout,
+            &module,
+            &[],
+            "shrink_vertex",
+            "shrink_fragment",
+        );
         // `nearest`, not `linear`: slots have no padding between them and
         // `linear`'s last column would blend the neighbour slot.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1275,6 +1318,7 @@ impl Gpu {
             emoji,
             glyph_fx,
             image,
+            shrink,
             plane_layout,
             fx_layout,
             sampler,
@@ -3229,6 +3273,7 @@ fn pipeline_over(
 
 #[cfg(test)]
 mod picture_tests;
+pub(crate) mod shrink;
 #[cfg(test)]
 pub(crate) mod tests;
 #[cfg(test)]

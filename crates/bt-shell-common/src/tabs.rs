@@ -1592,8 +1592,10 @@ pub enum CardCommand {
 }
 
 /// What a tab's summary card tells ([`card_lines`]); the platform shell reads each from the tab's
-/// focused pane. A split tab's card also holds the map of its panes ([`Card::panes`]), which
-/// takes over what the lines say about a command and a transfer: each pane tells its own.
+/// focused pane. The card also carries a picture of its tab ([`Card::panes`]): the map of its
+/// panes when the tab is split, which takes over what the lines say about a command and a
+/// transfer (each pane tells its own), and for a tab of one pane the one picture under the lines,
+/// which tell everything as they always did.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Card {
     pub title: String,
@@ -1606,15 +1608,30 @@ pub struct Card {
     /// A transfer flowing: the item's name, the percentage, and `true` when it is a download.
     pub upload: Option<(String, u8, bool)>,
     pub mark: HostMark,
-    /// The tab's panes in tree order; empty for a tab of one pane, whose card is just its lines.
+    /// The tab's panes in tree order, each the tile of a picture: one standing over the whole
+    /// area for a tab of one pane, which is a picture and nothing else; empty only for a card
+    /// with no picture.
     pub panes: Vec<CardPane>,
     /// The tab's content area, its height over its width: the map takes the area's shape
     /// ([`map_height`]).
     pub aspect: f64,
 }
 
-/// One pane on a split tab's summary card: where it stands, the program it runs, its name and
-/// what it is doing.
+impl Card {
+    /// The card carries a picture of its tab under its lines: one tile per pane.
+    pub fn pictured(&self) -> bool {
+        !self.panes.is_empty()
+    }
+
+    /// The tab holds several panes: the picture is a map that names each pane's program and
+    /// state, and the lines leave out the command and the transfer it tells.
+    pub fn split(&self) -> bool {
+        self.panes.len() > 1
+    }
+}
+
+/// One pane on a summary card's picture: where it stands, the program it runs, its name and
+/// what it is doing (a tab of one pane has the first and not the rest: its lines tell them).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CardPane {
     /// The pane's identity in its window — what a press on the map names.
@@ -1652,6 +1669,18 @@ impl CardPane {
     }
 }
 
+/// The summary card's width without a picture, its inner margins and the space between its lines,
+/// points (the design's).
+pub const CARD_WIDTH: f64 = 272.0;
+pub const CARD_PAD_X: f64 = 12.0;
+pub const CARD_PAD_Y: f64 = 10.0;
+pub const CARD_LINE_GAP: f64 = 3.0;
+/// A picture stands under the lines their own gap below the last one and this much more.
+pub const MAP_LEAD: f64 = 7.0;
+/// How often the map's pictures of its panes are taken afresh while the card is open: twice a
+/// second, a pace at which a prompt typed or a build's output reads as live and a pane costs
+/// next to nothing.
+pub const MAP_REFRESH: Duration = Duration::from_millis(500);
 /// The map's width on the summary card, in points.
 pub const MAP_WIDTH: f64 = 276.0;
 /// The map's height stays between these, whatever shape the tab's area has: a wide window's map
@@ -1662,6 +1691,31 @@ pub const MAP_MAX_HEIGHT: f64 = 180.0;
 const MAP_GAP: f64 = 3.0;
 /// The corner of a pane on the map.
 pub const MAP_RADIUS: f64 = 6.0;
+
+/// A card with a picture is as wide as the map and its margins.
+pub const CARD_MAP_WIDTH: f64 = MAP_WIDTH + 2.0 * CARD_PAD_X;
+
+/// The card's width: [`CARD_MAP_WIDTH`] with a picture, [`CARD_WIDTH`] without.
+pub fn card_width(pictured: bool) -> f64 {
+    if pictured { CARD_MAP_WIDTH } else { CARD_WIDTH }
+}
+
+/// Where the picture starts, from the card's top, when its lines end at `lines_bottom` (the foot
+/// of the last one, no gap after it): [`CARD_LINE_GAP`] and [`MAP_LEAD`] below.
+pub fn map_top(lines_bottom: f64) -> f64 {
+    lines_bottom + CARD_LINE_GAP + MAP_LEAD
+}
+
+/// The card's height for lines ending at `lines_bottom`: the margin under them without a picture;
+/// with one (`Some(aspect)`, the tab area's height over its width) the picture's own height
+/// ([`map_height`] — a tab of one pane and a split tab have the same rule) under the gap, and
+/// the margin under that.
+pub fn card_height(lines_bottom: f64, aspect: Option<f64>) -> f64 {
+    match aspect {
+        Some(aspect) => map_top(lines_bottom) + map_height(aspect) + CARD_PAD_Y,
+        None => lines_bottom + CARD_PAD_Y,
+    }
+}
 
 /// The map's height for a tab area whose height over width is `aspect`: [`MAP_WIDTH`] times it,
 /// kept within [`MAP_MIN_HEIGHT`] and [`MAP_MAX_HEIGHT`], in whole points.
@@ -1717,8 +1771,9 @@ pub enum Tone {
 /// The card's lines, top to bottom: the title; the directory (`host:path` in a remote session);
 /// what the newest command did — "Running · {command} · {time}", "Finished · {command} · {time}",
 /// "Exit {n} · {command}"; a flowing transfer; a marked host's kind. A split tab's card keeps only
-/// the title, the directory and the host's kind: what each pane is doing is on its map. A part
-/// nobody knows is left out rather than shown empty.
+/// the title, the directory and the host's kind: what each pane is doing is on its map. A tab of
+/// one pane keeps all of them under its one picture. A part nobody knows is left out rather than
+/// shown empty.
 pub fn card_lines(card: &Card) -> Vec<(String, Tone)> {
     let mut lines = vec![(card.title.clone(), Tone::Title)];
     let directory = match &card.remote {
@@ -1740,7 +1795,7 @@ pub fn card_lines(card: &Card) -> Vec<(String, Tone)> {
             .collect::<Vec<_>>()
             .join(" · ")
     };
-    let mapped = card.panes.len() > 1;
+    let mapped = card.split();
     match card.command.as_ref().filter(|_| !mapped) {
         Some(CardCommand::Running { command, elapsed }) => {
             let time = bt_core::running_counter(*elapsed).unwrap_or_default();
@@ -2068,20 +2123,26 @@ pub struct Clock {
     pub running: Vec<Duration>,
     /// How long the command of the tab whose summary card is open has run, when it runs.
     pub card: Option<Duration>,
+    /// The open card carries a map of its tab's panes: each pane's picture is taken afresh every
+    /// [`MAP_REFRESH`] for as long as it is open.
+    pub map: bool,
 }
 
 impl Clock {
     /// When the bar must look again, `None` for never: the nearest moment something it shows
     /// changes with time — where a running ring's turn changes pace (`bt_core::counter_tier_end`:
-    /// the hour, where it slows to a twelfth) or the open card's running time changes
-    /// (`bt_core::next_tick`, the duration counter's own clock).
+    /// the hour, where it slows to a twelfth), the open card's running time changes
+    /// (`bt_core::next_tick`, the duration counter's own clock) or the open card's map is due its
+    /// panes' pictures ([`MAP_REFRESH`]).
     ///
-    /// **Two arms, one wake.** A ring turns by itself between its pace changes, so it asks for no
+    /// **Three arms, one wake.** A ring turns by itself between its pace changes, so it asks for no
     /// wake per step; the rings need the one at the hour only while the window is visible and
     /// Reduce Motion is off (a ring that is not turning has no pace to change). The card's
     /// seconds are text, not motion, so they go on under Reduce Motion — still only while the
-    /// window is visible. No running command before its hour and no card: no wake, the bar is
-    /// idle.
+    /// window is visible. So do the map's pictures: they are what the panes show, not an
+    /// animation. **A map's wake stops when the card does** (`map` is false without a card) and
+    /// when the window is not on screen. No running command before its hour and no card: no wake,
+    /// the bar is idle.
     pub fn delay(&self) -> Option<Duration> {
         if !self.visible {
             return None;
@@ -2091,7 +2152,10 @@ impl Clock {
             .iter()
             .filter(|_| !self.reduce_motion)
             .filter_map(|&elapsed| bt_core::counter_tier_end(elapsed));
-        rings.chain(self.card.map(bt_core::next_tick)).min()
+        rings
+            .chain(self.card.map(bt_core::next_tick))
+            .chain(self.map.then_some(MAP_REFRESH))
+            .min()
     }
 }
 
@@ -3833,6 +3897,7 @@ mod tests {
                 .map(|&ms| Duration::from_millis(ms))
                 .collect(),
             card: card.map(Duration::from_millis),
+            map: false,
         }
     }
 
@@ -3889,6 +3954,48 @@ mod tests {
             Some(Duration::from_secs(40)),
             "an hour on, the card's counter still moves once a minute"
         );
+    }
+
+    /// The open card's map asks for its pictures twice a second, and only for as long as it is
+    /// open on a window that is seen — whatever the rings and the counter want.
+    #[test]
+    fn the_clock_wakes_a_mapped_card_for_its_pictures() {
+        let ms = Duration::from_millis;
+        let mapped = |visible, reduce_motion, running: &[u64], card| Clock {
+            map: true,
+            ..clock(visible, reduce_motion, running, card)
+        };
+        assert_eq!(
+            mapped(true, false, &[], None).delay(),
+            Some(MAP_REFRESH),
+            "a card with a map and nothing else running"
+        );
+        assert_eq!(
+            mapped(true, true, &[], None).delay(),
+            Some(MAP_REFRESH),
+            "Reduce Motion: pictures are not an animation"
+        );
+        assert_eq!(
+            mapped(false, false, &[], None).delay(),
+            None,
+            "a window nobody sees takes none"
+        );
+        assert_eq!(
+            clock(true, false, &[], None).delay(),
+            None,
+            "no card, no map: the bar is idle again"
+        );
+        assert_eq!(
+            mapped(true, false, &[3_600_000 - 40], None).delay(),
+            Some(ms(40)),
+            "the hour, when it is nearer"
+        );
+        assert_eq!(
+            mapped(true, false, &[1_200], Some(4_900)).delay(),
+            Some(ms(100)),
+            "the counter's tick, when it is nearer"
+        );
+        assert_eq!(MAP_REFRESH, ms(500), "twice a second");
     }
 
     /// A full-screen program runs as long as it is open: no ring, and so no clock for it — but the
@@ -4102,6 +4209,7 @@ mod tests {
                 ("Production host".to_owned(), Tone::Mark),
             ]
         );
+        assert!(card.pictured() && card.split());
         let one = Card {
             panes: vec![pane_on_the_map(1, Rect::new(0.0, 0.0, 1.0, 1.0), None)],
             ..card
@@ -4109,8 +4217,48 @@ mod tests {
         assert_eq!(
             card_lines(&one).len(),
             5,
-            "a map of one pane is no map: the lines tell"
+            "a tab of one pane keeps its lines: the command, the transfer and the rest"
         );
+        assert!(
+            one.pictured() && !one.split(),
+            "and carries a picture, which is no map of panes"
+        );
+        let none = Card {
+            panes: Vec::new(),
+            ..one
+        };
+        assert!(!none.pictured() && !none.split());
+    }
+
+    /// A card with a picture is the map's width, and as tall as its lines, the gap, the picture
+    /// (the tab area's shape within the map's limits) and the margin; a card without is as it was.
+    /// A tab of one pane and a split tab are the same in this.
+    #[test]
+    fn a_card_with_a_picture_is_as_wide_and_as_tall_as_the_picture_makes_it() {
+        assert_eq!(card_width(false), 272.0);
+        assert_eq!(card_width(true), 300.0, "the map and its margins");
+        assert_eq!(card_width(true), MAP_WIDTH + 2.0 * CARD_PAD_X);
+        // Lines ending 50 pt down: the picture starts the line gap and 7 pt below.
+        assert_eq!(map_top(50.0), 60.0);
+        assert_eq!(card_height(50.0, None), 60.0, "the margin under the lines");
+        assert_eq!(
+            card_height(50.0, Some(0.5)),
+            60.0 + 138.0 + 10.0,
+            "the picture 276 × 0.5 tall, and the margin under it"
+        );
+        assert_eq!(
+            card_height(50.0, Some(0.2)),
+            60.0 + MAP_MIN_HEIGHT + 10.0,
+            "a wide window's picture is not a sliver"
+        );
+        assert_eq!(
+            card_height(50.0, Some(3.0)),
+            60.0 + MAP_MAX_HEIGHT + 10.0,
+            "a tall one's does not push the card off the screen"
+        );
+        // The picture of a tab of one pane is the map's whole width and the area's height.
+        let tile = map_tile(Rect::new(0.0, 0.0, 1.0, 1.0), map_height(0.5));
+        assert_eq!(tile, Rect::new(0.0, 0.0, MAP_WIDTH, 138.0));
     }
 
     /// The tab says what its panes say, and nothing they do not: the union's indicator is the

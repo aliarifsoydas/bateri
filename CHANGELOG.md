@@ -30,12 +30,18 @@ of every installed copy. A version without a section is not released.
   column's empty space. Tabs along the top stay the default and look as they
   did; `content_edge = "line"` draws no line along the window's top with the
   tabs at the side.
-- **A split tab's summary card maps its panes.** Hovering over a tab that holds
-  several panes shows each pane where it sits in the tab, with its program's
-  mark, its name and what it is doing, the focused one outlined, in place of
-  "N panes". A press on a pane selects the tab and focuses that pane, and the
-  tab's icon follows to that pane's program. The card waits a moment as the
-  pointer crosses from the tab to the card, so it does not close on the way.
+- **A tab's summary card shows its panes.** Hovering over a tab shows a small
+  picture of what its pane shows right now — the grid, the history above it,
+  the dock, a program on the alternate screen like vim or htop as it looks in
+  the pane — under the lines its card has always had. A tab that holds several
+  panes shows each pane where it sits in the tab, with its program's mark, its
+  name and what it is doing over its picture, the focused one outlined, in
+  place of "N panes". The pictures are taken when the card opens and twice a
+  second while it stays open, and only then; panes in tabs that are not shown
+  give theirs too. A press on a pane selects the tab and focuses that pane, and
+  the tab's icon follows to that pane's program; a press on the picture of a
+  tab with one pane shows that tab. The card waits a moment as the pointer crosses from
+  the tab to the card, so it does not close on the way.
 
 ### Changed
 

@@ -50,6 +50,8 @@ use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{NSEvent, NSView, NSWindow, NSWindowOcclusionState};
+use objc2_core_foundation::CFRetained;
+use objc2_core_graphics::CGImage;
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect};
 
 use crate::app;
@@ -61,7 +63,7 @@ use crate::pane::{PaneHost, TerminalPane};
 use crate::program::identity::Kind;
 use crate::restore::{SavedTab, Shape};
 use crate::sheets;
-use crate::split::{Axis, Direction, Placement, Removal, Tree};
+use crate::split::{Axis, Direction, Placement, Rect, Removal, Tree};
 use crate::split_view::SplitView;
 use crate::tab_bar::{Emblem, Upload};
 use crate::tabs::{self, Card, CardCommand, CardPane, Finish, Indicator, Signals, Tally, Unseen};
@@ -1258,8 +1260,9 @@ impl TerminalTab {
 
     /// What the tab's summary card tells, from the focused pane: its title,
     /// directory (`host:path` remotely), newest command, transfer and marked
-    /// host (`tabs::card_lines` lays them out) — and, for a tab of several
-    /// panes, the map of them all ([`Self::card_panes`]). The
+    /// host (`tabs::card_lines` lays them out) — and the tiles of the picture
+    /// under them: the map of all the panes of a split tab, the one pane of
+    /// a tab of one ([`Self::card_panes`]). The
     /// newest command's row is read from the grid — a `Term` round, never
     /// on the frame path: when the card opens and, while it is open, when
     /// what the tab's chip shows changes (`tab_bar::TabBar::show`;
@@ -1319,15 +1322,58 @@ impl TerminalTab {
         }
     }
 
+    /// A picture of each pane the card's map asks for, `(pane id, tile size in points)`, at
+    /// `scale` pixels to the point: `TerminalPane::snapshot` for each — none for a pane that is
+    /// gone or has not been laid out. The panes of a tab that is not shown answer as well as
+    /// the shown ones.
+    pub(crate) fn card_shots(
+        &self,
+        tiles: &[(u64, (f64, f64))],
+        scale: f64,
+    ) -> Vec<(u64, Option<CFRetained<CGImage>>)> {
+        let panes = self.panes();
+        tiles
+            .iter()
+            .map(|&(id, size)| {
+                let still = panes
+                    .iter()
+                    .find(|pane| pane.id() == id)
+                    .and_then(|pane| pane.snapshot(size, scale));
+                (id, still)
+            })
+            .collect()
+    }
+
+    /// The card is done with its pictures: every pane lets go of what it kept for them.
+    pub(crate) fn release_card_shots(&self) {
+        for pane in self.panes() {
+            pane.release_snapshot();
+        }
+    }
+
     /// The card's map: every pane of a split tab where it stands in the tab (the split tree's own
     /// proportions, so a zoomed pane does not fold the map), with the program it shows, its
     /// name and what it reports — the tab's indicator rule over the pane's signals alone
     /// ([`Self::signals_of`]). While a pane shows a tick or a dot the program is the one that
-    /// ended, as the chip's emblem has it ([`Self::emblem`]). Empty for a tab of one pane. A
+    /// ended, as the chip's emblem has it ([`Self::emblem`]). A
     /// failed pane's exit code is read from its newest command's row — a `Term` round, which the
     /// card's own read allows.
+    ///
+    /// A tab of one pane has one, standing over the whole area: the card's picture of it, with
+    /// nothing else — its lines tell the program's state, so no state is read for it.
     fn card_panes(&self) -> Vec<CardPane> {
         let panes = self.panes();
+        if let [only] = panes.as_slice() {
+            return vec![CardPane {
+                id: only.id(),
+                place: Rect::new(0.0, 0.0, 1.0, 1.0),
+                kind: only.program_kind(),
+                name: String::new(),
+                indicator: None,
+                exit: None,
+                focused: true,
+            }];
+        }
         if panes.len() < 2 {
             return Vec::new();
         }

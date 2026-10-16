@@ -143,6 +143,12 @@ impl Surface {
         self.size.get().is_some()
     }
 
+    /// The configured size in pixels, `None` before one is known — what a
+    /// still of the pane is drawn at, so it has the layout the surface has.
+    pub(crate) fn size(&self) -> Option<(u32, u32)> {
+        self.size.get()
+    }
+
     /// This frame's texture. `Outdated`/`Suboptimal` reconfigure and try
     /// once more (the layer's size moved under the swap chain); a second
     /// miss is skipped, not failed.

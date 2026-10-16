@@ -108,6 +108,8 @@ use objc2_app_kit::{
     NSView, NSWindow, NSWindowDelegate, NSWindowOcclusionState, NSWindowOrderingMode,
     NSWindowStyleMask, NSWindowTabbingMode, NSWindowTitleVisibility, NSWindowToolbarStyle,
 };
+use objc2_core_foundation::CFRetained;
+use objc2_core_graphics::CGImage;
 use objc2_foundation::{
     NSAttributedStringKey, NSDictionary, NSKeyValueObservingOptions, NSNotification, NSObject,
     NSObjectNSKeyValueObserverRegistration, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -1870,6 +1872,26 @@ impl TerminalWindow {
     /// this window's.
     pub(crate) fn tab_card(&self, id: u64) -> Option<Card> {
         self.tab(id).map(|tab| tab.card())
+    }
+
+    /// A picture of each pane of tab `id` the card's map asks for ([`TerminalTab::card_shots`]);
+    /// none if the tab is not this window's.
+    pub(crate) fn tab_shots(
+        &self,
+        id: u64,
+        tiles: &[(u64, (f64, f64))],
+        scale: f64,
+    ) -> Vec<(u64, Option<CFRetained<CGImage>>)> {
+        self.tab(id)
+            .map(|tab| tab.card_shots(tiles, scale))
+            .unwrap_or_default()
+    }
+
+    /// The card is done with tab `id`'s pictures ([`TerminalTab::release_card_shots`]).
+    pub(crate) fn release_tab_shots(&self, id: u64) {
+        if let Some(tab) = self.tab(id) {
+            tab.release_card_shots();
+        }
     }
 
     /// The selected tab's position in the strip.

@@ -114,6 +114,16 @@
 //! ends; blink is off by default and even when on stops after keyboard
 //! silence ([`crate::blink::Blink`]); the bar fades out a second after the
 //! last scrolling input.
+//!
+//! **A still is not a frame** ([`DisplayLink::snapshot`], `still`): the card
+//! over a split tab's chip asks for a picture of a pane, and the answer is
+//! pulled, never pushed. It composes the pane's frame again, from the session,
+//! with the composition's own pieces ([`push_lists`], [`place_dock`],
+//! [`place_caret`]) but in a [`Shot`] of its own, at rest, and draws it into a
+//! texture of its own: it plants no damage, takes none, wakes nobody, counts
+//! in none of `content=`, `motion=`, `slide=`, `requests=` or `frames=`, steps
+//! no animator and no blink, and reads the cursor's target, not its place
+//! on the way there.
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
@@ -123,8 +133,8 @@ use std::time::{Duration, Instant};
 
 use bt_core::{
     BlockHandle, Blocks, CaretStyle, Clusters, ContentEdge, Cursor, CursorMotion, DirtyFlag,
-    DockArrival, DockBudget, DockCols, DockContext, DockState, Erase, Keypress, LinearRgba,
-    SearchRuns, SelectionRun, SelectionRuns, Session, Theme, TrackBlock, TrackMarks,
+    DockArrival, DockBudget, DockCaret, DockCols, DockContext, DockState, Erase, Keypress,
+    LinearRgba, SearchRuns, SelectionRun, SelectionRuns, Session, Theme, TrackBlock, TrackMarks,
 };
 
 use crate::arrival::{RISE_PT, Scene};
@@ -137,6 +147,9 @@ use crate::scrollbar::{Look, Mode, Scrollbar, ScrollbarLayout};
 use crate::stats::Stats;
 use crate::surface::{self, Acquired};
 use crate::{GpuError, Renderer, Surface};
+
+mod still;
+pub use still::{Shot, Snapshot};
 
 /// The platform's side of the frame loop — **four jobs**.
 ///
@@ -1093,6 +1106,20 @@ impl Core {
         self.focused.get() && self.keyboard.get()
     }
 
+    /// The numbers a composition reads from the link ([`View`]).
+    fn view(&self) -> View {
+        View {
+            cell: self.cell.get(),
+            caret_style: self.caret_style.get(),
+            edge: self.content_edge.get(),
+            dock_rows: self.dock_rows.get(),
+            dock_cols: self.dock_cols.get(),
+            context: self.context.get(),
+            focused: self.focused.get(),
+            caret_focused: self.caret_focused(),
+        }
+    }
+
     /// Hands every frame the GPU has finished to its four jobs:
     /// a frame finished without error gives the failure budget back, closes
     /// `startup=` (the first one) and records the GPU delta when measured; a
@@ -1235,7 +1262,8 @@ impl Core {
             // The damage was taken above; `acquire` planted it again.
             return;
         };
-        frame.clear(self.cell.get(), self.caret_style.get());
+        let view = self.view();
+        frame.clear(view.cell, view.caret_style);
         // **Two** CPU spans, not one: the lock wait is inside
         // `session.frame`, the encode inside `draw`. One span would add them
         // and erase the split.
@@ -1342,67 +1370,17 @@ impl Core {
         if cursor.shell_ready {
             motion.arrival_prompt(now, self.focused.get());
         }
-        // The fraction **before** the origin (`Frame::set_origin_rows` adds it
-        // the moment it is written) and before the caret (`Frame::push_caret`
-        // adds it to the grid's caret).
-        frame.set_scroll_frac(cursor.scroll_frac);
-        // **The channel's height before the cells** (`Frame::set_fill_rows`):
-        // `push_fill`'s guard measures the row against it. The channel is the
-        // band plus the fraction's top row; if zero, the boundary never called
-        // the second sink, so the loop is empty too and the frame is
-        // bit-identical to its fill-less form.
-        frame.set_fill_rows(cursor.top_row + cursor.fill);
-        for cell in fill.drain(..) {
-            frame.push_fill(cell);
-        }
-        // The band's own block marks (`Blocks::fill_slice`): **after** the
-        // cells, because `push_fill_block`'s guard reads the band's height and
-        // that is written in the same frame as the cells. It does not go
-        // through the grid's `borrow` round — the band's list is separate and
-        // lands in `fill_rules`.
-        for block in self.blocks.borrow().fill_slice() {
-            frame.push_fill_block(*block);
-        }
-        // Stripes in the **same** frame as the cells and from the same
-        // `frame()` call: read from a separate query they would lag one frame
-        // behind on a scroll frame. After the
-        // sink rather than inside it, because the block list is resolved per
-        // frame, not per cell — and `borrow_mut` dropped at the end of the
-        // expression above, so this `borrow` does not clash.
-        //
-        // **No animation**: the stripe appears at once, `motion`
-        // gains no second consumer and this path asks for no frame — zero
-        // frames at idle stays untouched. The motion frame's path
-        // (`Core::motion_tick`, `move_caret`) never comes here; the grid did
-        // not change, so the stripe must not either and `Frame` keeps it.
-        for block in self.blocks.borrow().as_slice() {
-            frame.push_block(*block);
-        }
-        // **The selection's colour comes from focus**: both
-        // colours arrive ready from the boundary, which one is drawn is
-        // decided here. Not a new source of frames — a focus change asks for a
-        // content frame already ([`DisplayLink::set_focused`]) and the colour
-        // turns in that frame; the motion frame keeps the list, and the colour.
-        let selection = self.selection.borrow();
-        let rgba = selection.color(self.focused.get());
-        // The slice at once: the corner decision looks at the neighbouring
-        // row's run.
-        frame.push_selection(selection.as_slice(), rgba);
-        drop(selection);
-        // **The search highlight by the same rule**: two roles,
-        // colour from focus; the grid's and the band's runs from the same
-        // `frame()` round. The band's after `set_fill_rows` — its guard reads
-        // the band's height — and their colours are the uniform `push_search`
-        // wrote. The motion frame keeps the lists and does not scan.
-        let search = self.search.borrow();
-        let focused = self.focused.get();
-        frame.push_search(
-            search.as_slice(),
-            search.match_color(focused),
-            search.current_color(focused),
+        // The lists of the grid and the band, from the buffers `frame()` just
+        // filled ([`push_lists`]: the order inside is required).
+        push_lists(
+            &mut frame,
+            &cursor,
+            &mut fill,
+            &self.blocks.borrow(),
+            &self.selection.borrow(),
+            &self.search.borrow(),
+            self.focused.get(),
         );
-        frame.push_fill_search(search.fill_slice());
-        drop(search);
         // The gate's operand rises here: damage was found, the frame will be
         // drawn. Before `frames` and independent of it — it does not wait for
         // the GPU to finish (see `Core::content_frames`).
@@ -1439,7 +1417,7 @@ impl Core {
         // processed, so `dirty` is already planted before entering this arm.
         // So the dock carries no frame request of its own — zero frames at
         // idle stays untouched.
-        let dock_rows = self.dock_rows.get();
+        let dock_rows = view.dock_rows;
         // The window's bottom, **in window space**: the dock's band and the
         // caret's target both lean on it. The height is read from the
         // texture, because that is its one correct source — `rows * cell_h`
@@ -1454,14 +1432,13 @@ impl Core {
         // it. The motion frame keeps it.
         place_edge(
             &mut frame,
-            self.content_edge.get(),
+            view.edge,
             viewport_height,
             dock_rows,
             cursor.rows,
-            self.cell.get(),
+            view.cell,
         );
         frame.set_grid(cursor.cols, cursor.rows);
-        let mut dock_caret = None;
         // The typing effects' clock advances on the content frame too: in fast
         // typing every tick finds damage and the motion arm never runs.
         let mut glyph_fx = self.glyph_fx.borrow_mut();
@@ -1469,179 +1446,31 @@ impl Core {
         // The band's rows, `None` for no band: one reading for the layout, the
         // dock's cells and the band's target below.
         let band_rows = cursor.band_rows();
-        if dock_rows > 0 {
-            // **The layout before the cells** (`Frame::set_dock_input_rows`):
-            // input rows + the context row, from the number `frame()` gave in
-            // the same read as the suppression. The band's top is not written
-            // here — the band is the animation's value and comes after `sync`
-            // (`Core::set_origin`). With no band the surface still opens: the
-            // band slides to zero height and the mouse reads a zero-row dock.
-            frame.set_dock_input_rows(band_rows);
-            let mut dock_state = self.dock.borrow_mut();
-            let mut dock_context = self.dock_context.borrow_mut();
-            // **The second sink flows into a local slot**, not straight into
-            // `Frame`: both sinks cannot borrow `frame` (`fill`'s reason). There
-            // is at most one edit per frame, so the buffer is an `Option`.
-            let mut edit = None;
-            // The twin of the grid's table, same reason.
-            let mut dock_clusters = frame.take_dock_clusters();
-            // The handover's answer comes from `frame()`, the dock does not
-            // recompute it: only `frame()` knows the three preconditions (a
-            // window with a dock, the alternate screen, the mirror's
-            // freshness).
-            let dock = self.session.dock(
-                DockCols {
-                    input: self.dock_cols.get(),
-                    // The context row's budget: the strip between the two
-                    // side margins in the small step. The arithmetic is the
-                    // grid's (`ContextStrip`), because `bt-core` does not see
-                    // pixels.
-                    context: self.context.get().cols,
-                },
-                // The number passes from where it was computed, the dock does
-                // not derive it again (`caret_in_dock`'s precedent).
-                band_rows,
-                &mut dock_state,
-                &mut dock_context,
-                cursor.caret_in_dock,
-                &mut self.dock_selection.borrow_mut(),
-                &mut dock_clusters,
-                |cell| frame.push_dock(cell),
-                |dock_edit| edit = Some(dock_edit),
-            );
-            frame.put_dock_clusters(dock_clusters);
-            // **The trailing zone moves before anything reads a context
-            // position**: the arrival's letters, the effects' static match and
-            // the buttons' fills all go through `dock_pos`, and the zone's
-            // start is only known from this dock call.
-            frame.set_context_trailing(dock.trailing, self.context.get().offset_px);
-            // No mark → the input's first row is outside the vertical window.
-            // **The mark is pushed with the cells, before the effects**: the
-            // arrival scene hides it and turns it into an effect in
-            // `set_dock_fx`, which can only find a mark that is already there.
-            if let Some(sigil) = dock.sigil {
-                frame.push_dock_sigil(sigil);
-            }
-            // **The arrival scene is decided here, from this frame's dock**:
-            // a program that has the dock step aside ends it (the band is
-            // gone, there is nothing to arrive), the text the dock holds sizes
-            // its typing, and the scene — whichever way it went — is written
-            // before the effects, which turn its letters and › into effects.
-            if band_rows.is_none() {
-                motion.end_arrival();
-            }
-            // Only a pane that still has a scene counts its letters.
-            if motion.arrival_armed() {
-                motion.note_arrival_letters(frame.dock_letter_span());
-            }
-            self.write_arrival(&mut frame, &motion);
-            // The order is required: an edit can shift and finish the ones in
-            // flight, an arrival whose static glyph cannot be found is only
-            // known **after** the dock is printed, and the list to draw comes
-            // last.
-            if cursor.input_rows == 0 {
-                // No input row (remote session, no band): no surface for the
-                // effect either. It ends unconditionally — `Reset` only comes
-                // when the mirror changed, and an arrival left in flight would
-                // be drawn on row 0, i.e. now in the context row's place, at
-                // the wrong size.
-                glyph_fx.finish();
-            } else if let Some(edit) = edit {
-                // The vertical window's height is the very number passed to
-                // `dock()`: an effect the scroll pushes out of the window drops.
-                glyph_fx.apply(edit, motion, cursor.input_rows, frame.dock_clusters());
-            }
-            frame.suppress_dock(&mut glyph_fx);
-            frame.set_dock_fx(glyph_fx.iter(), glyph_fx.clusters(), theme.cursor_linear());
-            dock_caret = dock.caret.map(|at| (at, dock.caret_text));
-            // The dock's selection is the grid's shape and colour uniform;
-            // the colour was written above with `push_selection` — one
-            // selection per window, one colour.
-            frame.push_dock_selection(&self.dock_selection.borrow());
-            // The surface opens **after** the cells: the call bringing the
-            // colours is the very call printing the cells (`Frame::open_dock`).
-            frame.open_dock(dock.ground, dock.edge, dock.separator, dock.band);
-            frame.set_dock_depth(
-                dock.shadow,
-                dock.shadow_strength,
-                dock.glow,
-                dock.glow_strength,
-            );
-            frame.set_dock_progress(dock.progress, dock.track);
-            frame.set_dock_buttons(dock.buttons);
-        } else {
-            // No dock (alternate screen): the effect has no subject either,
-            // nor has the arrival.
-            glyph_fx.finish();
-            motion.end_arrival();
-        }
+        let dock_caret = place_dock(
+            &self.session,
+            &mut frame,
+            &view,
+            &cursor,
+            band_rows,
+            DockBufs {
+                state: &mut self.dock.borrow_mut(),
+                context: &mut self.dock_context.borrow_mut(),
+                selection: &mut self.dock_selection.borrow_mut(),
+            },
+            &mut motion,
+            Some(&mut glyph_fx),
+            &theme,
+        );
         drop(glyph_fx);
-        // **The caret's single target.** There are two homes and both enter
-        // the same animator: the dock if it took over, otherwise the grid's
-        // cursor. With separate animators there would be no glide in the dock
-        // and the handover would stay a teleport — two separate user
-        // complaints, one cause.
-        //
-        // The dock has priority and the two **cannot** be `Some` at once: the
-        // handover's answer is computed in one place (`Session::frame`) and
-        // given from the same value to both the grid's `visible` and the
-        // dock's caret (`Cursor::caret_in_dock`). This sentence was once
-        // false: `dock::render` asked the predicate itself, did not know
-        // `frame()`'s three preconditions, and on a stale mirror both were
-        // born — the `.or_else` below picked the dock and the fresh row lost
-        // its caret. The order still stays written:
-        // a caret drawn in the wrong place is a visible defect, rather than
-        // one drawn in two places.
-        //
-        // **The band's excess in both targets**: the grid's caret is
-        // that much higher together with the grid by the band's **target**
-        // excess, the dock's is in the bottom-aligned input block, on the
-        // wrapped row's own row. The grid's is lower by the top edge too, as
-        // the grid is ([`grid_caret_at`]); the dock's is not — the dock is
-        // its own panel.
-        let band_target = band_target(band_rows, dock_rows, self.cell.get());
-        let caret = dock_caret
-            .map(|(at, text)| {
-                // A dock caret exists only on a band with input rows: the
-                // dock gives none with no band.
-                let at = dock_caret_at(
-                    at.col,
-                    at.row,
-                    cursor.input_rows,
-                    viewport_height,
-                    self.cell.get(),
-                );
-                (at, text)
-            })
-            .or_else(|| {
-                cursor.visible.then(|| {
-                    let at = grid_caret_at(
-                        cursor.col,
-                        cursor.row,
-                        origin_target(cursor),
-                        band_target,
-                        frame.edge_px(),
-                        self.cell.get(),
-                    );
-                    (at, cursor.text)
-                })
-            });
+        let Placed { caret, band_target } = place_caret(
+            &mut frame,
+            &view,
+            &cursor,
+            dock_caret,
+            band_rows,
+            viewport_height,
+        );
         self.last_caret_text.set(caret.map(|(_, text)| text));
-        // **The hidden cursor keeps its place for the text input system**
-        // ([`Frame::set_hidden_caret`]): only the one a program hid. One the
-        // dock took over has its caret there, and one scrolled out of the
-        // window has no real row — `Cursor` clamps it to the window's edge.
-        if caret.is_none() && !cursor.caret_in_dock && cursor.display_offset == 0 {
-            let at = grid_caret_at(
-                cursor.col,
-                cursor.row,
-                origin_target(cursor),
-                band_target,
-                frame.edge_px(),
-                self.cell.get(),
-            );
-            frame.set_hidden_caret(at);
-        }
         // **Blink AFTER the caret** and the order is required: "is the user
         // typing" is answered by the caret's target moving, and that target
         // is only known here.
@@ -2009,33 +1838,10 @@ impl Core {
         }
     }
 
-    /// Writes the dock's arrival scene into the frame — the one step both frame
-    /// paths take, so what a motion frame replays is what the content frame
-    /// wrote. The climb is in whole pixels (an edge that does not land on the
-    /// device grid would fade). The wave line starts in the context row's quiet
-    /// tone, the theme's, and the dust is drawn in the theme's text and accent.
-    /// Call before `Frame::set_dock_fx`.
+    /// The dock's arrival scene into the frame ([`write_scene`]), in the
+    /// theme and cell the frame path keeps.
     fn write_arrival(&self, frame: &mut Frame, motion: &Motion) {
-        let scene = motion.arrival_scene();
-        let rise = scene.map_or(0.0, |scene| self.rise_px(scene));
-        frame.set_dock_scene(scene, rise);
-        if scene.is_some_and(|scene| scene.wave.is_some()) {
-            frame.set_dock_quiet(self.theme.get().quiet_linear());
-        }
-        if scene.is_some_and(|scene| scene.dust.is_some()) {
-            let theme = self.theme.get();
-            frame.set_dock_dust_tones(
-                theme.foreground_linear(),
-                theme.accent_linear(),
-                theme.background_linear(),
-            );
-        }
-    }
-
-    /// How far below its place the dock is, in pixels, at this point of the
-    /// scene's climb ([`RISE_PT`] points at the start).
-    fn rise_px(&self, scene: Scene) -> f32 {
-        (scene.rise * self.cell.get().pt_px(RISE_PT)).round()
+        write_scene(frame, motion, &self.theme.get(), self.cell.get());
     }
 
     /// Hides the scroll bar at once and takes its thumb out of the kept
@@ -2292,6 +2098,360 @@ impl Core {
             }),
         );
     }
+}
+
+/// What one composition of the frame reads from the link besides the session:
+/// the layout the shell last gave it and the settings that shape what is
+/// drawn, copied out of [`Core`]'s cells.
+///
+/// A copy, so the pieces of a composition ([`push_lists`], [`place_dock`],
+/// [`place_caret`]) take what they read as an argument and the content frame
+/// ([`Core::tick`]) and a still of the pane ([`still`]) call the very same
+/// ones — the second does not own the first's cells, only its numbers.
+#[derive(Clone, Copy)]
+struct View {
+    cell: CellMetrics,
+    caret_style: CaretStyle,
+    edge: ContentEdge,
+    dock_rows: u16,
+    dock_cols: u16,
+    context: ContextStrip,
+    /// The window is key: the selection's and the search highlight's colours.
+    focused: bool,
+    /// The caret's focus ([`Core::caret_focused`]): solid or hollow.
+    caret_focused: bool,
+}
+
+/// The dock's buffers one composition fills — the mirror, the context row and
+/// the selection's runs — refilled in place every time, the capacity kept.
+struct DockBufs<'a> {
+    state: &'a mut DockState,
+    context: &'a mut DockContext,
+    selection: &'a mut Vec<SelectionRun>,
+}
+
+/// Pushes the lists of the grid and of the fill band that one `Session::frame`
+/// read fills: the cells of the band, the block stripes, the selection and
+/// the search highlight. Common to the content frame and a still, called
+/// right after the scan.
+///
+/// The order is required, every step leans on the one before it.
+fn push_lists(
+    frame: &mut Frame,
+    cursor: &Cursor,
+    fill: &mut Vec<bt_core::Cell>,
+    blocks: &Blocks,
+    selection: &SelectionRuns,
+    search: &SearchRuns,
+    focused: bool,
+) {
+    // The fraction **before** the origin (`Frame::set_origin_rows` adds it
+    // the moment it is written) and before the caret (`Frame::push_caret`
+    // adds it to the grid's caret).
+    frame.set_scroll_frac(cursor.scroll_frac);
+    // **The channel's height before the cells** (`Frame::set_fill_rows`):
+    // `push_fill`'s guard measures the row against it. The channel is the
+    // band plus the fraction's top row; if zero, the boundary never called
+    // the second sink, so the loop is empty too and the frame is
+    // bit-identical to its fill-less form.
+    frame.set_fill_rows(cursor.top_row + cursor.fill);
+    for cell in fill.drain(..) {
+        frame.push_fill(cell);
+    }
+    // The band's own block marks (`Blocks::fill_slice`): **after** the
+    // cells, because `push_fill_block`'s guard reads the band's height and
+    // that is written in the same frame as the cells. It does not go
+    // through the grid's `borrow` round — the band's list is separate and
+    // lands in `fill_rules`.
+    for block in blocks.fill_slice() {
+        frame.push_fill_block(*block);
+    }
+    // Stripes in the **same** frame as the cells and from the same
+    // `frame()` call: read from a separate query they would lag one frame
+    // behind on a scroll frame. After the sink rather than inside it,
+    // because the block list is resolved per frame, not per cell.
+    //
+    // **No animation**: the stripe appears at once, `motion` gains no second
+    // consumer and this path asks for no frame — zero frames at idle stays
+    // untouched. The motion frame's path (`Core::motion_tick`, `move_caret`)
+    // never comes here; the grid did not change, so the stripe must not
+    // either and `Frame` keeps it.
+    for block in blocks.as_slice() {
+        frame.push_block(*block);
+    }
+    // **The selection's colour comes from focus**: both colours arrive ready
+    // from the boundary, which one is drawn is decided here. Not a new source
+    // of frames — a focus change asks for a content frame already
+    // ([`DisplayLink::set_focused`]) and the colour turns in that frame; the
+    // motion frame keeps the list, and the colour. The slice at once: the
+    // corner decision looks at the neighbouring row's run.
+    frame.push_selection(selection.as_slice(), selection.color(focused));
+    // **The search highlight by the same rule**: two roles, colour from
+    // focus; the grid's and the band's runs from the same `frame()` round.
+    // The band's after `set_fill_rows` — its guard reads the band's height —
+    // and their colours are the uniform `push_search` wrote. The motion frame
+    // keeps the lists and does not scan.
+    frame.push_search(
+        search.as_slice(),
+        search.match_color(focused),
+        search.current_color(focused),
+    );
+    frame.push_fill_search(search.fill_slice());
+}
+
+/// The dock's surface for one composition: its cells, mark, selection,
+/// buttons and colours — and the answer to where its caret stands, if it
+/// holds one. Common to the content frame and a still.
+///
+/// `fx` is the live frame's typing effects: with `Some` the dock's edit
+/// starts or ends an effect, the arrival scene plays and the effects are
+/// written. With `None` — a still — none of it runs: the dock is drawn at
+/// rest, every letter in its place, and the dock's edit (which a mirror that
+/// is not "the last drawn one" would make of its whole text) is dropped.
+///
+/// The arrival scene is in `motion`: a still hands in a motion that has none.
+// The arguments are the session, the frame being built and the pieces of
+// state one composition reads or advances; gathering them in a struct would
+// create a type only for this call (`Session::dock`'s precedent).
+#[allow(clippy::too_many_arguments)]
+fn place_dock(
+    session: &Session,
+    frame: &mut Frame,
+    view: &View,
+    cursor: &Cursor,
+    band_rows: Option<u16>,
+    bufs: DockBufs<'_>,
+    motion: &mut Motion,
+    fx: Option<&mut GlyphFx>,
+    theme: &Theme,
+) -> Option<(DockCaret, LinearRgba)> {
+    let mut dock_caret = None;
+    if view.dock_rows > 0 {
+        // **The layout before the cells** (`Frame::set_dock_input_rows`):
+        // input rows + the context row, from the number `frame()` gave in
+        // the same read as the suppression. The band's top is not written
+        // here — the band is the animation's value and comes after `sync`
+        // (`Core::set_origin`). With no band the surface still opens: the
+        // band slides to zero height and the mouse reads a zero-row dock.
+        frame.set_dock_input_rows(band_rows);
+        // **The second sink flows into a local slot**, not straight into
+        // `Frame`: both sinks cannot borrow `frame` (`fill`'s reason). There
+        // is at most one edit per frame, so the buffer is an `Option`.
+        let mut edit = None;
+        // The twin of the grid's table, same reason.
+        let mut dock_clusters = frame.take_dock_clusters();
+        // The handover's answer comes from `frame()`, the dock does not
+        // recompute it: only `frame()` knows the three preconditions (a
+        // window with a dock, the alternate screen, the mirror's freshness).
+        let dock = session.dock(
+            DockCols {
+                input: view.dock_cols,
+                // The context row's budget: the strip between the two side
+                // margins in the small step. The arithmetic is the grid's
+                // (`ContextStrip`), because `bt-core` does not see pixels.
+                context: view.context.cols,
+            },
+            // The number passes from where it was computed, the dock does not
+            // derive it again (`caret_in_dock`'s precedent).
+            band_rows,
+            bufs.state,
+            bufs.context,
+            cursor.caret_in_dock,
+            bufs.selection,
+            &mut dock_clusters,
+            |cell| frame.push_dock(cell),
+            |dock_edit| edit = Some(dock_edit),
+        );
+        frame.put_dock_clusters(dock_clusters);
+        // **The trailing zone moves before anything reads a context
+        // position**: the arrival's letters, the effects' static match and
+        // the buttons' fills all go through `dock_pos`, and the zone's start
+        // is only known from this dock call.
+        frame.set_context_trailing(dock.trailing, view.context.offset_px);
+        // No mark → the input's first row is outside the vertical window.
+        // **The mark is pushed with the cells, before the effects**: the
+        // arrival scene hides it and turns it into an effect in
+        // `set_dock_fx`, which can only find a mark that is already there.
+        if let Some(sigil) = dock.sigil {
+            frame.push_dock_sigil(sigil);
+        }
+        if let Some(fx) = fx {
+            // **The arrival scene is decided here, from this frame's dock**:
+            // a program that has the dock step aside ends it (the band is
+            // gone, there is nothing to arrive), the text the dock holds
+            // sizes its typing, and the scene — whichever way it went — is
+            // written before the effects, which turn its letters and › into
+            // effects.
+            if band_rows.is_none() {
+                motion.end_arrival();
+            }
+            // Only a pane that still has a scene counts its letters.
+            if motion.arrival_armed() {
+                motion.note_arrival_letters(frame.dock_letter_span());
+            }
+            write_scene(frame, motion, theme, view.cell);
+            // The order is required: an edit can shift and finish the ones in
+            // flight, an arrival whose static glyph cannot be found is only
+            // known **after** the dock is printed, and the list to draw comes
+            // last.
+            if cursor.input_rows == 0 {
+                // No input row (remote session, no band): no surface for the
+                // effect either. It ends unconditionally — `Reset` only comes
+                // when the mirror changed, and an arrival left in flight would
+                // be drawn on row 0, i.e. now in the context row's place, at
+                // the wrong size.
+                fx.finish();
+            } else if let Some(edit) = edit {
+                // The vertical window's height is the very number passed to
+                // `dock()`: an effect the scroll pushes out of the window
+                // drops.
+                fx.apply(edit, *motion, cursor.input_rows, frame.dock_clusters());
+            }
+            frame.suppress_dock(fx);
+            frame.set_dock_fx(fx.iter(), fx.clusters(), theme.cursor_linear());
+        }
+        dock_caret = dock.caret.map(|at| (at, dock.caret_text));
+        // The dock's selection is the grid's shape and colour uniform; the
+        // colour was written above with `push_selection` — one selection per
+        // window, one colour.
+        frame.push_dock_selection(bufs.selection);
+        // The surface opens **after** the cells: the call bringing the
+        // colours is the very call printing the cells (`Frame::open_dock`).
+        frame.open_dock(dock.ground, dock.edge, dock.separator, dock.band);
+        frame.set_dock_depth(
+            dock.shadow,
+            dock.shadow_strength,
+            dock.glow,
+            dock.glow_strength,
+        );
+        frame.set_dock_progress(dock.progress, dock.track);
+        frame.set_dock_buttons(dock.buttons);
+    } else {
+        // No dock (alternate screen): the effect has no subject either, nor
+        // has the arrival.
+        if let Some(fx) = fx {
+            fx.finish();
+        }
+        motion.end_arrival();
+    }
+    dock_caret
+}
+
+/// What [`place_caret`] decided.
+struct Placed {
+    /// The caret's target, in screen cells, with the colour of the text under
+    /// it; `None` for none.
+    caret: Option<([f32; 2], LinearRgba)>,
+    /// The band's excess target ([`band_target`]), which `Motion::sync` takes
+    /// next to the caret's.
+    band_target: f32,
+}
+
+/// The caret's single target, and the hidden cursor's place. Common to the
+/// content frame and a still.
+fn place_caret(
+    frame: &mut Frame,
+    view: &View,
+    cursor: &Cursor,
+    dock_caret: Option<(DockCaret, LinearRgba)>,
+    band_rows: Option<u16>,
+    viewport_height: f32,
+) -> Placed {
+    let cursor = *cursor;
+    // **The caret's single target.** There are two homes and both enter
+    // the same animator: the dock if it took over, otherwise the grid's
+    // cursor. With separate animators there would be no glide in the dock
+    // and the handover would stay a teleport — two separate user
+    // complaints, one cause.
+    //
+    // The dock has priority and the two **cannot** be `Some` at once: the
+    // handover's answer is computed in one place (`Session::frame`) and
+    // given from the same value to both the grid's `visible` and the
+    // dock's caret (`Cursor::caret_in_dock`). This sentence was once
+    // false: `dock::render` asked the predicate itself, did not know
+    // `frame()`'s three preconditions, and on a stale mirror both were
+    // born — the `.or_else` below picked the dock and the fresh row lost
+    // its caret. The order still stays written:
+    // a caret drawn in the wrong place is a visible defect, rather than
+    // one drawn in two places.
+    //
+    // **The band's excess in both targets**: the grid's caret is
+    // that much higher together with the grid by the band's **target**
+    // excess, the dock's is in the bottom-aligned input block, on the
+    // wrapped row's own row. The grid's is lower by the top edge too, as
+    // the grid is ([`grid_caret_at`]); the dock's is not — the dock is
+    // its own panel.
+    let band_target = band_target(band_rows, view.dock_rows, view.cell);
+    let caret = dock_caret
+        .map(|(at, text)| {
+            // A dock caret exists only on a band with input rows: the
+            // dock gives none with no band.
+            let at = dock_caret_at(
+                at.col,
+                at.row,
+                cursor.input_rows,
+                viewport_height,
+                view.cell,
+            );
+            (at, text)
+        })
+        .or_else(|| {
+            cursor.visible.then(|| {
+                let at = grid_caret_at(
+                    cursor.col,
+                    cursor.row,
+                    origin_target(cursor),
+                    band_target,
+                    frame.edge_px(),
+                    view.cell,
+                );
+                (at, cursor.text)
+            })
+        });
+    // **The hidden cursor keeps its place for the text input system**
+    // ([`Frame::set_hidden_caret`]): only the one a program hid. One the
+    // dock took over has its caret there, and one scrolled out of the
+    // window has no real row — `Cursor` clamps it to the window's edge.
+    if caret.is_none() && !cursor.caret_in_dock && cursor.display_offset == 0 {
+        let at = grid_caret_at(
+            cursor.col,
+            cursor.row,
+            origin_target(cursor),
+            band_target,
+            frame.edge_px(),
+            view.cell,
+        );
+        frame.set_hidden_caret(at);
+    }
+    Placed { caret, band_target }
+}
+
+/// Writes the dock's arrival scene into the frame — the one step both frame
+/// paths take, so what a motion frame replays is what the content frame
+/// wrote. The climb is in whole pixels (an edge that does not land on the
+/// device grid would fade). The wave line starts in the context row's quiet
+/// tone, the theme's, and the dust is drawn in the theme's text and accent.
+/// Call before `Frame::set_dock_fx`.
+fn write_scene(frame: &mut Frame, motion: &Motion, theme: &Theme, cell: CellMetrics) {
+    let scene = motion.arrival_scene();
+    let rise = scene.map_or(0.0, |scene| rise_px(scene, cell));
+    frame.set_dock_scene(scene, rise);
+    if scene.is_some_and(|scene| scene.wave.is_some()) {
+        frame.set_dock_quiet(theme.quiet_linear());
+    }
+    if scene.is_some_and(|scene| scene.dust.is_some()) {
+        frame.set_dock_dust_tones(
+            theme.foreground_linear(),
+            theme.accent_linear(),
+            theme.background_linear(),
+        );
+    }
+}
+
+/// How far below its place the dock is, in pixels, at this point of the
+/// scene's climb ([`RISE_PT`] points at the start).
+fn rise_px(scene: Scene, cell: CellMetrics) -> f32 {
+    (scene.rise * cell.pt_px(RISE_PT)).round()
 }
 
 /// This frame's offset **target**, rows: how many of the grid's rows stay

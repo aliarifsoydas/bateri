@@ -10308,8 +10308,13 @@ impl Session {
     /// **The second sink is the typing animations'**: it prints the glyph
     /// added or removed since the last drawn mirror, with its screen column, as
     /// **at most one** [`DockEdit`]. The diff is taken against the caller's
-    /// buffer, i.e. `into` **must be the last drawn** mirror — its only caller is
-    /// `bt-gpu`'s content frame and nobody but it writes its buffer. The diff's
+    /// buffer, i.e. `into` **must be the last drawn** mirror — of **that caller**:
+    /// `bt-gpu`'s content frame has one and a still of the pane
+    /// (`DisplayLink::snapshot`) has its own, from which it draws no effect and
+    /// whose edit it drops; nobody but the owner writes a buffer, and the diff
+    /// reads nothing but the two mirrors, so one caller's buffer never steals
+    /// another's edit. Every call records the hit-test window below, with the
+    /// same numbers whichever of them makes it. The diff's
     /// cost is behind the stamp gate (`dock::change`): if there is no new input a
     /// single comparison. In an input exceeding the ceiling the vertical window's
     /// shift goes together with the edit as a **row** difference (the doc of

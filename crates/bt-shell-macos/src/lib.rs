@@ -67,6 +67,7 @@ mod remote_ports;
 mod search_bar;
 mod settings_window;
 mod sheets;
+mod snapshot;
 mod split_view;
 mod stats;
 mod stats_popover;

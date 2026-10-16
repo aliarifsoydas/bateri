@@ -49,8 +49,8 @@ use bt_core::{
 };
 use bt_core::{load_shell, smoke_shell};
 use bt_gpu::{
-    CellMetrics, DisplayLink, GpuError, Layout, Pacer, Renderer, ScrollbarMode, Stats, Surface,
-    Waker,
+    CellMetrics, DisplayLink, GpuError, Layout, Pacer, Renderer, ScrollbarMode, Shot, Stats,
+    Surface, Waker,
 };
 use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::Retained;
@@ -66,6 +66,8 @@ use objc2_app_kit::{
     NSWindowDidChangeOcclusionStateNotification, NSWindowDidEndSheetNotification,
     NSWindowDidResignKeyNotification, NSWindowOcclusionState,
 };
+use objc2_core_foundation::CFRetained;
+use objc2_core_graphics::CGImage;
 use objc2_foundation::{
     NSAttributedString, NSAttributedStringKey, NSDate, NSDateFormatter, NSDateFormatterStyle,
     NSDictionary, NSMutableAttributedString, NSNotification, NSNotificationCenter,
@@ -1905,6 +1907,10 @@ pub struct PaneIvars {
     /// frame path; shown by [`TerminalPane::set_link_target`].
     link_label: (Retained<LinkLabel>, Retained<NSTextField>),
     link: OnceCell<DisplayLink>,
+    /// What a still of the pane keeps between two ([`TerminalPane::snapshot`]): its frame, its
+    /// buffers and the textures the picture is shrunk through. Empty until a card first asks and
+    /// given back when the card goes ([`TerminalPane::release_snapshot`]).
+    shot: RefCell<Option<Shot>>,
     /// The second step of the closing sequence is called from here; `DisplayLink`
     /// holds a copy too but reaching there after `stop()` would be wrong.
     session: OnceCell<Arc<Session>>,
@@ -2529,6 +2535,7 @@ impl TerminalPane {
             card_frame: card_frame.clone(),
             link_label: link_label.clone(),
             link: OnceCell::new(),
+            shot: RefCell::new(None),
             session: OnceCell::new(),
             shell_parent: OnceCell::new(),
             wake: Arc::new(ShellWake {
@@ -2893,6 +2900,38 @@ impl TerminalPane {
 
     pub(crate) fn link(&self) -> Option<&DisplayLink> {
         self.ivars().link.get()
+    }
+
+    /// The pane as it is now, as an image for a tile `size` points across at `scale` pixels to the
+    /// point (a split tab's summary card, `tab_bar`): the whole of its frame — grid, history band,
+    /// dock, pictures — drawn at the pane's own size and shrunk on the GPU, so the pixels that
+    /// cross are the tile's. `None` before the pane has been laid out or if the GPU declined.
+    ///
+    /// Pulled, never pushed: it asks the link for no frame and takes none of its damage, counts in
+    /// none of its tokens and steps none of its animations (`bt_gpu::DisplayLink::snapshot`). A
+    /// pane in a tab that is not shown answers like any other — its renderer, surface and session
+    /// live while it is hidden; only its frames stop. The cursor is where it is heading, drawn in
+    /// the open phase of its blink.
+    ///
+    /// The textures stay between two calls (the card asks every half second) until
+    /// [`TerminalPane::release_snapshot`].
+    pub fn snapshot(&self, size: (f64, f64), scale: f64) -> Option<CFRetained<CGImage>> {
+        let link = self.link()?;
+        let tile = |points: f64| (points * scale).round().max(1.0) as u32;
+        // A still asked for from inside a still (the session's notices run on this thread) gets
+        // none rather than a second borrow.
+        let mut shot = self.ivars().shot.try_borrow_mut().ok()?;
+        let still = link.snapshot(
+            shot.get_or_insert_with(Shot::default),
+            (tile(size.0), tile(size.1)),
+        )?;
+        crate::snapshot::image(&still)
+    }
+
+    /// Lets go of what [`TerminalPane::snapshot`] kept: its textures and buffers. The next
+    /// snapshot makes them again.
+    pub fn release_snapshot(&self) {
+        self.ivars().shot.replace(None);
     }
 
     /// Scrolling **input** reached this pane's grid — the wheel, a page
