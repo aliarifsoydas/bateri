@@ -59,6 +59,11 @@ of every installed copy. A version without a section is not released.
   several panes.** A window restored at launch drew a filled, blinking cursor
   in every pane of its split tab, as if each had the keyboard, until you
   clicked into each one; the others now show the hollow cursor from the start.
+- **Resizing a window with a split tab keeps up with the pointer.** Every step
+  of a resize — the window's edge or the line between two panes — drew the
+  shadows under the panes again, which took about 55 ms on a Retina display
+  and held the resize to a handful of steps a second. The shadows are now
+  drawn once and stretched to each pane, and look the same.
 
 ## [0.16.0] - 2026-10-16
 

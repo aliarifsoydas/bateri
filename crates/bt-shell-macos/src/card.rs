@@ -31,7 +31,7 @@
 //! content frame replaces it at the final size.
 
 use std::cell::{Cell, RefCell};
-use std::ptr::NonNull;
+use std::ptr::{NonNull, null_mut};
 use std::sync::OnceLock;
 
 use block2::RcBlock;
@@ -42,11 +42,12 @@ use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send,
 };
 use objc2_app_kit::{
-    NSAnimatablePropertyContainer, NSAnimationContext, NSBezierPath, NSColor,
-    NSCompositingOperation, NSGradient, NSGraphicsContext, NSImage, NSShadow, NSView,
+    NSAnimatablePropertyContainer, NSAnimationContext, NSBezierPath, NSBitmapImageRep, NSColor,
+    NSCompositingOperation, NSDeviceRGBColorSpace, NSGradient, NSGraphicsContext, NSImage, NSView,
     NSWindingRule, NSWindow, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGRect;
+use objc2_core_graphics::{CGContext, CGImage};
 use objc2_foundation::{
     NSNumber, NSObjectProtocol, NSOperatingSystemVersion, NSPoint, NSProcessInfo, NSRect, NSSize,
     NSString, NSValue, ns_string,
@@ -660,7 +661,10 @@ pub(crate) fn animate(secs: f64, change: impl Fn() + 'static, done: impl Fn() + 
 
 /// How a card stands off the ground: the shadow under its foot (`offset`
 /// down, `blur`, cast by a fill `spread` points inside the card, so it shows
-/// under the foot and not round the sides) and the cut round it.
+/// under the foot and not round the sides) and the cut round it. The shadow's
+/// `offset` and `blur` are in the device's pixels, not points: the footings
+/// were tuned on what `NSShadow` cast in a view, which took them so
+/// (`draw_shadow`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Footing {
     pub offset: f64,
@@ -786,7 +790,7 @@ fn caster_radius(corner: f64, footing: &Footing) -> f64 {
 /// nothing at its tail ([`Footing::tail`]).
 ///
 /// It is made in a picture of its own: clearing the tail takes a compositing operation that would
-/// reach into the other cards' shadows, drawn in the same view, if it were done there. A drawing-
+/// reach into whatever was drawn under it, if it were done there. A drawing-
 /// handler image is made when it is drawn, at the destination's resolution, so the picture is as
 /// sharp as the view it lands in; `the_shadows_picture_is_made_at_the_destinations_scale` holds
 /// it to that, and to being a picture of its own.
@@ -813,11 +817,24 @@ fn draw_shadow(rect: NSRect, footing: Footing) {
         };
         let caster = at(caster);
         NSGraphicsContext::saveGraphicsState_class();
-        let shadow = NSShadow::new();
-        shadow.setShadowOffset(NSSize::new(0.0, -footing.offset));
-        shadow.setShadowBlurRadius(footing.blur);
-        shadow.setShadowColor(Some(&srgb(footing.shadow.0, footing.shadow.1)));
-        shadow.set();
+        // The shadow is cast in the device's space, where its numbers are the footing's own —
+        // pixels, as `NSShadow` cast them in the view the footings were tuned in — and down the
+        // picture: `NSShadow` itself casts the same offset down a view's backing store and up a
+        // bitmap, so only the direction is taken from this drawing.
+        if let Some(context) = NSGraphicsContext::currentContext() {
+            let context = context.CGContext();
+            let down =
+                CGContext::convert_size_to_device_space(Some(&context), NSSize::new(0.0, -1.0))
+                    .height
+                    .signum();
+            let tone = srgb(footing.shadow.0, footing.shadow.1).CGColor();
+            CGContext::set_shadow_with_color(
+                Some(&context),
+                NSSize::new(0.0, down * footing.offset),
+                footing.blur,
+                Some(&tone),
+            );
+        }
         srgb([0, 0, 0], 1.0).setFill();
         rounded(caster, caster_radius).fill();
         NSGraphicsContext::restoreGraphicsState_class();
@@ -850,6 +867,168 @@ fn draw_shadow(rect: NSRect, footing: Footing) {
     );
 }
 
+/// One card's footing as a picture Core Animation stretches over the card: [`draw_footing`]
+/// drawn once round a card just big enough for every curve in it, and laid on a layer whose
+/// `contentsCenter` stretches the middle, where nothing changes along the edges. A straight
+/// edge's shadow, tail and cut are measured off that edge alone, so the stretched picture is the
+/// one the card's own size would paint (`a_stretched_footing_is_what_the_cards_own_size_paints`)
+/// — and a card that changes size moves a layer instead of drawing its shadow again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Slices {
+    /// How far the picture reaches past the card on every side, in whole points.
+    margin: f64,
+    /// The card the picture is drawn round, in points: on an axis where the card is too small for
+    /// its curves, the card's own length, and nothing stretches along it.
+    card: NSSize,
+    /// What stretches, in the picture's unit square, bottom-up.
+    center: CGRect,
+}
+
+/// The breadth of the stretching middle, in whole points so it stays on the screen's pixels.
+const STRETCH_PT: f64 = 2.0;
+
+impl Slices {
+    fn of(footing: &Footing, corner: f64, card: NSSize) -> Self {
+        // The shadow's picture reaches this far past its caster, the cut lies inside it. Its
+        // offset and blur are pixels: read as points, as here, they only reach further.
+        let margin = (footing.offset + footing.blur + 1.0 - footing.spread)
+            .max(footing.cut.0)
+            .ceil();
+        let caster = caster_radius(corner, footing);
+        // How far in from the card's edge the picture still changes along it: the caster's
+        // corner (its edge `edge` in from the card's) and the blur round it — the tail is
+        // inside the blur — and the cut's corner, the card's own. Whole points, with one to
+        // spare.
+        let reach = |edge: f64| ((edge + caster + footing.blur).max(corner) + 1.0).ceil();
+        let side = reach(footing.spread);
+        // The shadow is cast down by its offset: its curves reach further into the card from
+        // the top than from the bottom.
+        let below = reach(footing.spread - footing.offset);
+        let above = reach(footing.spread + footing.offset);
+        // A length, where along it the middle starts and how long the middle is.
+        let axis = |length: f64, low: f64, high: f64| {
+            let least = low + high + STRETCH_PT;
+            if length > least {
+                (least, low, STRETCH_PT)
+            } else {
+                (length, length / 2.0, 0.0)
+            }
+        };
+        let (width, left, across) = axis(card.width, side, side);
+        let (height, bottom, up) = axis(card.height, below, above);
+        let (wide, high) = (width + 2.0 * margin, height + 2.0 * margin);
+        Self {
+            margin,
+            card: NSSize::new(width, height),
+            center: CGRect::new(
+                NSPoint::new((margin + left) / wide, (margin + bottom) / high),
+                NSSize::new(across / wide, up / high),
+            ),
+        }
+    }
+
+    /// The picture's size, in points.
+    fn size(&self) -> NSSize {
+        NSSize::new(
+            self.card.width + 2.0 * self.margin,
+            self.card.height + 2.0 * self.margin,
+        )
+    }
+}
+
+/// A picture of [`Slices`] at a scale, and what it was drawn for.
+struct Picture {
+    footing: Footing,
+    corner: f64,
+    card: NSSize,
+    scale: f64,
+    contents: Retained<CGImage>,
+}
+
+thread_local! {
+    /// The pictures drawn last, newest first: the four footings at the screen's scale stay, the
+    /// odd small card's own drawings fall off the end.
+    static PICTURES: RefCell<Vec<Picture>> = const { RefCell::new(Vec::new()) };
+}
+
+/// How many pictures [`PICTURES`] keeps.
+const PICTURES_KEPT: usize = 12;
+
+/// The picture `slices` asks for, drawn by [`draw_footing`] at `scale`, from [`PICTURES`] when it
+/// was drawn already.
+fn footing_picture(
+    footing: Footing,
+    corner: f64,
+    slices: &Slices,
+    scale: f64,
+) -> Option<Retained<CGImage>> {
+    PICTURES.with(|kept| {
+        let mut kept = kept.borrow_mut();
+        let same = |picture: &Picture| {
+            picture.footing == footing
+                && picture.corner == corner
+                && picture.card == slices.card
+                && picture.scale == scale
+        };
+        if let Some(at) = kept.iter().position(same) {
+            let picture = kept.remove(at);
+            let contents = picture.contents.clone();
+            kept.insert(0, picture);
+            return Some(contents);
+        }
+        let card = NSRect::new(NSPoint::new(slices.margin, slices.margin), slices.card);
+        let contents = draw_picture(slices.size(), scale, || draw_footing(card, footing))?;
+        kept.insert(
+            0,
+            Picture {
+                footing,
+                corner,
+                card: slices.card,
+                scale,
+                contents: contents.clone(),
+            },
+        );
+        kept.truncate(PICTURES_KEPT);
+        Some(contents)
+    })
+}
+
+/// What `draw` paints in a transparent picture `size` points big, in pixels at `scale`, in
+/// bottom-up coordinates: the bitmap the tests read back (`on_retina`), so the pixels a layer
+/// shows are the ones they hold to the card's own drawing.
+fn draw_picture(size: NSSize, scale: f64, draw: impl FnOnce()) -> Option<Retained<CGImage>> {
+    let (wide, high) = ((size.width * scale).round(), (size.height * scale).round());
+    // SAFETY: no planes of our own (the bitmap allocates them), 8-bit RGBA at the size given, and
+    // a constant colour space name AppKit exposes.
+    let rep = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            null_mut(),
+            wide as isize,
+            high as isize,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            0,
+            0,
+        )
+    }?;
+    rep.setSize(size);
+    let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep)?;
+    NSGraphicsContext::saveGraphicsState_class();
+    NSGraphicsContext::setCurrentContext(Some(&context));
+    // Transparent to begin with: a new bitmap holds whatever was in the memory.
+    context.setCompositingOperation(NSCompositingOperation::Clear);
+    NSBezierPath::fillRect(NSRect::new(NSPoint::ZERO, size));
+    context.setCompositingOperation(NSCompositingOperation::SourceOver);
+    draw();
+    context.flushGraphics();
+    NSGraphicsContext::restoreGraphicsState_class();
+    rep.CGImage()
+}
+
 pub(crate) struct ShadeIvars {
     /// The cards on screen, in this view's coordinates, and whether each
     /// holds the focus.
@@ -858,6 +1037,8 @@ pub(crate) struct ShadeIvars {
     /// The tab on screen is lifted for arranging: the lift's own plates
     /// stand under the shrunk panes and this shade would show round them.
     lifted: Cell<bool>,
+    /// One layer per card, in the cards' order ([`Slices`]).
+    layers: RefCell<Vec<Retained<CALayer>>>,
 }
 
 define_class!(
@@ -877,13 +1058,15 @@ define_class!(
             None
         }
 
-        #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, _dirty: NSRect) {
-            let iv = self.ivars();
-            let dark = iv.dark.get();
-            for (rect, focused) in iv.cards.borrow().iter() {
-                draw_footing(*rect, footing(dark, *focused));
-            }
+        /// A window of another scale, or a first window: the pictures are drawn for it.
+        #[unsafe(method(viewDidChangeBackingProperties))]
+        fn did_change_backing(&self) {
+            self.lay();
+        }
+
+        #[unsafe(method(viewDidMoveToWindow))]
+        fn did_move_to_window(&self) {
+            self.lay();
         }
     }
 );
@@ -894,27 +1077,71 @@ impl Shade {
             cards: RefCell::new(Vec::new()),
             dark: Cell::new(true),
             lifted: Cell::new(false),
+            layers: RefCell::new(Vec::new()),
         });
         // SAFETY: `initWithFrame:` is NSView's designated initializer and the
         // ivars are set.
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         this.setWantsLayer(true);
+        // The cards' layers are clipped to the view, as a drawing in it would be.
+        if let Some(layer) = this.layer() {
+            layer.setMasksToBounds(true);
+        }
         this
     }
 
     /// The theme's lightness: which footing the cards stand on.
     pub(crate) fn paint(&self, theme: &Theme) {
         if self.ivars().dark.replace(theme.is_dark()) != theme.is_dark() {
-            self.setNeedsDisplay(true);
+            self.lay();
         }
     }
 
-    /// The cards on screen now; redrawn only when they changed.
+    /// The cards on screen now; laid again only when they changed.
     pub(crate) fn set_cards(&self, cards: Vec<(NSRect, bool)>) {
         if *self.ivars().cards.borrow() != cards {
             *self.ivars().cards.borrow_mut() = cards;
-            self.setNeedsDisplay(true);
+            self.lay();
         }
+    }
+
+    /// Lays a layer under every card with its footing's picture ([`Slices`]), at once: Core
+    /// Animation's implicit move would trail the cards a window resize has already moved.
+    fn lay(&self) {
+        let (Some(host), Some(window)) = (self.layer(), self.window()) else {
+            return;
+        };
+        let scale = window.backingScaleFactor();
+        let corner = corner_pt();
+        let iv = self.ivars();
+        let dark = iv.dark.get();
+        let cards = iv.cards.borrow();
+        let mut layers = iv.layers.borrow_mut();
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        let kept = cards.len().min(layers.len());
+        for gone in layers.drain(kept..) {
+            gone.removeFromSuperlayer();
+        }
+        for (index, (rect, focused)) in cards.iter().enumerate() {
+            if index == layers.len() {
+                let layer = CALayer::new();
+                host.addSublayer(&layer);
+                layers.push(layer);
+            }
+            let layer = &layers[index];
+            let footing = footing(dark, *focused);
+            let slices = Slices::of(&footing, corner, rect.size);
+            let picture = footing_picture(footing, corner, &slices, scale);
+            layer.setContentsScale(scale);
+            // SAFETY: a `CGImage` is what `contents` takes.
+            unsafe { layer.setContents(picture.as_deref().map(|image| image.as_ref())) };
+            layer.setContentsCenter(slices.center);
+            // AppKit keeps the view's own layer flipped or not as it likes (it flips it once the
+            // view stands in the flipped root): the place goes through its conversion.
+            layer.setFrame(self.convertRectToLayer(grown(*rect, slices.margin)));
+        }
+        CATransaction::commit();
     }
 
     /// The tab on screen is lifted, or set down.
@@ -1042,11 +1269,6 @@ mod tests {
 
     // ─── the picture, drawn ──────────────────────────────────────────────
 
-    use std::ptr::null_mut;
-
-    use objc2::AnyThread;
-    use objc2_app_kit::{NSBitmapImageRep, NSDeviceRGBColorSpace};
-
     /// The window `draw_shadow` is drawn in, in points, and its pixels per point: a retina
     /// window's backing store.
     const WINDOW: (f64, f64) = (200.0, 120.0);
@@ -1055,7 +1277,12 @@ mod tests {
     /// What `draw` leaves in a transparent `WINDOW` at [`SCALE`]x, as a retina window's backing
     /// store would hold it: `(width, height, rows from the top, premultiplied RGBA)`.
     fn on_retina(draw: impl FnOnce()) -> (usize, usize, Vec<[u8; 4]>) {
-        let (wide, high) = (WINDOW.0 as usize * SCALE, WINDOW.1 as usize * SCALE);
+        on_retina_of(WINDOW, draw)
+    }
+
+    /// [`on_retina`] in a window `window` points big.
+    fn on_retina_of(window: (f64, f64), draw: impl FnOnce()) -> (usize, usize, Vec<[u8; 4]>) {
+        let (wide, high) = (window.0 as usize * SCALE, window.1 as usize * SCALE);
         // SAFETY: no planes of our own (the bitmap allocates them), 8-bit RGBA at the size given,
         // and a constant colour space name AppKit exposes.
         let rep = unsafe {
@@ -1074,14 +1301,14 @@ mod tests {
         )
         }
         .expect("a bitmap");
-        rep.setSize(NSSize::new(WINDOW.0, WINDOW.1));
+        rep.setSize(NSSize::new(window.0, window.1));
         let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep)
             .expect("a context on the bitmap");
         NSGraphicsContext::saveGraphicsState_class();
         NSGraphicsContext::setCurrentContext(Some(&context));
         // Transparent to begin with: a new bitmap holds whatever was in the memory.
         context.setCompositingOperation(NSCompositingOperation::Clear);
-        NSBezierPath::fillRect(NSRect::new(NSPoint::ZERO, NSSize::new(WINDOW.0, WINDOW.1)));
+        NSBezierPath::fillRect(NSRect::new(NSPoint::ZERO, NSSize::new(window.0, window.1)));
         context.setCompositingOperation(NSCompositingOperation::SourceOver);
         draw();
         NSGraphicsContext::restoreGraphicsState_class();
@@ -1148,5 +1375,121 @@ mod tests {
         let far = pixel_at(&held, 36.0, 60.0);
         assert_eq!(far[3], 255, "what the view held was cleared: {far:?}");
         assert_eq!(far[1], 0, "what the view held was painted over: {far:?}");
+    }
+
+    #[test]
+    fn a_cards_shadow_falls_below_its_foot() {
+        for footing in every_footing() {
+            let picture = on_retina(|| draw_shadow(card(), footing));
+            // The caster stands `spread` inside the card (40..90 pt high): as far over its top as
+            // under its foot, only the foot has the shadow.
+            let caster = (40.0 + footing.spread, 90.0 - footing.spread);
+            let under = pixel_at(&picture, 100.0, caster.0 - 2.0)[3];
+            let over = pixel_at(&picture, 100.0, caster.1 + 2.0)[3];
+            // The faintest footing (a light theme's unfocused card) is under a fifth opaque.
+            assert!(
+                under >= 20 && under > 4 * over,
+                "{footing:?}: {under} under the foot, {over} over the top"
+            );
+        }
+    }
+
+    /// The card a picture of `slices` is drawn round, and the picture as a window would hold it.
+    fn footing_on_retina(
+        footing: Footing,
+        card: NSSize,
+        margin: f64,
+    ) -> (usize, usize, Vec<[u8; 4]>) {
+        let window = (card.width + 2.0 * margin, card.height + 2.0 * margin);
+        on_retina_of(window, || {
+            draw_footing(NSRect::new(NSPoint::new(margin, margin), card), footing);
+        })
+    }
+
+    #[test]
+    fn a_stretched_footing_is_what_the_cards_own_size_paints() {
+        let corner = corner_pt();
+        for footing in every_footing() {
+            let slices = Slices::of(&footing, corner, NSSize::new(1000.0, 1000.0));
+            assert!(slices.center.size.width > 0.0 && slices.center.size.height > 0.0);
+            let picture = footing_on_retina(footing, slices.card, slices.margin);
+            // A card longer by an odd number of points both ways, drawn at its own size.
+            let (longer, taller) = (37.0, 23.0);
+            let card = NSSize::new(slices.card.width + longer, slices.card.height + taller);
+            let drawn = footing_on_retina(footing, card, slices.margin);
+            let (wide, high, pixels) = &picture;
+            let (drawn_wide, drawn_high, drawn_pixels) = &drawn;
+            // The picture's parts in its pixels: left of the middle, the middle, right of it; and
+            // the same from the top (the unit square is bottom-up).
+            let px = |unit: f64, of: usize| (unit * of as f64).round() as usize;
+            let left = px(slices.center.origin.x, *wide);
+            let right = *wide - px(slices.center.origin.x + slices.center.size.width, *wide);
+            let top = *high - px(slices.center.origin.y + slices.center.size.height, *high);
+            let bottom = px(slices.center.origin.y, *high);
+            let from = |at: usize, near: usize, far: usize, length: usize, of: usize| {
+                if at < near {
+                    at
+                } else if at >= length - far {
+                    at - (length - of)
+                } else {
+                    near
+                }
+            };
+            for y in 0..*drawn_high {
+                for x in 0..*drawn_wide {
+                    let (sx, sy) = (
+                        from(x, left, right, *drawn_wide, *wide),
+                        from(y, top, bottom, *drawn_high, *high),
+                    );
+                    let got = drawn_pixels[y * drawn_wide + x];
+                    let stretched = pixels[sy * wide + sx];
+                    let apart = got
+                        .iter()
+                        .zip(stretched)
+                        .map(|(a, b)| a.abs_diff(b))
+                        .max()
+                        .unwrap_or(0);
+                    assert!(
+                        apart <= 2,
+                        "{footing:?}: pixel ({x}, {y}) is {got:?} drawn, {stretched:?} stretched"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_card_too_small_to_stretch_is_drawn_at_its_own_size() {
+        let footing = footing(true, true);
+        let corner = corner_pt();
+        let roomy = Slices::of(&footing, corner, NSSize::new(1000.0, 1000.0));
+        let small = NSSize::new(roomy.card.width - 1.0, roomy.card.height + 50.0);
+        let slices = Slices::of(&footing, corner, small);
+        assert_eq!(slices.card.width, small.width, "nothing to stretch across");
+        assert_eq!(slices.center.size.width, 0.0);
+        assert_eq!(
+            slices.card.height, roomy.card.height,
+            "the height still stretches"
+        );
+        assert!(slices.center.size.height > 0.0);
+    }
+
+    #[test]
+    fn a_footings_picture_is_on_whole_points() {
+        let corner = corner_pt();
+        for footing in every_footing() {
+            let slices = Slices::of(&footing, corner, NSSize::new(1000.0, 1000.0));
+            let size = slices.size();
+            let whole = |value: f64| value.fract() == 0.0;
+            assert!(whole(slices.margin) && whole(size.width) && whole(size.height));
+            for edge in [
+                slices.center.origin.x * size.width,
+                slices.center.origin.y * size.height,
+                slices.center.size.width * size.width,
+                slices.center.size.height * size.height,
+            ] {
+                assert!((edge - edge.round()).abs() < 1e-9, "{footing:?}: {edge}");
+            }
+        }
     }
 }
