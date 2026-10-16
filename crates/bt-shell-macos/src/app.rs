@@ -62,7 +62,7 @@ use crate::ssh_route::{self, Masters};
 use crate::tab::{Histories, TabHost, TerminalTab};
 use crate::tab_drag::TabDragSource;
 use crate::tab_merge::{End, Merge};
-use crate::tabs::Landing;
+use crate::tabs::{self, Landing};
 use crate::undo::Record;
 use crate::watch::{Notify, Watch};
 use crate::window::{self, CloseScope, Placement, TerminalWindow};
@@ -3692,11 +3692,21 @@ impl AppDelegate {
         let source = from.ns_window().frame();
         let frame = match at {
             Some(at) => {
-                // The pointer lands in the middle of the title row, the window's one copy of it.
+                // The pointer lands in the middle of the title row, the window's one copy of it;
+                // with the tabs at the side, on the middle of the column's first row, the tab it
+                // carries.
                 let row = from.title_row();
+                let (grab_x, grab_y) = if window::tabs_at_side(self.mtm()) {
+                    (
+                        tabs::SIDE_WIDTH / 2.0,
+                        row + tabs::LIST_PAD + tabs::TAB_HEIGHT / 2.0,
+                    )
+                } else {
+                    (source.size.width / 2.0, row / 2.0)
+                };
                 let wanted = Frame {
-                    x: at.x - source.size.width / 2.0,
-                    y: at.y + row / 2.0 - source.size.height,
+                    x: at.x - grab_x,
+                    y: at.y + grab_y - source.size.height,
                     width: source.size.width,
                     height: source.size.height,
                 };

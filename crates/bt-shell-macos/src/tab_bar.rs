@@ -11,8 +11,8 @@
 //!
 //! **The bar has a second place**, a column down the window's left edge
 //! (`[appearance] tab_position = "side"`): the same bar, its tabs, chips and doings, laid out
-//! from `tabs::Side::layout` and `tabs::Row` instead ([`TabBar::set_side`]; `tab_side.rs`,
-//! which says what is and is not in the column yet). Where this file says "the strip", "the
+//! from `tabs::Side::layout` and `tabs::Row` instead ([`TabBar::set_side`]; `tab_side.rs`). The
+//! dragging below is the column's as well, read along y. Where this file says "the strip", "the
 //! chip" or "the title row", it means the bar's own place.
 //!
 //! **What is where** comes from the pure model (`tabs::Bar::layout`): every
@@ -3362,12 +3362,17 @@ impl Chip {
             .or_else(|| Some(Retained::into_super(self.retain())))
     }
 
-    /// Moves the chip to `x` in the strip's space and nothing else: the held chip following the
-    /// pointer while the others stay where the last layout put them. The frame is recorded as the
-    /// one asked for, so the next layout moves it from here.
-    fn follow(&self, x: f64) {
+    /// Moves the chip to `along` in the strip's space — its x in the bar, its y (`upright`) in the
+    /// column — and nothing else: the held chip following the pointer while the others stay where
+    /// the last layout put them. The frame is recorded as the one asked for, so the next layout
+    /// moves it from here.
+    fn follow(&self, along: f64, upright: bool) {
         let mut frame = self.frame();
-        frame.origin.x = x;
+        if upright {
+            frame.origin.y = along;
+        } else {
+            frame.origin.x = along;
+        }
         self.ivars().target.set(frame);
         self.setFrame(frame);
     }
@@ -4963,6 +4968,11 @@ pub(crate) struct BarIvars {
     target: Cell<Option<u64>>,
     /// The tab a carried pane waits on to open it (the line under its chip).
     dwelling: Cell<Option<u64>>,
+    /// In the side column, the gap a carried pane would become a tab at: a line stands there
+    /// instead of room opening ([`TabBar::show_pane_target`]; [`tab_side::Insertion`]).
+    mark: Cell<Option<usize>>,
+    /// The line's views.
+    insertion: tab_side::Insertion,
     /// The side column's mode: `Some(top)` — the title row's height, where the list starts —
     /// puts the tabs in a column the window's height at its left edge, `None` in the bar in
     /// the title row ([`TabBar::set_side`]; `tab_side.rs`).
@@ -5238,6 +5248,8 @@ impl TabBar {
             hint_pending: Cell::new(false),
             target: Cell::new(None),
             dwelling: Cell::new(None),
+            mark: Cell::new(None),
+            insertion: tab_side::Insertion::default(),
             side: Cell::new(None),
             column: RefCell::new(None),
             mask: tab_side::Mask::default(),
@@ -5438,8 +5450,9 @@ impl TabBar {
     /// which does not slide.
     ///
     /// **Two things in flight change what is laid out, neither of them the window's list.** A tab
-    /// dragged along the strip is laid out at the place it would take, and its chip at the
-    /// pointer, not at its place ([`Dragging::at`]); the others slide around it the way they slide
+    /// dragged along the strip (or down the column) is laid out at the place it would take, and
+    /// its chip at the pointer, not at its place ([`Dragging::at`]); the others slide around it
+    /// the way they slide
     /// for any change of order, so a drag has no animation path of its own. A tab carried over
     /// from another window opens a gap at its place ([`BarIvars::gap`]): the layout has one more
     /// place and the chips from the gap on take the next. The list itself changes once, when the
@@ -5461,12 +5474,11 @@ impl TabBar {
             self.end_rename(false);
             return;
         }
-        // The side column has no drag yet: no press is held for one, no tab opens a gap.
         let side = iv.side.get();
         let drag = iv
             .drag
             .get()
-            .filter(|drag| side.is_none() && shown.tabs.iter().any(|label| label.tab == drag.tab));
+            .filter(|drag| shown.tabs.iter().any(|label| label.tab == drag.tab));
         iv.drag.set(drag);
         // The tabs in the order the strip shows them now: the dragged one at its place.
         if let Some(Dragging {
@@ -5489,11 +5501,7 @@ impl TabBar {
         let position = |tab: u64| shown.tabs.iter().position(|label| label.tab == tab);
         let dragged = drag.and_then(|drag| position(drag.tab));
         let hovered = iv.hovered.get().and_then(position);
-        let gap = iv
-            .gap
-            .get()
-            .filter(|_| side.is_none())
-            .map(|gap| gap.min(count));
+        let gap = iv.gap.get().map(|gap| gap.min(count));
         // The lone tab is today's title bar; with a tab on its way in it is the first chip. A
         // column has no title bar: a lone tab is a row like the rest.
         let single = side.is_none() && count == 1 && gap.is_none();
@@ -5545,7 +5553,8 @@ impl TabBar {
             seats
         };
         if let Some(top) = side {
-            self.lay_out_column(top, &shown, &chips, &glowing, reflow);
+            let flight = tab_side::Flight { drag, gap };
+            self.lay_out_column(top, &shown, &chips, &glowing, reflow, flight);
             return;
         }
         let lit_at = |place: usize| seats.get(place).copied().unwrap_or(false);
@@ -6001,17 +6010,30 @@ impl TabBar {
         (count > 0).then(|| self.bar_for(count + room, 0, None, None).layout())
     }
 
-    /// The press on tab `tab`'s chip, as `event` reports it, may become a drag. Not among
-    /// fewer than two tabs (a lone title is the window's), not while a name is being typed, and
-    /// not while the window holds a question of its own: the tab could not move then.
+    /// The place under `point` (the bar's space) of the list as it would be with `room` more
+    /// places: the strip's along x, the column's along y — the one rule ([`tabs::Run::slot_at`])
+    /// whichever way the tabs lie. 0 for a bar with no tabs.
+    fn slot_under(&self, room: usize, point: NSPoint) -> usize {
+        if self.ivars().side.get().is_some() {
+            self.column_with_room(room)
+                .map_or(0, |column| column.slot_at(point.y))
+        } else {
+            self.strip_with_room(room)
+                .map_or(0, |strip| strip.slot_at(point.x))
+        }
+    }
+
+    /// The press on tab `tab`'s chip, as `event` reports it, may become a drag. Not in a bar of
+    /// fewer than two tabs (a lone title is the window's; a column's lone row is a row, and the
+    /// way to another window), not while a name is being typed, and not while the window holds a
+    /// question of its own: the tab could not move then.
     fn grip(&self, tab: u64, event: &NSEvent) {
         let iv = self.ivars();
         iv.drag.set(None);
         let free = self
             .terminal_window()
             .is_some_and(|window| window.selection_free());
-        // A column's rows are not dragged yet: the press only selects.
-        if iv.renaming.get().is_some() || !free || iv.side.get().is_some() {
+        if iv.renaming.get().is_some() || !free {
             return;
         }
         let press = self.convertPoint_fromView(event.locationInWindow(), None);
@@ -6022,8 +6044,14 @@ impl TabBar {
             .iter()
             .position(|label| label.tab == tab);
         let grip = index.and_then(|index| {
-            let laid = iv.laid.borrow();
-            Grip::new(laid.as_ref()?, index, press.x)
+            if iv.side.get().is_some() {
+                // The column is read along y.
+                let column = iv.column.borrow();
+                Grip::new(column.as_ref()?, index, press.y)
+            } else {
+                let laid = iv.laid.borrow();
+                Grip::new(laid.as_ref()?, index, press.x)
+            }
         });
         if let Some(grip) = grip {
             iv.drag.set(Some(Dragging {
@@ -6045,7 +6073,20 @@ impl TabBar {
         };
         let point = self.convertPoint_fromView(event.locationInWindow(), None);
         let size = self.bounds().size;
-        let (tracked, strip_x) = {
+        let upright = iv.side.get().is_some();
+        // The pointer `(along, across)` the list and the bar's `(along, across)` extent; and where
+        // the list starts, which the chip's place is counted from.
+        let (tracked, origin) = if upright {
+            let column = iv.column.borrow();
+            let Some(column) = column.as_ref() else {
+                return;
+            };
+            (
+                drag.grip
+                    .track(column, (point.y, point.x), (size.height, size.width)),
+                column.list.y,
+            )
+        } else {
             let laid = iv.laid.borrow();
             let Some(laid) = laid.as_ref() else {
                 return;
@@ -6074,7 +6115,7 @@ impl TabBar {
                 }
                 match chip {
                     // Only the held chip moved: the rest of the strip is as it was laid out.
-                    Some(chip) if same_place && !first => chip.follow(left - strip_x),
+                    Some(chip) if same_place && !first => chip.follow(left - origin, upright),
                     _ => self.lay_out(),
                 }
             }
@@ -6174,16 +6215,20 @@ impl TabBar {
     // ─── A pane carried over the strip ───────────────────────────────────
 
     /// What a pane carried with the pointer at `at` (window coordinates) is over in
-    /// the strip, `None` when the pointer is not in the bar. The strip is read as it
-    /// is, without a gap: the room a gap opens is not under the pointer's reach, so
-    /// the answer does not depend on it ([`tabs::Strip::pane_over`]).
+    /// the strip (or the column), `None` when the pointer is not in the bar. The list is read as
+    /// it is, without a gap: the room a gap opens is not under the pointer's reach, so
+    /// the answer does not depend on it ([`tabs::Strip::pane_over`], [`tabs::Column::pane_over`]).
     pub(crate) fn pane_target(&self, at: NSPoint) -> Option<PaneTarget> {
         let point = self.convertPoint_fromView(at, None);
-        if self.ivars().side.get().is_some() || !contains(self.bounds(), point) {
+        if !contains(self.bounds(), point) {
             return None;
         }
-        let strip = self.strip_with_room(0)?;
-        match strip.pane_over(point.x) {
+        let over = if self.ivars().side.get().is_some() {
+            self.column_with_room(0)?.pane_over(point.y)
+        } else {
+            self.strip_with_room(0)?.pane_over(point.x)
+        };
+        match over {
             tabs::PaneOver::OnTab { index } => self
                 .ivars()
                 .shown
@@ -6195,28 +6240,36 @@ impl TabBar {
         }
     }
 
-    /// Whether `at` (window coordinates) is in the bar: a drop there is the bar's.
+    /// Whether `at` (window coordinates) is in the bar — in the side mode, the column down the
+    /// window's edge: a drop there is the bar's.
     pub(crate) fn holds(&self, at: NSPoint) -> bool {
-        self.ivars().side.get().is_none()
-            && contains(self.bounds(), self.convertPoint_fromView(at, None))
+        contains(self.bounds(), self.convertPoint_fromView(at, None))
     }
 
     /// The strip's answer to a carried pane: the chip it is over the middle of is lit,
     /// or room opens between the chips where it would become a tab; `None` when it
-    /// is over neither (or has left).
+    /// is over neither (or has left). The column marks the place with a line and moves no row
+    /// ([`tab_side::Insertion`]).
     pub(crate) fn show_pane_target(&self, target: Option<PaneTarget>) {
         let iv = self.ivars();
         let tab = match target {
             Some(PaneTarget::Tab(tab)) => Some(tab),
             _ => None,
         };
-        if iv.target.replace(tab) != tab {
-            self.lay_out();
-        }
-        self.open_gap(match target {
+        let between = match target {
             Some(PaneTarget::Between(gap)) => Some(gap),
             _ => None,
-        });
+        };
+        let mut changed = iv.target.replace(tab) != tab;
+        if iv.side.get().is_some() {
+            changed |= iv.mark.replace(between) != between;
+        }
+        if changed {
+            self.lay_out();
+        }
+        if iv.side.get().is_none() {
+            self.open_gap(between);
+        }
     }
 
     /// The pane is about to become a tab here: the lit chip and the room between chips are
@@ -6227,6 +6280,7 @@ impl TabBar {
         let iv = self.ivars();
         iv.target.set(None);
         iv.gap.set(None);
+        iv.mark.set(None);
     }
 
     /// A carried pane waits on tab `tab`'s chip (`Some`): the line under it fills over
@@ -6274,8 +6328,7 @@ impl TabBar {
     /// is not a tab of this process, or that this window cannot take now (it holds a question
     /// of its own), is not taken: the drop is then on nothing, and the tab becomes a window.
     fn carried_over(&self, info: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
-        let Some(tab) = tab_drag::carried(info).filter(|_| self.ivars().side.get().is_none())
-        else {
+        let Some(tab) = tab_drag::carried(info) else {
             return NSDragOperation::None;
         };
         let Some(window) = self
@@ -6287,8 +6340,7 @@ impl TabBar {
         };
         let gap = window.index_of(tab).is_none().then(|| {
             let point = self.convertPoint_fromView(info.draggingLocation(), None);
-            self.strip_with_room(1)
-                .map_or(0, |strip| strip.slot_at(point.x))
+            self.slot_under(1, point)
         });
         self.open_gap(gap);
         NSDragOperation::Move
@@ -6300,8 +6352,7 @@ impl TabBar {
     /// accepted if it is a tab this window takes: a refusal would read as a drop on nothing and
     /// make a window.
     fn accept_drop(&self, info: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
-        let Some(tab) = tab_drag::carried(info).filter(|_| self.ivars().side.get().is_none())
-        else {
+        let Some(tab) = tab_drag::carried(info) else {
             return false;
         };
         let (Some(window), Some(app)) = (self.terminal_window(), app::delegate(self.mtm())) else {
@@ -6310,15 +6361,11 @@ impl TabBar {
         let point = self.convertPoint_fromView(info.draggingLocation(), None);
         let over = if window.index_of(tab).is_some() {
             Over::Own {
-                place: self
-                    .strip_with_room(0)
-                    .map_or(0, |strip| strip.slot_at(point.x)),
+                place: self.slot_under(0, point),
             }
         } else {
             Over::Other {
-                gap: self
-                    .strip_with_room(1)
-                    .map_or(0, |strip| strip.slot_at(point.x)),
+                gap: self.slot_under(1, point),
             }
         };
         app.tab_dropped(window.id(), tabs::landing(Some(over)));

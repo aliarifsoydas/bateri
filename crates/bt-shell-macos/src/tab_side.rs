@@ -27,18 +27,26 @@
 //! same wait and the same map as the title row's, arriving from the row's side
 //! ([`ROW_LEFT`](super::ROW_LEFT)).
 //!
-//! **Not yet in the column**: dragging a row (a press only selects) and the dropping of a tab or
-//! a pane on it.
+//! **Dragging** is the strip's, turned upright: a press on a row is a [`Grip`](crate::tabs::Grip)
+//! read along y, the row follows the pointer and the others slide to make room, and the list
+//! changes once, when the row is let go. Pulled out of the column it comes away in a drag session
+//! (`tab_drag`), as from the bar, and the column takes a row from another window the way the bar
+//! takes a chip: rows part under the pointer and the landing is `tabs::landing`'s. A pane carried
+//! over the column (⌥⌘) lights the row it is over the middle of and, between two rows, draws a
+//! line ([`Insertion`]) instead of opening room: a pane's drop is a mark, a tab's is a seat.
 
 use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadOnly};
-use objc2_app_kit::{NSAccessibility, NSBezierPath, NSColor, NSTextAlignment, NSView};
+use objc2_app_kit::{NSAccessibility, NSBezierPath, NSBox, NSColor, NSTextAlignment, NSView};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::{CALayer, CATransaction};
 
-use super::{Chip, IconStyle, Motion, Palette, Seen, Shown, Standing, TabBar, Tint, paint_in};
+use super::{
+    Chip, Dragging, IconStyle, Motion, Palette, Seen, Shown, Standing, TabBar, Tint, paint_in,
+    plain_box,
+};
 use crate::card;
 use crate::split::Rect;
 use crate::tabs::{self, Column, FADE, Side, TAB_RADIUS};
@@ -222,6 +230,69 @@ fn fade_picture(rect: NSRect, top: bool, bottom: bool) {
     }
 }
 
+/// What is in flight over the column while it is laid out ([`TabBar::lay_out`] works the strip's
+/// the same way): a row held by the pointer, and room a tab carried from another window opens.
+#[derive(Clone, Copy)]
+pub(super) struct Flight {
+    pub(super) drag: Option<Dragging>,
+    pub(super) gap: Option<usize>,
+}
+
+/// The ring's side and its stroke, and how far it hangs out to the left of the line it starts.
+const RING: f64 = 8.0;
+const RING_LINE: f64 = 2.0;
+
+/// The line that marks "a new tab here" between two rows while a pane is carried over them: a ring
+/// at the left and a line along the row's width, in the accent, standing in the gap
+/// ([`Column::between`]). It lives in the list's view, so the list's edges cut it as they cut the
+/// rows.
+#[derive(Default)]
+pub(super) struct Insertion {
+    parts: RefCell<Option<(Retained<NSBox>, Retained<NSBox>)>>,
+}
+
+impl Insertion {
+    /// Takes the line away.
+    pub(super) fn clear(&self) {
+        if let Some((line, ring)) = self.parts.take() {
+            line.removeFromSuperview();
+            ring.removeFromSuperview();
+        }
+    }
+
+    /// Stands the line with its middle at `y` (the list's space), or takes it away (`None`).
+    fn set(&self, list: &NSView, at: Option<f64>, palette: Palette) {
+        let Some(y) = at else {
+            self.clear();
+            return;
+        };
+        let mut parts = self.parts.borrow_mut();
+        let (line, ring) = parts.get_or_insert_with(|| {
+            let mtm = list.mtm();
+            let line = plain_box(mtm, Tint::of(palette.accent, 1.0), tabs::GAP / 2.0);
+            let ring = plain_box(mtm, Tint::of(palette.accent, 0.0), RING / 2.0);
+            ring.setBorderWidth(RING_LINE);
+            list.addSubview(&line);
+            list.addSubview(&ring);
+            (line, ring)
+        });
+        let accent = Tint::of(palette.accent, 1.0).color();
+        line.setFillColor(&accent);
+        ring.setBorderColor(&accent);
+        // The ring hangs out of the row's edge by its half, the line begins where it ends.
+        let ring_x = tabs::EDGE - RING_LINE - 1.0;
+        let line_x = ring_x + RING;
+        ring.setFrame(NSRect::new(
+            NSPoint::new(ring_x, y - RING / 2.0),
+            NSSize::new(RING, RING),
+        ));
+        line.setFrame(NSRect::new(
+            NSPoint::new(line_x, y - tabs::GAP / 2.0),
+            NSSize::new((tabs::EDGE + tabs::ROW_WIDTH - line_x).max(0.0), tabs::GAP),
+        ));
+    }
+}
+
 impl TabBar {
     /// Puts the bar in the side column (`Some(top)`: the title row's height, where the list
     /// starts) or back in the title row (`None`). A change of place forgets what belonged to the
@@ -243,6 +314,8 @@ impl TabBar {
         iv.gap.set(None);
         iv.target.set(None);
         iv.dwelling.set(None);
+        iv.mark.set(None);
+        iv.insertion.clear();
         if top.is_some() {
             iv.fade_leading.setHidden(true);
             iv.fade_trailing.setHidden(true);
@@ -266,6 +339,7 @@ impl TabBar {
         chips: &[Retained<Chip>],
         glowing: &[bool],
         reflow: bool,
+        flight: Flight,
     ) {
         let iv = self.ivars();
         let (Some(palette), Some(theme)) = (iv.palette.get(), iv.theme.get()) else {
@@ -273,19 +347,13 @@ impl TabBar {
         };
         let count = shown.tabs.len();
         let bounds = self.bounds();
-        let hovered = iv
-            .hovered
-            .get()
-            .and_then(|tab| shown.tabs.iter().position(|label| label.tab == tab));
-        let corner = card::window_corner_pt(self.window().as_deref());
-        let side = Side {
-            height: bounds.size.height,
-            top,
-            count,
-            scroll: iv.scroll.get(),
-            warning: !shown.notice.is_empty(),
-            corner,
-        };
+        let position = |tab: u64| shown.tabs.iter().position(|label| label.tab == tab);
+        let hovered = iv.hovered.get().and_then(position);
+        // The held row, at the place it would take (`shown` is in that order already).
+        let dragged = flight.drag.and_then(|drag| position(drag.tab));
+        // The row's place in the layout: past the gap a carried tab opens, one on.
+        let seat = |index: usize| tabs::seat(index, flight.gap);
+        let side = self.side_for(top, count + usize::from(flight.gap.is_some()));
         let mut column = side.layout();
         let selected_tab = shown.tabs.get(shown.selected).map(|label| label.tab);
         let was_overflowing = iv.overflowed.replace(column.overflow);
@@ -296,7 +364,7 @@ impl TabBar {
         let kept_in_sight = column.overflow && (!was_overflowing || resized);
         let mut revealed = false;
         if selection_changed || kept_in_sight {
-            let target = column.revealing(shown.selected);
+            let target = column.revealing(seat(shown.selected));
             if target != column.scroll {
                 column = Side {
                     scroll: target,
@@ -333,9 +401,17 @@ impl TabBar {
             } else {
                 label.title.clone()
             };
-            let row = column.rows[index];
+            let row = column.rows[seat(index)];
+            // A row held and moving is at the pointer, at once; the rest slide.
+            let carried = flight
+                .drag
+                .filter(|drag| !drag.torn && dragged == Some(index))
+                .and_then(|drag| drag.at);
             let frame = NSRect::new(
-                NSPoint::new(row.x - column.list.x, row.y - column.list.y),
+                NSPoint::new(
+                    row.x - column.list.x,
+                    carried.map_or(row.y, |(top, _)| top) - column.list.y,
+                ),
                 NSSize::new(row.width, row.height),
             );
             let look = seen.look(
@@ -345,15 +421,26 @@ impl TabBar {
                     index,
                     naming,
                     selected: index == shown.selected,
-                    hovered: hovered == Some(index) && !naming,
+                    hovered: (hovered == Some(index)
+                        || carried.is_some()
+                        || iv.target.get() == Some(label.tab))
+                        && !naming,
                     glowing: glowing[index],
                     single: false,
-                    lifted: false,
-                    ghost: false,
+                    lifted: carried.is_some(),
+                    ghost: flight
+                        .drag
+                        .is_some_and(|drag| drag.torn && dragged == Some(index)),
                     side: true,
                 },
             );
-            chip.set(frame, &look, palette, motion, slide);
+            chip.set(
+                frame,
+                &look,
+                palette,
+                motion,
+                slide.filter(|_| carried.is_none()),
+            );
             if naming {
                 self.place_row_field(row, palette);
             }
@@ -379,10 +466,42 @@ impl TabBar {
             }
             None => iv.warning.setHidden(true),
         }
+        iv.insertion.set(
+            &iv.strip,
+            // `between` is the gap's top; the line's middle is half a gap down.
+            iv.mark
+                .get()
+                .map(|gap| column.between(gap) + tabs::GAP / 2.0 - column.list.y),
+            palette,
+        );
         iv.column.replace(Some(column));
         // An open card follows its row (a scroll, a new height, a closed tab above).
         self.place_card();
         self.arm_clock();
+    }
+
+    /// The pure column's input for `count` places: the window's height, where the list starts, the
+    /// settings diagnostic and the corner, and the scroll as it stands
+    /// ([`TabBar::bar_for`]'s upright half).
+    pub(super) fn side_for(&self, top: f64, count: usize) -> Side {
+        let iv = self.ivars();
+        Side {
+            height: self.bounds().size.height,
+            top,
+            count,
+            scroll: iv.scroll.get(),
+            warning: !iv.shown.borrow().notice.is_empty(),
+            corner: card::window_corner_pt(self.window().as_deref()),
+        }
+    }
+
+    /// The column as the window's list lays it out — without a drag's preview or a gap — with
+    /// `room` more places than it has tabs: 0 is the column as it is, 1 the column a carried tab
+    /// would make ([`TabBar::strip_with_room`]'s upright half).
+    pub(super) fn column_with_room(&self, room: usize) -> Option<Column> {
+        let top = self.ivars().side.get()?;
+        let count = self.ivars().shown.borrow().tabs.len();
+        (count > 0).then(|| self.side_for(top, count + room).layout())
     }
 
     /// Puts the name field over `row` (the bar's space), in the type the selected row's title

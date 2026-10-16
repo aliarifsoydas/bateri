@@ -946,7 +946,8 @@ pub struct Grip {
 
 impl Grip {
     /// The grip of a press at `at` (along the list's axis) on tab `from` of `laid`; `None` for a
-    /// tab that is not there and for a lone tab, whose title is not a tab to carry.
+    /// tab that is not there and for the strip's lone tab, whose title is not a tab to carry. A
+    /// column's lone row is a row like the rest: it is held, and carried to another window.
     pub fn new(laid: &impl Laid, from: usize, at: f64) -> Option<Self> {
         let run = laid.run();
         let place = run.places.get(from).filter(|_| run.slot > 0.0)?;
@@ -1284,6 +1285,14 @@ impl Column {
     /// new tab at the place the point stands between ([`Run::pane_over`]).
     pub fn pane_over(&self, y: f64) -> PaneOver {
         self.run().pane_over(y)
+    }
+
+    /// Where the line that marks "a new tab here" runs (the window's space): in the [`GAP`] above
+    /// the row at `gap`, below the last for `gap` at the end. It marks the place a carried pane
+    /// would become a tab ([`PaneOver::Between`]) without moving a row — a pane's drop is a line,
+    /// where a tab brought from another window opens room (`tabs::seat`).
+    pub fn between(&self, gap: usize) -> f64 {
+        self.list.y + LIST_PAD + gap as f64 * self.slot - GAP - self.scroll
     }
 }
 
@@ -4585,6 +4594,76 @@ mod tests {
             Drag::TearOff,
             "out of its foot"
         );
+    }
+
+    #[test]
+    fn a_lone_row_is_held_and_carried_like_the_rest() {
+        // The strip's lone title is the window's and cannot be held; a column's lone row is a row,
+        // and the way to another window's list.
+        let column = side(600.0, 1).layout();
+        let extent = (600.0, SIDE_WIDTH);
+        let mut grip = Grip::new(&column, 0, 60.0).expect("a lone row can be held");
+        assert_eq!(grip.track(&column, (62.0, 100.0), extent), Drag::Press);
+        assert_eq!(
+            grip.track(&column, (300.0, 100.0), extent),
+            Drag::Reorder { left: 46.0, to: 0 },
+            "the one place there is, as high as the list lets it"
+        );
+        assert_eq!(
+            grip.track(&column, (60.0, SIDE_WIDTH + TEAR_DISTANCE + 1.0), extent),
+            Drag::TearOff,
+            "and pulled out of the column it comes away"
+        );
+    }
+
+    #[test]
+    fn room_made_for_a_tab_in_the_column_moves_the_rows_not_the_answer() {
+        // A tab carried over a column of 5 is placed on the column of 6 it will make: the room
+        // opens under the pointer.
+        let six = side(600.0, 6).layout();
+        for y in [60.0, 100.0, 141.0, 200.0] {
+            let gap = six.slot_at(y);
+            let seated: Vec<usize> = (0..5).map(|index| seat(index, Some(gap))).collect();
+            assert!(!seated.contains(&gap), "{seated:?} / {gap} at {y}");
+            assert!(
+                six.rows[gap].y <= y && y < six.rows[gap].y + six.rows[gap].height + GAP,
+                "the pointer is over the room that opened at {y}"
+            );
+        }
+        // Past the last row the tab goes to the end, and the end is a place the room can open at.
+        assert_eq!(six.slot_at(580.0), 5);
+    }
+
+    #[test]
+    fn the_line_for_a_new_tab_runs_in_the_gap_between_rows() {
+        let column = side(600.0, 4).layout();
+        // Rows are 46, 76, 106, 136, 28 high: the line is the 2 above a row, and below the last.
+        assert_eq!(column.between(0), 44.0);
+        assert_eq!(column.between(1), 74.0);
+        assert_eq!(column.between(3), 134.0);
+        assert_eq!(column.between(4), 164.0, "under the last row");
+        for gap in 0..=4 {
+            // It stands in the gap the pane means (`Between { gap }`) and over no row.
+            let line = column.between(gap);
+            assert!(
+                column
+                    .rows
+                    .iter()
+                    .all(|row| line + GAP <= row.y || row.y + row.height <= line),
+                "{gap}"
+            );
+            assert_eq!(
+                column.pane_over(line + GAP / 2.0),
+                PaneOver::Between { gap }
+            );
+        }
+        // A scrolled list carries the line with its rows.
+        let scrolled = Side {
+            scroll: 300.0,
+            ..side(400.0, 30)
+        }
+        .layout();
+        assert_eq!(scrolled.between(12), scrolled.rows[12].y - GAP);
     }
 
     #[test]
