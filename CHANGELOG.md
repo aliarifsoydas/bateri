@@ -12,6 +12,8 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-17
+
 ### Added
 
 - **The side column can be made wider or narrower.** With the tabs at the
