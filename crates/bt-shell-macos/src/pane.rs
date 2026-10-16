@@ -3569,6 +3569,17 @@ impl TerminalPane {
         // arrive and `focused` would stay `true`: an unfocused window would
         // draw a filled caret and set up the blink clock.
         self.apply_focus(self.is_active());
+        // **And the keyboard**, for the same ordering: the view became first
+        // responder, or another pane did, before the link entered the slot, and
+        // the link is born believing the keyboard is its own. Unseeded, every
+        // pane of a window opened with a split (a restored session, a tab torn
+        // off with its panes) would draw a filled, blinking caret until the
+        // keyboard came to it and left.
+        if self.ivars().run.is_none()
+            && let Some(link) = self.ivars().link.get()
+        {
+            link.set_keyboard_in_terminal(self.view().is_first_responder());
+        }
         // **The dock's arrival**, for a shell born here and only that: a pane
         // that adopted a running session (the update's handover, a crash
         // recovery) has a shell at its prompt already, and the timed run

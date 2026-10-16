@@ -1965,8 +1965,9 @@ impl BateriView {
     }
 
     /// Whether this view is the window's first responder — a buttonless
-    /// motion from the window reaches only that one.
-    fn is_first_responder(&self) -> bool {
+    /// motion from the window reaches only that one; the caret's keyboard bit
+    /// is seeded from it (`TerminalPane::start_session`).
+    pub(crate) fn is_first_responder(&self) -> bool {
         let me: &NSResponder = self;
         self.window()
             .and_then(|window| window.firstResponder())

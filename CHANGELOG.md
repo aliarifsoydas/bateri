@@ -55,6 +55,10 @@ of every installed copy. A version without a section is not released.
 - **The line between the side column and a tab with one pane comes back.**
   In a window that opened on a split tab — reopened by bateri at launch — the
   thin line beside the column stayed away when a tab with one pane was shown.
+- **Only the focused pane's cursor looks focused when a window opens with
+  several panes.** A window restored at launch drew a filled, blinking cursor
+  in every pane of its split tab, as if each had the keyboard, until you
+  clicked into each one; the others now show the hollow cursor from the start.
 
 ## [0.16.0] - 2026-10-16
 
