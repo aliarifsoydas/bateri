@@ -712,16 +712,19 @@ pub(crate) fn footing(dark: bool, focused: bool) -> Footing {
 
 impl Footing {
     /// The stretch of the shadow's reach that runs out to nothing, as `(from, to)` points off the
-    /// caster's edge: the last quarter of the blur, ending a little short of it.
+    /// caster's edge: the last quarter of the blur, ending a little short of it. `None` for a blur
+    /// too small to have one: there is no cut worth hiding, and fading would take the shadow with
+    /// it.
     ///
     /// Core Graphics' blur is a Gaussian cut off at (just under) its radius, so a shadow ends on
     /// a faint step instead of dying away, and a step is what the eye finds along a long edge. It
     /// never showed while every card stood in a gap that ended under a neighbour or the window's
     /// edge, short of that cut; the side column is bare ground beside the first card. So the
     /// shadow's own tail is faded by hand before the cut can show.
-    fn tail(&self) -> (f64, f64) {
-        let to = (self.blur - BLUR_SHORT_PT).max(0.0);
-        ((to - self.blur / TAIL_SHARE).max(0.0), to)
+    fn tail(&self) -> Option<(f64, f64)> {
+        let to = self.blur - BLUR_SHORT_PT;
+        let from = (to - self.blur / TAIL_SHARE).max(0.0);
+        (to > from).then_some((from, to))
     }
 }
 
@@ -738,9 +741,12 @@ const RING_PT: f64 = 0.25;
 
 /// The clearing that runs `footing`'s shadow out: ring by ring, `(distance, alpha)` clears `alpha`
 /// of whatever is left beyond `distance` off the caster's edge. What stays at a distance falls from
-/// all to nothing along a smooth step across [`Footing::tail`]; the last ring clears the rest.
+/// all to nothing along a smooth step across [`Footing::tail`]; the last ring clears the rest. No
+/// rings where there is no tail.
 fn tail_rings(footing: &Footing) -> Vec<(f64, f64)> {
-    let (from, to) = footing.tail();
+    let Some((from, to)) = footing.tail() else {
+        return Vec::new();
+    };
     let count = (((to - from) / RING_PT).ceil() as usize).max(1);
     let mut rings = Vec::with_capacity(count);
     let mut before = 1.0;
@@ -758,20 +764,38 @@ fn tail_rings(footing: &Footing) -> Vec<(f64, f64)> {
     rings
 }
 
-/// Draws `footing` for a card at `rect` (bottom-up coordinates): its shadow,
-/// cast by a fill the card hides and run out to nothing at its tail
-/// ([`Footing::tail`]), then the cut just outside it.
-///
-/// The shadow is made in a picture of its own: clearing the tail takes a
-/// compositing operation that would reach into the other cards' shadows, drawn
-/// in the same view, if it were done there.
+/// Draws `footing` for a card at `rect` (bottom-up coordinates): its shadow
+/// ([`draw_shadow`]), then the cut just outside the card.
 pub(crate) fn draw_footing(rect: NSRect, footing: Footing) {
+    draw_shadow(rect, footing);
     let radius = corner_pt();
+    let (width, tone, alpha) = footing.cut;
+    srgb(tone, alpha).setFill();
+    rounded(grown(rect, width), radius + width).fill();
+}
+
+/// The corner radius of the fill that casts a card's shadow: the card's, less the spread it is
+/// inset by. Never negative — the card's corner is smaller than the spread on the releases before
+/// macOS 26 — because the rings round their corners by this radius plus their distance, and a
+/// square-cornered caster casts a shadow as round as its distance, not less.
+fn caster_radius(corner: f64, footing: &Footing) -> f64 {
+    (corner - footing.spread).max(0.0)
+}
+
+/// The shadow of `footing` for a card at `rect`: cast by a fill the card hides and run out to
+/// nothing at its tail ([`Footing::tail`]).
+///
+/// It is made in a picture of its own: clearing the tail takes a compositing operation that would
+/// reach into the other cards' shadows, drawn in the same view, if it were done there. A drawing-
+/// handler image is made when it is drawn, at the destination's resolution, so the picture is as
+/// sharp as the view it lands in; `the_shadows_picture_is_made_at_the_destinations_scale` holds
+/// it to that, and to being a picture of its own.
+fn draw_shadow(rect: NSRect, footing: Footing) {
+    let caster_radius = caster_radius(corner_pt(), &footing);
     let caster = grown(rect, -footing.spread);
-    let caster_radius = radius - footing.spread;
-    // The picture holds the caster and all of the shadow's reach, on whole
-    // points so its pixels fall on the screen's.
-    let reach = grown(caster, footing.offset + footing.tail().1 + 1.0);
+    // The picture holds the caster and all of the blur's reach, on whole points so its pixels
+    // fall on the screen's.
+    let reach = grown(caster, footing.offset + footing.blur + 1.0);
     let (left, bottom) = (reach.origin.x.floor(), reach.origin.y.floor());
     let area = NSRect::new(
         NSPoint::new(left, bottom),
@@ -824,9 +848,6 @@ pub(crate) fn draw_footing(rect: NSRect, footing: Footing) {
         NSCompositingOperation::SourceOver,
         1.0,
     );
-    let (width, tone, alpha) = footing.cut;
-    srgb(tone, alpha).setFill();
-    rounded(grown(rect, width), radius + width).fill();
 }
 
 pub(crate) struct ShadeIvars {
@@ -957,7 +978,7 @@ mod tests {
     #[test]
     fn a_shadow_runs_out_to_nothing_before_the_blur_stops() {
         for footing in every_footing() {
-            let (from, to) = footing.tail();
+            let (from, to) = footing.tail().expect("a real footing has a tail");
             assert!(0.0 < from && from < to && to < footing.blur);
             let rings = tail_rings(&footing);
             assert!(rings.iter().all(|(at, _)| from < *at && *at <= to));
@@ -972,7 +993,7 @@ mod tests {
     #[test]
     fn the_tail_is_a_smooth_step_that_leaves_the_body_alone() {
         for footing in every_footing() {
-            let (from, to) = footing.tail();
+            let (from, to) = footing.tail().expect("a real footing has a tail");
             let rings = tail_rings(&footing);
             // Nothing is cleared where the tail has not begun.
             assert_eq!(left_at(&rings, from), 1.0);
@@ -988,5 +1009,144 @@ mod tests {
                 before = now;
             }
         }
+    }
+
+    /// A blur too small to have a tail keeps its shadow as cast: nothing fades, nothing clears.
+    #[test]
+    fn a_blur_too_small_for_a_tail_is_left_as_cast() {
+        for blur in [0.0, 0.5, BLUR_SHORT_PT] {
+            let small = Footing {
+                blur,
+                ..footing(true, false)
+            };
+            assert_eq!(small.tail(), None, "blur {blur}");
+            assert!(tail_rings(&small).is_empty(), "blur {blur}");
+        }
+        // Just over the line there is a tail, and it clears everything by its end.
+        let over = Footing {
+            blur: BLUR_SHORT_PT + 0.1,
+            ..footing(true, false)
+        };
+        let rings = tail_rings(&over);
+        assert_eq!(left_at(&rings, over.tail().expect("a tail").1), 0.0);
+    }
+
+    #[test]
+    fn a_caster_smaller_in_the_corner_than_its_spread_is_square() {
+        for footing in every_footing() {
+            // The corner before macOS 26 (10 pt, less the 8 pt gap) is under every spread.
+            assert_eq!(caster_radius(2.0, &footing), 0.0);
+            assert_eq!(caster_radius(footing.spread + 2.5, &footing), 2.5);
+        }
+    }
+
+    // ─── the picture, drawn ──────────────────────────────────────────────
+
+    use std::ptr::null_mut;
+
+    use objc2::AnyThread;
+    use objc2_app_kit::{NSBitmapImageRep, NSDeviceRGBColorSpace};
+
+    /// The window `draw_shadow` is drawn in, in points, and its pixels per point: a retina
+    /// window's backing store.
+    const WINDOW: (f64, f64) = (200.0, 120.0);
+    const SCALE: usize = 2;
+
+    /// What `draw` leaves in a transparent `WINDOW` at [`SCALE`]x, as a retina window's backing
+    /// store would hold it: `(width, height, rows from the top, premultiplied RGBA)`.
+    fn on_retina(draw: impl FnOnce()) -> (usize, usize, Vec<[u8; 4]>) {
+        let (wide, high) = (WINDOW.0 as usize * SCALE, WINDOW.1 as usize * SCALE);
+        // SAFETY: no planes of our own (the bitmap allocates them), 8-bit RGBA at the size given,
+        // and a constant colour space name AppKit exposes.
+        let rep = unsafe {
+            NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            null_mut(),
+            wide as isize,
+            high as isize,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            0,
+            0,
+        )
+        }
+        .expect("a bitmap");
+        rep.setSize(NSSize::new(WINDOW.0, WINDOW.1));
+        let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep)
+            .expect("a context on the bitmap");
+        NSGraphicsContext::saveGraphicsState_class();
+        NSGraphicsContext::setCurrentContext(Some(&context));
+        // Transparent to begin with: a new bitmap holds whatever was in the memory.
+        context.setCompositingOperation(NSCompositingOperation::Clear);
+        NSBezierPath::fillRect(NSRect::new(NSPoint::ZERO, NSSize::new(WINDOW.0, WINDOW.1)));
+        context.setCompositingOperation(NSCompositingOperation::SourceOver);
+        draw();
+        NSGraphicsContext::restoreGraphicsState_class();
+        let row = rep.bytesPerRow() as usize;
+        // SAFETY: the bitmap owns `row * high` bytes at `bitmapData`, which `rep` keeps alive.
+        let bytes = unsafe { std::slice::from_raw_parts(rep.bitmapData(), row * high) };
+        let pixels = (0..high)
+            .flat_map(|y| (0..wide).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let at = y * row + x * 4;
+                [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]
+            })
+            .collect();
+        (wide, high, pixels)
+    }
+
+    /// The pixel at `(x, y)` points, `y` up from the bottom, as `[r, g, b, a]`: the middle of its
+    /// first pixel row, left of that pixel.
+    fn pixel_at(picture: &(usize, usize, Vec<[u8; 4]>), x: f64, y: f64) -> [u8; 4] {
+        let (wide, high, pixels) = picture;
+        let column = (x * SCALE as f64) as usize;
+        let row = high - 1 - (y * SCALE as f64) as usize;
+        pixels[row * wide + column]
+    }
+
+    /// A focused card on a window `WINDOW` big, its caster's left edge on a pixel boundary at 2x
+    /// that is half a point from the points' own.
+    fn card() -> NSRect {
+        NSRect::new(NSPoint::new(60.5, 40.0), NSSize::new(80.0, 50.0))
+    }
+
+    #[test]
+    fn the_shadows_picture_is_made_at_the_destinations_scale() {
+        let footing = footing(true, true);
+        let picture = on_retina(|| draw_shadow(card(), footing));
+        // The caster's left edge is at 70.5 pt: between pixels 140 and 141 at 2x, and in the
+        // middle of pixel 70 at 1x. Made at 1x and stretched, the edge would be a blur of both
+        // sides; made at 2x, the pixel inside is solid and the one outside is the shadow's.
+        let (inside, outside) = (
+            pixel_at(&picture, 70.75, 55.0),
+            pixel_at(&picture, 70.25, 55.0),
+        );
+        assert!(
+            inside[3] >= 250,
+            "the caster is solid at its edge: {inside:?}"
+        );
+        assert!(
+            outside[3] <= 150,
+            "the pixel beside it is the shadow's alone: {outside:?}"
+        );
+    }
+
+    #[test]
+    fn the_shadows_picture_clears_only_its_own_tail() {
+        let footing = footing(true, true);
+        // The window already holds something opaque all over, as the shade view does where
+        // another card's shadow was drawn: far from this caster, inside the picture's reach and
+        // beyond where its tail ends, that must still be there.
+        let held = on_retina(|| {
+            NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 0.0, 0.0, 1.0).setFill();
+            NSBezierPath::fillRect(NSRect::new(NSPoint::ZERO, NSSize::new(WINDOW.0, WINDOW.1)));
+            draw_shadow(card(), footing);
+        });
+        let far = pixel_at(&held, 36.0, 60.0);
+        assert_eq!(far[3], 255, "what the view held was cleared: {far:?}");
+        assert_eq!(far[1], 0, "what the view held was painted over: {far:?}");
     }
 }

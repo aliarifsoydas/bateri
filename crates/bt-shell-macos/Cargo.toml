@@ -216,6 +216,10 @@ libc = { workspace = true }
 # The shared crate's test helpers (`TempRoot`, `SilentWake`, `wait_until`)
 # for this crate's tests (`bt-atlas`'s `fixture` precedent).
 bt-shell-common = { workspace = true, features = ["test-support"] }
+# A bitmap to draw into and read back, for the card's shadow picture: header flags over
+# `objc2-foundation` headers already in the set (and `NSImageRep` for the bitmap's size),
+# `Cargo.lock` does not move.
+objc2-app-kit = { workspace = true, features = ["NSBitmapImageRep", "NSImageRep"] }
 
 # A pane opened the way an application that embeds one opens it — no bateri
 # application object, a host that records what it hears. Its own `main`: AppKit
