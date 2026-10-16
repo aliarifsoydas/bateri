@@ -37,13 +37,14 @@ use std::sync::OnceLock;
 use block2::RcBlock;
 use bt_core::Theme;
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, Bool};
 use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send,
 };
 use objc2_app_kit::{
-    NSAnimatablePropertyContainer, NSAnimationContext, NSBezierPath, NSColor, NSGradient,
-    NSGraphicsContext, NSShadow, NSView, NSWindingRule, NSWindow, NSWindowStyleMask,
+    NSAnimatablePropertyContainer, NSAnimationContext, NSBezierPath, NSColor,
+    NSCompositingOperation, NSGradient, NSGraphicsContext, NSImage, NSShadow, NSView,
+    NSWindingRule, NSWindow, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGRect;
 use objc2_foundation::{
@@ -709,19 +710,120 @@ pub(crate) fn footing(dark: bool, focused: bool) -> Footing {
     }
 }
 
+impl Footing {
+    /// The stretch of the shadow's reach that runs out to nothing, as `(from, to)` points off the
+    /// caster's edge: the last quarter of the blur, ending a little short of it.
+    ///
+    /// Core Graphics' blur is a Gaussian cut off at (just under) its radius, so a shadow ends on
+    /// a faint step instead of dying away, and a step is what the eye finds along a long edge. It
+    /// never showed while every card stood in a gap that ended under a neighbour or the window's
+    /// edge, short of that cut; the side column is bare ground beside the first card. So the
+    /// shadow's own tail is faded by hand before the cut can show.
+    fn tail(&self) -> (f64, f64) {
+        let to = (self.blur - BLUR_SHORT_PT).max(0.0);
+        ((to - self.blur / TAIL_SHARE).max(0.0), to)
+    }
+}
+
+/// How far short of its radius Core Graphics' blur stops painting, with a margin: the fade ends
+/// here, so the cut falls in the part already cleared.
+const BLUR_SHORT_PT: f64 = 1.5;
+
+/// The tail is this share of the blur (a quarter): long enough to take the step out, short enough
+/// to leave the shadow's body as cast.
+const TAIL_SHARE: f64 = 4.0;
+
+/// The spacing of the rings that clear a tail, in points: finer than a pixel at 2x.
+const RING_PT: f64 = 0.25;
+
+/// The clearing that runs `footing`'s shadow out: ring by ring, `(distance, alpha)` clears `alpha`
+/// of whatever is left beyond `distance` off the caster's edge. What stays at a distance falls from
+/// all to nothing along a smooth step across [`Footing::tail`]; the last ring clears the rest.
+fn tail_rings(footing: &Footing) -> Vec<(f64, f64)> {
+    let (from, to) = footing.tail();
+    let count = (((to - from) / RING_PT).ceil() as usize).max(1);
+    let mut rings = Vec::with_capacity(count);
+    let mut before = 1.0;
+    for ring in 1..=count {
+        let t = ring as f64 / count as f64;
+        let after = 1.0 - t * t * (3.0 - 2.0 * t);
+        let alpha = if after > 0.0 {
+            1.0 - after / before
+        } else {
+            1.0
+        };
+        rings.push((from + t * (to - from), alpha));
+        before = after;
+    }
+    rings
+}
+
 /// Draws `footing` for a card at `rect` (bottom-up coordinates): its shadow,
-/// cast by a fill the card hides, then the cut just outside it.
+/// cast by a fill the card hides and run out to nothing at its tail
+/// ([`Footing::tail`]), then the cut just outside it.
+///
+/// The shadow is made in a picture of its own: clearing the tail takes a
+/// compositing operation that would reach into the other cards' shadows, drawn
+/// in the same view, if it were done there.
 pub(crate) fn draw_footing(rect: NSRect, footing: Footing) {
     let radius = corner_pt();
-    NSGraphicsContext::saveGraphicsState_class();
-    let shadow = NSShadow::new();
-    shadow.setShadowOffset(NSSize::new(0.0, -footing.offset));
-    shadow.setShadowBlurRadius(footing.blur);
-    shadow.setShadowColor(Some(&srgb(footing.shadow.0, footing.shadow.1)));
-    shadow.set();
-    srgb([0, 0, 0], 1.0).setFill();
-    rounded(grown(rect, -footing.spread), radius - footing.spread).fill();
-    NSGraphicsContext::restoreGraphicsState_class();
+    let caster = grown(rect, -footing.spread);
+    let caster_radius = radius - footing.spread;
+    // The picture holds the caster and all of the shadow's reach, on whole
+    // points so its pixels fall on the screen's.
+    let reach = grown(caster, footing.offset + footing.tail().1 + 1.0);
+    let (left, bottom) = (reach.origin.x.floor(), reach.origin.y.floor());
+    let area = NSRect::new(
+        NSPoint::new(left, bottom),
+        NSSize::new(
+            (reach.origin.x + reach.size.width).ceil() - left,
+            (reach.origin.y + reach.size.height).ceil() - bottom,
+        ),
+    );
+    let paint = RcBlock::new(move |bounds: NSRect| -> Bool {
+        let at = |rect: NSRect| {
+            NSRect::new(
+                NSPoint::new(rect.origin.x - area.origin.x, rect.origin.y - area.origin.y),
+                rect.size,
+            )
+        };
+        let caster = at(caster);
+        NSGraphicsContext::saveGraphicsState_class();
+        let shadow = NSShadow::new();
+        shadow.setShadowOffset(NSSize::new(0.0, -footing.offset));
+        shadow.setShadowBlurRadius(footing.blur);
+        shadow.setShadowColor(Some(&srgb(footing.shadow.0, footing.shadow.1)));
+        shadow.set();
+        srgb([0, 0, 0], 1.0).setFill();
+        rounded(caster, caster_radius).fill();
+        NSGraphicsContext::restoreGraphicsState_class();
+        // The blur is centred on the caster as the offset moved it.
+        let centre = NSRect::new(
+            NSPoint::new(caster.origin.x, caster.origin.y - footing.offset),
+            caster.size,
+        );
+        NSGraphicsContext::saveGraphicsState_class();
+        if let Some(context) = NSGraphicsContext::currentContext() {
+            context.setCompositingOperation(NSCompositingOperation::DestinationOut);
+        }
+        for (distance, alpha) in tail_rings(&footing) {
+            // Everything beyond this distance, the frame the picture's edge makes with it.
+            let beyond = NSBezierPath::bezierPathWithRect(bounds);
+            beyond.appendBezierPath(&rounded(grown(centre, distance), caster_radius + distance));
+            beyond.setWindingRule(NSWindingRule::EvenOdd);
+            srgb([0, 0, 0], alpha).setFill();
+            beyond.fill();
+        }
+        NSGraphicsContext::restoreGraphicsState_class();
+        Bool::YES
+    });
+    let picture = NSImage::imageWithSize_flipped_drawingHandler(area.size, false, &paint);
+    picture.drawInRect_fromRect_operation_fraction(
+        area,
+        NSRect::ZERO,
+        NSCompositingOperation::SourceOver,
+        1.0,
+    );
     let (width, tone, alpha) = footing.cut;
     srgb(tone, alpha).setFill();
     rounded(grown(rect, width), radius + width).fill();
@@ -833,3 +935,58 @@ impl Shade {
 
 /// How long the shade takes to come back after a slide.
 const HOLD_FADE_SECS: f64 = 0.15;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What is left of a shadow at `distance` once every ring up to it has cleared its share.
+    fn left_at(rings: &[(f64, f64)], distance: f64) -> f64 {
+        rings
+            .iter()
+            .filter(|(at, _)| *at <= distance)
+            .fold(1.0, |left, (_, alpha)| left * (1.0 - alpha))
+    }
+
+    fn every_footing() -> impl Iterator<Item = Footing> {
+        [(true, true), (true, false), (false, true), (false, false)]
+            .into_iter()
+            .map(|(dark, focused)| footing(dark, focused))
+    }
+
+    #[test]
+    fn a_shadow_runs_out_to_nothing_before_the_blur_stops() {
+        for footing in every_footing() {
+            let (from, to) = footing.tail();
+            assert!(0.0 < from && from < to && to < footing.blur);
+            let rings = tail_rings(&footing);
+            assert!(rings.iter().all(|(at, _)| from < *at && *at <= to));
+            assert_eq!(
+                left_at(&rings, to),
+                0.0,
+                "the last ring leaves nothing at {to}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tail_is_a_smooth_step_that_leaves_the_body_alone() {
+        for footing in every_footing() {
+            let (from, to) = footing.tail();
+            let rings = tail_rings(&footing);
+            // Nothing is cleared where the tail has not begun.
+            assert_eq!(left_at(&rings, from), 1.0);
+            // The middle of the tail has lost half: a smooth step, not a ramp or a cliff.
+            let middle = left_at(&rings, (from + to) / 2.0);
+            assert!((middle - 0.5).abs() < 0.1, "{middle} left at the middle");
+            // It only ever falls, and no ring takes more than a smooth step's steepest share.
+            let steepest = 1.5 * RING_PT / (to - from);
+            let mut before = 1.0;
+            for (at, _) in &rings {
+                let now = left_at(&rings, *at);
+                assert!(now <= before && before - now <= steepest + 0.02);
+                before = now;
+            }
+        }
+    }
+}
