@@ -872,6 +872,7 @@ fn render_reconnect(
 ) {
     let accent = theme.mark_linear(offer.mark);
     let dim = theme.dim_linear();
+    let label = offer.label();
     // `PREDISPLAY` carries only the column (`None`): its cells were drawn in
     // the main walk.
     let items = state
@@ -881,7 +882,7 @@ fn render_reconnect(
         .chain(
             [REMOTE_MARK, ' ']
                 .into_iter()
-                .chain(offer.host.chars())
+                .chain(label.chars())
                 .map(|ch| (ch, Some(accent))),
         )
         .chain(RECONNECT_HINT.chars().map(|ch| (ch, Some(dim))));
@@ -3381,6 +3382,7 @@ mod tests {
             cwd: "/Users/me/proj".into(),
             branch: "main".into(),
             remote: Some(RemoteTarget::ssh(host)),
+            remote_label: host.into(),
             remote_mark: HostMark::None,
             remote_cwd: remote_cwd.into(),
             reconnect: None,
@@ -4591,6 +4593,7 @@ mod tests {
         DockContext {
             reconnect: Some(Reconnect {
                 host: host.into(),
+                port: None,
                 mark,
                 line: format!("ssh {host}"),
             }),
@@ -4630,6 +4633,20 @@ mod tests {
         let (cells, _) = draw_with(&state, &offered("prod", HostMark::None), COLS);
         let mark = cells.iter().find(|cell| cell.row == 0 && cell.col == 2);
         assert_eq!(mark.map(|cell| cell.fg), Some(THEME.info_linear()));
+    }
+
+    #[test]
+    fn a_reconnect_offer_names_the_port_the_dropped_target_had() {
+        let state = live("", "", "", 0);
+        let mut context = offered("deploy@prod", HostMark::None);
+        if let Some(offer) = &mut context.reconnect {
+            offer.port = Some(2222);
+        }
+        let (cells, _) = draw_with(&state, &context, 60);
+        assert_eq!(
+            text(&cells),
+            "  ⇄ deploy@prod:2222  Connection lost · ⏎ reconnect"
+        );
     }
 
     #[test]
@@ -4741,6 +4758,40 @@ mod tests {
         let state = live("", "", "", 0);
         let (cells, _) = draw_with(&state, &remote("deploy@10.0.0.5", ""), COLS);
         assert_eq!(row_text(&cells, 1), "⇄ deploy@10.0.0.5");
+    }
+
+    /// [`remote`] for a target the user gave a port.
+    fn remote_on(host: &str, port: u16, remote_cwd: &str) -> DockContext {
+        let target = RemoteTarget {
+            port: Some(port),
+            ..RemoteTarget::ssh(host)
+        };
+        DockContext {
+            remote_label: target.label().into_owned(),
+            remote: Some(target),
+            ..remote(host, remote_cwd)
+        }
+    }
+
+    #[test]
+    fn the_remote_line_names_the_port_the_user_asked_for() {
+        let state = live("", "", "", 0);
+        let (cells, _) = draw_with(&state, &remote_on("10.0.0.5", 2222, "/srv"), COLS);
+        assert_eq!(row_text(&cells, 1), "⇄ 10.0.0.5:2222  /srv");
+        let (cells, _) = draw_with(&state, &remote_on("deploy@10.0.0.5", 2222, ""), COLS);
+        assert_eq!(row_text(&cells, 1), "⇄ deploy@10.0.0.5:2222");
+        let (cells, _) = draw_with(&state, &remote_on("::1", 2222, ""), COLS);
+        assert_eq!(row_text(&cells, 1), "⇄ [::1]:2222");
+        // The default port is not shown; the host stays what it was.
+        let (cells, _) = draw_with(&state, &remote_on("prod", 22, "/srv"), COLS);
+        assert_eq!(row_text(&cells, 1), "⇄ prod  /srv");
+        // The port is part of the name that is never cut: `⇄ prod:22…` would
+        // read as another machine.
+        let context = remote_on("prod", 2222, "/var/www/app");
+        let (cells, _) = draw_with(&state, &context, 11);
+        assert_eq!(row_text(&cells, 1), "⇄ prod:2222");
+        let (cells, _) = draw_with(&state, &context, 10);
+        assert_eq!(row_text(&cells, 1), "⇄");
     }
 
     #[test]

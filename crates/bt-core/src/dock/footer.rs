@@ -72,7 +72,7 @@ pub struct FooterHit {
 enum Lead<'a> {
     /// `{path} | {branch}`.
     Local { cwd: &'a str, branch: &'a str },
-    /// `⇄ {host}  {remote path}`.
+    /// `⇄ {host}  {remote path}` (`host` as shown, with a port the user named).
     Remote { host: &'a str, cwd: &'a str },
     /// `{title} · {detail}  {path}`.
     Program(&'a ProgramBar),
@@ -286,7 +286,7 @@ fn parts(context: &DockContext) -> (Lead<'_>, [Option<Item<'_>>; ITEMS]) {
         let buttons = (transfer.controls.items > 0).then_some(Item::Buttons(transfer));
         return (Lead::Transfer(transfer), [ports, buttons]);
     }
-    if let Some(host) = context.remote_host() {
+    if let Some(host) = context.remote_label() {
         // Sign In… takes the indicator's place: there is no sample without a login.
         let own = if context.sign_in.is_some() {
             Some(Item::SignIn)

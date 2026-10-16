@@ -2005,6 +2005,7 @@ mod tests {
     fn target(argv: &[&str]) -> RemoteTarget {
         RemoteTarget {
             host: "prod".to_owned(),
+            port: None,
             kind: RemoteKind::Ssh,
             argv: words(argv),
             line: String::new(),
@@ -2772,6 +2773,7 @@ exit $code
         let ssh = root.join("ssh").display().to_string();
         RemoteTarget {
             host: host.to_owned(),
+            port: None,
             kind: RemoteKind::Ssh,
             argv: vec![ssh, host.to_owned()],
             line: String::new(),
@@ -3621,6 +3623,7 @@ exit $code
         let user = std::env::var("USER").expect("USER");
         let target = RemoteTarget {
             host: "local".to_owned(),
+            port: None,
             kind: RemoteKind::Ssh,
             argv: vec![
                 "ssh".to_owned(),
@@ -3754,6 +3757,7 @@ exit $code
         .to_vec();
         let target = RemoteTarget {
             host: "deneme@127.0.0.1".to_owned(),
+            port: None,
             kind: RemoteKind::Ssh,
             argv: argv.clone(),
             line: String::new(),
@@ -3910,6 +3914,7 @@ exit $code
         .to_vec();
         let target = RemoteTarget {
             host: "deneme@127.0.0.1".to_owned(),
+            port: None,
             kind: RemoteKind::Ssh,
             argv: argv.clone(),
             line: String::new(),

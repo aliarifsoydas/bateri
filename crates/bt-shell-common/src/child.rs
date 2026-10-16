@@ -1926,6 +1926,7 @@ pub(crate) mod tests {
             {
                 let remote = bt_core::RemoteTarget {
                     host: target.host.clone(),
+                    port: target.port,
                     kind: target.kind,
                     argv: target.argv.clone(),
                     line: target.argv.join(" "),

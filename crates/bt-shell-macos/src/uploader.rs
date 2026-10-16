@@ -146,7 +146,10 @@ impl TerminalPane {
         let mark = session
             .remote_mark()
             .map_or(HostMark::None, |(_, mark)| mark);
-        let host = target.host.clone();
+        // What the user reads for the target (its host, and a port they named):
+        // for the sheets, the failure texts and the transfer line only; the
+        // connection comes from `target`.
+        let host = target.label().into_owned();
         // The job holds the sheet gate from here: the password sheet opens within it.
         let dial = self.dial(target, Some((SheetJob::Upload, true)));
         let reported = !cwd.is_empty();
@@ -324,7 +327,10 @@ impl TerminalPane {
         let mark = session
             .remote_mark()
             .map_or(HostMark::None, |(_, mark)| mark);
-        let host = target.host.clone();
+        // What the user reads for the target (its host, and a port they named):
+        // for the sheets, the failure texts and the transfer line only; the
+        // connection comes from `target`.
+        let host = target.label().into_owned();
         // The job holds the sheet gate from here: the password sheet opens within it.
         let dial = self.dial(target, Some((SheetJob::Download, true)));
         let download_dir = self.remote_files().borrow().download_dir.clone();

@@ -9797,7 +9797,8 @@ impl Session {
 
     /// The window's title: the application's OSC 0/2 title → the directory's last
     /// component (home `~`) → `bateri`; in a remote session `⇄ {OSC title}`,
-    /// otherwise `⇄ {host}` (rule `shell::title_of`).
+    /// otherwise `⇄ {host}`, with the port when the user named one other than
+    /// 22 (rule `shell::title_of`).
     ///
     /// Takes the two leaf locks **in sequence**, not nested; does not touch the
     /// `Term` lock. The directory and the remote host are in the **same** lock
@@ -9811,7 +9812,7 @@ impl Session {
             let log = lock(&self.shell);
             (
                 log.context.cwd.clone(),
-                log.context.remote_host().map(str::to_owned),
+                log.context.remote_label().map(str::to_owned),
             )
         };
         crate::shell::title_of(
@@ -13681,6 +13682,7 @@ mod tests {
             if offer {
                 log.context.reconnect = Some(crate::shell::Reconnect {
                     host: "prod".to_owned(),
+                    port: None,
                     mark: HostMark::None,
                     line: "ssh -p 2222 prod".to_owned(),
                 });
@@ -24265,6 +24267,17 @@ e\\314\\201.'; sleep 5";
         assert_eq!(wake.wait_commands(1, Duration::from_secs(5)), 1);
         let first = session.running_command().expect("running after `C`");
         assert!(session.set_remote(first, Some(&RemoteTarget::ssh("prod"))));
+        assert_eq!(session.title(), "⇄ prod");
+        // A port the user named is part of the name the title shows (the same
+        // host on another port is another machine to the reader); the default
+        // port is not shown.
+        let on_port = |port| RemoteTarget {
+            port,
+            ..RemoteTarget::ssh("prod")
+        };
+        assert!(session.set_remote(first, Some(&on_port(Some(2222)))));
+        assert_eq!(session.title(), "⇄ prod:2222");
+        assert!(session.set_remote(first, Some(&on_port(Some(22)))));
         assert_eq!(session.title(), "⇄ prod");
         // In a dock-less window the remote session does not move the input row
         // count: there is no band.

@@ -104,7 +104,15 @@ pub enum Probe {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
     /// As the user typed it; the `ssh://` scheme and the port are stripped.
+    /// This is the **key** (marks, integration, saved passwords, file jobs):
+    /// the port lives in [`Self::port`], never in here.
     pub host: String,
+    /// The port the user asked for, if they did: the first of `-p`,
+    /// `-o Port` and an `ssh://` target's, as OpenSSH reads them. Only what
+    /// the argv says — a `Port` in
+    /// `~/.ssh/config` is not known — and `None` for mosh, whose `-p` is a
+    /// UDP port of the mosh server, not the door the user knocked on.
+    pub port: Option<u16>,
     pub kind: RemoteKind,
     /// The argv to re-run ([`ssh_target`], [`mosh_argv`]).
     pub argv: Vec<String>,
@@ -396,6 +404,7 @@ fn remote_target(name: &str, args: &[String]) -> Option<Option<Target>> {
     (base == "mosh").then(|| {
         mosh_target(script_args).map(|host| Target {
             host,
+            port: None,
             kind: RemoteKind::Mosh,
             argv: mosh_argv(script_args),
             nonce: None,
@@ -443,6 +452,7 @@ fn ssh_target(program: &str, args: &[String]) -> Option<Target> {
     let call = ssh_call(program, ssh_wrap::unwrap(args))?;
     Some(Target {
         host: call.host,
+        port: call.port,
         kind: RemoteKind::Ssh,
         argv: call.argv,
         nonce: ssh_wrap::nonce(args).map(str::to_owned),
@@ -451,8 +461,10 @@ fn ssh_target(program: &str, args: &[String]) -> Option<Target> {
 
 /// What one walk of an interactive ssh argv says ([`ssh_call`]).
 pub(crate) struct SshCall {
-    /// As typed; only the `ssh://` form drops its scheme and port ([`ssh_host`]).
+    /// As typed; only the `ssh://` form drops its scheme and port ([`ssh_destination`]).
     pub(crate) host: String,
+    /// The port the argv names ([`SshSession::port`]).
+    pub(crate) port: Option<u16>,
     /// The re-run argv ([`ssh_target`]'s doc).
     pub(crate) argv: Vec<String>,
     /// A remote command follows the target (only with a forced tty, or the
@@ -469,6 +481,10 @@ pub(crate) fn ssh_call(program: &str, args: &[String]) -> Option<SshCall> {
     let (index, terminated) = session.options(args, 0, &mut argv);
     let target = args.get(index)?;
     argv.push(target.clone());
+    // A URI's port counts only if no option before the target named one, and
+    // it comes before the options after the target (OpenSSH takes the first).
+    let (host, uri_port) = ssh_destination(target);
+    session.port = session.port.or(uri_port);
     // OpenSSH parses options **again** after the target (`ssh prod -p 2222`);
     // it does not if they ended with `--`.
     let rest = if terminated {
@@ -482,7 +498,8 @@ pub(crate) fn ssh_call(program: &str, args: &[String]) -> Option<SshCall> {
     }
     argv.extend(args[rest..].iter().cloned());
     Some(SshCall {
-        host: ssh_host(target),
+        host,
+        port: session.port,
         argv,
         command,
     })
@@ -496,6 +513,11 @@ struct SshSession {
     /// A non-interactive mode: [`SSH_NON_INTERACTIVE`], `RequestTTY=no` or
     /// `SessionType=none|subsystem`.
     quiet: bool,
+    /// The first port the arguments name: `-p`, `-o Port` or the target's
+    /// `ssh://…:port` ([`ssh_call`]). OpenSSH keeps the first too
+    /// (`ssh -p 1 -p 2 host` connects to 1). A value that is not a port is
+    /// skipped, so a later valid one can still be the first.
+    port: Option<u16>,
 }
 
 impl SshSession {
@@ -551,10 +573,10 @@ impl SshSession {
                         }
                         Some(attached)
                     };
-                    if flag == 'o'
-                        && let Some(value) = value
-                    {
-                        self.config(value);
+                    match (flag, value) {
+                        ('o', Some(value)) => self.config(value),
+                        ('p', Some(value)) => self.name_port(value),
+                        _ => {}
                     }
                     break;
                 }
@@ -567,11 +589,10 @@ impl SshSession {
         (index, false)
     }
 
-    /// `-o Key=value` (or with a space): the two keys that change interactivity.
+    /// `-o Key=value` (or with a space): the keys that change interactivity,
+    /// and `Port`.
     fn config(&mut self, option: &str) {
-        let (key, value) = option
-            .split_once(['=', ' ', '\t'])
-            .map_or((option, ""), |(key, value)| (key, value.trim()));
+        let (key, value) = config_pair(option);
         if key.eq_ignore_ascii_case("RequestTTY") {
             if value.eq_ignore_ascii_case("yes") || value.eq_ignore_ascii_case("force") {
                 self.tty = true;
@@ -582,29 +603,57 @@ impl SshSession {
             && (value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("subsystem"))
         {
             self.quiet = true;
+        } else if key.eq_ignore_ascii_case("Port") {
+            self.name_port(value);
         }
+    }
+
+    /// Records `value` as the port unless one was named before it.
+    fn name_port(&mut self, value: &str) {
+        self.port = self.port.or_else(|| parse_port(value));
     }
 }
 
-/// The target as written; only in the `ssh://` form are the scheme and port stripped.
-fn ssh_host(target: &str) -> String {
+/// An `-o` argument split the way `ssh_config(5)` spells a keyword and its
+/// argument: `Key=value`, `Key value` and `Key = value`.
+fn config_pair(option: &str) -> (&str, &str) {
+    let option = option.trim_start();
+    let end = option
+        .find(|c: char| c == '=' || c.is_whitespace())
+        .unwrap_or(option.len());
+    let (key, rest) = option.split_at(end);
+    let rest = rest.trim_start();
+    (key, rest.strip_prefix('=').unwrap_or(rest).trim())
+}
+
+/// A TCP port: a decimal `1..=65535`. What is not one (`0`, `http`, `22x`) is
+/// not the user's port.
+fn parse_port(text: &str) -> Option<u16> {
+    text.trim().parse::<u16>().ok().filter(|port| *port != 0)
+}
+
+/// The target as written and the port it names. Only in the `ssh://` form are
+/// the scheme and the port stripped (the port is returned, not dropped).
+fn ssh_destination(target: &str) -> (String, Option<u16>) {
     let Some(rest) = target.strip_prefix("ssh://") else {
-        return target.to_owned();
+        return (target.to_owned(), None);
     };
     let rest = rest.split('/').next().unwrap_or_default();
     let (user, host) = match rest.rsplit_once('@') {
         Some((user, host)) => (Some(user), host),
         None => (None, rest),
     };
-    let host = match host.strip_prefix('[') {
+    let (host, tail) = match host.strip_prefix('[') {
         // IPv6 is in square brackets; the port comes after the closing one.
-        Some(inner) => inner.split(']').next().unwrap_or_default(),
-        None => host.split(':').next().unwrap_or_default(),
+        Some(inner) => inner.split_once(']').unwrap_or((inner, "")),
+        None => host.split_at(host.find(':').unwrap_or(host.len())),
     };
-    match user {
+    let port = tail.strip_prefix(':').and_then(parse_port);
+    let host = match user {
         Some(user) => format!("{user}@{host}"),
         None => host.to_owned(),
-    }
+    };
+    (host, port)
 }
 
 /// The mosh script's options that take a value as a separate argument (the
@@ -666,6 +715,7 @@ fn mosh_client_target(args: &[String]) -> Option<Target> {
     let all: Vec<&str> = line.split_whitespace().collect();
     Some(Target {
         host,
+        port: None,
         kind: RemoteKind::Mosh,
         argv: mosh_argv(&all),
         nonce: None,
@@ -1638,6 +1688,7 @@ pub(crate) mod tests {
     fn remote_host(host: &str) -> Probe {
         Probe::Remote(Target {
             host: host.to_owned(),
+            port: None,
             kind: RemoteKind::Ssh,
             argv: Vec::new(),
             nonce: None,
@@ -1915,6 +1966,89 @@ pub(crate) mod tests {
             remote_of(&[(200, 101, &["ssh", "ssh://[::1]:22"])]),
             remote_host("::1")
         );
+    }
+
+    #[test]
+    fn the_first_port_the_argv_names_wins() {
+        let port_of = |argv: &[&'static str]| target_of(argv).port;
+        // Every spelling OpenSSH takes, the option's key in any case.
+        for argv in [
+            &["ssh", "-p", "2222", "prod"][..],
+            &["ssh", "-p2222", "prod"],
+            &["ssh", "-vp2222", "prod"],
+            &["ssh", "-o", "Port=2222", "prod"],
+            &["ssh", "-o", "Port 2222", "prod"],
+            &["ssh", "-oPort=2222", "prod"],
+            &["ssh", "-o", "port = 2222", "prod"],
+            &["ssh", "-v", "-o", "PORT=2222", "prod"],
+            // Options after the target are read again.
+            &["ssh", "prod", "-p", "2222"],
+            &["ssh", "-p", "2222", "--", "prod"],
+            &["ssh", "ssh://prod:2222"],
+            &["ssh", "ssh://deploy@prod:2222/"],
+        ] {
+            assert_eq!(port_of(argv), Some(2222), "{argv:?}");
+        }
+        // The first one wins, whichever way it was given: an option before the
+        // target beats the URI's, the URI's beats an option after the target.
+        assert_eq!(
+            port_of(&["ssh", "-p", "2222", "-p", "2223", "prod"]),
+            Some(2222)
+        );
+        assert_eq!(
+            port_of(&["ssh", "-o", "Port=2223", "-p", "2222", "prod"]),
+            Some(2223)
+        );
+        assert_eq!(port_of(&["ssh", "-p", "22", "ssh://prod:2222"]), Some(22));
+        assert_eq!(
+            port_of(&["ssh", "ssh://prod:2222", "-p", "2223"]),
+            Some(2222)
+        );
+        assert_eq!(port_of(&["ssh", "ssh://prod", "-p", "2223"]), Some(2223));
+        // What is not a port is not the user's port, and does not hide a later one.
+        assert_eq!(
+            port_of(&["ssh", "-p", "0", "-p", "2223", "prod"]),
+            Some(2223)
+        );
+        assert_eq!(port_of(&["ssh", "-p", "70000", "prod"]), None);
+        assert_eq!(port_of(&["ssh", "-p", "ssh", "prod"]), None);
+        assert_eq!(port_of(&["ssh", "ssh://prod:x"]), None);
+        // Nothing named, nothing known; the key does not change.
+        assert_eq!(port_of(&["ssh", "prod"]), None);
+        assert_eq!(port_of(&["ssh", "-o", "User=x", "ssh://prod"]), None);
+        let uri = target_of(&["ssh", "ssh://deploy@prod:2222"]);
+        assert_eq!((uri.host.as_str(), uri.port), ("deploy@prod", Some(2222)));
+        let v6 = target_of(&["ssh", "ssh://[::1]:2222"]);
+        assert_eq!((v6.host.as_str(), v6.port), ("::1", Some(2222)));
+        // The re-run argv keeps the user's own option, as it did.
+        assert_eq!(
+            target_of(&["ssh", "-vp2222", "prod"]).argv,
+            words(&["ssh", "-vp2222", "prod"])
+        );
+    }
+
+    #[test]
+    fn mosh_has_no_port_to_show() {
+        // mosh's `-p` is the UDP port of the mosh server, not ssh's door.
+        let script = ["/usr/bin/perl5.34", "-w", "/opt/homebrew/bin/mosh"];
+        let argv: Vec<&'static str> = script.into_iter().chain(["-p", "60001", "prod"]).collect();
+        let target = target_of(&argv);
+        assert_eq!((target.kind, target.port), (RemoteKind::Mosh, None));
+    }
+
+    #[test]
+    fn an_option_is_split_the_way_ssh_config_spells_it() {
+        for (option, want) in [
+            ("RequestTTY=no", ("RequestTTY", "no")),
+            ("RequestTTY no", ("RequestTTY", "no")),
+            ("RequestTTY = no", ("RequestTTY", "no")),
+            ("  Port\t2222 ", ("Port", "2222")),
+            ("Port", ("Port", "")),
+        ] {
+            assert_eq!(config_pair(option), want, "{option:?}");
+        }
+        // The spaced form was missed before: it now reads as the keyword it is.
+        assert!(ssh_call("ssh", &words(&["-o", "RequestTTY = no", "prod"])).is_none());
     }
 
     #[test]

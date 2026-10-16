@@ -1328,6 +1328,7 @@ mod tests {
     fn ssh(argv: &[&str]) -> RemoteTarget {
         RemoteTarget {
             host: "prod".to_owned(),
+            port: None,
             kind: RemoteKind::Ssh,
             argv: words(argv),
             line: String::new(),
@@ -1739,6 +1740,7 @@ mod tests {
         }
         let mosh = RemoteTarget {
             host: "deploy@prod".to_owned(),
+            port: None,
             kind: RemoteKind::Mosh,
             argv: words(&["mosh", "--ssh=ssh -p 2222", "deploy@prod"]),
             line: String::new(),

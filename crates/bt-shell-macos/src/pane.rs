@@ -4229,6 +4229,7 @@ impl TerminalPane {
                 let line = quote::command_line(&target.argv);
                 let target = RemoteTarget {
                     host: target.host,
+                    port: target.port,
                     kind: target.kind,
                     argv: target.argv,
                     line,

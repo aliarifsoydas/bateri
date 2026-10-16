@@ -270,13 +270,16 @@ impl TerminalPane {
         let downloads = bt_core::expand_home(&download_dir, home.as_deref());
         let (Some(dir), Some(downloads)) = (dir, downloads) else {
             self.preview_failed(
-                &target.host,
+                &target.label(),
                 &format!("The preview folder {preview_dir} can't be found."),
             );
             return;
         };
-        let host = target.host.clone();
-        let Some(local) = remote_files::preview_path(&dir, &host, &remote) else {
+        // What the user reads for the target (its host, and a port they named):
+        // for the failure texts and the transfer line only. The copy's folder is
+        // named by the bare host — a key, not a label.
+        let host = target.label().into_owned();
+        let Some(local) = remote_files::preview_path(&dir, &target.host, &remote) else {
             self.preview_failed(&host, &format!("{remote} can't be previewed."));
             return;
         };

@@ -103,6 +103,7 @@
 //!   them too, otherwise a `D;0\r` payload with a pasted line ending would look
 //!   corrupt to us.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::{self, Write as _};
 use std::path::Path;
@@ -628,6 +629,15 @@ pub struct DockContext {
     /// after the lock: if it were `ShellLog`'s own field, it would take either a
     /// `String` allocation per frame or holding the lock through the drawing.
     pub remote: Option<RemoteTarget>,
+    /// [`Self::remote`] as shown ([`RemoteTarget::label`]): the host, plus the
+    /// port when the user asked for one other than 22. Meaningful only while
+    /// [`Self::remote`] is filled ([`Self::remote_label`]).
+    ///
+    /// Written where the target is ([`ShellLog::set_remote`]) and kept here
+    /// rather than formatted per read, like [`Self::remote_mark`]: the context
+    /// line plans on every frame and every pointer move, and its plan is made
+    /// of borrows.
+    pub remote_label: String,
     /// The **resolved** mark of the active remote host; meaningful only
     /// while [`Self::remote`] is filled, [`HostMark::None`] locally.
     ///
@@ -931,7 +941,9 @@ impl Eq for RemoteStats {}
 /// the same layout.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Transfer {
-    /// The target's host, as shown ([`RemoteTarget::host`]).
+    /// The target as shown ([`RemoteTarget::label`]) — what the context line
+    /// shows for the same session. Display only: [`Self::mark`] is resolved
+    /// from the bare host, not from this.
     pub host: String,
     /// The host's resolved mark: the color of `⇄ host` and of the progress bar.
     pub mark: HostMark,
@@ -1031,8 +1043,13 @@ pub enum ButtonState {
 /// ⏎ will send.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Reconnect {
-    /// The dropped target's host, as shown ([`RemoteTarget::host`]).
+    /// The dropped target's host, the key of its mark ([`RemoteTarget::host`]).
     pub host: String,
+    /// The port the dropped target was given ([`RemoteTarget::port`]). A
+    /// handover carries the offer as `(host, line)` only, so an offer that
+    /// crossed one has none: the placeholder then shows the bare host while
+    /// ⏎ still sends the line, port and all.
+    pub port: Option<u16>,
     /// The host's **resolved** mark; re-resolved when the list changes
     /// ([`ShellLog::set_host_rules`]).
     pub mark: HostMark,
@@ -1051,8 +1068,16 @@ impl Clone for Reconnect {
     /// every frame, so the strings' capacity must be kept.
     fn clone_from(&mut self, source: &Self) {
         self.host.clone_from(&source.host);
+        self.port = source.port;
         self.mark = source.mark;
         self.line.clone_from(&source.line);
+    }
+}
+
+impl Reconnect {
+    /// What the placeholder calls the dropped target ([`host_label`]).
+    pub fn label(&self) -> Cow<'_, str> {
+        host_label(&self.host, self.port)
     }
 }
 
@@ -1071,6 +1096,8 @@ impl Clone for DockContext {
         // Capacity is kept: allocation happens only at the **edge** of the remote session
         // (`Option::clone_from` descends to `RemoteTarget::clone_from` on `Some`/`Some`).
         self.remote.clone_from(&source.remote);
+        self.remote_label.clear();
+        self.remote_label.push_str(&source.remote_label);
         self.remote_mark = source.remote_mark;
         self.remote_cwd.clear();
         self.remote_cwd.push_str(&source.remote_cwd);
@@ -1087,9 +1114,16 @@ impl Clone for DockContext {
 }
 
 impl DockContext {
-    /// Uzak oturumun host'u; yerelde `None`.
+    /// Uzak oturumun host'u; yerelde `None`. The **key** (marks, integration,
+    /// saved passwords): what is shown is [`Self::remote_label`].
     pub fn remote_host(&self) -> Option<&str> {
         self.remote.as_ref().map(|target| target.host.as_str())
+    }
+
+    /// The remote session's name as the context line and the title show it
+    /// ([`host_label`]); `None` locally.
+    pub fn remote_label(&self) -> Option<&str> {
+        self.remote.is_some().then_some(self.remote_label.as_str())
     }
 
     /// Deletes the remote state; `true` **if the title's input changed** (there was a
@@ -1102,6 +1136,7 @@ impl DockContext {
         self.remote_cwd.clear();
         self.remote_setup = None;
         self.remote_mark = HostMark::None;
+        self.remote_label.clear();
         // The load belongs to the host, and so does its login.
         self.stats = None;
         self.sign_in = None;
@@ -1159,8 +1194,14 @@ pub enum RemoteKind {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RemoteTarget {
     /// As the user typed it (`prod`, `deploy@10.0.0.5`); the `ssh://` scheme and the
-    /// port are dropped.
+    /// port are dropped. The **key** of everything about the host (its mark, the
+    /// integration decision, the saved password, the preview folder): the port is
+    /// not part of it, and what is shown is [`Self::label`].
     pub host: String,
+    /// The port the user named on the command line (`-p`, `-o Port`, the
+    /// `ssh://` form), `None` if they named none or mosh. A `Port` in
+    /// `~/.ssh/config` is not known here.
+    pub port: Option<u16>,
     pub kind: RemoteKind,
     /// The argv to re-run — for ssh the local forwardings (`-L -R -D`), `-M` and `-f`
     /// are stripped; for mosh `mosh` + the script's arguments.
@@ -1175,10 +1216,42 @@ impl RemoteTarget {
     pub(crate) fn ssh(host: &str) -> Self {
         Self {
             host: host.to_owned(),
+            port: None,
             kind: RemoteKind::Ssh,
             argv: vec!["ssh".to_owned(), host.to_owned()],
             line: format!("ssh {host}"),
         }
+    }
+}
+
+impl RemoteTarget {
+    /// The name every surface shows for the target — the context line, the
+    /// title, the reconnect placeholder, the transfer line and the transfer
+    /// texts ([`host_label`]).
+    pub fn label(&self) -> Cow<'_, str> {
+        host_label(&self.host, self.port)
+    }
+}
+
+/// ssh's own default; a target on it shows no port.
+const DEFAULT_SSH_PORT: u16 = 22;
+
+/// A host as shown, with the port when the user asked for one other than 22:
+/// `prod`, `10.0.0.5:2222`, `deploy@10.0.0.5:2222`. An IPv6 address is
+/// bracketed once it has a port, as it is written in a URI
+/// (`deploy@[::1]:2222`), since the port's colon would join the address's.
+///
+/// The one place that spells the port; the key stays the bare host
+/// ([`RemoteTarget::host`]).
+pub(crate) fn host_label(host: &str, port: Option<u16>) -> Cow<'_, str> {
+    let Some(port) = port.filter(|port| *port != DEFAULT_SSH_PORT) else {
+        return Cow::Borrowed(host);
+    };
+    let (user, name) = host.split_at(host.rfind('@').map_or(0, |at| at + 1));
+    if name.contains(':') && !name.starts_with('[') {
+        Cow::Owned(format!("{user}[{name}]:{port}"))
+    } else {
+        Cow::Owned(format!("{user}{name}:{port}"))
     }
 }
 
@@ -1194,6 +1267,7 @@ impl Clone for RemoteTarget {
     /// strings every frame. `Vec<String>::clone_from` keeps the elements' capacity.
     fn clone_from(&mut self, source: &Self) {
         self.host.clone_from(&source.host);
+        self.port = source.port;
         self.kind = source.kind;
         self.argv.clone_from(&source.argv);
         self.line.clone_from(&source.line);
@@ -1233,8 +1307,9 @@ pub(crate) fn title_directory(title: &str) -> Option<&str> {
 ///    one.
 /// 3. `bateri`.
 ///
-/// **While a remote session is active** (`remote` = host) the title
-/// carries the [`crate::dock::REMOTE_MARK`] prefix: `⇄ {OSC title}`, `⇄ {host}` if
+/// **While a remote session is active** (`remote` = the target as shown,
+/// [`host_label`]) the title carries the [`crate::dock::REMOTE_MARK`] prefix:
+/// `⇄ {OSC title}`, `⇄ {host}` (`⇄ {host}:{port}` for a port the user named) if
 /// there is no title; the local directory is never consulted. The prefix is
 /// unconditional, because most remote shells print `user@host: dir` into the
 /// title and what tells the remote apart among tabs is that; since the dock goes
@@ -2589,6 +2664,7 @@ impl ShellLog {
                         .reconnect
                         .get_or_insert_with(Reconnect::default);
                     offer.host.clone_from(&target.host);
+                    offer.port = target.port;
                     offer.line.clone_from(&target.line);
                     offer.mark = self.context.remote_mark;
                 }
@@ -2836,11 +2912,15 @@ impl ShellLog {
     ///
     /// The target is written as a whole and the mark is resolved here,
     /// from the pattern list ([`Self::host_rules`]); the return is still only the
-    /// change of the **host** — that is the title's input.
+    /// change of the **host or its port** — that is the title's input
+    /// (`localhost:2222` and `localhost:2223` are two machines to the reader).
     pub(crate) fn set_remote(&mut self, target: Option<&RemoteTarget>) -> bool {
         let target = target
             .filter(|target| !target.host.is_empty() && !target.host.chars().any(char::is_control));
-        let changed = self.context.remote_host() != target.map(|target| target.host.as_str());
+        fn named(target: &RemoteTarget) -> (&str, Option<u16>) {
+            (target.host.as_str(), target.port)
+        }
+        let changed = self.context.remote.as_ref().map(named) != target.map(named);
         // Another host's load is not this one's; the same host
         // re-reported keeps its indicator.
         if changed {
@@ -2855,6 +2935,8 @@ impl ShellLog {
                     Some(slot) => slot.clone_from(target),
                     slot => *slot = Some(target.clone()),
                 }
+                self.context.remote_label.clear();
+                self.context.remote_label.push_str(&target.label());
                 self.context.remote_mark =
                     crate::settings::host_mark(&self.host_rules, &target.host);
                 // A new remote session invalidates the old one's offer.
@@ -2864,6 +2946,7 @@ impl ShellLog {
             // `C`/`D`/`A` deletes it.
             None => {
                 self.context.remote = None;
+                self.context.remote_label.clear();
                 self.context.remote_mark = HostMark::None;
             }
         }
@@ -5799,6 +5882,7 @@ impl ShellLog {
         self.context.reconnect = carried.reconnect.map(|(host, line)| Reconnect {
             mark: crate::settings::host_mark(&self.host_rules, &host),
             host,
+            port: None,
             line,
         });
         let cluster = self.dock.cluster;
@@ -10059,6 +10143,7 @@ mod tests {
         assert!(!log.set_host_rules(&[rule("prod-*", HostMark::Production)]));
         let target = RemoteTarget {
             host: "deploy@prod-web-1".to_owned(),
+            port: None,
             kind: RemoteKind::Ssh,
             argv: ["ssh", "-p", "2222", "deploy@prod-web-1"]
                 .map(str::to_owned)
@@ -10120,6 +10205,7 @@ mod tests {
         );
         let offer = Reconnect {
             host: "prod".to_owned(),
+            port: None,
             mark: HostMark::Production,
             line: "ssh prod".to_owned(),
         };
@@ -10142,6 +10228,101 @@ mod tests {
         );
         log.apply(Mark::CommandStart);
         assert_eq!(log.context.reconnect, None, "sonraki `C` siliyor");
+    }
+
+    fn on_port(host: &str, port: Option<u16>) -> RemoteTarget {
+        RemoteTarget {
+            port,
+            ..RemoteTarget::ssh(host)
+        }
+    }
+
+    #[test]
+    fn a_port_is_shown_only_when_the_user_named_one_other_than_22() {
+        for (host, port, shown) in [
+            ("prod", None, "prod"),
+            ("prod", Some(22), "prod"),
+            ("prod", Some(2222), "prod:2222"),
+            ("10.0.0.5", Some(2222), "10.0.0.5:2222"),
+            ("deploy@10.0.0.5", Some(2222), "deploy@10.0.0.5:2222"),
+            ("example.com", Some(2222), "example.com:2222"),
+            // The port's colon must not read as part of the address.
+            ("::1", Some(2222), "[::1]:2222"),
+            ("deploy@fe80::1", Some(2222), "deploy@[fe80::1]:2222"),
+            ("deploy@::1", Some(22), "deploy@::1"),
+            ("::1", None, "::1"),
+            // Already bracketed (as typed): left as it is.
+            ("[::1]", Some(2222), "[::1]:2222"),
+        ] {
+            assert_eq!(host_label(host, port), shown, "{host} {port:?}");
+            assert_eq!(on_port(host, port).label(), shown, "{host} {port:?}");
+        }
+        // The reconnect placeholder spells it the same way.
+        let offer = Reconnect {
+            host: "deploy@prod".to_owned(),
+            port: Some(2222),
+            ..Reconnect::default()
+        };
+        assert_eq!(offer.label(), "deploy@prod:2222");
+    }
+
+    #[test]
+    fn a_port_is_part_of_what_the_title_shows_but_not_of_the_key() {
+        let mut log = running_log();
+        log.set_host_rules(&[rule("prod", HostMark::Production)]);
+        assert!(log.set_remote(Some(&on_port("prod", Some(2222)))));
+        // The key is the bare host: the mark, the marks menu and the saved
+        // password do not see the port.
+        assert_eq!(log.context.remote_host(), Some("prod"));
+        assert_eq!(log.context.remote_label(), Some("prod:2222"));
+        assert_eq!(log.context.remote_mark, HostMark::Production);
+        // The same target re-reported is no change and keeps the load.
+        log.context.stats = Some(sample(40));
+        assert!(!log.set_remote(Some(&on_port("prod", Some(2222)))));
+        assert_eq!(log.context.stats, Some(sample(40)));
+        // Another port is another machine to the reader — the title's
+        // input changed and the previous one's load is gone.
+        assert!(log.set_remote(Some(&on_port("prod", Some(2223)))));
+        assert_eq!(log.context.remote_label(), Some("prod:2223"));
+        assert_eq!(log.context.stats, None);
+        assert!(log.set_remote(Some(&on_port("prod", None))));
+        assert_eq!(log.context.remote_label(), Some("prod"));
+        // Naming the default port is showing none.
+        assert!(log.set_remote(Some(&on_port("prod", Some(22)))));
+        assert_eq!(log.context.remote_label(), Some("prod"));
+        // The context line takes the label with the rest of the context.
+        assert!(log.set_remote(Some(&on_port("prod", Some(2222)))));
+        let mut copy = DockContext::default();
+        copy.clone_from(&log.context);
+        assert_eq!(copy.remote_label(), Some("prod:2222"));
+        assert_eq!(
+            copy.remote.as_ref().map(|target| target.port),
+            Some(Some(2222))
+        );
+        assert!(log.set_remote(None));
+        assert_eq!(log.context.remote_label(), None);
+        assert_eq!(log.context.remote_label, "");
+    }
+
+    #[test]
+    fn the_reconnect_offer_keeps_the_port_the_dropped_target_had() {
+        let mut log = running_log();
+        assert!(log.set_remote(Some(&on_port("deploy@prod", Some(2222)))));
+        log.apply(our_end(255));
+        let offer = log.context.reconnect.as_ref().expect("an offer");
+        assert_eq!(
+            (offer.host.as_str(), offer.port),
+            ("deploy@prod", Some(2222))
+        );
+        assert_eq!(offer.label(), "deploy@prod:2222");
+        // A handover carries `(host, line)` only: the offer that comes out of
+        // one shows the bare host and still re-runs the whole line.
+        let carried = log.carried(None, 0);
+        let mut next = ShellLog::new(BLOCK_LOG_FLOOR);
+        next.restore(carried, 0);
+        let offer = next.context.reconnect.as_ref().expect("the offer crossed");
+        assert_eq!((offer.host.as_str(), offer.port), ("deploy@prod", None));
+        assert_eq!(offer.line, "ssh deploy@prod");
     }
 
     #[test]
@@ -10925,6 +11106,7 @@ mod tests {
         log.context.remote_setup = Some(RemoteSetupFault::Decode);
         log.context.reconnect = Some(Reconnect {
             host: "prod".to_owned(),
+            port: None,
             mark: HostMark::None,
             line: "ssh -p 2222 prod".to_owned(),
         });

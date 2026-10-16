@@ -460,7 +460,10 @@ impl TerminalPane {
             .session()
             .and_then(|session| session.remote_mark())
             .map_or(HostMark::None, |(_, mark)| mark);
-        let host = target.host.clone();
+        // What the user reads for the target (its host, and a port they named):
+        // for the sheets, the failure texts and the transfer line only; the
+        // connection comes from `target`.
+        let host = target.label().into_owned();
         // The job does not hold the sheet gate: the password sheet takes it if free.
         let dial = self.dial(target, Some((SheetJob::Finder, false)));
         let (id, lookup) = (self.id(), self.lookup());

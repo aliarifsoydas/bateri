@@ -51,6 +51,14 @@ of every installed copy. A version without a section is not released.
   With Reduce Motion on they only fade.
 - **A tab's summary card eases in from the tab** and fades out, instead of
   appearing and vanishing at once.
+- **An `ssh` session on another port shows its port.** When the port is given
+  on the command line (`ssh -p 2222 host`, `-o Port=2222` or an
+  `ssh://host:2222` address), the context line, the window and tab title, the
+  reconnect prompt and the transfer line read `⇄ 10.0.0.5:2222` instead of
+  `⇄ 10.0.0.5`, so two sessions on the same machine, `localhost:2222` and
+  `localhost:2223`, are no longer the same label. Marks, saved passwords and
+  Shell Integration still go by the host alone; a `Port` set only in
+  `~/.ssh/config` is not shown, nor is port 22 or a mosh session's.
 
 ### Fixed
 

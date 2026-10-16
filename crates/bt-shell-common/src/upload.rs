@@ -1538,6 +1538,9 @@ pub struct Started {
 struct Queue {
     command: u64,
     ssh: Vec<String>,
+    /// The target as shown ([`bt_core::RemoteTarget::label`]): the sheets', the
+    /// result texts' and the transfer line's name for it. Never read as a key —
+    /// the connection is [`Self::ssh`].
     host: String,
     mark: HostMark,
     entries: Vec<Item>,
@@ -2594,6 +2597,7 @@ mod tests {
     fn ssh_target(argv: &[&str]) -> RemoteTarget {
         RemoteTarget {
             host: "prod".to_owned(),
+            port: None,
             kind: RemoteKind::Ssh,
             argv: words(argv),
             line: String::new(),
@@ -2646,6 +2650,7 @@ mod tests {
     fn mosh_uploads_through_plain_ssh_to_the_host() {
         let target = RemoteTarget {
             host: "deploy@prod".to_owned(),
+            port: None,
             kind: RemoteKind::Mosh,
             argv: words(&["mosh", "--ssh=ssh -p 2222", "deploy@prod"]),
             line: String::new(),

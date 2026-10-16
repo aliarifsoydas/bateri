@@ -2610,6 +2610,7 @@ mod remote_shells {
         let command = session.running_command().expect("a running command");
         let target = RemoteTarget {
             host: "server".to_owned(),
+            port: None,
             kind: RemoteKind::Ssh,
             argv: vec!["ssh".to_owned(), "server".to_owned()],
             line: "ssh server".to_owned(),
