@@ -50,6 +50,12 @@ of every installed copy. A version without a section is not released.
   lines are a split tab's too — the title, the folder and a marked host — so
   "Running · npm run dev · 0:12" is now the tile's "Running".
 
+### Fixed
+
+- **The line between the side column and a tab with one pane comes back.**
+  In a window that opened on a split tab — reopened by bateri at launch — the
+  thin line beside the column stayed away when a tab with one pane was shown.
+
 ## [0.16.0] - 2026-10-16
 
 ### Added

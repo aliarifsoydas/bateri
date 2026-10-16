@@ -1357,6 +1357,15 @@ impl RootView {
         let ruled = shown.is_none() && tabs_at_side(self.mtm());
         if self.ivars().ruled.replace(ruled) != ruled {
             fade_to(&self.ivars().rule, ruled, still || !on_screen);
+            // A line the window first showed transparent — a window restored on a split tab —
+            // was never drawn, and the box draws its fill again only when the fill changes:
+            // given again as it comes in, or it would come in as a clear box.
+            if ruled {
+                let rule = &self.ivars().rule;
+                let fill = rule.fillColor();
+                rule.setFillColor(&NSColor::clearColor());
+                rule.setFillColor(&fill);
+            }
         }
     }
 
