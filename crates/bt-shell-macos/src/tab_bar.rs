@@ -2686,7 +2686,7 @@ define_class!(
                 );
             }
             if let Some(rgb) = left {
-                let stripe = tabs::Row::of(None, 0.0, false).host_mark;
+                let stripe = tabs::Row::of(self.bounds().size.width, None, 0.0, false).host_mark;
                 rounded(
                     NSRect::new(
                         NSPoint::new(stripe.x, stripe.y),
@@ -3560,7 +3560,7 @@ impl Chip {
         // the right end, the title after the icon).
         let row = side.then(|| {
             // The title gives way to the `×` while it shows and to the key while that does.
-            tabs::Row::of(lead, natural.width, hovered || hint.is_some())
+            tabs::Row::of(size.width, lead, natural.width, hovered || hint.is_some())
         });
         let (glyph_x, text_x, text_width) = match &row {
             Some(row) => (row.lead.map(|lead| lead.x), row.title.x, row.title.width),

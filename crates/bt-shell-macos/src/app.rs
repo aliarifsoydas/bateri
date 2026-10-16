@@ -3379,6 +3379,11 @@ impl AppDelegate {
         let source = from.map(|from| from.selected_tab().focused_pane());
         let (launch, theme) = self.pane_launch(tab, source.as_deref(), opening);
         let window = TerminalWindow::new(mtm, id, tab, launch).map_err(|e| e.to_string())?;
+        // The side column is as wide as the one the window opens from: a width the user chose
+        // is the user's, not one window's accident.
+        if let Some(from) = from {
+            window.set_side_width(from.side_width());
+        }
         window.set_notice(&self.ivars().notices.borrow().subtitle());
         self.ivars().windows.borrow_mut().push(window.clone());
         // Chrome **before** the window is visible: if painted afterwards, every ⌘N
@@ -3708,7 +3713,7 @@ impl AppDelegate {
     /// **The applier: a window around a tab** ([`moves::Step::OpenWindow`]):
     /// window `id` around `moved`, a tab that has left `from` — the size and
     /// place `from` has (or, with `at`, its title row under that screen
-    /// point), the theme of its focused pane, shown and brought up
+    /// point), `from`'s side column width, the theme of its focused pane, shown and brought up
     /// ([`TerminalWindow::show_arrived`]). No shell is started or told to end.
     /// A layout edge.
     fn open_window_around(
@@ -3732,6 +3737,7 @@ impl AppDelegate {
                 let (grab_x, grab_y) = if window::tabs_at_side(self.mtm()) {
                     // The first row's own place in the column's layout, not a copy of it.
                     let column = tabs::Side {
+                        width: from.column_width(),
                         height: source.size.height,
                         top: row,
                         count: 1,
@@ -3743,7 +3749,7 @@ impl AppDelegate {
                     column
                         .rows
                         .first()
-                        .map_or((tabs::SIDE_WIDTH / 2.0, row), |first| {
+                        .map_or((column.width / 2.0, row), |first| {
                             (first.x + first.width / 2.0, first.y + first.height / 2.0)
                         })
                 } else {
@@ -3763,7 +3769,14 @@ impl AppDelegate {
             }
             None => source,
         };
-        let window = TerminalWindow::with_tab(self.mtm(), id, from.run(), moved, Some(frame));
+        let window = TerminalWindow::with_tab(
+            self.mtm(),
+            id,
+            from.run(),
+            moved,
+            Some(frame),
+            from.side_width(),
+        );
         window.set_notice(&self.ivars().notices.borrow().subtitle());
         self.ivars().windows.borrow_mut().push(window.clone());
         window.set_theme(theme);
@@ -4371,6 +4384,9 @@ impl AppDelegate {
                         self.ivars().windows.borrow_mut().push(this.clone());
                         this.set_theme(theme);
                         this.set_content_edge(edge);
+                        if let Some(side) = window.side_width {
+                            this.set_side_width(side);
+                        }
                         this.show_at(frame);
                     })
                     .map(|this| built = Some(this))
@@ -4565,6 +4581,9 @@ impl AppDelegate {
                 tabs,
                 selected: selected_index,
                 key: key.as_deref().is_some_and(|key| window.owns(key)),
+                // A column at the default is written as none: the layout then stays in the
+                // version before widths.
+                side_width: Some(window.side_width()).filter(|&side| side != tabs::SIDE_WIDTH),
             });
         }
         (Saved { windows }, histories)

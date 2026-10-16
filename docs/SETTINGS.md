@@ -469,6 +469,12 @@ created from the [template](#template), an invalid or unreadable file is left
 alone — holds here, with the title bar saying `…; the setting was not saved`.
 The items are grey where there is no file to write.
 
+The column's width is not a setting. Drag its right edge, the space between
+the rows and the content, to make it anywhere from 136 to 400 pt wide; a
+double click there brings it back to 200 pt. Each window keeps its own width,
+a window opened from another starts with that one's, and the width is saved
+with the windows when bateri restores them.
+
 ## If something goes wrong
 
 The error appears in English in the window's title bar. With a single tab it

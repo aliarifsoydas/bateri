@@ -2,7 +2,7 @@
 //! the directory that holds it.
 //!
 //! **The model** is what comes back after a quit: windows (frame, selected tab,
-//! key), tabs (the split tree's shape, focus, zoom) and panes (the persistent `PaneUuid`, the local
+//! key, the side column's width), tabs (the split tree's shape, focus, zoom) and panes (the persistent `PaneUuid`, the local
 //! directory, the point-size step, the remote target's line, whether a history file was written).
 //! The tree's leaves are **indices** into the tab's pane list ([`Shape`]): the in-process `u64`
 //! pane identity means nothing in the next process, so it never reaches the disk —
@@ -12,11 +12,13 @@
 //! **The format** follows `remote-hosts` (`ssh_wrap`): line based, the first line names the
 //! version ([`HEADER`] + [`VERSION`]), then one `W` line per window, one `T` line per tab under it
 //! and one `P` line per pane under that; the tree is a pre-order token run (`S h|v {ratio} … L
-//! {index}`). **Two versions are read**, the current one and the one before it: version 2 gave a
-//! tab its own name (a `T` line's third field), version 1 has none. The writer says version 1
-//! whenever no tab is named, so a session nobody named stays readable by the bateri that only
-//! knew version 1 — whose reader drops any other number and, with it, a holder's programs.
-//! A version's frozen text stays in the tests: its reader must keep reading it. Text fields (directory, remote line) are escaped so that a field never holds a
+//! {index}`). **Every version the writer still writes is read**: version 3 gave a window the width
+//! its side column was dragged to (a `W` line's seventh field), version 2 a tab its own name (a
+//! `T` line's third field), version 1 has neither. The writer says the oldest version that holds
+//! what there is — 1 while no tab is named and no column was resized, 2 while only names are, 3
+//! once a width is — so a session that uses nothing new stays readable by the bateri before it,
+//! whose reader drops any other number and, with it, a holder's programs. A version's frozen text
+//! stays in the tests: its reader must keep reading it. Text fields (directory, remote line) are escaped so that a field never holds a
 //! space, a tab or a line break ([`escape`]); an absent field is `-`, a present one `+` followed
 //! by the escaped text, so the empty string and absence stay apart. Reading is strict: an
 //! unknown version, a malformed line, an index out of range, a tree whose leaves are not exactly
@@ -58,12 +60,17 @@ use crate::split::{Axis, Tree};
 /// The first line's word; the version follows it after one space.
 pub const HEADER: &str = "bateri-session";
 
-/// The format's current version: a tab may carry its own name. The previous one ([`UNNAMED`]) is
-/// read too; any other number is not read (a newer bateri's file after a downgrade is dropped, not
-/// misread).
-pub const VERSION: u32 = 2;
+/// The format's current version: a window may carry its side column's width. The ones before it
+/// ([`NAMED`], [`UNNAMED`]) are read too; any other number is not read (a newer bateri's file after
+/// a downgrade is dropped, not misread).
+pub const VERSION: u32 = 3;
 
-/// The version before names, which a session with no named tab is still written in.
+/// The version before widths, which a session with a named tab and no resized column is still
+/// written in.
+const NAMED: u32 = 2;
+
+/// The version before names, which a session with no named tab and no resized column is still
+/// written in.
 const UNNAMED: u32 = 1;
 
 /// The layout file's name inside the directory.
@@ -104,6 +111,10 @@ pub struct SavedWindow {
     pub selected: usize,
     /// Whether this was the key window.
     pub key: bool,
+    /// The width the user dragged the side column to (`tabs::side_width` fits it to the window);
+    /// `None` keeps the default. Kept while the tabs are in the title row as well, so the column
+    /// comes back as it was.
+    pub side_width: Option<f64>,
 }
 
 /// A tab: the split tree's shape over `panes`.
@@ -337,6 +348,7 @@ impl Saved {
                 tabs,
                 selected: selected.unwrap_or(0),
                 key: window.key,
+                side_width: window.side_width,
             });
         }
         Saved { windows }
@@ -448,12 +460,22 @@ impl Saved {
     /// The file's text. Only a model that [`Saved::parse`] accepts round-trips; the caller builds
     /// it from live windows, which are always consistent.
     pub fn render(&self) -> String {
+        let sided = self
+            .windows
+            .iter()
+            .any(|window| window.side_width.is_some());
         let named = self
             .windows
             .iter()
             .flat_map(|window| &window.tabs)
             .any(|tab| tab.name.is_some());
-        let version = if named { VERSION } else { UNNAMED };
+        let version = if sided {
+            VERSION
+        } else if named {
+            NAMED
+        } else {
+            UNNAMED
+        };
         let mut out = format!("{HEADER} {version}\n");
         for window in &self.windows {
             let Frame {
@@ -463,16 +485,23 @@ impl Saved {
                 height,
             } = window.frame;
             out.push_str(&format!(
-                "W {x} {y} {width} {height} {} {}\n",
+                "W {x} {y} {width} {height} {} {}",
                 window.selected,
                 u8::from(window.key)
             ));
+            if version >= VERSION {
+                match window.side_width {
+                    Some(side) => out.push_str(&format!(" {side}")),
+                    None => out.push_str(" -"),
+                }
+            }
+            out.push('\n');
             for tab in &window.tabs {
                 let zoomed = tab.zoomed.map_or("-".to_owned(), |z| z.to_string());
                 out.push_str(&format!("T {} {zoomed}", tab.focused));
                 // The name sits before the shape: a field of fixed place, where the shape is a
                 // run of tokens of any length.
-                if named {
+                if version >= NAMED {
                     out.push(' ');
                     out.push_str(&render_optional(tab.name.as_deref()));
                 }
@@ -502,7 +531,7 @@ impl Saved {
             return None;
         }
         let version = header.next()?.parse::<u32>().ok()?;
-        if ![UNNAMED, VERSION].contains(&version) || header.next().is_some() {
+        if ![UNNAMED, NAMED, VERSION].contains(&version) || header.next().is_some() {
             return None;
         }
         let mut windows: Vec<SavedWindow> = Vec::new();
@@ -518,7 +547,7 @@ impl Saved {
             }
             let mut tokens = line.split(' ');
             match tokens.next()? {
-                "W" => windows.push(parse_window(&mut tokens)?),
+                "W" => windows.push(parse_window(&mut tokens, version)?),
                 "T" => windows
                     .last_mut()?
                     .tabs
@@ -560,7 +589,10 @@ impl SavedTab {
     }
 }
 
-fn parse_window<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Option<SavedWindow> {
+fn parse_window<'a>(
+    tokens: &mut impl Iterator<Item = &'a str>,
+    version: u32,
+) -> Option<SavedWindow> {
     let mut number = || -> Option<f64> {
         let value: f64 = tokens.next()?.parse().ok()?;
         value.is_finite().then_some(value)
@@ -574,11 +606,29 @@ fn parse_window<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Option<SavedW
     if frame.width <= 0.0 || frame.height <= 0.0 {
         return None;
     }
+    let selected = tokens.next()?.parse().ok()?;
+    let key = parse_bit(tokens.next()?)?;
+    // Versions before 3 have no width: the column is the default.
+    let side_width = if version >= VERSION {
+        match tokens.next()? {
+            "-" => None,
+            side => {
+                let side: f64 = side.parse().ok()?;
+                if !side.is_finite() || side <= 0.0 {
+                    return None;
+                }
+                Some(side)
+            }
+        }
+    } else {
+        None
+    };
     Some(SavedWindow {
         frame,
         tabs: Vec::new(),
-        selected: tokens.next()?.parse().ok()?,
-        key: parse_bit(tokens.next()?)?,
+        selected,
+        key,
+        side_width,
     })
 }
 
@@ -589,7 +639,7 @@ fn parse_tab<'a>(tokens: &mut impl Iterator<Item = &'a str>, version: u32) -> Op
         index => Some(index.parse().ok()?),
     };
     // Version 1 has no name field. An empty name is no name: the title it would show is blank.
-    let name = if version >= VERSION {
+    let name = if version >= NAMED {
         parse_optional(tokens.next()?)?.filter(|name| !name.is_empty())
     } else {
         None
@@ -866,6 +916,8 @@ mod tests {
     use crate::settings::TempRoot;
 
     const A: &str = "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0";
+    /// A width with a long fraction: a dragged edge stops at any point.
+    const SIDE_SAMPLE: f64 = 213.333_333_333_333_34;
     const B: &str = "11111111-2222-3333-4444-555555555555";
     const C: &str = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
 
@@ -904,6 +956,7 @@ mod tests {
             tabs,
             selected: 0,
             key: false,
+            side_width: None,
         }
     }
 
@@ -965,6 +1018,13 @@ mod tests {
         saved
     }
 
+    /// [`rich`] with the first window's side column dragged wider: the model of [`V3_FIXTURE`].
+    fn rich_sided() -> Saved {
+        let mut saved = rich();
+        saved.windows[0].side_width = Some(260.5);
+        saved
+    }
+
     /// Version 1 as the writer of that version produced it for [`rich`], frozen: a bateri that
     /// only knows version 1 reads what an unnamed session is still written as, and this
     /// bateri reads what that one wrote. Never updated — a change of the format is a new
@@ -1004,29 +1064,67 @@ mod tests {
         "P AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE 0 0 - -\n",
     );
 
+    /// Version 3 for [`rich_sided`], frozen the same way: the width is the seventh field of a `W`
+    /// line, `-` where a window keeps the default, and the `T` lines carry version 2's name field.
+    const V3_FIXTURE: &str = concat!(
+        "bateri-session 3\n",
+        "W 120.5 -30 800 600.25 1 1 260.5\n",
+        "T 0 - - L 0\n",
+        "P 11111111-2222-3333-4444-555555555555 0 0 - -\n",
+        "T 1 2 - S h 0.3333333333333333 L 2 S v 0.71 L 0 L 1\n",
+        r"P 0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0 3 1 +/Users/ömer/My\sDrive/çalışma\\dosya -",
+        "\n",
+        r"P 11111111-2222-3333-4444-555555555555 -2 0 +/tmp/tab\there\nnew\sline\rcr\s- +ssh\s-p\s2222\sprod",
+        "\n",
+        "P AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE 0 1 + +\n",
+        "W 120.5 -30 800 600.25 0 0 -\n",
+        "T 0 - - L 0\n",
+        "P AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE 0 0 - -\n",
+    );
+
     #[test]
     fn the_previous_version_is_read_byte_for_byte() {
         assert_eq!(Saved::parse(V1_FIXTURE), Some(rich()));
+        assert_eq!(Saved::parse(V2_FIXTURE), Some(rich_named()));
     }
 
     #[test]
     fn the_current_version_is_read_byte_for_byte() {
-        assert_eq!(Saved::parse(V2_FIXTURE), Some(rich_named()));
+        assert_eq!(Saved::parse(V3_FIXTURE), Some(rich_sided()));
     }
 
-    /// The writer says the version before names while no tab is named — the bateri that only
-    /// knew that version still reads such a session — and the current one as soon as one is.
+    /// The writer says the oldest version that holds the session — the one before names while no
+    /// tab is named and no column was resized, the one before widths while only names are — so
+    /// the bateri that only knew that version still reads it; the current one as soon as a width
+    /// is there.
     #[test]
     fn an_unnamed_session_is_written_as_the_previous_version() {
         assert_eq!(rich().render(), V1_FIXTURE);
         assert_eq!(rich_named().render(), V2_FIXTURE);
+        assert_eq!(rich_sided().render(), V3_FIXTURE);
+    }
+
+    /// A width is a positive number of points or `-`; anything else is a layout not understood.
+    #[test]
+    fn a_side_width_that_is_no_width_drops_the_layout() {
+        for side in ["0", "-4", "inf", "NaN", "wide", "+"] {
+            let text = V3_FIXTURE.replace("1 1 260.5\n", &format!("1 1 {side}\n"));
+            assert_eq!(Saved::parse(&text), None, "{side}");
+        }
+        // Version 2's window line has no width field; one there is a stray token.
+        let text = V2_FIXTURE.replace("600.25 1 1\n", "600.25 1 1 260.5\n");
+        assert_eq!(Saved::parse(&text), None);
     }
 
     #[test]
     fn format_round_trips() {
+        let mut both = rich_named();
+        both.windows[1].side_width = Some(SIDE_SAMPLE);
         for (saved, header) in [
             (rich(), "bateri-session 1\n"),
             (rich_named(), "bateri-session 2\n"),
+            (rich_sided(), "bateri-session 3\n"),
+            (both, "bateri-session 3\n"),
         ] {
             let text = saved.render();
             assert!(text.starts_with(header), "{text}");

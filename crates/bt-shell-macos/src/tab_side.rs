@@ -10,8 +10,9 @@
 //! Linux shell can lay the same list out. This file is a child of `tab_bar` for the bar's
 //! private state, which a sibling could not reach without every field going public.
 //!
-//! **Where it sits.** The column is [`tabs::SIDE_WIDTH`] wide and the window's height tall, the
-//! traffic lights at its head: the list starts a title row down (`top`, read from the window, the
+//! **Where it sits.** The column is as wide as the window makes the bar (`tabs::side_width` of the
+//! width the user dragged its edge to, `side_edge`) and the window's height tall, the traffic
+//! lights at its head: the list starts a title row down (`top`, read from the window, the
 //! same in full screen so the rows do not move as it comes and goes) and ends above New Tab,
 //! which sits in the window's bottom-left corner and keeps that corner's centre
 //! ([`tabs::Fit`]). The rows scroll by the wheel when they do not fit, run under the list's ends
@@ -260,8 +261,9 @@ impl Insertion {
         }
     }
 
-    /// Stands the line with its middle at `y` (the list's space), or takes it away (`None`).
-    fn set(&self, list: &NSView, at: Option<f64>, palette: Palette) {
+    /// Stands the line with its middle at `y` (the list's space) along rows `row_width` wide, or
+    /// takes it away (`None`).
+    fn set(&self, list: &NSView, at: Option<f64>, row_width: f64, palette: Palette) {
         let Some(y) = at else {
             self.clear();
             return;
@@ -288,7 +290,7 @@ impl Insertion {
         ));
         line.setFrame(NSRect::new(
             NSPoint::new(line_x, y - tabs::GAP / 2.0),
-            NSSize::new((tabs::EDGE + tabs::ROW_WIDTH - line_x).max(0.0), tabs::GAP),
+            NSSize::new((tabs::EDGE + row_width - line_x).max(0.0), tabs::GAP),
         ));
     }
 }
@@ -472,6 +474,7 @@ impl TabBar {
             iv.mark
                 .get()
                 .map(|gap| column.between(gap) + tabs::GAP / 2.0 - column.list.y),
+            column.row_width(),
             palette,
         );
         iv.column.replace(Some(column));
@@ -480,13 +483,15 @@ impl TabBar {
         self.arm_clock();
     }
 
-    /// The pure column's input for `count` places: the window's height, where the list starts, the
-    /// settings diagnostic and the corner, and the scroll as it stands
-    /// ([`TabBar::bar_for`]'s upright half).
+    /// The pure column's input for `count` places: the bar's width (the window gives the bar the
+    /// column's), the window's height, where the list starts, the settings diagnostic and the
+    /// corner, and the scroll as it stands ([`TabBar::bar_for`]'s upright half).
     pub(super) fn side_for(&self, top: f64, count: usize) -> Side {
         let iv = self.ivars();
+        let bounds = self.bounds();
         Side {
-            height: self.bounds().size.height,
+            width: bounds.size.width,
+            height: bounds.size.height,
             top,
             count,
             scroll: iv.scroll.get(),
@@ -512,7 +517,7 @@ impl TabBar {
         field.setAlignment(NSTextAlignment::Left);
         self.dress_field(palette, false);
         let height = field.intrinsicContentSize().height;
-        let covers = tabs::Row::field();
+        let covers = tabs::Row::field(row.width);
         field.setFrame(NSRect::new(
             NSPoint::new(
                 row.x + covers.x,

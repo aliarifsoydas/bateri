@@ -12,6 +12,20 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **The side column can be made wider or narrower.** With the tabs at the
+  side, drag the column's right edge — the pointer turns into a resize cursor
+  over the space between the rows and the content — anywhere from 136 to
+  400 pt; the terminal reflows as it moves, as it does while the window is
+  resized, and with `resize_in_steps` on the column moves a cell at a time so
+  a lone pane keeps whole cells. A double click on the edge brings it back to
+  200 pt. In a narrow window the column gives way before the panes do, leaving
+  them at least 300 pt, and widens again with the window. Each window keeps
+  its own width: a new window, or one a tab is torn off into, starts as wide
+  as the window it came from, and the width comes back when bateri restores
+  its windows.
+
 ## [0.16.0] - 2026-10-16
 
 ### Added

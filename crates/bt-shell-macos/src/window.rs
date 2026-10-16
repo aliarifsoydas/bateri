@@ -92,21 +92,22 @@ use std::ffi::c_void;
 use std::time::Duration;
 
 use block2::RcBlock;
-use bt_core::{ConfirmClose, ContentEdge, Settings, TabPosition, Theme};
+use bt_core::{ConfirmClose, ContentEdge, PointerShape, Settings, TabPosition, Theme};
 use bt_gpu::GpuError;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAccessibilityAnnouncementKey, NSAccessibilityAnnouncementRequestedNotification,
-    NSAccessibilityNotificationUserInfoKey, NSAccessibilityPostNotificationWithUserInfo, NSAlert,
-    NSAlertFirstButtonReturn, NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua,
-    NSAppearanceNameDarkAqua, NSApplication, NSBackingStoreType, NSColor, NSControlStateValueOff,
-    NSControlStateValueOn, NSFloatingWindowLevel, NSFont, NSFontAttributeName, NSMenuItem,
-    NSModalResponse, NSModalResponseCancel, NSStringDrawing, NSTitlebarSeparatorStyle, NSToolbar,
-    NSView, NSWindow, NSWindowDelegate, NSWindowOcclusionState, NSWindowOrderingMode,
-    NSWindowStyleMask, NSWindowTabbingMode, NSWindowTitleVisibility, NSWindowToolbarStyle,
+    NSAccessibility, NSAccessibilityAnnouncementKey,
+    NSAccessibilityAnnouncementRequestedNotification, NSAccessibilityNotificationUserInfoKey,
+    NSAccessibilityPostNotificationWithUserInfo, NSAlert, NSAlertFirstButtonReturn, NSAppearance,
+    NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
+    NSBackingStoreType, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSCursor, NSEvent,
+    NSFloatingWindowLevel, NSFont, NSFontAttributeName, NSMenuItem, NSModalResponse,
+    NSModalResponseCancel, NSStringDrawing, NSTitlebarSeparatorStyle, NSToolbar, NSView, NSWindow,
+    NSWindowDelegate, NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask,
+    NSWindowTabbingMode, NSWindowTitleVisibility, NSWindowToolbarStyle,
 };
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::CGImage;
@@ -125,6 +126,7 @@ use crate::jobs::Foreground;
 use crate::launch::Closing;
 use crate::moves::{self, Joins, Move};
 use crate::pane::TerminalPane;
+use crate::pointer;
 use crate::preview::beep;
 use crate::restore::SavedTab;
 use crate::sheets::{self, Asker};
@@ -1221,6 +1223,13 @@ pub(crate) struct RootIvars {
     /// so a press there is the pane's and the window server does not move the window
     /// ([`RowClaim`]). Hidden while the bar is in the row. Above every container.
     claim: Retained<RowClaim>,
+    /// The side column's right edge, which resizes it ([`SideEdge`]): the top of the stack, over
+    /// the claim and every container. Hidden while the bar is in the row.
+    edge: Retained<SideEdge>,
+    /// The side column's width as the user left it by dragging its edge; the column is this
+    /// fitted to the window ([`tabs::side_width`]), so one the window narrowed comes back as it
+    /// widens. The default until dragged, and kept while the tabs are in the title row.
+    side_width: Cell<f64>,
     /// The title row's last measured height; `0` until the window reports one.
     row: Cell<f64>,
 }
@@ -1270,7 +1279,7 @@ define_class!(
 );
 
 impl RootView {
-    fn new(mtm: MainThreadMarker, frame: NSRect, bar: &TabBar) -> Retained<Self> {
+    fn new(mtm: MainThreadMarker, frame: NSRect, bar: &TabBar, side_width: f64) -> Retained<Self> {
         let ground = Ground::new(mtm, NSRect::new(NSPoint::ZERO, frame.size));
         let shade = Shade::new(mtm, NSRect::new(NSPoint::ZERO, frame.size));
         // Born unseen, not hidden: it fades in and out like the ground.
@@ -1279,6 +1288,7 @@ impl RootView {
         rule.setAlphaValue(0.0);
         let claim = RowClaim::new(mtm);
         claim.setHidden(true);
+        let edge = SideEdge::new(mtm);
         let this = Self::alloc(mtm).set_ivars(RootIvars {
             bar: bar.retain(),
             ground: ground.clone(),
@@ -1286,6 +1296,8 @@ impl RootView {
             rule: rule.clone(),
             ruled: Cell::new(false),
             claim: claim.clone(),
+            edge: edge.clone(),
+            side_width: Cell::new(side_width),
             row: Cell::new(0.0),
         });
         // SAFETY: `initWithFrame:` is NSView's designated initializer and the
@@ -1299,6 +1311,7 @@ impl RootView {
         this.addSubview(&rule);
         this.addSubview(bar);
         this.addSubview(&claim);
+        this.addSubview(&edge);
         this
     }
 
@@ -1373,13 +1386,37 @@ impl RootView {
         self.ivars().row.get()
     }
 
-    /// What the tabs keep of the window: the width of the side column, or the height of the
-    /// title row the bar stands in. The content is the rest.
-    pub(crate) fn tabs_inset(&self) -> NSSize {
+    /// What the tabs keep of a content `width` wide: the width of the side column, or the
+    /// height of the title row the bar stands in. The content is the rest.
+    pub(crate) fn tabs_inset(&self, width: f64) -> NSSize {
         if tabs_at_side(self.mtm()) {
-            NSSize::new(tabs::SIDE_WIDTH, 0.0)
+            NSSize::new(self.column_for(width), 0.0)
         } else {
             NSSize::new(0.0, self.title_row())
+        }
+    }
+
+    /// The side column's width in a content `width` wide: the width the user left it at, fitted
+    /// to the window ([`tabs::side_width`]).
+    fn column_for(&self, width: f64) -> f64 {
+        tabs::side_width(self.ivars().side_width.get(), width)
+    }
+
+    /// The side column's width as it stands now.
+    pub(crate) fn column_width(&self) -> f64 {
+        self.column_for(self.bounds().size.width)
+    }
+
+    /// The width the user left the side column at ([`RootIvars::side_width`]).
+    pub(crate) fn side_width(&self) -> f64 {
+        self.ivars().side_width.get()
+    }
+
+    /// The side column is to be `width` wide: kept, and everything placed again when it changed.
+    pub(crate) fn set_side_width(&self, width: f64) {
+        let width = width.clamp(tabs::SIDE_MIN, tabs::SIDE_MAX);
+        if self.ivars().side_width.replace(width) != width {
+            self.lay_out();
         }
     }
 
@@ -1393,9 +1430,10 @@ impl RootView {
     /// a question up in a tab follows its container (`sheets::fit_owner`).
     ///
     /// In the title row (`row` tall) the bar is the row's width and the containers are under it.
-    /// In the side column it is the window's height and [`tabs::SIDE_WIDTH`] wide at the left,
-    /// the containers beside it from the window's top — there is no title row over the content —
-    /// and the row's band over them is claimed, so a press there is the pane's.
+    /// In the side column it is the window's height and the column's width at the left
+    /// ([`RootView::column_for`]), the containers beside it from the window's top — there is no
+    /// title row over the content — the row's band over them is claimed, so a press there is the
+    /// pane's, and the column's last [`EDGE_GRIP`] is its resizing edge.
     fn place(&self, row: f64) {
         let bounds = self.bounds();
         let row = row.min(bounds.size.height);
@@ -1407,7 +1445,11 @@ impl RootView {
         let claim = &self.ivars().claim;
         let side = tabs_at_side(self.mtm());
         let (bar_frame, below) = if side {
-            let column = tabs::SIDE_WIDTH.min(bounds.size.width);
+            let column = self.column_for(bounds.size.width);
+            self.ivars().edge.setFrame(NSRect::new(
+                NSPoint::new((column - EDGE_GRIP).max(0.0), 0.0),
+                NSSize::new(EDGE_GRIP.min(column), bounds.size.height),
+            ));
             claim.setFrame(NSRect::new(
                 NSPoint::new(column, 0.0),
                 NSSize::new(bounds.size.width - column, row),
@@ -1429,6 +1471,7 @@ impl RootView {
             )
         };
         claim.setHidden(!side);
+        self.ivars().edge.setHidden(!side);
         bar.set_side(side.then_some(row));
         bar.setFrame(bar_frame);
         if side {
@@ -1461,6 +1504,136 @@ impl RootView {
         self.addSubview_positioned_relativeTo(container, NSWindowOrderingMode::Below, Some(claim));
         self.lay_out();
     }
+}
+
+/// How far the side column's resizing edge reaches in from the column's right side: the column's
+/// own empty padding right of the rows ([`tabs::EDGE`]), so the edge takes no press from a row,
+/// and none from a pane.
+const EDGE_GRIP: f64 = tabs::EDGE;
+
+/// Where a press on the column's edge started: the pointer's x in the window and the column's
+/// width at that moment.
+#[derive(Clone, Copy)]
+struct Grab {
+    x: f64,
+    width: f64,
+}
+
+pub(crate) struct EdgeIvars {
+    /// The press being dragged; `None` between drags.
+    grab: Cell<Option<Grab>>,
+}
+
+define_class!(
+    /// The side column's right edge: dragging it makes the column wider or narrower, a double
+    /// click brings it back to the default ([`tabs::SIDE_WIDTH`]) — the way a Finder or Mail
+    /// sidebar's edge does. Nothing is drawn; the resize cursor is the cue.
+    ///
+    /// It is the root view's top subview, over the column's empty right padding, so the bar's
+    /// own `mouseDown:` (which moves the window from the column's empty part) never sees the
+    /// press. In the title row's band the bar's claim lies under it (`RowClaim`), so the window
+    /// server does not move the window from there either.
+    ///
+    /// The terminal reflows as the column moves, as it does while the window is resized; under
+    /// `[appearance] resize_in_steps` the column moves a whole cell at a time
+    /// ([`TerminalWindow::drag_side_to`]). The layout is saved once, when the press ends.
+    // SAFETY: NSView is designed for subclassing; SideEdge implements no
+    // `Drop` and is born with `initWithFrame:`.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "BateriSideEdge"]
+    #[ivars = EdgeIvars]
+    pub(crate) struct SideEdge;
+
+    unsafe impl NSObjectProtocol for SideEdge {}
+
+    impl SideEdge {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        /// Like the bar beside it: the first click on an inactive window takes the edge.
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+            true
+        }
+
+        /// The edge's press resizes the column; it never moves the window.
+        #[unsafe(method(mouseDownCanMoveWindow))]
+        fn can_move_window(&self) -> bool {
+            false
+        }
+
+        #[unsafe(method(resetCursorRects))]
+        fn reset_cursor_rects(&self) {
+            self.addCursorRect_cursor(self.bounds(), &edge_cursor());
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            let Some(window) = self.terminal_window() else {
+                return;
+            };
+            if event.clickCount() >= 2 {
+                self.ivars().grab.set(None);
+                window.drag_side_to(tabs::SIDE_WIDTH);
+                window.layout_changed();
+                return;
+            }
+            edge_cursor().set();
+            self.ivars().grab.set(Some(Grab {
+                x: event.locationInWindow().x,
+                width: window.column_width(),
+            }));
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            let (Some(grab), Some(window)) = (self.ivars().grab.get(), self.terminal_window())
+            else {
+                return;
+            };
+            // The pointer may outrun the edge it holds: the cursor stays the edge's.
+            edge_cursor().set();
+            window.drag_side_to(grab.width + event.locationInWindow().x - grab.x);
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _event: &NSEvent) {
+            if self.ivars().grab.take().is_some()
+                && let Some(window) = self.terminal_window()
+            {
+                window.layout_changed();
+            }
+        }
+    }
+);
+
+impl SideEdge {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(EdgeIvars {
+            grab: Cell::new(None),
+        });
+        // SAFETY: `initWithFrame:` is NSView's designated initializer and the
+        // ivars are set.
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        this.setHidden(true);
+        this.setAccessibilityElement(false);
+        this
+    }
+
+    /// The window the edge belongs to, found by its `NSWindow`.
+    fn terminal_window(&self) -> Option<Retained<TerminalWindow>> {
+        let window = self.window()?;
+        app::delegate(self.mtm())?.window_owning(&window)
+    }
+}
+
+/// The edge's cursor: the column resize cursor, the older left-right one before macOS 15
+/// (`pointer::cursor`, a program's `col-resize`).
+fn edge_cursor() -> Retained<NSCursor> {
+    pointer::cursor(PointerShape::ColResize)
 }
 
 /// A new window's first size, before the caller places it — also the first
@@ -1510,7 +1683,7 @@ impl TerminalWindow {
         pane: &TerminalPane,
     ) -> Retained<Self> {
         let tab = TerminalTab::new(mtm, tab, id, pane);
-        let this = Self::with_tab(mtm, id, run, tab, None);
+        let this = Self::with_tab(mtm, id, run, tab, None, tabs::SIDE_WIDTH);
         // The content's size changes independently of the window too (the
         // title row); so the geometry comes from the view's own notification,
         // its observer the pane (`TerminalPane::observe_frame`). The
@@ -1525,14 +1698,16 @@ impl TerminalWindow {
     /// ([`TerminalWindow::with_pane`]) or one that left another window
     /// ([`TerminalWindow::release_tab`]): its panes' observers, if it is that
     /// one, are already set. `frame` is the size (and place) of the window
-    /// before its tab joins: a moved tab's panes then meet their final size
-    /// once, and their programs one resize, not two.
+    /// before its tab joins, and `side_width` its side column's
+    /// ([`TerminalWindow::set_side_width`]): a moved tab's panes then meet
+    /// their final size once, and their programs one resize, not two.
     pub(crate) fn with_tab(
         mtm: MainThreadMarker,
         id: u64,
         run: Option<Run>,
         tab: Retained<TerminalTab>,
         frame: Option<NSRect>,
+        side_width: f64,
     ) -> Retained<Self> {
         let rect = initial_rect();
         tab.moved_to(id);
@@ -1580,7 +1755,7 @@ impl TerminalWindow {
         window.setToolbar(Some(&toolbar));
         window.setToolbarStyle(NSWindowToolbarStyle::UnifiedCompact);
         let bar = TabBar::new(mtm, id);
-        let root = RootView::new(mtm, rect, &bar);
+        let root = RootView::new(mtm, rect, &bar, side_width);
         // The content view is the root: the bar on top, the tabs' containers
         // below; each container lays its panes out (`SplitView::layout_panes`;
         // with a single pane the whole boundary).
@@ -2965,10 +3140,10 @@ impl TerminalWindow {
         let pane = self.try_selected_tab()?.filling_pane()?;
         // The tab's area is the content beside the side column or below the title row, and the
         // filling pane is all of it.
-        let inset = self.ivars().root.tabs_inset();
         let content = window
             .contentRectForFrameRect(NSRect::new(NSPoint::ZERO, size))
             .size;
+        let inset = self.ivars().root.tabs_inset(content.width);
         let fitted = pane.fitted_size(NSSize::new(
             content.width - inset.width,
             content.height - inset.height,
@@ -3173,6 +3348,48 @@ impl TerminalWindow {
     /// or the side column stands under it.
     pub(crate) fn title_row(&self) -> f64 {
         self.ivars().root.title_row()
+    }
+
+    /// The width the user left the side column at — what a window opened from this one starts
+    /// with and what the saved layout keeps ([`RootView::side_width`]).
+    pub(crate) fn side_width(&self) -> f64 {
+        self.ivars().root.side_width()
+    }
+
+    /// The side column's width as it stands in this window ([`tabs::side_width`]).
+    pub(crate) fn column_width(&self) -> f64 {
+        self.ivars().root.column_width()
+    }
+
+    /// Gives the side column `width` (a window opened from another, a restored one), before the
+    /// window is shown or its tab's programs see their size.
+    pub(crate) fn set_side_width(&self, width: f64) {
+        self.ivars().root.set_side_width(width);
+    }
+
+    /// The side column's edge was dragged to `wanted` (or double-clicked back to the default):
+    /// the column takes it, fitted to the window. Under `[appearance] resize_in_steps` the lone
+    /// pane beside it keeps whole cells, as the window's own edges do
+    /// ([`TerminalWindow::stepped_size`]): the column takes the remainder, so it moves a cell at
+    /// a time. Not in full screen, where the window does not step either.
+    pub(crate) fn drag_side_to(&self, wanted: f64) {
+        let root = &self.ivars().root;
+        let size = root.bounds().size;
+        let column = tabs::side_width(wanted, size.width);
+        let stepping = app::delegate(self.mtm()).is_some_and(|app| app.settings().resize_in_steps)
+            && !self
+                .ivars()
+                .window
+                .styleMask()
+                .contains(NSWindowStyleMask::FullScreen);
+        let fitted = stepping
+            .then(|| self.try_selected_tab()?.filling_pane())
+            .flatten()
+            .and_then(|pane| pane.fitted_size(NSSize::new(size.width - column, size.height)));
+        let column = fitted.map_or(column, |fitted| {
+            tabs::side_width(size.width - fitted.width, size.width)
+        });
+        root.set_side_width(column);
     }
 
     /// `[appearance] tab_position` changed: the tabs move between the title row and the side

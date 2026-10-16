@@ -1110,12 +1110,40 @@ pub fn landing(over: Option<Over>) -> Landing {
     }
 }
 
-/// The side column's width: a row at its widest ([`MAX_WIDTH`]) and [`EDGE`] on both sides. Fixed
-/// — it does not narrow, hide or follow a drag.
+/// The side column's width as a window first has it: a row at its widest ([`MAX_WIDTH`]) and
+/// [`EDGE`] on both sides. The user drags the column's right edge to make it wider or narrower,
+/// within [`side_width`]'s bounds; a double click there brings it back to this. It does not hide.
 pub const SIDE_WIDTH: f64 = MAX_WIDTH + 2.0 * EDGE;
 
-/// A row's width: the column less its edge on both sides.
-pub const ROW_WIDTH: f64 = SIDE_WIDTH - 2.0 * EDGE;
+/// The narrowest column: the bar's narrowest tab ([`MIN_WIDTH`]) and its edges. The tile, the
+/// deck, the ⌘ hint and `×` keep their places there and the title gives way to them, as on a
+/// narrow chip.
+pub const SIDE_MIN: f64 = MIN_WIDTH + 2.0 * EDGE;
+
+/// The widest column: twice the default. A design number — room for a long program title without
+/// the column becoming most of the window.
+pub const SIDE_MAX: f64 = 2.0 * SIDE_WIDTH;
+
+/// What a wide column leaves the content at the least: in a narrow window the column gives way
+/// before the panes do, down to [`SIDE_MIN`].
+pub const SIDE_CONTENT_MIN: f64 = 300.0;
+
+/// The column's width for a `wanted` one in a window `window` wide: within [`SIDE_MIN`] and
+/// [`SIDE_MAX`], and no wider than leaves the content [`SIDE_CONTENT_MIN`] — but never under
+/// [`SIDE_MIN`] for that (a window narrower than both narrows its content) and never wider than
+/// the window. It is a whole number of points: a pointer drags by fractions, and a column edge
+/// between two device pixels would put the content's edge there too — the line between them,
+/// half a point wide, then rounds away to nothing and the panes start mid-pixel. The window's
+/// layout, its stepped size and the edge's drag all ask this one rule; the window keeps
+/// `wanted`, so a column the window narrowed comes back as the window widens.
+pub fn side_width(wanted: f64, window: f64) -> f64 {
+    let window = window.max(0.0).floor();
+    let room = (window - SIDE_CONTENT_MIN).max(SIDE_MIN);
+    wanted
+        .round()
+        .clamp(SIDE_MIN, SIDE_MAX.min(room))
+        .min(window)
+}
 
 /// Space above the first row and below the last, in the scrolled content: the rows keep off the
 /// title row's foot and off New Tab.
@@ -1143,6 +1171,8 @@ pub const CLOSE_INSET: f64 = 4.0;
 /// What the side column is laid out from ([`Side::layout`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Side {
+    /// The column's width, as the window gives it ([`side_width`]).
+    pub width: f64,
     /// The column's height — the window's, full: there is no title row above it.
     pub height: f64,
     /// Where the list starts: the height of the window's title row, the traffic lights' row. The
@@ -1174,11 +1204,12 @@ impl Side {
     pub fn layout(&self) -> Column {
         let fit = Fit::of(self.corner);
         let foot = self.height - fit.inset - BUTTON;
-        let list = Rect::new(0.0, self.top, SIDE_WIDTH, (foot - EDGE - self.top).max(0.0));
+        let width = self.width;
+        let list = Rect::new(0.0, self.top, width, (foot - EDGE - self.top).max(0.0));
         let warning = self
             .warning
-            .then(|| Rect::new(SIDE_WIDTH - EDGE - BUTTON, foot, BUTTON, BUTTON));
-        let new_tab_end = warning.map_or(SIDE_WIDTH - EDGE, |button| button.x - FOOT_GAP);
+            .then(|| Rect::new(width - EDGE - BUTTON, foot, BUTTON, BUTTON));
+        let new_tab_end = warning.map_or(width - EDGE, |button| button.x - FOOT_GAP);
         let new_tab = Rect::new(fit.inset, foot, (new_tab_end - fit.inset).max(0.0), BUTTON);
 
         let slot = TAB_HEIGHT + GAP;
@@ -1196,10 +1227,10 @@ impl Side {
             .collect();
         let rows = along
             .iter()
-            .map(|row| Rect::new(EDGE, row.x, ROW_WIDTH, row.width))
+            .map(|row| Rect::new(EDGE, row.x, (width - 2.0 * EDGE).max(0.0), row.width))
             .collect();
         Column {
-            width: SIDE_WIDTH,
+            width,
             list,
             rows,
             overflow,
@@ -1219,7 +1250,7 @@ impl Side {
 /// Where everything in the side column sits ([`Side::layout`]), in the window's space.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Column {
-    /// The column's width, [`SIDE_WIDTH`]; it spans the window's full height.
+    /// The column's width, [`Side::width`]; it spans the window's full height.
     pub width: f64,
     /// The list's visible extent; rows outside it are clipped, and the ends where rows run under
     /// fade.
@@ -1265,6 +1296,11 @@ impl Laid for Column {
 }
 
 impl Column {
+    /// A row's width: the column less its [`EDGE`] on both sides.
+    pub fn row_width(&self) -> f64 {
+        (self.width - 2.0 * EDGE).max(0.0)
+    }
+
     /// The scroll that brings row `index` into view, [`REVEAL_MARGIN`] from the edge it was
     /// beyond ([`Run::revealing`]).
     pub fn revealing(&self, index: usize) -> f64 {
@@ -1299,7 +1335,7 @@ impl Column {
 }
 
 /// Where the parts of a row sit, from the row's own top-left corner ([`Row::of`]). A row is
-/// [`ROW_WIDTH`] wide and [`TAB_HEIGHT`] high; the parts that are centred up and down (the
+/// [`Column::row_width`] wide and [`TAB_HEIGHT`] high; the parts that are centred up and down (the
 /// leading element, the title) have no y here.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Row {
@@ -1319,35 +1355,36 @@ pub struct Row {
 }
 
 impl Row {
-    /// The row for a leading element `lead` wide (the front tile and its deck edges —
-    /// [`lead_width`]; the indicator's side where icons are off; `None` for nothing, so a title
-    /// does not move as an indicator comes and goes, the shell gives the indicator's room while it
-    /// shows nothing) and a title `text` wide. `crowded` while `×` or the ⌘ hint shows: the title
-    /// gives way to it.
-    pub fn of(lead: Option<f64>, text: f64, crowded: bool) -> Self {
+    /// The row `width` wide ([`Column::row_width`]) for a leading element `lead` wide (the front
+    /// tile and its deck edges — [`lead_width`]; the indicator's side where icons are off; `None`
+    /// for nothing, so a title does not move as an indicator comes and goes, the shell gives the
+    /// indicator's room while it shows nothing) and a title `text` wide. `crowded` while `×` or
+    /// the ⌘ hint shows: the title gives way to it.
+    pub fn of(width: f64, lead: Option<f64>, text: f64, crowded: bool) -> Self {
         let reserve = if crowded { ROW_CROWDED } else { ROW_END };
-        let inner = ROW_WIDTH - ROW_LEAD - reserve;
+        let inner = (width - ROW_LEAD - reserve).max(0.0);
         let start = lead.map_or(ROW_LEAD, |lead| ROW_LEAD + lead + ICON_GAP);
-        let width = text.ceil().min(title_room(inner, lead));
+        let title = text.ceil().min(title_room(inner, lead));
         Self {
             lead: lead.map(|lead| Span::new(ROW_LEAD, lead)),
-            title: Span::new(start, width),
+            title: Span::new(start, title),
             close: Rect::new(
-                ROW_WIDTH - CLOSE_INSET - CLOSE_SIDE,
+                width - CLOSE_INSET - CLOSE_SIDE,
                 (TAB_HEIGHT - CLOSE_SIDE) / 2.0,
                 CLOSE_SIDE,
                 CLOSE_SIDE,
             ),
-            key: Span::new(ROW_WIDTH - ROW_CROWDED, CHIP_PAD),
+            key: Span::new(width - ROW_CROWDED, CHIP_PAD),
             host_mark: Rect::new(2.0, 7.0, 2.5, TAB_HEIGHT - 14.0),
         }
     }
 
-    /// What a name field covers while a row is renamed: from where the leading element starts to
-    /// the row's end, over the icon and the title alike. The same bounds [`Row::of`] cuts a title
-    /// at, so the field's text starts where the title's did and ends where it would have ended.
-    pub fn field() -> Span {
-        Span::new(ROW_LEAD, (ROW_WIDTH - ROW_LEAD - ROW_END).max(0.0))
+    /// What a name field covers while a row `width` wide is renamed: from where the leading
+    /// element starts to the row's end, over the icon and the title alike. The same bounds
+    /// [`Row::of`] cuts a title at, so the field's text starts where the title's did and ends
+    /// where it would have ended.
+    pub fn field(width: f64) -> Span {
+        Span::new(ROW_LEAD, (width - ROW_LEAD - ROW_END).max(0.0))
     }
 }
 
@@ -4384,6 +4421,7 @@ mod tests {
 
     fn side(height: f64, count: usize) -> Side {
         Side {
+            width: SIDE_WIDTH,
             height,
             top: 40.0,
             count,
@@ -4397,7 +4435,10 @@ mod tests {
     fn the_columns_rows_stand_in_a_list_between_the_title_row_and_new_tab() {
         let column = side(600.0, 3).layout();
         assert_eq!(column.width, 200.0);
-        assert_eq!((SIDE_WIDTH, ROW_WIDTH), (MAX_WIDTH + 16.0, MAX_WIDTH));
+        assert_eq!(
+            (SIDE_WIDTH, column.row_width()),
+            (MAX_WIDTH + 16.0, MAX_WIDTH)
+        );
         // New Tab is 8 from the window's foot and left edge; the list ends 8 above it.
         assert_eq!(column.new_tab, Rect::new(8.0, 564.0, 184.0, 28.0));
         assert_eq!(column.list, Rect::new(0.0, 40.0, 200.0, 516.0));
@@ -4826,17 +4867,14 @@ mod tests {
     #[test]
     fn a_rows_parts_make_room_for_the_deck_and_for_the_close_button() {
         // The tile alone, a title of 50.4 pt: 8 + 22 + 6 in, up to the 8 at the row's end.
-        let row = Row::of(Some(TILE_WIDTH), 50.4, false);
+        let width = SIDE_WIDTH - 2.0 * EDGE;
+        let row = Row::of(width, Some(TILE_WIDTH), 50.4, false);
         assert_eq!(row.lead, Some(Span::new(8.0, 22.0)));
         assert_eq!(row.title, Span::new(36.0, 51.0), "the text, rounded up");
-        let long = Row::of(Some(TILE_WIDTH), 500.0, false);
-        assert_eq!(
-            long.title.end(),
-            ROW_WIDTH - ROW_END,
-            "cut at the row's end"
-        );
+        let long = Row::of(width, Some(TILE_WIDTH), 500.0, false);
+        assert_eq!(long.title.end(), width - ROW_END, "cut at the row's end");
         // × or ⌘ showing: the title ends where the hint's box begins.
-        let crowded = Row::of(Some(TILE_WIDTH), 500.0, true);
+        let crowded = Row::of(width, Some(TILE_WIDTH), 500.0, true);
         assert_eq!(crowded.title, Span::new(36.0, 118.0));
         assert_eq!(crowded.title.end(), crowded.key.x);
         assert!(crowded.title.end() <= crowded.close.x);
@@ -4845,16 +4883,19 @@ mod tests {
         // The ⌘ hint's box is the bar's: as wide as a chip's padding, the same inset from the
         // end, so the hint that fits a chip fits a row; and it ends where the × does.
         assert_eq!(crowded.key.width, CHIP_PAD);
-        assert_eq!(crowded.key.end(), ROW_WIDTH - CLOSE_INSET);
+        assert_eq!(crowded.key.end(), width - CLOSE_INSET);
         assert_eq!(crowded.key.end(), crowded.close.x + crowded.close.width);
         // A deck of two edges takes its steps from the title.
-        let deck = Row::of(Some(lead_width(TILE_WIDTH, 2)), 500.0, false);
+        let deck = Row::of(width, Some(lead_width(TILE_WIDTH, 2)), 500.0, false);
         assert_eq!(deck.lead, Some(Span::new(8.0, 30.0)));
         assert_eq!(deck.title, Span::new(44.0, 132.0));
         assert_eq!(deck.title.end(), long.title.end(), "the same end");
         // Icons off: the indicator's room, kept while it shows nothing; or no element at all.
-        assert_eq!(Row::of(Some(INDICATOR_SIDE), 500.0, false).title.x, 26.0);
-        let bare = Row::of(None, 500.0, false);
+        assert_eq!(
+            Row::of(width, Some(INDICATOR_SIDE), 500.0, false).title.x,
+            26.0
+        );
+        let bare = Row::of(width, None, 500.0, false);
         assert_eq!((bare.lead, bare.title), (None, Span::new(8.0, 168.0)));
         // The title's room is the chip's rule: one copy.
         assert_eq!(
@@ -4865,10 +4906,93 @@ mod tests {
         assert_eq!(row.host_mark, Rect::new(2.0, 7.0, 2.5, 14.0));
         // The name field covers the lead and the longest title: the same ends.
         assert_eq!(
-            Row::field().x,
+            Row::field(width).x,
             bare.title.x,
             "a row with no lead starts at the field"
         );
-        assert_eq!(Row::field().end(), long.title.end());
+        assert_eq!(Row::field(width).end(), long.title.end());
+    }
+
+    /// The column's width is the window's to give, within the bounds: a wide window takes what was
+    /// asked, a narrow one narrows the column first so the content keeps its least, and nothing
+    /// narrows it past the bar's narrowest tab.
+    #[test]
+    fn the_columns_width_keeps_its_bounds_and_gives_way_to_the_content() {
+        assert_eq!((SIDE_MIN, SIDE_MAX), (136.0, 400.0));
+        assert_eq!(side_width(SIDE_WIDTH, 900.0), SIDE_WIDTH, "as asked");
+        assert_eq!(side_width(260.0, 900.0), 260.0);
+        assert_eq!(side_width(50.0, 900.0), SIDE_MIN, "no narrower than a tab");
+        assert_eq!(
+            side_width(900.0, 1600.0),
+            SIDE_MAX,
+            "no wider than twice the default"
+        );
+        // The content keeps 300 pt while the column can give it.
+        assert_eq!(side_width(400.0, 600.0), 300.0);
+        assert_eq!(side_width(SIDE_WIDTH, 450.0), 150.0);
+        assert_eq!(
+            side_width(SIDE_WIDTH, 300.0),
+            SIDE_MIN,
+            "the column stops at its least"
+        );
+        assert_eq!(
+            side_width(SIDE_WIDTH, 100.0),
+            100.0,
+            "never wider than the window"
+        );
+        // Whole points, so the content's edge and the line before it sit on device pixels.
+        assert_eq!(side_width(230.37, 900.0), 230.0);
+        assert_eq!(side_width(230.5, 900.0), 231.0);
+        assert_eq!(side_width(400.0, 650.6), 350.0);
+    }
+
+    /// A wider or narrower column moves its rows' ends, New Tab's end and the warning with its
+    /// edge, and a row's parts with the row's end: the right-hand ones stay at the end, the title
+    /// takes or gives the difference.
+    #[test]
+    fn a_resized_column_carries_its_rows_and_their_ends() {
+        for width in [SIDE_MIN, SIDE_WIDTH, 260.0, SIDE_MAX] {
+            let column = Side {
+                width,
+                warning: true,
+                ..side(600.0, 3)
+            }
+            .layout();
+            assert_eq!(column.width, width);
+            assert_eq!(column.list.width, width);
+            assert_eq!(column.row_width(), width - 2.0 * EDGE);
+            assert!(
+                column
+                    .rows
+                    .iter()
+                    .all(|row| row.x == EDGE && row.width == column.row_width())
+            );
+            let warning = column.warning.expect("a warning shows");
+            assert_eq!(warning.x + warning.width, width - EDGE, "{width}");
+            assert_eq!(
+                column.new_tab.x + column.new_tab.width,
+                warning.x - FOOT_GAP
+            );
+
+            let row = Row::of(column.row_width(), Some(TILE_WIDTH), 1000.0, true);
+            assert_eq!(
+                row.close.x + row.close.width,
+                column.row_width() - CLOSE_INSET
+            );
+            assert_eq!(row.key.end(), column.row_width() - CLOSE_INSET);
+            assert_eq!(row.title.end(), row.key.x, "{width}");
+            assert_eq!(
+                Row::field(column.row_width()).end(),
+                column.row_width() - ROW_END
+            );
+        }
+        // At the narrowest the title still has room beside the tile and the ⌘ box.
+        let narrow = Row::of(
+            SIDE_MIN - 2.0 * EDGE,
+            Some(lead_width(TILE_WIDTH, 2)),
+            1000.0,
+            true,
+        );
+        assert!(narrow.title.width > 40.0, "{:?}", narrow.title);
     }
 }
