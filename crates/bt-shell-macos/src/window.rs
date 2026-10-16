@@ -3155,8 +3155,12 @@ impl TerminalWindow {
 
     /// `[appearance] tab_position` changed: the tabs move between the title row and the side
     /// column in place, and the content takes the rest — its container's frame changes once.
+    /// The content's width and height change with it, so under `resize_in_steps` the window
+    /// takes the step of the new area at once ([`TerminalWindow::fit_to_cells`], a no-op when
+    /// the setting is off).
     pub(crate) fn apply_tab_position(&self) {
         self.ivars().root.lay_out();
+        self.fit_to_cells();
     }
 
     /// Paints the window chrome with the theme: the

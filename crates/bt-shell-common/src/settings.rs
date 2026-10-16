@@ -94,7 +94,7 @@ pub fn create_if_missing(root: &Path) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Writing a single key — View ▸ Theme ▸ and the settings window: changes `edit`'s key in
+/// Writing a single key — View ▸ Theme ▸, View ▸ Tabs ▸ and the settings window: changes `edit`'s key in
 /// `{root}/settings.toml` ([`Settings::with_edit`]); the error is the write slot's message.
 /// The message says what was not saved: the theme choice by its name in the menu ("the
 /// theme"), every other key "the setting".

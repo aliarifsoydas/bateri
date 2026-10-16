@@ -19,8 +19,9 @@ glides instead of jumping, and an idle window draws nothing at all.
   bottom of the window with your current directory and git branch beneath it.
   It wraps, grows for multi-line input, supports mouse selection and editing,
   and animates typing and deleting (configurable, or off).
-- **Tabs and splits.** Native macOS tabs; split any tab right or down, move
-  between panes, resize, equalize and zoom — all from the keyboard.
+- **Tabs and splits.** Tabs along the top or in a column down the left edge;
+  split any tab right or down, move between panes, resize, equalize and
+  zoom — all from the keyboard.
 - **Search in scrollback** with case-sensitive and regular-expression modes and
   a live match count.
 - **SSH aware.** Over ssh or mosh the dock turns into a status bar showing the

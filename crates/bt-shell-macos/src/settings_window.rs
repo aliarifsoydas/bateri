@@ -32,7 +32,7 @@ use bt_core::{
     KeepRunning, Keypress, LETTER_SPACING_RANGE, LINE_HEIGHT_RANGE, Osc52, PreviewKeep,
     ReduceMotion, RemoteStatsMode, RestoreWindows, SCROLLBACK_MAX, STATS_INTERVAL_RANGE,
     SYSTEM_THEME, Scrollbar, Settings, SettingsEdit, ShellIntegration, SmoothScroll, SplitStyle,
-    UnfocusedCaret,
+    TabPosition, UnfocusedCaret,
 };
 use bt_gpu::{FontNotice, ScrollbarMode};
 use objc2::rc::Retained;
@@ -209,11 +209,12 @@ enum Key {
     TabIcons,
     TabIconColors,
     ResizeInSteps,
+    TabPosition,
 }
 
 impl Key {
     /// The order is the `tag` itself: `ALL[tag]`.
-    const ALL: [Key; 45] = [
+    const ALL: [Key; 46] = [
         Key::ConfirmClose,
         Key::Clipboard,
         Key::Scrollback,
@@ -259,6 +260,7 @@ impl Key {
         Key::TabIcons,
         Key::TabIconColors,
         Key::ResizeInSteps,
+        Key::TabPosition,
     ];
 
     fn tag(self) -> NSInteger {
@@ -291,6 +293,7 @@ impl Key {
             Key::ResizeInSteps => "appearance.resize_in_steps",
             Key::TabIcons => "appearance.tab_icons",
             Key::TabIconColors => "appearance.tab_icon_colors",
+            Key::TabPosition => "appearance.tab_position",
             Key::Font => "font.family",
             Key::Size => "font.size",
             Key::LineHeight => "font.line_height",
@@ -471,6 +474,18 @@ impl Choice for SplitStyle {
         match self {
             SplitStyle::Cards => "Cards",
             SplitStyle::Lines => "Lines",
+        }
+    }
+}
+
+impl Choice for TabPosition {
+    fn names() -> &'static [(&'static str, Self)] {
+        Self::NAMES
+    }
+    fn title(self) -> &'static str {
+        match self {
+            TabPosition::Top => "Top",
+            TabPosition::Side => "Side",
         }
     }
 }
@@ -1120,6 +1135,7 @@ struct Controls {
     split_style: Retained<NSPopUpButton>,
     tab_icons: Retained<NSSwitch>,
     tab_icon_colors: Retained<NSPopUpButton>,
+    tab_position: Retained<NSPopUpButton>,
     minimum_contrast: Retained<NSPopUpButton>,
     shape: Retained<NSPopUpButton>,
     blink: Retained<NSPopUpButton>,
@@ -1309,6 +1325,7 @@ define_class!(
                 Key::ContentEdge => choice_at(index).map(SettingsEdit::ContentEdge),
                 Key::SplitStyle => choice_at(index).map(SettingsEdit::SplitStyle),
                 Key::TabIconColors => choice_at(index).map(SettingsEdit::IconColors),
+                Key::TabPosition => choice_at(index).map(SettingsEdit::TabPosition),
                 Key::ShellIntegration => choice_at(index).map(SettingsEdit::ShellIntegration),
                 Key::Shape => choice_at(index).map(SettingsEdit::Cursor),
                 Key::Blink => choice_at(index).map(SettingsEdit::CursorBlink),
@@ -1702,6 +1719,7 @@ impl SettingsWindow {
         select_choice(&c.split_style, settings.split_style);
         set_switch(&c.tab_icons, settings.tab_icons);
         select_choice(&c.tab_icon_colors, settings.tab_icon_colors);
+        select_choice(&c.tab_position, settings.tab_position);
 
         select_choice(&c.shape, settings.cursor);
         select_choice(&c.blink, settings.cursor_blink);
@@ -2372,6 +2390,7 @@ impl SettingsWindow {
         let resize_in_steps = self.switch(Key::ResizeInSteps);
         let tab_icons = self.switch(Key::TabIcons);
         let tab_icon_colors = self.popup::<IconColors>(Key::TabIconColors);
+        let tab_position = self.popup::<TabPosition>(Key::TabPosition);
         let mut appearance = Form::new(mtm);
         appearance.row(Key::Theme, "Theme:", &theme, &[&theme], None);
         appearance.row(
@@ -2453,6 +2472,13 @@ impl SettingsWindow {
             &resize_in_steps,
             &[&resize_in_steps],
             Some("Resize a window a whole cell at a time while you drag its edge, so the text keeps the same margin on both sides. Off: the window follows the pointer."),
+        );
+        appearance.row(
+            Key::TabPosition,
+            "Tabs:",
+            &tab_position,
+            &[&tab_position],
+            Some("Top: a bar along the top of the window. Side: a column down the left edge, tall as the window, where the title row goes."),
         );
         appearance.row(
             Key::TabIcons,
@@ -2738,6 +2764,7 @@ impl SettingsWindow {
             split_style,
             tab_icons,
             tab_icon_colors,
+            tab_position,
             minimum_contrast,
             shape,
             blink,
@@ -3226,7 +3253,7 @@ mod tests {
                     restore_windows = []\nkeep_running = []\nscrollbar = []\n\
                     [appearance]\ntheme = []\nlight_theme = []\ndark_theme = []\n\
                     content_edge = []\nminimum_contrast = []\ndim_unfocused_splits = []\n\
-                    split_style = []\nresize_in_steps = []\ntab_icons = []\ntab_icon_colors = []\n\
+                    split_style = []\nresize_in_steps = []\ntab_icons = []\ntab_icon_colors = []\ntab_position = []\n\
                     [font]\nfamily = []\nsize = []\nline_height = []\nletter_spacing = []\n\
                     [clipboard]\nosc52 = []\n\
                     [motion]\ncursor_motion = []\nreduce_motion = []\nsmooth_scroll = []\n\
@@ -3291,6 +3318,7 @@ mod tests {
                 Key::SplitStyle => SettingsEdit::SplitStyle(SplitStyle::Lines),
                 Key::TabIcons => SettingsEdit::TabIcons(false),
                 Key::TabIconColors => SettingsEdit::IconColors(IconColors::Brand),
+                Key::TabPosition => SettingsEdit::TabPosition(TabPosition::Side),
             };
             assert_eq!(edit.path(), key.path(), "{key:?}");
         }
@@ -3356,6 +3384,7 @@ mod tests {
         check::<ContentEdge>();
         check::<SplitStyle>();
         check::<IconColors>();
+        check::<TabPosition>();
         check::<ShellIntegration>();
         check::<CaretShape>();
         check::<CursorBlink>();

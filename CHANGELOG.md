@@ -12,6 +12,46 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **Tabs can stand in a column down the window's left edge.** Choose
+  View ▸ Tabs ▸ Side (or Tabs in the settings window, `tab_position = "side"`
+  in the file) and the tabs move, in every window at once, into a 200 pt
+  column as tall as the window: the title row goes and the traffic lights sit
+  at the column's head. A row is a tab's chip stood upright, with its icon,
+  title, indicator, ⌘1–9 number, × and summary card, which opens to the right
+  of the row; New Tab is at the foot with the ⚠ of a settings problem beside
+  it, and a long list scrolls and fades at its ends. Drag a row to reorder it,
+  out of the column to tear it off into a window, or onto another window's
+  column or bar; carry a pane with ⌥⌘ onto a row to join that tab, or between
+  two rows to open a new one. A tab with one pane is set off from the column by
+  a thin line; a split tab's cards and the column stand on the same ground, and
+  the first card keeps its 8 pt from the column. The window moves by the
+  column's empty space. Tabs along the top stay the default and look as they
+  did; `content_edge = "line"` draws no line along the window's top with the
+  tabs at the side.
+- **A split tab's summary card maps its panes.** Hovering over a tab that holds
+  several panes shows each pane where it sits in the tab, with its program's
+  mark, its name and what it is doing, the focused one outlined, in place of
+  "N panes". A press on a pane selects the tab and focuses that pane, and the
+  tab's icon follows to that pane's program. The card waits a moment as the
+  pointer crosses from the tab to the card, so it does not close on the way.
+
+### Changed
+
+- **A transfer fills its tab.** The tab's own ground fills from the left as an
+  upload goes, at an even pace between reports, instead of a line under the tab
+  that stepped and vanished. When it ends the fill runs to the end and fades
+  and a tick (or, if it failed, a dot) stays on the tab until you look at it,
+  so a transfer that finishes in a background tab is no longer missed.
+- **Badges and the running line move.** A question, tick, dot or arrow on a
+  tab's icon grows onto the tile's corner and shrinks away, one badge turning
+  into another keeps its circle, and the line round a running tile fades in and
+  out. A tick or a dot rests for a moment after you look at the tab, then goes.
+  With Reduce Motion on they only fade.
+- **A tab's summary card eases in from the tab** and fades out, instead of
+  appearing and vanishing at once.
+
 ### Fixed
 
 - **The input source balloon appears at the cursor.** Pressing fn (🌐) or

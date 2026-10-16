@@ -1131,8 +1131,10 @@ pub const ROW_LEAD: f64 = 8.0;
 /// What a row keeps free at its right end while neither `×` nor the ⌘ hint shows.
 pub const ROW_END: f64 = 8.0;
 
-/// What a row keeps free at its right end while `×` or the ⌘ hint shows: the title gives way to it.
-pub const ROW_CROWDED: f64 = 30.0;
+/// What a row keeps free at its right end while `×` or the ⌘ hint shows: the title gives way to
+/// it. The hint's box is the bar's — [`CHIP_PAD`] wide, [`CLOSE_INSET`] in from the end — so a
+/// hint that fits a chip fits a row (a narrower box cut "⌘1" to "…").
+pub const ROW_CROWDED: f64 = CHIP_PAD + CLOSE_INSET;
 
 /// Side of the `×` that closes a row, and its space from the row's right edge.
 pub const CLOSE_SIDE: f64 = 20.0;
@@ -1336,9 +1338,16 @@ impl Row {
                 CLOSE_SIDE,
                 CLOSE_SIDE,
             ),
-            key: Span::new(ROW_WIDTH - ROW_CROWDED, ROW_CROWDED - ROW_END),
+            key: Span::new(ROW_WIDTH - ROW_CROWDED, CHIP_PAD),
             host_mark: Rect::new(2.0, 7.0, 2.5, TAB_HEIGHT - 14.0),
         }
+    }
+
+    /// What a name field covers while a row is renamed: from where the leading element starts to
+    /// the row's end, over the icon and the title alike. The same bounds [`Row::of`] cuts a title
+    /// at, so the field's text starts where the title's did and ends where it would have ended.
+    pub fn field() -> Span {
+        Span::new(ROW_LEAD, (ROW_WIDTH - ROW_LEAD - ROW_END).max(0.0))
     }
 }
 
@@ -4684,7 +4693,12 @@ mod tests {
         assert_eq!(crowded.title.end(), crowded.key.x);
         assert!(crowded.title.end() <= crowded.close.x);
         assert_eq!(crowded.close, Rect::new(160.0, 4.0, 20.0, 20.0));
-        assert_eq!(crowded.key, Span::new(154.0, 22.0));
+        assert_eq!(crowded.key, Span::new(154.0, 26.0));
+        // The ⌘ hint's box is the bar's: as wide as a chip's padding, the same inset from the
+        // end, so the hint that fits a chip fits a row; and it ends where the × does.
+        assert_eq!(crowded.key.width, CHIP_PAD);
+        assert_eq!(crowded.key.end(), ROW_WIDTH - CLOSE_INSET);
+        assert_eq!(crowded.key.end(), crowded.close.x + crowded.close.width);
         // A deck of two edges takes its steps from the title.
         let deck = Row::of(Some(lead_width(TILE_WIDTH, 2)), 500.0, false);
         assert_eq!(deck.lead, Some(Span::new(8.0, 30.0)));
@@ -4701,5 +4715,12 @@ mod tests {
             "the strip's title and the column's take the same room"
         );
         assert_eq!(row.host_mark, Rect::new(2.0, 7.0, 2.5, 14.0));
+        // The name field covers the lead and the longest title: the same ends.
+        assert_eq!(
+            Row::field().x,
+            bare.title.x,
+            "a row with no lead starts at the field"
+        );
+        assert_eq!(Row::field().end(), long.title.end());
     }
 }

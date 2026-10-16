@@ -18,7 +18,7 @@ use block2::RcBlock;
 use bt_core::{
     AdoptMode, HostMark, InitialInput, KeepRunning, MarkSubject, PaneUuid, ReduceMotion,
     RemoteKind, RestoreWindows, SHUTDOWN_GRACE, SYSTEM_THEME, Scrollbar, Settings, SettingsEdit,
-    ShellIntegration, Teardown, Theme,
+    ShellIntegration, TabPosition, Teardown, Theme,
 };
 use bt_gpu::{DisplayLink, MIN_SAMPLES, Renderer, ScrollbarMode, Stats};
 use dispatch2::{DispatchQueue, DispatchTime};
@@ -1584,6 +1584,27 @@ define_class!(
                     NSControlStateValueOff
                 });
                 model.enabled
+            } else if let Some(place) = [
+                (sel!(tabsAtTop:), TabPosition::Top),
+                (sel!(tabsAtSide:), TabPosition::Side),
+            ]
+            .into_iter()
+            .find_map(|(action, place)| (item.action() == Some(action)).then_some(place))
+            {
+                // View ▸ Tabs ▸: the checked place is the setting's. With no file for the
+                // choice to write (a timed run, no home directory) the items are grey, as
+                // Theme ▸ is left empty there.
+                item.setState(if self.settings().tab_position == place {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
+                matches!(
+                    self.inputs(),
+                    Inputs::User {
+                        config_root: Some(_)
+                    }
+                )
             } else if item.action() == Some(sel!(mergeWindows:)) {
                 // Merging needs a second window to take tabs from.
                 self.windows().len() > 1
@@ -1703,6 +1724,18 @@ define_class!(
         #[unsafe(method(matchSystemTheme:))]
         fn match_system_theme(&self, _sender: Option<&AnyObject>) {
             self.save_theme(SYSTEM_THEME);
+        }
+
+        /// View ▸ Tabs ▸ Top: the tabs in the title row of every window.
+        #[unsafe(method(tabsAtTop:))]
+        fn show_tabs_at_top(&self, _sender: Option<&AnyObject>) {
+            self.save_edit(&SettingsEdit::TabPosition(TabPosition::Top));
+        }
+
+        /// View ▸ Tabs ▸ Side: the tabs in a column down the left edge of every window.
+        #[unsafe(method(tabsAtSide:))]
+        fn show_tabs_at_side(&self, _sender: Option<&AnyObject>) {
+            self.save_edit(&SettingsEdit::TabPosition(TabPosition::Side));
         }
 
         #[unsafe(method(runDeadline:))]
@@ -3697,10 +3730,22 @@ impl AppDelegate {
                 // carries.
                 let row = from.title_row();
                 let (grab_x, grab_y) = if window::tabs_at_side(self.mtm()) {
-                    (
-                        tabs::SIDE_WIDTH / 2.0,
-                        row + tabs::LIST_PAD + tabs::TAB_HEIGHT / 2.0,
-                    )
+                    // The first row's own place in the column's layout, not a copy of it.
+                    let column = tabs::Side {
+                        height: source.size.height,
+                        top: row,
+                        count: 1,
+                        scroll: 0.0,
+                        warning: false,
+                        corner: 0.0,
+                    }
+                    .layout();
+                    column
+                        .rows
+                        .first()
+                        .map_or((tabs::SIDE_WIDTH / 2.0, row), |first| {
+                            (first.x + first.width / 2.0, first.y + first.height / 2.0)
+                        })
                 } else {
                     (source.size.width / 2.0, row / 2.0)
                 };
@@ -5145,7 +5190,7 @@ impl AppDelegate {
     }
 
     /// Writes a single key's new value to the file and applies it through the path that reads
-    /// the file — the **shared** path of View ▸ Theme ▸ and the settings window
+    /// the file — the **shared** path of View ▸ Theme ▸, View ▸ Tabs ▸ and the settings window
     /// (the rationale of [`AppDelegate::save_theme`] applies as is). On a write error the
     /// window returns to the file's value: the control must not show a value that could
     /// not be written.

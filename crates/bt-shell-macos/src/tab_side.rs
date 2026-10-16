@@ -512,15 +512,13 @@ impl TabBar {
         field.setAlignment(NSTextAlignment::Left);
         self.dress_field(palette, false);
         let height = field.intrinsicContentSize().height;
+        let covers = tabs::Row::field();
         field.setFrame(NSRect::new(
             NSPoint::new(
-                row.x + tabs::ROW_LEAD,
+                row.x + covers.x,
                 row.y + ((row.height - height) / 2.0).max(0.0),
             ),
-            NSSize::new(
-                (tabs::ROW_WIDTH - tabs::ROW_LEAD - tabs::ROW_END).max(0.0),
-                height,
-            ),
+            NSSize::new(covers.width, height),
         ));
     }
 }

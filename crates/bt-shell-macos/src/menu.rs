@@ -4,7 +4,7 @@
 //! Forget Password, Cancel Upload, Open Port ▸, Split
 //! Right, Split Down, Close Tab/Close, Close Window), Edit (Undo Move, Cut, Copy, Paste, Paste
 //! Escaped Text, Select All, Clear to Start, Clear Scrollback, Find ▸
-//! Find…/Find Next/Find Previous/Use Selection for Find), View (Theme ▸,
+//! Find…/Find Next/Find Previous/Use Selection for Find), View (Theme ▸, Tabs ▸,
 //! Bigger, Smaller, Actual Size, Scroll to Top, Scroll to Bottom, Page Up,
 //! Page Down) and Window (Minimize,
 //! Zoom, Show Previous/Next Tab, Select Tab ▸, Show All Tabs, Rename Tab…, splits — Select Previous/Next
@@ -32,7 +32,10 @@
 //! window would answer before its delegate); `performMiniaturize:` and
 //! `performZoom:` to `NSWindow` itself; `mergeWindows:` (Merge All Windows,
 //! grey with a single window) to the app delegate, which reaches every window;
-//! `openSettings:`, the theme actions, `markHost:`, `toggleHostIntegration:`
+//! `openSettings:`, the theme actions, `tabsAtTop:`/`tabsAtSide:` (View ▸ Tabs ▸: the
+//! checkmark follows `[appearance] tab_position` and the items are grey where there is no
+//! file to write, both in the app delegate's `validateMenuItem:`), `markHost:`,
+//! `toggleHostIntegration:`
 //! (its title, checkmark and grey state in the app delegate's
 //! `validateMenuItem:`, from [`integration_menu`]) and
 //! `newWindow:`/`newTab:`/`newLocalTab:`/`quitAndEndPrograms:` to the app delegate
@@ -461,6 +464,17 @@ pub(crate) fn install(
         "View",
         &[
             theme_menu,
+            // Where the window's tabs sit: the check and the grey state come from the app
+            // delegate's `validateMenuItem:`, not from a delegate of the submenu's own (one
+            // that defines `menuNeedsUpdate:` enters AppKit's shortcut search, see above).
+            submenu(
+                mtm,
+                "Tabs",
+                &[
+                    item(mtm, "Top", sel!(tabsAtTop:), ""),
+                    item(mtm, "Side", sel!(tabsAtSide:), ""),
+                ],
+            ),
             NSMenuItem::separatorItem(mtm),
             // `+` is a Shift character: the menu matches Cmd-Shift-= and shows
             // "⌘+". `-` is an ASCII hyphen, not the minus sign (U+2212) — the keyboard does

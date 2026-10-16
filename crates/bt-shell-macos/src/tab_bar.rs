@@ -4367,7 +4367,8 @@ fn card_arrival(frame: Rect, toward: (f64, f64)) -> Rect {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     NewTab,
-    /// Show All Tabs, only while the tabs do not fit.
+    /// Show All Tabs, only while the tabs do not fit. The side column has no such button: it
+    /// lists every tab itself and scrolls, and ⇧⌘\ opens the same menu at the list's head.
     List,
     Warning,
 }
@@ -5286,6 +5287,13 @@ impl TabBar {
         app::delegate(self.mtm())?.window(self.ivars().window)
     }
 
+    /// Whether a bar of `count` tabs is just the window's title: one tab in the title row. It
+    /// has no menu, no card, no ring and no `×`. The side column has no title bar, so there a
+    /// lone tab is a row like the rest.
+    fn lone_title(&self, count: usize) -> bool {
+        count < 2 && self.ivars().side.get().is_none()
+    }
+
     /// Reduce Motion now — the setting and the system's answer, one `bool`.
     fn reduce_motion(&self) -> bool {
         app::delegate(self.mtm()).is_some_and(|app| app.reduce_motion())
@@ -5502,9 +5510,8 @@ impl TabBar {
         let dragged = drag.and_then(|drag| position(drag.tab));
         let hovered = iv.hovered.get().and_then(position);
         let gap = iv.gap.get().map(|gap| gap.min(count));
-        // The lone tab is today's title bar; with a tab on its way in it is the first chip. A
-        // column has no title bar: a lone tab is a row like the rest.
-        let single = side.is_none() && count == 1 && gap.is_none();
+        // The lone tab is today's title bar; with a tab on its way in it is the first chip.
+        let single = self.lone_title(count) && gap.is_none();
         // The layout's place for the tab at `index`: past the gap, one on.
         let seat = |index: usize| tabs::seat(index, gap);
         let (chips, reflow) = self.chips_for(&shown.tabs);
@@ -5858,7 +5865,7 @@ impl TabBar {
     /// ([`tabs::menu_tag`]) and acts through the window's applier.
     fn context_menu(&self, tab: u64) -> Option<Retained<NSMenu>> {
         let window = self.terminal_window()?;
-        if self.ivars().shown.borrow().tabs.len() < 2 {
+        if self.lone_title(self.ivars().shown.borrow().tabs.len()) {
             return None;
         }
         // A menu is no place for the card; and the pointer resting on the
@@ -6415,7 +6422,7 @@ impl TabBar {
         let shown = iv.shown.borrow();
         // The rings that show: a running tab whose glyph is not a more
         // urgent one (a question), among several tabs.
-        let running = if shown.tabs.len() > 1 {
+        let running = if !self.lone_title(shown.tabs.len()) {
             shown
                 .tabs
                 .iter()
@@ -6545,10 +6552,10 @@ impl TabBar {
         self.close_card();
     }
 
-    /// Opens (or turns) the card to tab `tab`'s — only among several tabs,
-    /// where a tab is a chip.
+    /// Opens (or turns) the card to tab `tab`'s — only where a tab is a chip: among several
+    /// tabs, or in the side column, where a lone tab is a row like the rest.
     fn open_card(&self, tab: u64) {
-        if self.ivars().shown.borrow().tabs.len() < 2 {
+        if self.lone_title(self.ivars().shown.borrow().tabs.len()) {
             return;
         }
         self.read_card(tab);
@@ -6643,7 +6650,8 @@ impl TabBar {
             .cloned();
         // SAFETY: reading the superview; we are on the main thread.
         let root = unsafe { self.superview() };
-        let (Some(chip), Some(root), true) = (chip, root, iv.chips.borrow().len() > 1) else {
+        let chips = iv.chips.borrow().len();
+        let (Some(chip), Some(root), false) = (chip, root, self.lone_title(chips)) else {
             self.close_card();
             return;
         };

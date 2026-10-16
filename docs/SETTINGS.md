@@ -39,10 +39,12 @@ does not exist (see [Settings…](#settings-1)). Creating the directory and the
 file by hand works too. The file may be a symbolic link to somewhere else (a
 dotfiles repository); the link's target is read.
 
-The app writes to this file from four places: **Open settings.toml** creates
+The app writes to this file from five places: **Open settings.toml** creates
 the template when the file does not exist, choosing a theme from **View ▸
 Theme ▸** writes the `[appearance] theme` line (see [View ▸ Theme
-▸](#view--theme-)), **Shell ▸ Mark “host” as ▸** and **Shell ▸ Shell
+▸](#view--theme-)), choosing **View ▸ Tabs ▸ Top** or **Side** writes the
+`[appearance] tab_position` line (see [View ▸ Tabs ▸](#view--tabs-)),
+**Shell ▸ Mark “host” as ▸** and **Shell ▸ Shell
 Integration on “host”** write that host's entry in `[remote] hosts` (see
 [`[remote]`](#remote)), and the **settings window** writes the line of the
 setting you changed. No other line of an existing file — comments, order,
@@ -84,7 +86,8 @@ looks, `[appearance] content_edge` ("Content edge") and
 `[appearance] minimum_contrast` ("Minimum contrast", under the themes) and
 `[appearance] dim_unfocused_splits` ("Dim unfocused splits") and
 `[appearance] split_style` ("Split style") and `[appearance]
-resize_in_steps` ("Resize in steps") and `[appearance] tab_icons`
+resize_in_steps` ("Resize in steps") and `[appearance] tab_position`
+("Tabs") and `[appearance] tab_icons`
 ("Tab icons") with `tab_icon_colors` ("Icon colors"); on
 folder rows
 Change… opens a folder
@@ -452,6 +455,20 @@ the title bar gives the reason (`…; the theme was not saved`):
 The warning goes away with the next successful choice, or once the file is
 saved readable and valid.
 
+### View ▸ Tabs ▸
+
+**Top** and **Side** set where the tabs of every window sit; the checked item
+is the `tab_position` value in the settings file (see
+[`[appearance]`](#appearance)). Choosing one **writes that line** and applies
+it to the windows that are open at once, the way View ▸ Theme ▸ does for
+`theme`: the tabs move between the title row and the column in place, and each
+pane is resized once. Everything View ▸ Theme ▸ says about what is written
+and what is not — comments and unrecognized keys stay, a missing section or key
+is added, a symbolic link's target is written, a file that does not exist is
+created from the [template](#template), an invalid or unreadable file is left
+alone — holds here, with the title bar saying `…; the setting was not saved`.
+The items are grey where there is no file to write.
+
 ## If something goes wrong
 
 The error appears in English in the window's title bar. With a single tab it
@@ -462,8 +479,9 @@ bateri – settings.toml: line 2: `terminal.scrollback` must be an integer, foun
 ```
 
 With several tabs the title bar holds the tabs, so the error becomes a ⚠
-button left of `+`: hover over it to read the text, click it to open the
-settings window, which shows the file's state.
+button left of `+` (with the tabs at the side, right of New Tab at the foot of
+the column): hover over it to read the text, click it to open the settings
+window, which shows the file's state.
 
 If there are several errors, the first one and the number of the rest are
 shown (`(+2 more)`); all of them are also printed to standard error with the
@@ -888,7 +906,9 @@ tab_position = "top"
   fewer than with the other two values.
 - `content_edge = "line"` cuts the text at the top as `"cut"` does, under a
   one-pixel line in the color of the split panes' frames, along the top of the
-  window's panes (a split pane's own frame is that line).
+  window's panes (a split pane's own frame is that line). With the tabs at the
+  side there is no bar for the line to stand under, so it draws nothing and
+  `"line"` cuts the text as `"cut"` does.
 - `content_edge = "cut"` cuts the text where the pane ends, through a letter
   if it falls so — every line the height allows.
 - Changing the value applies at once; between `"fade"` and the other two the
@@ -937,21 +957,32 @@ tab_position = "top"
   background — the most room for text. The focused pane is then told by its
   cursor alone, or also by `dim_unfocused_splits`. It applies at once.
 - A tab's chip shows which program runs in it, before its title: Claude Code,
-  Codex, OpenCode, Antigravity, Gemini CLI, Pi, Herdr, Cursor CLI, Copilot CLI,
-  Qwen Code and Kimi CLI by their own marks, and a shell, a remote session, an
-  editor, a language shell, a database client, a container tool, a monitor, a
-  git tool, a task, a pager, a file manager and a root shell by marks bateri
-  draws. The mark stands on a tile, like an application's icon, in its kind's
-  color; while a command runs a line runs round the tile's edge, and a
-  question, a tick, a dot or an arrow sits on its corner for a tab that waits,
-  finished, failed or transfers. A tab of several panes shows a deck: the
-  focused pane's program on the front tile, and a smaller tile behind it for
-  each other pane, up to two, the front ones turned a little more than the
-  ones behind. `tab_icons = false` shows no icon, only the small indicator a
-  tab had before icons. `tab_icon_colors = "brand"` lets Claude Code,
-  Antigravity, Gemini CLI and Qwen Code keep their own colors as the tile's
-  ground; the others and the marks bateri draws stay in the theme's. Both
-  apply at once, and the Show All Tabs list wears the same icons.
+  Codex, OpenCode, Antigravity, Gemini CLI, Pi, Herdr, Cursor CLI, Copilot
+  CLI, Qwen Code and Kimi CLI by their own marks, and a shell, a remote
+  session, an editor, a language shell, a database client, a container tool, a
+  monitor, a git tool, a task, a pager, a file manager and a root shell by
+  marks bateri draws. The mark stands on a tile, like an application's icon,
+  in its kind's color; while a command runs a line runs round the tile's edge,
+  and a question, a tick, a dot or an arrow sits on its corner for a tab that
+  waits, finished, failed or transfers. A tab of several panes shows a deck:
+  the focused pane's program on the front tile, and a smaller tile behind it
+  for each other pane, up to two, the front ones turned a little more than the
+  ones behind. A badge grows from small onto the tile's corner, with a little
+  spring, and shrinks away when it goes; one badge turning into another keeps
+  its circle, and the line round a running tile fades in and out. A tick or a
+  dot stays for 0.6 s after you look at the tab, then goes. A tab that
+  transfers files fills its own ground from the left as the transfer goes; a
+  transfer that ends while the tab is away leaves a tick or a dot on it, like
+  a command's end. Hovering over a tab opens a summary card; for a split tab
+  it holds a map of the panes, each in its place with its program's mark, its
+  name and what it is doing, the focused one outlined — a press on a pane
+  selects that tab and focuses that pane. With Reduce Motion on, the badges
+  and the running line only fade. `tab_icons = false` shows no icon, only the
+  small indicator a tab had before icons. `tab_icon_colors = "brand"` lets
+  Claude Code, Antigravity, Gemini CLI and Qwen Code keep their own colors as
+  the tile's ground; the others and the marks bateri draws stay in the
+  theme's. Both apply at once, and the Show All Tabs list wears the same
+  icons.
 - `dim_unfocused_splits = true` brings back the veil over the panes that
   don't have the focus: the theme's background at 30% over their text, as
   other terminals do. It applies at once.
@@ -965,6 +996,28 @@ tab_position = "top"
   size as soon as you turn it on. It does not reach a split tab, full
   screen, a window tiled or filled by macOS, or the moment after ⌘+ or ⌘−:
   those keep the leftover inside the margin until the next drag.
+- `tab_position = "top"` keeps the tabs in a bar in the title row. `"side"`
+  puts them in a column 200 pt wide down the window's left edge, as tall as
+  the window: the title row goes, the traffic lights sit at the head of the
+  column and the panes start at the window's top. A row is a tab's chip stood
+  upright — its icon, its title, an × on the right when the pointer is over it
+  (⌘1–9 takes the place while ⌘ is held), a marked remote host's mark as a
+  stripe at the left edge — and the same tick, dot, transfer fill and summary
+  card, the card opening to the right of the row. New Tab stays at the foot of
+  the column, with the ⚠ of a settings problem beside it; a list longer than
+  the window scrolls and fades at its ends, and Show All Tabs (⇧⌘\) opens its
+  menu at the head of the list (the column has no button for it). The window
+  moves by the column's empty space and beside the traffic lights, and a press
+  on a pane's top line selects text as anywhere else. Rows are dragged as the
+  tabs of the bar are: drag one to reorder, out of the column to tear it off
+  into a window of its own, onto another window's column or bar to move it
+  there. A pane carried with ⌥⌘ and dropped on a row joins that tab; dropped
+  between two rows it opens a new tab. One place for every window; it applies
+  at once, and `"top"` brings the bar back as it was. A tab with one pane is
+  set off from the column by a thin line in the divider's color; under
+  `split_style = "cards"` a split tab's cards and the column stand on the
+  ground together, the line fades as the ground comes in, and the first card
+  keeps its 8 pt from the column like its other sides.
 
 ### `[font]`
 
@@ -1720,10 +1773,11 @@ command line of a program running as root, so a script run with `sudo`
   pattern is the host without its `user@`, or a Kubernetes context's whole
   name. Comments and the array's formatting are not touched; if the file
   cannot be parsed or the list is broken, nothing is written.
-- A marked remote host's tab carries a small dot in the mark's color next
-  to its title while the tab bar is visible; an unmarked remote tab has no
-  dot. A database client's or a context's mark shows in its guide and the
-  dock's top line only.
+- A marked remote host's tab carries a small dot in the mark's color next to
+  its title while the tab bar is visible (a stripe at the left edge of its row
+  with the tabs at the side); an unmarked remote tab has no dot. A database
+  client's or a context's mark shows in its guide and the dock's top line
+  only.
 - It takes effect the moment you save, even while ssh, a database client or
   kubectl is running.
 - **`integration`** (`true` \| `false`, optional): remote shell integration on

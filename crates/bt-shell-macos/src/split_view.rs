@@ -52,7 +52,8 @@
 //! `NSBox`, one device pixel tall along the container's top edge and
 //! **above** the panes, in the theme's `separator` tone. It belongs to the
 //! container's edge, not a pane's, and it shows only while the panes touch
-//! that edge — in a split tab each card's own frame is that line. Its frame
+//! that edge (in a split tab each card's own frame is that line) and only with the tabs in
+//! the title row: the side column has no bar for it to stand under. Its frame
 //! does not depend on the tree: one `setFrame` before the single-pane
 //! branch covers one pane and zoom alike, and its height follows the scale
 //! (the window lays out again on a scale change). A pane joining the
@@ -921,11 +922,15 @@ impl SplitView {
         self.show_hairline(!self.carded());
     }
 
+    /// With the tabs in the side column the container's top edge is the window's, with no bar
+    /// above it for the line to stand under: it would read as a stray border across the
+    /// window's top, so it stays hidden and `line` cuts the text like `cut` does. The column
+    /// has its own rule along the panes' left edge.
     fn show_hairline(&self, panes_touch_the_edge: bool) {
         let line = self.ivars().edge.get() == ContentEdge::Line;
         self.ivars()
             .hairline
-            .setHidden(!(line && panes_touch_the_edge));
+            .setHidden(!(line && panes_touch_the_edge && !self.beside_tabs()));
     }
 
     /// Whether the panes are cards now: two or more and none zoomed.
