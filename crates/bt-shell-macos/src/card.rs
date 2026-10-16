@@ -618,18 +618,26 @@ impl Ground {
         if self.ivars().shown.replace(shown) == shown {
             return;
         }
-        let alpha = if shown { 1.0 } else { 0.0 };
-        if at_once {
-            self.setAlphaValue(alpha);
-            return;
-        }
-        let this = self.retain();
-        animate(
-            SLIDE_SECS,
-            move || this.animator().setAlphaValue(alpha),
-            || {},
-        );
+        fade_to(self, shown, at_once);
     }
+}
+
+/// Fades `view` in (`shown`) or out over the slide's length — the 220 ms the panes take to
+/// become cards — or at once. The ground and the line the side column leaves when the ground
+/// comes ([`crate::window::RootView::sync_ground`]) take it together, so the one that goes and
+/// the one that comes cross at the same pace.
+pub(crate) fn fade_to(view: &NSView, shown: bool, at_once: bool) {
+    let alpha = if shown { 1.0 } else { 0.0 };
+    if at_once {
+        view.setAlphaValue(alpha);
+        return;
+    }
+    let view = view.retain();
+    animate(
+        SLIDE_SECS,
+        move || view.animator().setAlphaValue(alpha),
+        || {},
+    );
 }
 
 /// Runs `change` as an AppKit animation of `secs` on the app's curve

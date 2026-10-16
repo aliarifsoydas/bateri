@@ -274,8 +274,17 @@ const CARD_SLIDE: f64 = 4.0;
 /// Animation's, begins with the next commit and is not timed by this clock.
 const CARD_SLACK: f64 = 0.05;
 /// The way from a card to the chip it opened under, as a step in the card's superview's own
-/// (top-down) axes: the chip is above it. A card beside its row has the row to its left.
+/// (top-down) axes: the chip is above it.
 const CHIP_ABOVE: (f64, f64) = (0.0, -1.0);
+/// The same for a card opened beside a row of the side column: the row is to its left, so the
+/// card comes in from there.
+const ROW_LEFT: (f64, f64) = (-1.0, 0.0);
+/// A card beside its row stands this far right of the column's edge, with its top this far above
+/// the row's (the row sits level with the card's first line), and keeps this far off the
+/// window's top and bottom.
+const CARD_BESIDE: f64 = 8.0;
+const CARD_RISE: f64 = 4.0;
+const CARD_EDGE: f64 = 8.0;
 /// A card with a map is as wide as the map and its margins, and the map sits under the lines:
 /// their own gap and 7 pt more, as the design has it.
 const CARD_MAP_WIDTH: f64 = tabs::MAP_WIDTH + 2.0 * CARD_PAD_X;
@@ -4301,6 +4310,22 @@ impl MapTile {
     }
 }
 
+/// Where the summary card (`card` points across and down) of the row of the side column that
+/// spans `row_top` down from the window's top sits in a `root` (width, height) window whose
+/// column ends at `column_right`: [`CARD_BESIDE`] right of the column, [`CARD_RISE`] above the
+/// row, slid up or down as far as it takes to fit the window with [`CARD_EDGE`] to spare (the
+/// top wins when the card is taller than the window). A window too narrow for it pushes it left
+/// only as far as the column's edge, never over the rows.
+fn card_beside(row_top: f64, column_right: f64, root: (f64, f64), card: (f64, f64)) -> (f64, f64) {
+    let x = (column_right + CARD_BESIDE)
+        .min(root.0 - card.0 - CARD_BESIDE)
+        .max(column_right);
+    let y = (row_top - CARD_RISE)
+        .min(root.1 - card.1 - CARD_EDGE)
+        .max(CARD_EDGE);
+    (x, y)
+}
+
 /// Where the summary card, `card_width` wide, of a chip spanning
 /// `chip_x`…`chip_x + chip_width` sits in a `bar_width` bar: under the
 /// chip's left edge, kept [`CARD_PAD_X`] inside both window edges.
@@ -5922,10 +5947,7 @@ impl TabBar {
     fn hover(&self, tab: Option<u64>) {
         if self.ivars().hovered.replace(tab) != tab {
             self.lay_out();
-            // The column's summary card is the next phase's.
-            if self.ivars().side.get().is_none() {
-                self.hover_card(tab);
-            }
+            self.hover_card(tab);
         }
     }
 
@@ -6581,14 +6603,29 @@ impl TabBar {
         // The chip's frame is in the strip's space.
         let at = chip.frame();
         let size = iv.card_view.frame().size;
-        let origin = NSPoint::new(
-            card_x(
-                iv.strip.frame().origin.x + at.origin.x,
-                self.bounds().size.width,
-                size.width,
-            ),
-            self.frame().origin.y + at.origin.y + at.size.height + CARD_DROP,
-        );
+        let origin = if iv.side.get().is_some() {
+            // Beside the row, on its right: the column's edge and the row's top in the root
+            // view's space (the bar fills the column, the strip is placed in the bar).
+            let column_right = self.frame().origin.x + self.bounds().size.width;
+            let row_top = self.frame().origin.y + iv.strip.frame().origin.y + at.origin.y;
+            let window = root.bounds().size;
+            let (x, y) = card_beside(
+                row_top,
+                column_right,
+                (window.width, window.height),
+                (size.width, size.height),
+            );
+            NSPoint::new(x, y)
+        } else {
+            NSPoint::new(
+                card_x(
+                    iv.strip.frame().origin.x + at.origin.x,
+                    self.bounds().size.width,
+                    size.width,
+                ),
+                self.frame().origin.y + at.origin.y + at.size.height + CARD_DROP,
+            )
+        };
         let card = &iv.card_view;
         let reduce = self.reduce_motion();
         // SAFETY: reading the superview; we are on the main thread.
@@ -6648,7 +6685,12 @@ impl TabBar {
             frame.size.width,
             frame.size.height,
         );
-        let look = card_arrival(to, CHIP_ABOVE);
+        let toward = if self.ivars().side.get().is_some() {
+            ROW_LEFT
+        } else {
+            CHIP_ABOVE
+        };
+        let look = card_arrival(to, toward);
         if let Some(from) = fitted(&layer, look, to) {
             play_look(&layer, from, secs, Ease::Out);
         }
@@ -6848,11 +6890,12 @@ pub(crate) fn watch_command_key() -> Option<Retained<AnyObject>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BADGE_DOT, BADGE_HALO, BADGE_SIDE, Badge, CARD_MAP_WIDTH, CARD_PAD_X, CARD_SCALE,
-        CARD_SLIDE, CARD_WIDTH, CHIP_ABOVE, CHIP_HEIGHT, DISCS, Emblem, GLYPH_OVERHANG, GlyphLook,
-        HOLLOW_ROOM, IconStyle, Motion, Palette, Spin, TAB_RADIUS, TILE_BADGE_INSET, TILE_ROOM,
-        Tint, TitleAction, badge_centre, card_arrival, card_x, command_alone, contains, disc_side,
-        glyph_slot, inks, line_span, single_label, spin_of, title_double_click,
+        BADGE_DOT, BADGE_HALO, BADGE_SIDE, Badge, CARD_BESIDE, CARD_EDGE, CARD_MAP_WIDTH,
+        CARD_PAD_X, CARD_RISE, CARD_SCALE, CARD_SLIDE, CARD_WIDTH, CHIP_ABOVE, CHIP_HEIGHT, DISCS,
+        Emblem, GLYPH_OVERHANG, GlyphLook, HOLLOW_ROOM, IconStyle, Motion, Palette, ROW_LEFT, Spin,
+        TAB_RADIUS, TILE_BADGE_INSET, TILE_ROOM, Tint, TitleAction, badge_centre, card_arrival,
+        card_beside, card_x, command_alone, contains, disc_side, glyph_slot, inks, line_span,
+        single_label, spin_of, title_double_click,
     };
     use crate::icon;
     use crate::program::identity::{Agent, Kind as ProgramKind};
@@ -7235,6 +7278,37 @@ mod tests {
         );
     }
 
+    /// A card beside a row stands right of the column at the row's height and slides to stay
+    /// inside the window.
+    #[test]
+    fn a_card_beside_its_row_stays_inside_the_window() {
+        let window = (1000.0, 700.0);
+        let card = (300.0, 200.0);
+        // At the row, a little above it, [`CARD_BESIDE`] right of the column.
+        assert_eq!(
+            card_beside(120.0, 200.0, window, card),
+            (200.0 + CARD_BESIDE, 120.0 - CARD_RISE)
+        );
+        // A row near the bottom: the card slides up to clear the window's foot.
+        assert_eq!(
+            card_beside(650.0, 200.0, window, card).1,
+            700.0 - 200.0 - CARD_EDGE
+        );
+        // A row under the window's top: the card keeps off the top.
+        assert_eq!(card_beside(2.0, 200.0, window, card).1, CARD_EDGE);
+        // A card taller than the window starts at the top (that edge wins).
+        assert_eq!(
+            card_beside(300.0, 200.0, window, (300.0, 900.0)).1,
+            CARD_EDGE
+        );
+        // A window too narrow for the card: pushed left, but never over the column.
+        assert_eq!(card_beside(120.0, 200.0, (400.0, 700.0), card).0, 200.0);
+        assert_eq!(
+            card_beside(120.0, 200.0, (510.0, 700.0), card).0,
+            510.0 - 300.0 - CARD_BESIDE
+        );
+    }
+
     /// The fill is the accent at 7 % to 14 %, the error's once the transfer failed; the way still
     /// to go is the hover's own tone — on the bar's ladder of grounds the fill's two ends are the
     /// hover's (the foreground at 5 %) and the selected face's (10 %) in both themes, so the
@@ -7292,7 +7366,7 @@ mod tests {
         near(look.x + look.width / 2.0, 100.0 + 136.0);
         near(look.y, 50.0 - CARD_SLIDE);
         // Beside its row, on the row's right: the left edge's middle, 4 pt left.
-        let look = card_arrival(frame, (-1.0, 0.0));
+        let look = card_arrival(frame, ROW_LEFT);
         near(look.x, 100.0 - CARD_SLIDE);
         near(look.y + look.height / 2.0, 50.0 + 60.0);
         near(look.width, 272.0 * CARD_SCALE);

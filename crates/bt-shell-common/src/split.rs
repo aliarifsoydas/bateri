@@ -161,6 +161,8 @@ pub struct Spacing {
     around: f64,
     /// The margin at the area's top edge: `around` unless [`Spacing::with_top`] said otherwise.
     top: f64,
+    /// The margin at the area's left edge: `around` unless [`Spacing::with_left`] said otherwise.
+    left: f64,
 }
 
 impl Spacing {
@@ -169,6 +171,7 @@ impl Spacing {
         between: DIVIDER_PX,
         around: 0.0,
         top: 0.0,
+        left: 0.0,
     };
 
     /// A gap of `between` points between panes and `around` points between the panes and the
@@ -179,6 +182,7 @@ impl Spacing {
             between: pixels(between),
             around: pixels(around),
             top: pixels(around),
+            left: pixels(around),
         }
     }
 
@@ -188,6 +192,18 @@ impl Spacing {
     pub fn with_top(self, top: f64, scale: f64) -> Self {
         Self {
             top: (top * scale).round().max(0.0),
+            ..self
+        }
+    }
+
+    /// The same spacing with `left` points at the area's left edge instead of the margin
+    /// around: beside the tab column the column's own inner margin is the cards' gap on that
+    /// side, and a second one there would stand the cards twice as far from the rows as from
+    /// the window's other edges. Asked from here like every other margin, so the layout, the
+    /// room a split asks for, a drag and a resize all agree where the first card starts.
+    pub fn with_left(self, left: f64, scale: f64) -> Self {
+        Self {
+            left: (left * scale).round().max(0.0),
             ..self
         }
     }
@@ -207,12 +223,17 @@ impl Spacing {
         self.top
     }
 
+    /// The margin at the area's left edge, in device pixels.
+    pub fn left_px(self) -> f64 {
+        self.left
+    }
+
     /// `rect` (whole pixels) less this spacing's margins: where the root node is laid out.
     fn inside(self, rect: Rect) -> Rect {
         Rect::new(
-            rect.x + self.around,
+            rect.x + self.left,
             rect.y + self.top,
-            (rect.width - 2.0 * self.around).max(0.0),
+            (rect.width - self.left - self.around).max(0.0),
             (rect.height - self.around - self.top).max(0.0),
         )
     }
@@ -1970,6 +1991,99 @@ mod tests {
     }
 
     #[test]
+    fn a_left_margin_of_its_own_moves_only_the_left_edge() {
+        // Beside the tab column the first card starts at the area's left edge (the column's own
+        // inner margin is its gap) and keeps the margin round the other three sides.
+        let mut tree = Tree::Leaf(1);
+        assert!(tree.split(1, Axis::Horizontal, 2));
+        assert!(tree.split(2, Axis::Vertical, 3));
+        let bounds = Rect::new(0.0, 0.0, 400.0, 300.0);
+        let even = tree.layout_spaced(bounds, 1.0, Spacing::gapped(8.0, 8.0, 1.0));
+        let flush = Spacing::gapped(8.0, 8.0, 1.0).with_left(0.0, 1.0);
+        let open = tree.layout_spaced(bounds, 1.0, flush);
+        assert_eq!(
+            (flush.left_px(), flush.around_px(), flush.top_px()),
+            (0.0, 8.0, 8.0)
+        );
+        let (a, b) = (frame_of(&even, 1), frame_of(&open, 1));
+        assert_eq!((a.x, b.x), (8.0, 0.0), "the left card starts at the edge");
+        assert_eq!((b.y, b.height), (a.y, a.height));
+        for id in [2, 3] {
+            let (a, b) = (frame_of(&even, id), frame_of(&open, id));
+            assert_eq!((b.y, b.height), (a.y, a.height), "pane {id}");
+            assert_eq!(b.x + b.width, a.x + a.width, "the right margin stays");
+            assert_eq!(b.x + b.width, 400.0 - 8.0);
+        }
+        // The area the panes share is the whole width less the right and between margins.
+        let total: f64 = [1, 2].iter().map(|id| frame_of(&open, *id).width).sum();
+        assert_eq!(total, 400.0 - 8.0 - 8.0);
+    }
+
+    #[test]
+    fn a_left_margin_of_its_own_is_whole_pixels_and_never_negative() {
+        let spacing = Spacing::gapped(8.0, 8.0, 2.0).with_left(0.0, 2.0);
+        assert_eq!(spacing.left_px(), 0.0);
+        let spacing = Spacing::gapped(8.0, 8.0, 2.0).with_left(2.25, 2.0);
+        assert_eq!(spacing.left_px(), 5.0, "rounded to a device pixel once");
+        let spacing = Spacing::gapped(8.0, 8.0, 2.0).with_left(-3.0, 2.0);
+        assert_eq!(spacing.left_px(), 0.0);
+        assert_eq!(Spacing::DIVIDED.left_px(), 0.0);
+        assert_eq!(Spacing::gapped(8.0, 8.0, 2.0).left_px(), 16.0);
+    }
+
+    #[test]
+    fn a_flush_left_room_asks_the_layout_for_its_split_resize_and_drag() {
+        // The room a split, a keyboard step and a divider drag measure with is the one the
+        // layout draws with: with no left margin they all start from the area's left edge.
+        let min = min_100_by_60;
+        let spacing = Spacing::gapped(6.0, 6.0, 2.0).with_left(0.0, 2.0);
+        let room = Room {
+            bounds: Rect::new(0.0, 0.0, 1000.0, 600.0),
+            scale: 2.0,
+            spacing,
+            min: &min,
+        };
+        let tree = pair(Axis::Horizontal, 0.5, 1, 2);
+        // A subtree's minimum along the axis is the same sum with or without the left margin: the
+        // margin sits outside the panes and the gap between them.
+        assert_eq!(
+            tree.min_length(Axis::Horizontal, &room),
+            tree.min_length(
+                Axis::Horizontal,
+                &Room {
+                    spacing: Spacing::gapped(6.0, 6.0, 2.0),
+                    ..room
+                }
+            ),
+        );
+        // A newcomer lands where the flush layout draws it.
+        let plan = tree
+            .plan_beside(2, Direction::Down, &Tree::Leaf(9), &room)
+            .expect("there is room");
+        let layout = plan.tree.layout_spaced(room.bounds, 2.0, spacing);
+        assert_eq!(plan.landing, frame_of(&layout, 9));
+        assert_eq!(frame_of(&layout, 1).x, 0.0);
+        // A step and a drag move the divider where the layout puts it, from the edge.
+        let divider_x = |tree: &Tree| {
+            tree.layout_spaced(room.bounds, room.scale, room.spacing)
+                .dividers[0]
+                .rect
+                .x
+        };
+        let mut tree = tree;
+        let before = divider_x(&tree);
+        assert!(tree.resize_within(1, Direction::Right, 10.0, &room));
+        assert_eq!(divider_x(&tree), before + 10.0);
+        assert!(tree.drag_within(0, 300.0, &room));
+        assert_eq!(divider_x(&tree), 300.0);
+        // Past the limit the left pane keeps its minimum, measured from the edge itself.
+        assert!(tree.drag_within(0, -10_000.0, &room));
+        let layout = tree.layout_spaced(room.bounds, room.scale, room.spacing);
+        assert_eq!(frame_of(&layout, 1).x, 0.0);
+        assert_eq!(frame_of(&layout, 1).width, 100.0);
+    }
+
+    #[test]
     fn a_gapped_layout_tiles_the_area_inside_its_margin() {
         // Two scales, a fractional point boundary: panes and gaps tile the area inside the
         // margin with no overlap, every edge on a device pixel, and the gaps are the strips
@@ -2424,7 +2538,11 @@ mod tests {
         let block = pair(Axis::Vertical, 0.5, 20, 21);
         let mut plans = 0;
         for scale in [1.0, 2.0] {
-            for spacing in [Spacing::DIVIDED, Spacing::gapped(6.0, 6.0, scale)] {
+            for spacing in [
+                Spacing::DIVIDED,
+                Spacing::gapped(6.0, 6.0, scale),
+                Spacing::gapped(6.0, 6.0, scale).with_left(0.0, scale),
+            ] {
                 for width in (160..=900).step_by(37) {
                     for height in (130..=700).step_by(41) {
                         let room = Room {

@@ -117,7 +117,7 @@ use objc2_foundation::{
 use crate::Run;
 use crate::app;
 use crate::arrange::Tool;
-use crate::card::{Ground, Shade};
+use crate::card::{Ground, Shade, fade_to};
 use crate::embed;
 use crate::jobs::Foreground;
 use crate::launch::Closing;
@@ -127,7 +127,7 @@ use crate::preview::beep;
 use crate::restore::SavedTab;
 use crate::sheets::{self, Asker};
 use crate::split::{Axis, Direction, Tree};
-use crate::split_view::SplitView;
+use crate::split_view::{Hairline, SplitView};
 use crate::tab::{self, TerminalTab};
 use crate::tab_bar::{Label, RowClaim, TabBar};
 use crate::tabs::{self, Card, Finish, Tabs};
@@ -1208,6 +1208,13 @@ pub(crate) struct RootIvars {
     /// The cards' shadows and cuts (`card::Shade`): over the ground, under
     /// the containers.
     shade: Retained<Shade>,
+    /// With the tabs in the side column, the one line between the column and the content, in
+    /// the dividers' tone: over the ground and the shade, under the bar. It shows while the tab
+    /// on screen is not cards on the ground and gives way to the ground over the ground's own
+    /// 220 ms ([`RootView::sync_ground`]).
+    rule: Retained<Hairline>,
+    /// Whether [`RootIvars::rule`] is meant to show.
+    ruled: Cell<bool>,
     /// With the tabs in the side column, the title row's band over the content: a claim on it,
     /// so a press there is the pane's and the window server does not move the window
     /// ([`RowClaim`]). Hidden while the bar is in the row. Above every container.
@@ -1218,7 +1225,7 @@ pub(crate) struct RootIvars {
 
 /// Whether `[appearance] tab_position` puts the tabs in the side column. One answer for every
 /// window; without an application (a pane embedded in another one) the bar in the title row.
-fn tabs_at_side(mtm: MainThreadMarker) -> bool {
+pub(crate) fn tabs_at_side(mtm: MainThreadMarker) -> bool {
     app::delegate(mtm).is_some_and(|app| app.settings().tab_position == TabPosition::Side)
 }
 
@@ -1264,12 +1271,18 @@ impl RootView {
     fn new(mtm: MainThreadMarker, frame: NSRect, bar: &TabBar) -> Retained<Self> {
         let ground = Ground::new(mtm, NSRect::new(NSPoint::ZERO, frame.size));
         let shade = Shade::new(mtm, NSRect::new(NSPoint::ZERO, frame.size));
+        // Born unseen, not hidden: it fades in and out like the ground.
+        let rule = Hairline::new(mtm);
+        rule.setHidden(false);
+        rule.setAlphaValue(0.0);
         let claim = RowClaim::new(mtm);
         claim.setHidden(true);
         let this = Self::alloc(mtm).set_ivars(RootIvars {
             bar: bar.retain(),
             ground: ground.clone(),
             shade: shade.clone(),
+            rule: rule.clone(),
+            ruled: Cell::new(false),
             claim: claim.clone(),
             row: Cell::new(0.0),
         });
@@ -1281,9 +1294,19 @@ impl RootView {
         this.setWantsLayer(true);
         this.addSubview(&ground);
         this.addSubview(&shade);
+        this.addSubview(&rule);
         this.addSubview(bar);
         this.addSubview(&claim);
         this
+    }
+
+    /// The side column's line takes the theme's dividers' tone (`Theme::separator_srgb`, the
+    /// split's lines and the cards' frames). `NSColor` takes sRGB.
+    pub(crate) fn paint_rule(&self, theme: &Theme) {
+        let [r, g, b] = theme.separator_srgb().map(|byte| f64::from(byte) / 255.0);
+        self.ivars()
+            .rule
+            .setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0));
     }
 
     /// The ground follows the tab on screen: shown under a split one, gone
@@ -1313,6 +1336,13 @@ impl RootView {
         self.ivars()
             .ground
             .show(shown.is_some(), still || !on_screen);
+        // The side column's line is the ground's counterpart: it stands while the content is
+        // not cards on the ground (one pane, a zoomed pane, a lined split) and fades out as the
+        // ground comes in, so the column is never both ruled off and on the ground.
+        let ruled = shown.is_none() && tabs_at_side(self.mtm());
+        if self.ivars().ruled.replace(ruled) != ruled {
+            fade_to(&self.ivars().rule, ruled, still || !on_screen);
+        }
     }
 
     /// The cards slide for `secs`: the shade waits it out.
@@ -1399,6 +1429,17 @@ impl RootView {
         claim.setHidden(!side);
         bar.set_side(side.then_some(row));
         bar.setFrame(bar_frame);
+        if side {
+            // One device pixel, along the column's last: the content starts right after it.
+            let scale = self
+                .window()
+                .map_or(2.0, |window| window.backingScaleFactor());
+            let line = 1.0 / scale;
+            self.ivars().rule.setFrame(NSRect::new(
+                NSPoint::new((bar_frame.size.width - line).max(0.0), 0.0),
+                NSSize::new(line, bounds.size.height),
+            ));
+        }
         for view in self.subviews() {
             if let Ok(container) = view.downcast::<SplitView>() {
                 container.setFrame(below);
@@ -1406,6 +1447,9 @@ impl RootView {
             }
         }
         bar.lay_out();
+        // The line is the side column's: it comes and goes with the place of the tabs, and the
+        // containers laid out above may have been at the frame they already had.
+        self.sync_ground();
     }
 
     /// A tab's container joins under the bar, at the content's frame; under the title row's
@@ -3141,6 +3185,7 @@ impl TerminalWindow {
         // only from the background.
         self.ivars().root.ivars().ground.paint(theme);
         self.ivars().root.ivars().shade.paint(theme);
+        self.ivars().root.paint_rule(theme);
         // The chrome derives only from the background; giving AppKit the colour
         // and appearance again on the same background would redraw all title
         // bars on every settings save (the twin of `Session::set_theme` being a

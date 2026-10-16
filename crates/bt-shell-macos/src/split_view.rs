@@ -96,12 +96,20 @@ const HYPOTHETICAL: u64 = u64::MAX;
 /// The space the tree is laid out with when it has `leaves` panes in
 /// `style`: none of the card gap for one pane (the pane fills the area, with
 /// the one-pixel divider the tree never draws), the card gap between and
-/// around otherwise — except at the top, where the cards start right under
-/// the title row. Under [`SplitStyle::Lines`] the panes always touch, one
-/// pixel apart.
-fn spacing(leaves: usize, scale: f64, style: SplitStyle) -> Spacing {
+/// around otherwise — except at the edge the tabs stand along: the cards
+/// start right under the title row when the tabs are in it, and right at the
+/// side column when they are in that (`beside_tabs`), whose own inner margin is
+/// the cards' gap on that side — a second one would stand the cards twice as
+/// far from the rows as from the window's other edges. Under
+/// [`SplitStyle::Lines`] the panes always touch, one pixel apart.
+fn spacing(leaves: usize, scale: f64, style: SplitStyle, beside_tabs: bool) -> Spacing {
     if leaves > 1 && style == SplitStyle::Cards {
-        Spacing::gapped(GAP_PT, GAP_PT, scale).with_top(0.0, scale)
+        let gapped = Spacing::gapped(GAP_PT, GAP_PT, scale);
+        if beside_tabs {
+            gapped.with_left(0.0, scale)
+        } else {
+            gapped.with_top(0.0, scale)
+        }
     } else {
         Spacing::DIVIDED
     }
@@ -117,17 +125,26 @@ const EDGE_EPS: f64 = 0.5;
 /// to its edge): a card has its own round corners on both sides; a pane that
 /// is not a card has the **window's** corner exactly where it touches the
 /// window's bottom edge and that side edge, and a square one everywhere else —
-/// the lone pane, the zoomed pane and the bottom panes of a lined split. The
-/// text beside a corner starts where the curve lets it
+/// the lone pane, the zoomed pane and the bottom panes of a lined split. With
+/// the tabs in the side column (`beside_tabs`) the container's left edge is the
+/// column's, not the window's: the left corner is the column's foot, never a
+/// pane's. The text beside a corner starts where the curve lets it
 /// (`CellMetrics::with_corners`), and a corner the pane does not own is not
 /// the pane's to keep clear of. Pure.
-fn bottom_corners(rect: Rect, bounds: Rect, carded: bool, window: f64, card: f64) -> (f64, f64) {
+fn bottom_corners(
+    rect: Rect,
+    bounds: Rect,
+    carded: bool,
+    beside_tabs: bool,
+    window: f64,
+    card: f64,
+) -> (f64, f64) {
     if carded {
         return (card, card);
     }
     let on = |edge: f64, of: f64| (edge - of).abs() <= EDGE_EPS;
     let bottom = on(rect.y + rect.height, bounds.y + bounds.height);
-    let left = bottom && on(rect.x, bounds.x);
+    let left = bottom && !beside_tabs && on(rect.x, bounds.x);
     let right = bottom && on(rect.x + rect.width, bounds.x + bounds.width);
     (
         if left { window } else { 0.0 },
@@ -288,8 +305,8 @@ define_class!(
 
 impl Hairline {
     /// Born hidden, without a border; the colour is the container's
-    /// ([`SplitView::set_theme`]).
-    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+    /// ([`SplitView::set_theme`]) or the root view's ([`RootView::paint_rule`]).
+    pub(crate) fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(());
         // SAFETY: `NSBox`'s `init`; the subclass has no ivar.
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
@@ -461,7 +478,7 @@ impl SplitView {
         if !tree.split(id, axis, HYPOTHETICAL) {
             return None;
         }
-        let spacing = spacing(tree.leaves().len(), scale, self.style());
+        let spacing = spacing(tree.leaves().len(), scale, self.style(), self.beside_tabs());
         let layout = tree.layout_spaced(self.bounds_rect(), scale, spacing);
         let frame_of = |wanted: u64| {
             let (_, rect) = layout.panes.iter().find(|(pane, _)| *pane == wanted)?;
@@ -564,6 +581,7 @@ impl SplitView {
                 tree.leaves().len() + incoming.leaves().len(),
                 scale,
                 self.style(),
+                self.beside_tabs(),
             ),
             min: &min,
         };
@@ -658,7 +676,12 @@ impl SplitView {
         let room = Room {
             bounds: self.bounds_rect(),
             scale,
-            spacing: spacing(here.len() + foreign, scale, self.style()),
+            spacing: spacing(
+                here.len() + foreign,
+                scale,
+                self.style(),
+                self.beside_tabs(),
+            ),
             min: &min,
         };
         tree.verdict(carried, &room, (at.x, at.y))
@@ -672,7 +695,7 @@ impl SplitView {
         tree.layout_spaced(
             self.bounds_rect(),
             scale,
-            spacing(tree.leaves().len(), scale, self.style()),
+            spacing(tree.leaves().len(), scale, self.style(), self.beside_tabs()),
         )
         .panes
         .into_iter()
@@ -775,7 +798,7 @@ impl SplitView {
         tree.layout_spaced(
             self.bounds_rect(),
             scale,
-            spacing(tree.leaves().len(), scale, self.style()),
+            spacing(tree.leaves().len(), scale, self.style(), self.beside_tabs()),
         )
     }
 
@@ -814,6 +837,7 @@ impl SplitView {
                 self.ivars().tree.borrow().leaves().len(),
                 scale,
                 self.style(),
+                self.beside_tabs(),
             ),
             min,
         }
@@ -922,6 +946,13 @@ impl SplitView {
     fn style(&self) -> SplitStyle {
         crate::app::delegate(self.mtm())
             .map_or(SplitStyle::default(), |app| app.settings().split_style)
+    }
+
+    /// Whether `[appearance] tab_position` puts the tabs in the side column, which then
+    /// stands along the container's left edge ([`spacing`], [`bottom_corners`]). Read at every
+    /// layout, like [`Self::style`]; a change lays every container out again.
+    fn beside_tabs(&self) -> bool {
+        crate::window::tabs_at_side(self.mtm())
     }
 
     /// The divider's fill shows under [`SplitStyle::Lines`] while two panes
@@ -1047,7 +1078,7 @@ impl SplitView {
             self.bounds_rect(),
             scale,
             zoomed,
-            spacing(leaves, scale, self.style()),
+            spacing(leaves, scale, self.style(), self.beside_tabs()),
         );
         for pane in &panes {
             match layout.panes.iter().find(|(id, _)| *id == pane.id()) {
@@ -1081,6 +1112,7 @@ impl SplitView {
             rect,
             self.bounds_rect(),
             carded,
+            self.beside_tabs(),
             card::window_corner_pt(self.window().as_deref()),
             card::corner_pt(),
         )
@@ -1153,15 +1185,42 @@ mod tests {
         // The one-pane layout is the tree's own, bit for bit: the pane is the
         // area. From two panes on, the gap is the card gap at the scale, and
         // none at the top: the cards start right under the title row.
-        assert_eq!(spacing(1, 2.0, SplitStyle::Cards), Spacing::DIVIDED);
-        let cards = spacing(2, 2.0, SplitStyle::Cards);
+        assert_eq!(spacing(1, 2.0, SplitStyle::Cards, false), Spacing::DIVIDED);
+        let cards = spacing(2, 2.0, SplitStyle::Cards, false);
         assert_eq!(cards.between_px(), GAP_PT * 2.0);
         assert_eq!(cards.around_px(), GAP_PT * 2.0);
         assert_eq!(cards.top_px(), 0.0);
         assert_eq!(
-            spacing(5, 1.0, SplitStyle::Cards),
+            spacing(5, 1.0, SplitStyle::Cards, false),
             Spacing::gapped(GAP_PT, GAP_PT, 1.0).with_top(0.0, 1.0)
         );
+    }
+
+    #[test]
+    fn beside_the_side_column_the_cards_gap_is_the_columns_own_margin() {
+        // The tabs stand along the left edge: the first card starts at the container's edge,
+        // the column's margin being the gap there; the other three edges keep the card gap,
+        // the top included (no title row sits above the cards).
+        let beside = spacing(2, 2.0, SplitStyle::Cards, true);
+        assert_eq!(beside.left_px(), 0.0);
+        assert_eq!(beside.top_px(), GAP_PT * 2.0);
+        assert_eq!(beside.around_px(), GAP_PT * 2.0);
+        assert_eq!(beside.between_px(), GAP_PT * 2.0);
+        assert_eq!(
+            beside,
+            Spacing::gapped(GAP_PT, GAP_PT, 2.0).with_left(0.0, 2.0)
+        );
+        // With the tabs in the title row nothing changes: no top margin, the other three kept.
+        let above = spacing(2, 2.0, SplitStyle::Cards, false);
+        assert_eq!((above.top_px(), above.left_px()), (0.0, GAP_PT * 2.0));
+        // One pane and lines touch, whatever the tabs do.
+        assert_eq!(spacing(1, 2.0, SplitStyle::Cards, true), Spacing::DIVIDED);
+        for leaves in [1, 2, 5] {
+            assert_eq!(
+                spacing(leaves, 2.0, SplitStyle::Lines, true),
+                Spacing::DIVIDED
+            );
+        }
     }
 
     #[test]
@@ -1169,7 +1228,10 @@ mod tests {
         // Under `lines` there are no cards: every pane count is laid out with
         // the one-pixel divider, the layout from before the cards.
         for leaves in [1, 2, 5] {
-            assert_eq!(spacing(leaves, 2.0, SplitStyle::Lines), Spacing::DIVIDED);
+            assert_eq!(
+                spacing(leaves, 2.0, SplitStyle::Lines, false),
+                Spacing::DIVIDED
+            );
         }
     }
 
@@ -1180,7 +1242,7 @@ mod tests {
         tree.layout_spaced(bounds, 2.0, spacing)
             .panes
             .into_iter()
-            .map(|(id, rect)| (id, bottom_corners(rect, bounds, carded, 20.5, 12.5)))
+            .map(|(id, rect)| (id, bottom_corners(rect, bounds, carded, false, 20.5, 12.5)))
             .collect()
     }
 
@@ -1194,11 +1256,15 @@ mod tests {
         let bounds = Rect::new(0.0, 0.0, 1000.0, 600.0);
         let mut tree = Tree::Leaf(1);
         assert!(tree.split(1, Axis::Horizontal, 2));
-        let layout =
-            tree.layout_zoomed_spaced(bounds, 2.0, Some(2), spacing(2, 2.0, SplitStyle::Cards));
+        let layout = tree.layout_zoomed_spaced(
+            bounds,
+            2.0,
+            Some(2),
+            spacing(2, 2.0, SplitStyle::Cards, false),
+        );
         let (_, rect) = layout.panes[0];
         assert_eq!(
-            bottom_corners(rect, bounds, false, 20.5, 12.5),
+            bottom_corners(rect, bounds, false, false, 20.5, 12.5),
             (20.5, 20.5)
         );
     }
@@ -1237,7 +1303,7 @@ mod tests {
     fn a_card_has_the_cards_corner_on_both_sides_wherever_it_stands() {
         let mut tree = Tree::Leaf(1);
         assert!(tree.split(1, Axis::Horizontal, 2));
-        let cards = spacing(2, 2.0, SplitStyle::Cards);
+        let cards = spacing(2, 2.0, SplitStyle::Cards, false);
         assert_eq!(
             corners(&tree, cards, true),
             [(1, (12.5, 12.5)), (2, (12.5, 12.5))]
@@ -1251,16 +1317,54 @@ mod tests {
     }
 
     #[test]
+    fn beside_the_side_column_no_pane_owns_the_windows_left_corner() {
+        // The container's left edge is the column's: the column's foot keeps the window's
+        // corner there. A pane on the right edge keeps its own.
+        let bounds = Rect::new(0.0, 0.0, 1000.0, 600.0);
+        let lone = bounds;
+        assert_eq!(
+            bottom_corners(lone, bounds, false, true, 20.5, 12.5),
+            (0.0, 20.5)
+        );
+        assert_eq!(
+            bottom_corners(lone, bounds, false, false, 20.5, 12.5),
+            (20.5, 20.5)
+        );
+        // Side by side under lines: the left pane has no window corner now, the right pane
+        // still has.
+        let mut tree = Tree::Leaf(1);
+        assert!(tree.split(1, Axis::Horizontal, 2));
+        let layout = tree.layout_spaced(bounds, 2.0, Spacing::DIVIDED);
+        let corners: Vec<_> = layout
+            .panes
+            .iter()
+            .map(|(id, rect)| (*id, bottom_corners(*rect, bounds, false, true, 20.5, 12.5)))
+            .collect();
+        assert_eq!(corners, [(1, (0.0, 0.0)), (2, (0.0, 20.5))]);
+        // A card is a card wherever the tabs are.
+        assert_eq!(
+            bottom_corners(lone, bounds, true, true, 20.5, 12.5),
+            (12.5, 12.5)
+        );
+    }
+
+    #[test]
     fn a_pane_a_pixel_off_an_edge_is_still_on_it_and_a_gap_is_not() {
         let bounds = Rect::new(0.0, 0.0, 1000.0, 600.0);
         let near = Rect::new(0.25, 0.0, 400.0, 599.75);
-        assert_eq!(bottom_corners(near, bounds, false, 20.5, 12.5), (20.5, 0.0));
+        assert_eq!(
+            bottom_corners(near, bounds, false, false, 20.5, 12.5),
+            (20.5, 0.0)
+        );
         let gapped = Rect::new(8.0, 0.0, 400.0, 592.0);
         assert_eq!(
-            bottom_corners(gapped, bounds, false, 20.5, 12.5),
+            bottom_corners(gapped, bounds, false, false, 20.5, 12.5),
             (0.0, 0.0)
         );
         // A full screen window has no curve: nothing to keep clear of.
-        assert_eq!(bottom_corners(bounds, bounds, false, 0.0, 12.5), (0.0, 0.0));
+        assert_eq!(
+            bottom_corners(bounds, bounds, false, false, 0.0, 12.5),
+            (0.0, 0.0)
+        );
     }
 }

@@ -22,8 +22,13 @@
 //! `performWindowDragWithEvent:`), as it does on the bar's. The band of the title row over the
 //! content is claimed by a [`RowClaim`] of the root view, so a press there is the pane's.
 //!
-//! **Not yet in the column**: dragging a row (a press only selects), the summary card (hovering
-//! shows the hover fill alone) and the dropping of a tab or a pane on it.
+//! **The summary card** opens at the row's right, [`CARD_BESIDE`](super::CARD_BESIDE) off the
+//! column and level with the row, slid to fit the window (`card_beside`): the same card, the
+//! same wait and the same map as the title row's, arriving from the row's side
+//! ([`ROW_LEFT`](super::ROW_LEFT)).
+//!
+//! **Not yet in the column**: dragging a row (a press only selects) and the dropping of a tab or
+//! a pane on it.
 
 use std::cell::{Cell, RefCell};
 
@@ -375,6 +380,8 @@ impl TabBar {
             None => iv.warning.setHidden(true),
         }
         iv.column.replace(Some(column));
+        // An open card follows its row (a scroll, a new height, a closed tab above).
+        self.place_card();
         self.arm_clock();
     }
 
