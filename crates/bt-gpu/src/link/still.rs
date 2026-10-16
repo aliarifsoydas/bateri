@@ -236,6 +236,7 @@ mod tests {
         fn phase_edge(&self) {}
         fn remote_command_edge(&self) {}
         fn mirror_changed(&self) {}
+        fn environment_changed(&self) {}
         fn remote_up(&self) {}
         fn remote_typed(&self) {}
         fn link_hover_lost(&self) {}

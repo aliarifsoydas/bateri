@@ -210,11 +210,13 @@ enum Key {
     TabIconColors,
     ResizeInSteps,
     TabPosition,
+    PythonEnv,
+    NodeVersion,
 }
 
 impl Key {
     /// The order is the `tag` itself: `ALL[tag]`.
-    const ALL: [Key; 46] = [
+    const ALL: [Key; 48] = [
         Key::ConfirmClose,
         Key::Clipboard,
         Key::Scrollback,
@@ -261,6 +263,8 @@ impl Key {
         Key::TabIconColors,
         Key::ResizeInSteps,
         Key::TabPosition,
+        Key::PythonEnv,
+        Key::NodeVersion,
     ];
 
     fn tag(self) -> NSInteger {
@@ -322,6 +326,8 @@ impl Key {
             Key::StatsInterval => "remote.stats_interval",
             Key::RemoteIntegration => "remote.integration",
             Key::Ports => "shell.ports",
+            Key::PythonEnv => "shell.python_env",
+            Key::NodeVersion => "shell.node_version",
         }
     }
 }
@@ -1163,6 +1169,8 @@ struct Controls {
     stats_interval: Number,
     remote_integration: Retained<NSSwitch>,
     ports: Retained<NSSwitch>,
+    python_env: Retained<NSSwitch>,
+    node_version: Retained<NSSwitch>,
     dim_splits: Retained<NSSwitch>,
     resize_in_steps: Retained<NSSwitch>,
     /// The panes' rows: the lock, the dependent row and the row's
@@ -1378,6 +1386,8 @@ define_class!(
                 Some(Key::DownloadNotify) => Some(SettingsEdit::DownloadNotify(on)),
                 Some(Key::RemoteIntegration) => Some(SettingsEdit::RemoteIntegration(on)),
                 Some(Key::Ports) => Some(SettingsEdit::ShellPorts(on)),
+                Some(Key::PythonEnv) => Some(SettingsEdit::ShellPythonEnv(on)),
+                Some(Key::NodeVersion) => Some(SettingsEdit::ShellNodeVersion(on)),
                 Some(Key::DimSplits) => Some(SettingsEdit::DimUnfocusedSplits(on)),
                 Some(Key::ResizeInSteps) => Some(SettingsEdit::ResizeInSteps(on)),
                 Some(Key::TabIcons) => Some(SettingsEdit::TabIcons(on)),
@@ -1750,6 +1760,8 @@ impl SettingsWindow {
 
         set_switch(&c.remote_integration, settings.remote_integration);
         set_switch(&c.ports, settings.shell_ports);
+        set_switch(&c.python_env, settings.shell_python_env);
+        set_switch(&c.node_version, settings.shell_node_version);
         set_switch(&c.dim_splits, settings.dim_unfocused_splits);
         set_switch(&c.resize_in_steps, settings.resize_in_steps);
         let files = &settings.remote_files;
@@ -2310,6 +2322,8 @@ impl SettingsWindow {
         let scrollback = self.number(Key::Scrollback, 0.0, SCROLLBACK_MAX as f64, 1000.0, 80.0);
         let shell_integration = self.popup::<ShellIntegration>(Key::ShellIntegration);
         let ports = self.switch(Key::Ports);
+        let python_env = self.switch(Key::PythonEnv);
+        let node_version = self.switch(Key::NodeVersion);
         let mut general = Form::new(mtm);
         general.row(
             Key::ConfirmClose,
@@ -2360,6 +2374,20 @@ impl SettingsWindow {
             &ports,
             &[&ports],
             Some("The ports your programs listen on, at the right of the dock (↗ :3000). Click to list them, Cmd-click to open one."),
+        );
+        general.row(
+            Key::PythonEnv,
+            "Show Python environment:",
+            &python_env,
+            &[&python_env],
+            Some("The active venv or conda environment at the left of the dock's bottom line, as activate prints it: (.venv) 3.12."),
+        );
+        general.row(
+            Key::NodeVersion,
+            "Show Node version:",
+            &node_version,
+            &[&node_version],
+            Some("In a Node project, after the branch: node 22.11. In the warning color when the project asks for another version (.nvmrc)."),
         );
 
         // Appearance
@@ -2791,6 +2819,8 @@ impl SettingsWindow {
             stats_interval,
             remote_integration,
             ports,
+            python_env,
+            node_version,
             dim_splits,
             resize_in_steps,
             rows,
@@ -3258,7 +3288,7 @@ mod tests {
                     [clipboard]\nosc52 = []\n\
                     [motion]\ncursor_motion = []\nreduce_motion = []\nsmooth_scroll = []\n\
                     keypress = []\nerase = []\ndock_arrival = []\n\
-                    [shell]\nintegration = []\nports = []\n\
+                    [shell]\nintegration = []\nports = []\npython_env = []\nnode_version = []\n\
                     [remote]\npreview_max_size = []\npreview_read_only = []\n\
                     preview_dir = []\npreview_keep = []\npreview_limit = []\n\
                     download_dir = []\ndownload_conflict = []\ndownload_notify = []\n\
@@ -3313,6 +3343,8 @@ mod tests {
                 Key::StatsInterval => SettingsEdit::StatsInterval(3),
                 Key::RemoteIntegration => SettingsEdit::RemoteIntegration(false),
                 Key::Ports => SettingsEdit::ShellPorts(false),
+                Key::PythonEnv => SettingsEdit::ShellPythonEnv(false),
+                Key::NodeVersion => SettingsEdit::ShellNodeVersion(false),
                 Key::DimSplits => SettingsEdit::DimUnfocusedSplits(true),
                 Key::ResizeInSteps => SettingsEdit::ResizeInSteps(true),
                 Key::SplitStyle => SettingsEdit::SplitStyle(SplitStyle::Lines),

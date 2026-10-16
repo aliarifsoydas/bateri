@@ -3711,6 +3711,7 @@ exit $code
         fn phase_edge(&self) {}
         fn remote_command_edge(&self) {}
         fn mirror_changed(&self) {}
+        fn environment_changed(&self) {}
         fn blocks_changed(&self) {}
         fn unseen_changed(&self) {}
         fn program_status_changed(&self) {}

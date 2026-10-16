@@ -416,7 +416,8 @@ __bateri_cwd() {
 }
 
 # Sends the git branch through the mirror's channel; if it is not a repository
-# the body is EMPTY.
+# the body is EMPTY. The environment report rides after it
+# (`__bateri_env_fields`).
 #
 # A SINGLE FORK in the usual case: `--abbrev-ref` is one call even outside a
 # repository, a second call on a detached HEAD for the short SHA. The cost is
@@ -433,7 +434,38 @@ __bateri_branch_print() {
     ref=$(command git rev-parse --short HEAD 2>/dev/null)
   fi
   __bateri_b64 "$ref"
-  print -nr -- $'\e]8133;b;'$REPLY$'\a'
+  local branch=$REPLY
+  __bateri_env_fields
+  print -nr -- $'\e]8133;b;'$branch$__bateri_env_wire$'\a'
+}
+
+# The environment the dock's context row shows, as five more `8133;b` fields:
+# `VIRTUAL_ENV`, `VIRTUAL_ENV_PROMPT`, `CONDA_PREFIX`, `CONDA_PROMPT_MODIFIER`
+# and the `node` this shell would run, each base64, empty when unset. The
+# terminal reads the files they name (the Python version, whether this is a
+# Node project, the Node version) and RUNS NOTHING; this side only says what
+# the variables hold.
+#
+# THE VARIABLES, NOT THE PROMPT: `activate` and conda put their name in front
+# of PS1, and the dock's PS1 is ours — rebuilt at every prompt, so their
+# prefix is lost there. Reading the variables is what makes the name survive.
+#
+# ENCODED ONLY WHEN SOMETHING CHANGED: the encoder is a loop per three bytes,
+# and the five values change only at an `activate`, a `conda activate` or a
+# `nvm use`. `$commands[node]` is zsh's own command table, no fork; a `PATH`
+# assignment empties it, so a `nvm use` is seen at the next prompt.
+typeset -g __bateri_env_raw= __bateri_env_wire=
+__bateri_env_fields() {
+  emulate -L zsh
+  local REPLY field out= node=${commands[node]-}
+  local raw=$VIRTUAL_ENV$'\0'$VIRTUAL_ENV_PROMPT$'\0'$CONDA_PREFIX$'\0'$CONDA_PROMPT_MODIFIER$'\0'$node
+  [[ $raw == "$__bateri_env_raw" && -n $__bateri_env_wire ]] && return 0
+  for field in "$VIRTUAL_ENV" "$VIRTUAL_ENV_PROMPT" "$CONDA_PREFIX" "$CONDA_PROMPT_MODIFIER" "$node"; do
+    __bateri_b64 "$field"
+    out+=";$REPLY"
+  done
+  __bateri_env_raw=$raw
+  __bateri_env_wire=$out
 }
 
 # Sets up the prompt according to the owner of this session; its caller is `precmd`.

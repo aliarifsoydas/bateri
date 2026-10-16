@@ -1496,6 +1496,15 @@ pub struct Settings {
     /// pane's programs listen on (`↗ :3000`), and Shell ▸ Open Port ▸ lists
     /// them. Takes effect at once. Doesn't enter `TerminalOptions`.
     pub shell_ports: bool,
+    /// `[shell] python_env`: whether the dock's context row starts with the
+    /// active Python environment, as `activate` puts it in front of the
+    /// prompt (`(.venv) 3.12`). Takes effect at once. Doesn't enter
+    /// `TerminalOptions`.
+    pub shell_python_env: bool,
+    /// `[shell] node_version`: whether the dock's context row shows the Node
+    /// version that runs, after the branch, in a Node project
+    /// (`node 22.11`). Takes effect at once. Doesn't enter `TerminalOptions`.
+    pub shell_node_version: bool,
     /// `[terminal] confirm_close`: when to ask on close ([`ConfirmClose`]).
     /// Doesn't enter `TerminalOptions`.
     pub confirm_close: ConfirmClose,
@@ -1564,6 +1573,8 @@ impl Default for Settings {
             dock_arrival: DockArrival::default(),
             shell_integration: ShellIntegration::default(),
             shell_ports: true,
+            shell_python_env: true,
+            shell_node_version: true,
             confirm_close: ConfirmClose::default(),
             restore_windows: RestoreWindows::default(),
             keep_running: KeepRunning::default(),
@@ -1653,6 +1664,10 @@ pub enum SettingsEdit {
     ShellIntegration(ShellIntegration),
     /// The settings window's "Show listening ports": `[shell] ports`.
     ShellPorts(bool),
+    /// The settings window's "Show Python environment": `[shell] python_env`.
+    ShellPythonEnv(bool),
+    /// The settings window's "Show Node version": `[shell] node_version`.
+    ShellNodeVersion(bool),
     /// The settings window's "Dim unfocused splits": `[appearance]
     /// dim_unfocused_splits`.
     DimUnfocusedSplits(bool),
@@ -1779,6 +1794,8 @@ impl SettingsEdit {
             Self::DockArrival(_) => ("motion", "dock_arrival", "motion.dock_arrival"),
             Self::ShellIntegration(_) => ("shell", "integration", "shell.integration"),
             Self::ShellPorts(_) => ("shell", "ports", "shell.ports"),
+            Self::ShellPythonEnv(_) => ("shell", "python_env", "shell.python_env"),
+            Self::ShellNodeVersion(_) => ("shell", "node_version", "shell.node_version"),
             Self::RemoteHostMark { .. } | Self::RemoteHostIntegration { .. } => {
                 ("remote", "hosts", "remote.hosts")
             }
@@ -1838,6 +1855,8 @@ impl SettingsEdit {
             | Self::DownloadNotify(on)
             | Self::RemoteIntegration(on)
             | Self::ShellPorts(on)
+            | Self::ShellPythonEnv(on)
+            | Self::ShellNodeVersion(on)
             | Self::DimUnfocusedSplits(on)
             | Self::ResizeInSteps(on)
             | Self::TabIcons(on) => (*on).into(),
@@ -2075,6 +2094,16 @@ integration = "auto"
 # it in your browser. Every program started in the tab counts, in the
 # background too; a container's ports and programs run with sudo don't show.
 ports = true
+# true | false. Starts the dock's bottom line with the Python environment you
+# activated, the way activate shows it in front of a prompt: (.venv) 3.12 for
+# a virtual environment, (ml) 3.11 for conda. conda's base shows when conda
+# shows it in your prompt (its changeps1 setting).
+python_env = true
+# true | false. Shows the Node version that runs, after the branch, while you
+# are in a Node project (a package.json, .nvmrc or .node-version here or above,
+# up to the repository's root): node 22.11. It turns yellow when the project's
+# .nvmrc or .node-version asks for another version.
+node_version = true
 
 [remote]
 # Colors the dock of an ssh or mosh session by the host it is on, so a
@@ -2593,6 +2622,24 @@ stats_interval = 3
                         &mut parsed.diagnostics,
                     );
                 }
+                if let Some(item) = shell.get("python_env") {
+                    parsed.settings.shell_python_env = boolean(
+                        text,
+                        item,
+                        "shell.python_env",
+                        fallback.shell_python_env,
+                        &mut parsed.diagnostics,
+                    );
+                }
+                if let Some(item) = shell.get("node_version") {
+                    parsed.settings.shell_node_version = boolean(
+                        text,
+                        item,
+                        "shell.node_version",
+                        fallback.shell_node_version,
+                        &mut parsed.diagnostics,
+                    );
+                }
                 // Retired keys: the value isn't read, its presence is reported.
                 for (key, message) in RETIRED {
                     if let Some(item) = shell.get(key) {
@@ -2607,6 +2654,8 @@ stats_interval = 3
             None if root.contains_key("shell") => {
                 parsed.settings.shell_integration = fallback.shell_integration;
                 parsed.settings.shell_ports = fallback.shell_ports;
+                parsed.settings.shell_python_env = fallback.shell_python_env;
+                parsed.settings.shell_node_version = fallback.shell_node_version;
             }
             None => {}
         }
@@ -2737,6 +2786,8 @@ stats_interval = 3
                 || self.tab_icon_colors != new.tab_icon_colors,
             tab_position: self.tab_position != new.tab_position,
             ports: self.shell_ports != new.shell_ports,
+            environment: self.shell_python_env != new.shell_python_env
+                || self.shell_node_version != new.shell_node_version,
         }
     }
 
@@ -3457,6 +3508,10 @@ pub struct Changes {
     /// every pane's port probe. A field of its own, for [`Self::caret`]'s
     /// reason.
     pub ports: bool,
+    /// [`Settings::shell_python_env`] or [`Settings::shell_node_version`]
+    /// changed: every pane shows or hides that part of its context row. One
+    /// field for both, because the pane does the same for either.
+    pub environment: bool,
 }
 
 /// Parses the text into a TOML document; a one-line diagnostic if it can't be
@@ -4290,6 +4345,8 @@ mod tests {
             ("motion", "dock_arrival"),
             ("shell", "integration"),
             ("shell", "ports"),
+            ("shell", "python_env"),
+            ("shell", "node_version"),
             ("remote", "hosts"),
             ("remote", "preview_max_size"),
             ("remote", "preview_read_only"),
@@ -4460,6 +4517,7 @@ mod tests {
                 tab_icons: false,
                 tab_position: false,
                 ports: false,
+                environment: false,
             }
         );
         assert_eq!(
@@ -4511,6 +4569,8 @@ mod tests {
             dock_arrival: DockArrival::Ripple,
             shell_integration: ShellIntegration::Auto,
             shell_ports: true,
+            shell_python_env: true,
+            shell_node_version: true,
             confirm_close: ConfirmClose::Always,
             restore_windows: RestoreWindows::Off,
             keep_running: KeepRunning::Quit,
@@ -4697,6 +4757,7 @@ mod tests {
             tab_icons: false,
             tab_position: false,
             ports: false,
+            environment: false,
         };
         assert_eq!(before.changes(&clean("[font]\nsize = 14\n")), font_only);
         assert_eq!(
@@ -4896,6 +4957,7 @@ mod tests {
                 tab_icons: false,
                 tab_position: false,
                 ports: false,
+                environment: false,
             }
         );
         assert_eq!(
@@ -5053,6 +5115,7 @@ found {found}; using \"spring\""
                 tab_icons: false,
                 tab_position: false,
                 ports: false,
+                environment: false,
             }
         );
         assert_eq!(after.changes(&after), Changes::default());
@@ -5150,6 +5213,7 @@ found {found}; using \"system\""
                 tab_icons: false,
                 tab_position: false,
                 ports: false,
+                environment: false,
             }
         );
         assert_eq!(after.changes(&after), Changes::default());
@@ -6339,6 +6403,7 @@ found 1.5; using 0.1"
                     tab_icons: false,
                     tab_position: false,
                     ports: false,
+                    environment: false,
                 },
                 "{text}"
             );
@@ -6445,6 +6510,7 @@ found 1.5; using 0.1"
                 tab_icons: false,
                 tab_position: false,
                 ports: false,
+                environment: false,
             }
         );
         // The same value again is no change.
@@ -6555,6 +6621,7 @@ found 1.5; using 0.1"
                 tab_icons: false,
                 tab_position: false,
                 ports: false,
+                environment: false,
             }
         );
         assert_eq!(after.changes(&after), Changes::default());
@@ -7109,6 +7176,8 @@ cursor = \"spring\"
                 settings.shell_integration = integration;
             }
             SettingsEdit::ShellPorts(on) => settings.shell_ports = on,
+            SettingsEdit::ShellPythonEnv(on) => settings.shell_python_env = on,
+            SettingsEdit::ShellNodeVersion(on) => settings.shell_node_version = on,
             // The oracle is right only from an empty list: both of `every_edit`'s
             // texts carry `hosts = []`. The filled list's rule is in its own test.
             SettingsEdit::RemoteHostMark {
@@ -7204,6 +7273,8 @@ cursor = \"spring\"
             },
             SettingsEdit::RemoteIntegration(false),
             SettingsEdit::ShellPorts(false),
+            SettingsEdit::ShellPythonEnv(false),
+            SettingsEdit::ShellNodeVersion(false),
             // Written as "250MB" and "1500KB": the largest exact unit.
             SettingsEdit::PreviewMaxSize(250_000_000),
             SettingsEdit::PreviewReadOnly(false),

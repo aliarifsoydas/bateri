@@ -20,7 +20,8 @@
 //! shared memory and `bateri compact` (`journal`), the saved
 //! session layout and its file (`restore`), the
 //! process table (`jobs`), which program reads the keyboard and its guide
-//! bar (`program`), the drawing that stands for a program in a tab (`icon`),
+//! bar (`program`), the active Python environment and Node version the dock
+//! shows (`environment`), the drawing that stands for a program in a tab (`icon`),
 //! the shell's birth (`child`) and file watching (`watch`).
 //!
 //! **The boundary:** no AppKit, Foundation, Quartz or notification centre —
@@ -36,6 +37,7 @@
 
 pub mod child;
 pub mod download;
+pub mod environment;
 pub mod focus;
 pub mod gesture;
 pub mod grid;

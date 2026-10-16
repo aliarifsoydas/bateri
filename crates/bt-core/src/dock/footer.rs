@@ -28,6 +28,15 @@
 //! their last button. Never shortened — a cut one reads as another: a host, a
 //! branch, a title, a port number, a button's label.
 //!
+//! **The local form's own order** ([`LocalPlan`]): `(.venv) 3.12  {path} |
+//! {branch} | node 22.11`. The active environment heads the row like `⇄ host`
+//! does the remote form's — where you are, read first —, the Node version
+//! trails the branch. Within the lead's budget the path shortens from the
+//! left down to its last folder (`…/api`), then the Node version drops, then
+//! the Python version, then the path shortens further and drops, then the
+//! branch, and the environment's name goes last. The name and the branch are
+//! never shortened, and neither is a version.
+//!
 //! **One gap**: [`GAP`] columns between the lead's last drawn character and
 //! the zone, and between two items of the zone.
 //!
@@ -36,7 +45,7 @@
 //! arithmetics diverged a click would land next to what is drawn.
 
 use super::*;
-use crate::shell::FooterPort;
+use crate::shell::{DockEnvironment, FooterPort};
 
 /// The gap between the lead and the trailing zone, and between two of its
 /// items, in columns — the remote form's own gap (`⇄ prod  /srv`).
@@ -70,8 +79,12 @@ pub struct FooterHit {
 /// Where this row is: the left zone of each form.
 #[derive(Clone, Copy)]
 enum Lead<'a> {
-    /// `{path} | {branch}`.
-    Local { cwd: &'a str, branch: &'a str },
+    /// `{environment}  {path} | {branch} | node {version}` ([`LocalPlan`]).
+    Local {
+        cwd: &'a str,
+        branch: &'a str,
+        environment: &'a DockEnvironment,
+    },
     /// `⇄ {host}  {remote path}` (`host` as shown, with a port the user named).
     Remote { host: &'a str, cwd: &'a str },
     /// `{title} · {detail}  {path}`.
@@ -84,15 +97,11 @@ impl Lead<'_> {
     /// The width with everything showing.
     fn full(self) -> usize {
         match self {
-            Self::Local { cwd, branch } => {
-                let (path, branch) = (cwd.chars().count(), branch.chars().count());
-                let separator = if path > 0 && branch > 0 {
-                    SEPARATOR.chars().count()
-                } else {
-                    0
-                };
-                path + separator + branch
-            }
+            Self::Local {
+                cwd,
+                branch,
+                environment,
+            } => LocalWidths::of(cwd, branch, environment).full(),
             Self::Remote { host, cwd } => remote_head(host) + tail(cwd),
             Self::Program(bar) => program_head(bar) + tail(&bar.path),
             Self::Transfer(transfer) => remote_head(&transfer.host) + tail(&transfer.body),
@@ -104,11 +113,207 @@ impl Lead<'_> {
     /// text) gives way to what the trailing zone keeps.
     fn core(self) -> usize {
         match self {
-            Self::Local { branch, .. } => branch.chars().count(),
+            Self::Local {
+                cwd,
+                branch,
+                environment,
+            } => LocalWidths::of(cwd, branch, environment).core(),
             Self::Remote { host, .. } => remote_head(host),
             Self::Program(bar) => program_head(bar),
             Self::Transfer(transfer) => remote_head(&transfer.host),
         }
+    }
+}
+
+/// The local form's widths, in columns: what [`LocalPlan`] adds up.
+#[derive(Clone, Copy)]
+struct LocalWidths {
+    /// The environment's name (`(.venv)`); `0` for none.
+    name: usize,
+    /// Its version (`3.12`), without the space before it.
+    version: usize,
+    path: usize,
+    /// The shortest the path gets before anything else gives way: its last
+    /// folder behind the mark (`…/api`); the whole path when it has no parent.
+    floor: usize,
+    branch: usize,
+    /// `node 22.11`, or `node 18.20 (.nvmrc 22)`; `0` for none.
+    node: usize,
+}
+
+/// `node ` in front of the Node version.
+const NODE_LABEL: &str = "node ";
+
+impl LocalWidths {
+    fn of(cwd: &str, branch: &str, environment: &DockEnvironment) -> Self {
+        let node = match environment.node.chars().count() {
+            0 => 0,
+            version => {
+                NODE_LABEL.chars().count()
+                    + version
+                    + match environment.node_wanted.chars().count() {
+                        0 => 0,
+                        wanted => 3 + wanted,
+                    }
+            }
+        };
+        Self {
+            name: environment.python.chars().count(),
+            version: environment.python_version.chars().count(),
+            path: cwd.chars().count(),
+            floor: path_floor(cwd),
+            branch: branch.chars().count(),
+            node,
+        }
+    }
+
+    /// The width of `plan`'s parts, the separators between them included.
+    fn width(self, plan: LocalPlan) -> usize {
+        let branch = if plan.branch { self.branch } else { 0 };
+        let mut rest = plan.path;
+        if plan.path > 0 && branch > 0 {
+            rest += SEPARATOR.chars().count();
+        }
+        rest += branch;
+        if plan.node {
+            if rest > 0 {
+                rest += SEPARATOR.chars().count();
+            }
+            rest += self.node;
+        }
+        let head = if plan.name {
+            self.name + if plan.version { 1 + self.version } else { 0 }
+        } else {
+            0
+        };
+        let gap = if head > 0 && rest > 0 {
+            REMOTE_GAP.chars().count()
+        } else {
+            0
+        };
+        head + gap + rest
+    }
+
+    /// Everything showing.
+    fn full(self) -> usize {
+        self.width(LocalPlan::whole(self))
+    }
+
+    /// What is never shortened: the environment's name and the branch.
+    fn core(self) -> usize {
+        self.width(LocalPlan {
+            name: self.name > 0,
+            version: false,
+            path: 0,
+            branch: self.branch > 0,
+            node: false,
+        })
+    }
+}
+
+/// What the local form shows on its budget — the module doc's order, and
+/// the one reading of it: [`Lead::full`], [`Lead::core`] and the drawing all
+/// add the same parts ([`LocalWidths::width`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalPlan {
+    name: bool,
+    version: bool,
+    /// How many of the path's characters show (its mark included); `0` → none.
+    path: usize,
+    branch: bool,
+    node: bool,
+}
+
+impl LocalPlan {
+    fn whole(widths: LocalWidths) -> Self {
+        Self {
+            name: widths.name > 0,
+            version: widths.name > 0 && widths.version > 0,
+            path: widths.path,
+            branch: widths.branch > 0,
+            node: widths.node > 0,
+        }
+    }
+
+    fn on(widths: LocalWidths, budget: usize) -> Self {
+        let whole = Self::whole(widths);
+        // The path gives what `budget` lacks, down to `least`; `None` if
+        // even that does not fit.
+        let fit = |plan: Self, least: usize| -> Option<Self> {
+            let at = |path: usize| widths.width(Self { path, ..plan });
+            if at(least) > budget {
+                return None;
+            }
+            // `width` grows by one per path character once the path shows.
+            let path = match widths.path {
+                0 => 0,
+                _ if at(1) > budget => 0,
+                full => full.min(budget - (at(1) - 1)),
+            };
+            Some(Self { path, ..plan })
+        };
+        // While the path keeps its last folder: the Node version, then the
+        // Python version give way.
+        let steps = [
+            whole,
+            Self {
+                node: false,
+                ..whole
+            },
+            Self {
+                node: false,
+                version: false,
+                ..whole
+            },
+        ];
+        if let Some(plan) = steps.into_iter().find_map(|plan| fit(plan, widths.floor)) {
+            return plan;
+        }
+        // Then the path shortens further and drops, then the branch, and the
+        // name goes last. **A branch or a name that does not fit is not
+        // clipped, it drops**: a cut one names a branch or an environment
+        // that does not exist.
+        let bare = Self {
+            node: false,
+            version: false,
+            ..whole
+        };
+        [
+            bare,
+            Self {
+                branch: false,
+                ..bare
+            },
+            Self {
+                name: false,
+                ..bare
+            },
+            Self {
+                name: false,
+                branch: false,
+                ..bare
+            },
+        ]
+        .into_iter()
+        .find_map(|plan| fit(plan, 0))
+        .unwrap_or(Self {
+            name: false,
+            version: false,
+            path: 0,
+            branch: false,
+            node: false,
+        })
+    }
+}
+
+/// The path's [`LocalWidths::floor`]: `…/{last folder}`, or the whole path
+/// when that is no shorter.
+fn path_floor(path: &str) -> usize {
+    let chars = path.chars().count();
+    match path.chars().rev().position(|ch| ch == '/') {
+        // `…` stands for what precedes the last `/`.
+        Some(from_end) if from_end > 0 => chars.min(from_end + 2),
+        _ => chars,
     }
 }
 
@@ -308,6 +513,7 @@ fn parts(context: &DockContext) -> (Lead<'_>, [Option<Item<'_>>; ITEMS]) {
     let lead = Lead::Local {
         cwd: &context.cwd,
         branch: &context.branch,
+        environment: &context.environment,
     };
     (lead, [ports, None])
 }
@@ -531,48 +737,27 @@ fn emit_lead(
 ) {
     let (dim, quiet) = (theme.dim_linear(), theme.quiet_linear());
     match lead {
-        Lead::Local { cwd, branch } => {
-            let branch_chars = branch.chars().count();
-            // The budget is set aside **for the branch first**; the path gets
-            // the rest. The separator is counted on the path's side, because
-            // if the path drops the separator drops too.
-            //
-            // **A branch that does not fit is not clipped, it drops.** This is
-            // the degenerate-width counterpart of the branch's "no half can be
-            // thrown away" rule: showing the branch `release/2.1` as `release`
-            // in twelve columns would tell the user they are on **a branch that
-            // does not exist**, and putting a marker (`rele…`) would not fix
-            // that either. Not showing it at all is a loss of information but
-            // not wrong information; a window that narrow is unreadable anyway.
-            let shows_branch = branch_chars > 0 && branch_chars <= budget;
-            let path_budget = if shows_branch {
-                budget
-                    .saturating_sub(branch_chars)
-                    .saturating_sub(SEPARATOR.chars().count())
-            } else {
-                // If the branch is not drawn the whole width is the path's: its
-                // shortening is **marked** (`…`), so it cannot be misread.
-                budget
-            };
-            let (shows_path, path) = path_cells(cwd, path_budget, dim, quiet);
-            // **The separator is drawn if both sides are filled.** A dangling
-            // `|` in a directory that is not a repo would say "the branch could
-            // not be read"; there is no branch to read.
-            let separator = if shows_path && shows_branch {
-                SEPARATOR
-            } else {
-                ""
-            };
-            let line = path
-                // The separator is a division mark, not content: in the quietest tone.
-                .chain(separator.chars().map(|ch| (ch, quiet)))
-                .chain(
-                    shows_branch
-                        .then(|| branch.chars().map(|ch| (ch, dim)))
-                        .into_iter()
-                        .flatten(),
-                );
-            emit_context(line, budget, row, sink);
+        Lead::Local {
+            cwd,
+            branch,
+            environment,
+        } => {
+            // **A branch that does not fit is not clipped, it drops** — and so
+            // does the environment's name ([`LocalPlan::on`]). Showing the
+            // branch `release/2.1` as `release` in twelve columns would tell
+            // the user they are on **a branch that does not exist**, and a
+            // marker (`rele…`) would not fix that either. Not showing it at
+            // all is a loss of information but not wrong information; a window
+            // that narrow is unreadable anyway. The path is the one part that
+            // shortens: its shortening is **marked** (`…`), so it cannot be
+            // misread.
+            let plan = LocalPlan::on(LocalWidths::of(cwd, branch, environment), budget);
+            emit_context(
+                local_cells(environment, cwd, branch, plan, theme),
+                budget,
+                row,
+                sink,
+            );
         }
         // `⇄ {host}` in the mark's color (the theme's `info` when unmarked),
         // two spaces, then the remote path in the two tiers of the local path;
@@ -664,6 +849,79 @@ fn emit_lead(
             });
         }
     }
+}
+
+/// The local form's cells for `plan`.
+///
+/// The environment's name is the row's one part in the **foreground**: the
+/// path and the branch are the place, a tone back, and the name is what
+/// decides which `python` runs — a role color would lend it a meaning the
+/// row already gives that color (`info` remote, `warning` a staging host).
+/// Its version and the Node version are dim, their labels and every
+/// separator quiet (division marks, not content). A Node version the project
+/// does not ask for is in `warning`, the asked one after it.
+fn local_cells<'a>(
+    environment: &'a DockEnvironment,
+    cwd: &'a str,
+    branch: &'a str,
+    plan: LocalPlan,
+    theme: &Theme,
+) -> impl Iterator<Item = (char, LinearRgba)> + 'a {
+    let (fg, dim, quiet) = (
+        theme.foreground_linear(),
+        theme.dim_linear(),
+        theme.quiet_linear(),
+    );
+    let text = move |text: &'a str, tone: LinearRgba| text.chars().map(move |ch| (ch, tone));
+    // Each part is an iterator that may be empty: no buffer per frame.
+    let version = (plan.name && plan.version)
+        .then(|| std::iter::once((' ', dim)).chain(text(&environment.python_version, dim)));
+    let head = plan
+        .name
+        .then(|| text(&environment.python, fg))
+        .into_iter()
+        .flatten()
+        .chain(version.into_iter().flatten());
+    let path_on = plan.path > 0;
+    let gap = (plan.name && (path_on || plan.branch || plan.node))
+        .then(|| text(REMOTE_GAP, quiet))
+        .into_iter()
+        .flatten();
+    let (_, path) = path_cells(cwd, plan.path, dim, quiet);
+    let branch = plan
+        .branch
+        .then(|| {
+            path_on
+                .then(|| text(SEPARATOR, quiet))
+                .into_iter()
+                .flatten()
+                .chain(text(branch, dim))
+        })
+        .into_iter()
+        .flatten();
+    let wanted = !environment.node_wanted.is_empty();
+    let asked = wanted.then(|| {
+        text(" (", quiet)
+            .chain(text(&environment.node_wanted, quiet))
+            .chain(std::iter::once((')', quiet)))
+    });
+    let node = plan
+        .node
+        .then(|| {
+            (path_on || plan.branch)
+                .then(|| text(SEPARATOR, quiet))
+                .into_iter()
+                .flatten()
+                .chain(text(NODE_LABEL, quiet))
+                .chain(text(
+                    &environment.node,
+                    if wanted { theme.warning_linear() } else { dim },
+                ))
+                .chain(asked.into_iter().flatten())
+        })
+        .into_iter()
+        .flatten();
+    head.chain(gap).chain(path).chain(branch).chain(node)
 }
 
 /// `⇄ {host}  {tail}` within `budget`: the tail gets what is left after the

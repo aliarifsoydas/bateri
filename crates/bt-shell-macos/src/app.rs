@@ -5029,6 +5029,16 @@ impl AppDelegate {
                     pane.set_ports_shown(new.shell_ports);
                 }
             }
+            // The active environment's parts come and go at once in every pane.
+            if changes.environment {
+                let wants = crate::environment::Wants {
+                    python: new.shell_python_env,
+                    node: new.shell_node_version,
+                };
+                for pane in &panes {
+                    pane.set_environment_shown(wants);
+                }
+            }
             // The style and the dock's typing effects go to the link, not the session:
             // they change not which frame we draw but **how** we draw it.
             // The link is born inside `start_session` and this path runs after

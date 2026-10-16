@@ -109,7 +109,8 @@ __bateri_b64() {
 }
 
 # Sends the git branch through the dock's channel; empty outside a repository, which deletes
-# the previous directory's branch. One `git` in the usual case, per prompt.
+# the previous directory's branch. One `git` in the usual case, per prompt. The environment
+# report rides after it (`__bateri_env_fields`).
 __bateri_branch() {
   local REPLY ref
   ref=$(command git rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -118,7 +119,43 @@ __bateri_branch() {
     ref=$(command git rev-parse --short HEAD 2>/dev/null)
   fi
   __bateri_b64 "$ref"
-  printf '\033]8133;b;%s\007' "$REPLY"
+  local branch=$REPLY
+  __bateri_env_fields
+  printf '\033]8133;b;%s%s\007' "$branch" "$__bateri_env_wire"
+}
+
+# The environment the dock's context row shows, as five more `8133;b` fields: `VIRTUAL_ENV`,
+# `VIRTUAL_ENV_PROMPT`, `CONDA_PREFIX`, `CONDA_PROMPT_MODIFIER` and the `node` this shell would
+# run, each base64, empty when unset — the zsh wrapper's report. The terminal reads the files
+# they name and runs nothing. The dock's PS1 is ours and rebuilt at every prompt, so the name
+# `activate` puts in front of it is lost there: the variables carry it.
+#
+# Encoded only when something changed (the encoder is a loop per three bytes). `node` is found
+# by walking `PATH` here, with no fork — a `$(type -P node)` per prompt would be one; a relative
+# entry gives a relative path, which the terminal does not read.
+__bateri_env_raw=
+__bateri_env_wire=
+__bateri_env_fields() {
+  local REPLY field out= node= dir rest=$PATH:
+  while [[ -n $rest ]]; do
+    dir=${rest%%:*}
+    rest=${rest#*:}
+    if [[ -f ${dir:-.}/node && -x ${dir:-.}/node ]]; then
+      node=${dir:-.}/node
+      break
+    fi
+  done
+  local raw=${VIRTUAL_ENV-}$'\x1f'${VIRTUAL_ENV_PROMPT-}$'\x1f'${CONDA_PREFIX-}$'\x1f'${CONDA_PROMPT_MODIFIER-}$'\x1f'$node
+  if [[ $raw == "$__bateri_env_raw" && -n $__bateri_env_wire ]]; then
+    return 0
+  fi
+  for field in "${VIRTUAL_ENV-}" "${VIRTUAL_ENV_PROMPT-}" "${CONDA_PREFIX-}" \
+    "${CONDA_PROMPT_MODIFIER-}" "$node"; do
+    __bateri_b64 "$field"
+    out+=";$REPLY"
+  done
+  __bateri_env_raw=$raw
+  __bateri_env_wire=$out
 }
 
 # Reports the working directory with OSC 7, per prompt.

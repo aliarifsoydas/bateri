@@ -3361,6 +3361,120 @@ mod tests {
         }
     }
 
+    fn with_environment(
+        mut context: DockContext,
+        python: &str,
+        version: &str,
+        node: &str,
+        wanted: &str,
+    ) -> DockContext {
+        context.environment = crate::shell::DockEnvironment {
+            python: python.into(),
+            python_version: version.into(),
+            node: node.into(),
+            node_wanted: wanted.into(),
+        };
+        context
+    }
+
+    /// The tone of the context row's cell at `col`.
+    fn tone_at(cells: &[Cell], col: u16) -> LinearRgba {
+        cells
+            .iter()
+            .find(|cell| cell.row == 1 && cell.col == col)
+            .map(|cell| cell.fg)
+            .expect("a cell")
+    }
+
+    #[test]
+    fn the_environment_heads_the_local_row_and_node_trails_the_branch() {
+        // Where `activate` puts it in a prompt: first, as it prints it, in the
+        // row's one foreground tone; its version a tone back.
+        let state = live("", "ls", "", 2);
+        let venv = with_environment(context("~/Projects/api", "main"), "(.venv)", "3.12", "", "");
+        let (cells, _) = draw_with(&state, &venv, COLS);
+        assert_eq!(row_text(&cells, 1), "(.venv) 3.12  ~/Projects/api | main");
+        assert_eq!(tone_at(&cells, 0), THEME.foreground_linear(), "the name");
+        assert_eq!(tone_at(&cells, 8), THEME.dim_linear(), "the version");
+
+        // The Node version after the branch, a tone back like it; its label quiet.
+        let node = with_environment(context("~/Projects/web", "feat/login"), "", "", "22.11", "");
+        let (cells, _) = draw_with(&state, &node, COLS);
+        let row = row_text(&cells, 1);
+        assert_eq!(row, "~/Projects/web | feat/login | node 22.11");
+        let at = |part: &str| u16::try_from(row.find(part).expect(part)).expect("a column");
+        assert_eq!(
+            tone_at(&cells, at("node")),
+            THEME.quiet_linear(),
+            "the label"
+        );
+        assert_eq!(tone_at(&cells, at("22")), THEME.dim_linear(), "the version");
+
+        // A version the project does not ask for is a warning, the asked one beside it.
+        let both = with_environment(
+            context("~/Projects/studio", "main"),
+            "(.venv)",
+            "3.12",
+            "18.20",
+            ".nvmrc 22",
+        );
+        let (cells, _) = draw_with(&state, &both, 80);
+        let row = row_text(&cells, 1);
+        assert_eq!(
+            row,
+            "(.venv) 3.12  ~/Projects/studio | main | node 18.20 (.nvmrc 22)"
+        );
+        let at = |part: &str| u16::try_from(row.find(part).expect(part)).expect("a column");
+        assert_eq!(tone_at(&cells, at("18")), THEME.warning_linear());
+        assert_eq!(tone_at(&cells, at(".nvmrc")), THEME.quiet_linear());
+
+        // Without a path or a branch the head stands alone, with no gap after it.
+        let alone = with_environment(DockContext::default(), "(ml)", "3.11", "", "");
+        let (cells, _) = draw_with(&state, &alone, COLS);
+        assert_eq!(row_text(&cells, 1), "(ml) 3.11");
+    }
+
+    #[test]
+    fn a_narrow_row_lets_the_environment_go_last() {
+        // The order the row gives way in: the path shortens to its last folder,
+        // the Node version drops, the Python version drops, the path shortens
+        // further and drops, the branch drops, and the environment's name goes
+        // last. Names and versions are never cut.
+        let state = live("", "ls", "", 2);
+        let both = with_environment(
+            context("~/Projects/studio", "main"),
+            "(.venv)",
+            "3.12",
+            "18.20",
+            ".nvmrc 22",
+        );
+        let full = "(.venv) 3.12  ~/Projects/studio | main | node 18.20 (.nvmrc 22)";
+        let width = u16::try_from(full.chars().count()).expect("a width");
+        let row = |cols: u16| row_text(&draw_with(&state, &both, cols).0, 1);
+        assert_eq!(row(width), full);
+        assert_eq!(
+            row(width - 1),
+            "(.venv) 3.12  …Projects/studio | main | node 18.20 (.nvmrc 22)"
+        );
+        // Down to the last folder, the Node version stays.
+        assert_eq!(
+            row(width - 9),
+            "(.venv) 3.12  …/studio | main | node 18.20 (.nvmrc 22)"
+        );
+        // One less and it drops; the path takes the room back.
+        assert_eq!(row(width - 10), "(.venv) 3.12  ~/Projects/studio | main");
+        assert_eq!(row(29), "(.venv) 3.12  …/studio | main");
+        // Then the Python version.
+        assert_eq!(row(28), "(.venv)  …ects/studio | main");
+        assert_eq!(row(20), "(.venv)  …dio | main");
+        assert_eq!(row(13), "(.venv)  main");
+        // The branch before the name.
+        assert_eq!(row(12), "(.venv)  …io");
+        assert_eq!(row(7), "(.venv)");
+        // The name last: then the row is today's.
+        assert_eq!(row(6), "main");
+    }
+
     #[test]
     fn a_missing_branch_takes_the_separator_with_it() {
         // In a directory that is not a repo only the path; a dangling separator
@@ -3393,6 +3507,13 @@ mod tests {
             program: None,
             program_mark: HostMark::None,
             ports: Vec::new(),
+            // So is the local environment: it is this Mac's shell's, not the server's.
+            environment: crate::shell::DockEnvironment {
+                python: "(.venv)".into(),
+                python_version: "3.12".into(),
+                node: "22.11".into(),
+                node_wanted: String::new(),
+            },
             footer_hover: None,
         }
     }

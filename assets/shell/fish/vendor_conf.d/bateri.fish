@@ -220,14 +220,47 @@ function __bateri_cwd
 end
 
 # Sends the git branch through the dock's channel; empty if it is not a
-# repository. A single `git` fork in the usual case, per prompt.
+# repository. A single `git` fork in the usual case, per prompt. The
+# environment report rides after it (`__bateri_env_fields`).
 function __bateri_branch
     set -l ref (command git rev-parse --abbrev-ref HEAD 2>/dev/null)
     # `HEAD` is the answer of a detached HEAD, not a branch name: the short SHA.
     if test "$ref" = HEAD
         set ref (command git rev-parse --short HEAD 2>/dev/null)
     end
-    printf '\e]8133;b;%s\a' (printf %s "$ref" | command base64 | string join '')
+    set -l branch (printf %s "$ref" | command base64 | string join '')
+    __bateri_env_fields
+    printf '\e]8133;b;%s%s\a' "$branch" "$__bateri_env_wire"
+end
+
+# The environment the dock's context row shows, as five more `8133;b` fields:
+# `VIRTUAL_ENV`, `VIRTUAL_ENV_PROMPT`, `CONDA_PREFIX`, `CONDA_PROMPT_MODIFIER`
+# and the `node` fish would run, each base64, empty when unset — the zsh
+# wrapper's report. The terminal reads the files they name and runs nothing;
+# the prompt fish draws is ours, so the name `activate.fish` puts in front of
+# the user's is not on screen.
+#
+# ENCODED ONLY WHEN SOMETHING CHANGED: each field is a `base64` fork, and the
+# values change only at an `activate`, a `conda activate` or a `nvm use`.
+# `command -s` is fish's own lookup, no fork. An empty field is an empty
+# element, not a missing one, so the fields keep their places.
+function __bateri_env_fields
+    set -l node (command -s node)
+    set -l fields "$VIRTUAL_ENV" "$VIRTUAL_ENV_PROMPT" "$CONDA_PREFIX" "$CONDA_PROMPT_MODIFIER" "$node"
+    set -l raw (string join \x1f -- $fields)
+    if set -q __bateri_env_wire; and test "$raw" = "$__bateri_env_raw"
+        return
+    end
+    set -l out
+    for field in $fields
+        if test -n "$field"
+            set -a out (printf %s "$field" | command base64 | string join '')
+        else
+            set -a out ''
+        end
+    end
+    set -g __bateri_env_raw "$raw"
+    set -g __bateri_env_wire (string join '' -- ';'$out)
 end
 
 # The `ssh` function, defined at the first prompt — after `config.fish` — so a

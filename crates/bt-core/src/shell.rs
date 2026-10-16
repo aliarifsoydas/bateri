@@ -725,6 +725,16 @@ pub struct DockContext {
     /// in the background keeps its port across prompts, and it goes only when
     /// its process stops listening.
     pub ports: Vec<FooterPort>,
+    /// The active Python environment and the Node version, as the local
+    /// form shows them (`(.venv) 3.12  ~/proj | main | node 22.11`); empty
+    /// strings for what is not active or not shown.
+    ///
+    /// Its writer is `bt-shell`'s resolver ([`crate::Session::set_environment`],
+    /// generation gated): the shell reports its variables with the branch
+    /// ([`ShellEnvironment`]) and the resolver reads the files they name. It
+    /// belongs to the prompt's directory and variables, not to a command:
+    /// it stays while a command runs and changes only with the next report.
+    pub environment: DockEnvironment,
     /// The context row's part under the mouse — the **one** hover slot of its
     /// controls: an upload button's fill darkens, Sign In…'s too. A field of
     /// its own, so the rows' refreshes (an upload's progress) do not write it.
@@ -1109,8 +1119,149 @@ impl Clone for DockContext {
         self.program.clone_from(&source.program);
         self.program_mark = source.program_mark;
         self.ports.clone_from(&source.ports);
+        self.environment.clone_from(&source.environment);
         self.footer_hover = source.footer_hover;
     }
+}
+
+/// What the shell says of its environment at a prompt — the fields of
+/// `8133;b` after the branch, as its variables hold them; an empty string for
+/// an unset one.
+///
+/// **Raw, and resolved elsewhere**: `bt-shell` reads the files these name
+/// ([`crate::Session::environment_request`]) and writes what the context row
+/// shows ([`DockEnvironment`]). This side reads no file and runs nothing:
+/// the report crosses the reader thread, and a `cd` into a slow mount must
+/// not stall the stream.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ShellEnvironment {
+    /// `VIRTUAL_ENV`: the active virtual environment's directory.
+    pub virtual_env: String,
+    /// `VIRTUAL_ENV_PROMPT`: the name the environment's `activate` puts in
+    /// front of the prompt.
+    pub virtual_env_prompt: String,
+    /// `CONDA_PREFIX`: the active conda environment's directory.
+    pub conda_prefix: String,
+    /// `CONDA_PROMPT_MODIFIER`: what conda puts in front of the prompt —
+    /// `(base) `, or empty when the user told conda not to (`changeps1`).
+    pub conda_prompt: String,
+    /// The `node` the shell would run here, as its own command lookup finds
+    /// it; empty when there is none.
+    pub node: String,
+}
+
+impl ShellEnvironment {
+    /// The report's fields in wire order.
+    fn fields(&self) -> [&String; 5] {
+        [
+            &self.virtual_env,
+            &self.virtual_env_prompt,
+            &self.conda_prefix,
+            &self.conda_prompt,
+            &self.node,
+        ]
+    }
+
+    /// The report's fields in wire order, for the decoder.
+    fn fields_mut(&mut self) -> [&mut String; 5] {
+        [
+            &mut self.virtual_env,
+            &mut self.virtual_env_prompt,
+            &mut self.conda_prefix,
+            &mut self.conda_prompt,
+            &mut self.node,
+        ]
+    }
+}
+
+impl Clone for ShellEnvironment {
+    fn clone(&self) -> Self {
+        let mut fresh = Self::default();
+        fresh.clone_from(self);
+        fresh
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        for (field, from) in self.fields_mut().into_iter().zip(source.fields()) {
+            field.clear();
+            field.push_str(from);
+        }
+    }
+}
+
+/// The active environment as the context row shows it
+/// ([`DockContext::environment`]): `(.venv) 3.12` at the head of the local
+/// form, `node 22.11` after the branch.
+///
+/// **Text, already decided** ([`ProgramBar`]'s contract): `bt-shell` resolves
+/// the shell's report ([`ShellEnvironment`]) against the files and writes
+/// these strings; this side only lays them out (`dock::render_context`) —
+/// which part drops first on a narrow row is the drawing's rule.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DockEnvironment {
+    /// The active Python environments as their tools put them in front of
+    /// the prompt — `(.venv)`, `(ml)`, `(.venv) (base)`; empty for none.
+    /// Never shortened: a cut name reads as another environment.
+    pub python: String,
+    /// The version of the Python that runs, `3.12`; empty when unknown.
+    pub python_version: String,
+    /// The version of the `node` that runs here, `22.11`; empty outside a
+    /// Node project, or when it cannot be read without running it.
+    pub node: String,
+    /// What the project asks for when [`Self::node`] does not satisfy it —
+    /// `.nvmrc 22`; empty otherwise. Its presence is the warning.
+    pub node_wanted: String,
+}
+
+impl DockEnvironment {
+    /// Whether any of it shows.
+    pub fn is_empty(&self) -> bool {
+        self.python.is_empty() && self.node.is_empty()
+    }
+
+    fn fields(&self) -> [&String; 4] {
+        [
+            &self.python,
+            &self.python_version,
+            &self.node,
+            &self.node_wanted,
+        ]
+    }
+}
+
+impl Clone for DockEnvironment {
+    fn clone(&self) -> Self {
+        let mut fresh = Self::default();
+        fresh.clone_from(self);
+        fresh
+    }
+
+    // The frame path copies the context once per frame: capacities stay.
+    fn clone_from(&mut self, source: &Self) {
+        for (field, from) in [
+            &mut self.python,
+            &mut self.python_version,
+            &mut self.node,
+            &mut self.node_wanted,
+        ]
+        .into_iter()
+        .zip(source.fields())
+        {
+            field.clear();
+            field.push_str(from);
+        }
+    }
+}
+
+/// What the environment's resolver works from
+/// ([`crate::Session::environment_request`]): the shell's last report, the
+/// directory it was made in and its generation, which the answer carries
+/// back ([`crate::Session::set_environment`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnvironmentRequest {
+    pub generation: u64,
+    pub cwd: String,
+    pub reported: ShellEnvironment,
 }
 
 impl DockContext {
@@ -2272,6 +2423,12 @@ pub(crate) struct ShellLog {
     /// The notifications programs asked for, until the host takes them
     /// ([`crate::Session::take_notifications`]).
     pub(crate) notes: Pending,
+    /// The shell's last environment report ([`ShellEnvironment`]), the
+    /// directory it was made in and how many times the pair changed — the
+    /// resolver's input ([`Self::environment_request`]) and the gate its
+    /// answer passes ([`Self::set_environment`]). Outside the context: the
+    /// frame path draws the answer, never the report.
+    environment: EnvironmentRequest,
 }
 
 /// How many commands ended, by code: `ok` with `0`, `failed` with any other;
@@ -2550,7 +2707,50 @@ impl ShellLog {
             ends: Ends::default(),
             program: ProgramStatus::default(),
             notes: Pending::default(),
+            environment: EnvironmentRequest::default(),
         }
+    }
+
+    /// What the environment's resolver works from: the last report, its
+    /// directory and their generation (`0`: no report yet).
+    pub(crate) fn environment_request(&self) -> EnvironmentRequest {
+        self.environment.clone()
+    }
+
+    /// Writes the resolver's answer for `generation` ([`DockContext::environment`]);
+    /// `true` if what the row shows changed. An answer for an older report
+    /// is dropped — the shell moved on (another `cd`, a `deactivate`) while
+    /// the files were read, and the next answer is already on its way. A
+    /// string with a control character drops the answer whole,
+    /// [`Self::set_program`]'s rule: the names come from the shell's
+    /// variables and a line break or ESC would be drawn as a box.
+    pub(crate) fn set_environment(&mut self, generation: u64, shown: &DockEnvironment) -> bool {
+        if generation != self.environment.generation
+            || shown
+                .fields()
+                .iter()
+                .any(|text| text.chars().any(char::is_control))
+        {
+            return false;
+        }
+        if self.context.environment == *shown {
+            return false;
+        }
+        self.context.environment.clone_from(shown);
+        true
+    }
+
+    /// The `b` report: a new generation when it or the directory it was made
+    /// in differs from the last — a prompt repeating both costs nothing.
+    fn note_environment(&mut self, reported: &ShellEnvironment) {
+        let request = &mut self.environment;
+        if request.reported == *reported && request.cwd == self.context.cwd {
+            return;
+        }
+        request.reported.clone_from(reported);
+        request.cwd.clear();
+        request.cwd.push_str(&self.context.cwd);
+        request.generation += 1;
     }
 
     /// Moves the ledger's ceiling when `scrollback` changes at save time; does not
@@ -2792,7 +2992,11 @@ impl ShellLog {
             // commands to the remote shell. The defense is here, not in a script's
             // care. Our `D` clears the remote state, so the next local 8133 applies.
             ScanEvent::Dock(_) if self.context.remote.is_some() => {}
-            ScanEvent::Dock(event) => outcome.mirrored = self.apply_dock(event, answers),
+            ScanEvent::Dock(event) => {
+                let generation = self.environment.generation;
+                outcome.mirrored = self.apply_dock(event, answers);
+                outcome.environment = self.environment.generation != generation;
+            }
             // The directory arrives **resolved**: the scanner did the scheme, the path and
             // the percent-decoding, and only a drawable path and whether the authority is
             // local reach here. A rejected OSC 7 produces no event at all, so the old path
@@ -3100,9 +3304,13 @@ impl ShellLog {
             // it does not touch `status` or the text. An empty body means "not a repository"
             // and **deletes** the branch — if the previous repository's branch hung on in the
             // new directory the user would think they were on the wrong branch.
-            DockEvent::Branch(branch) => {
+            DockEvent::Branch {
+                branch,
+                environment,
+            } => {
                 self.context.branch.clear();
                 self.context.branch.push_str(branch);
+                self.note_environment(environment);
             }
             DockEvent::Editable => {
                 self.dock_editable = true;
@@ -4092,6 +4300,9 @@ pub(crate) struct ScanOutcome {
     pub(crate) status: bool,
     /// A program asked for a notification → [`crate::Wake::notification`].
     pub(crate) notified: bool,
+    /// The shell's environment report or the directory it was made in
+    /// changed → [`crate::Wake::environment_changed`].
+    pub(crate) environment: bool,
 }
 
 /// The event the scanner hands out.
@@ -4163,8 +4374,12 @@ pub(crate) enum DockEvent<'a> {
     Unavailable(DockFault),
     /// The git branch; an empty body means "not a repository". It comes from the
     /// mirror's channel (`precmd` prints it) but does not touch the mirror's
-    /// **state**.
-    Branch(&'a str),
+    /// **state**. The shell's environment report rides with it
+    /// ([`ShellEnvironment`]; all empty from a script that predates it).
+    Branch {
+        branch: &'a str,
+        environment: &'a ShellEnvironment,
+    },
     /// The editing widget is bound at this prompt (`line-init`); does not touch
     /// the mirror's state ([`ShellLog::dock_editable`]).
     Editable,
@@ -4209,6 +4424,8 @@ pub(crate) struct Scanner {
     path: String,
     /// The decoded branch — the buffer [`DockEvent::Branch`] lends.
     branch: String,
+    /// The decoded environment report — the buffer [`DockEvent::Branch`] lends.
+    environment: ShellEnvironment,
     /// The collected OSC number and whether any digit was seen.
     number: u32,
     has_digit: bool,
@@ -4248,6 +4465,7 @@ impl Scanner {
             line: DockState::default(),
             path: String::new(),
             branch: String::new(),
+            environment: ShellEnvironment::default(),
             number: 0,
             has_digit: false,
             screen_clears: 0,
@@ -4403,6 +4621,7 @@ impl Scanner {
                         &mut self.decoded,
                         &mut self.line,
                         &mut self.branch,
+                        &mut self.environment,
                     );
                     self.close(byte);
                     let event = match outcome {
@@ -4411,7 +4630,10 @@ impl Scanner {
                         DockOutcome::Unavailable(fault) => {
                             ScanEvent::Dock(DockEvent::Unavailable(fault))
                         }
-                        DockOutcome::Branch => ScanEvent::Dock(DockEvent::Branch(&self.branch)),
+                        DockOutcome::Branch => ScanEvent::Dock(DockEvent::Branch {
+                            branch: &self.branch,
+                            environment: &self.environment,
+                        }),
                         DockOutcome::Editable => ScanEvent::Dock(DockEvent::Editable),
                         DockOutcome::Grid => ScanEvent::Dock(DockEvent::Grid),
                         DockOutcome::Setup(Some(fault)) => ScanEvent::RemoteSetup(fault),
@@ -4835,7 +5057,7 @@ enum DockOutcome {
 /// ESC ] 8133 ; u ; {CURSOR} ; {PREDISPLAY} ; {BUFFER} ; {POSTDISPLAY} ; {region_highlight} BEL
 /// ESC ] 8133 ; e BEL
 /// ESC ] 8133 ; o BEL
-/// ESC ] 8133 ; b ; {branch} BEL
+/// ESC ] 8133 ; b ; {branch} ; {VIRTUAL_ENV} ; {VIRTUAL_ENV_PROMPT} ; {CONDA_PREFIX} ; {CONDA_PROMPT_MODIFIER} ; {node} BEL
 /// ESC ] 8133 ; w BEL
 /// ESC ] 8133 ; f ; {code} BEL
 /// ESC ] 8133 ; i ; up ; {nonce} BEL
@@ -4862,6 +5084,15 @@ enum DockOutcome {
 /// same reason as [`parse_mark`] tolerating unknown key-values: a future special
 /// mode signal should be addable without reopening this parser.
 ///
+/// **The environment report rides on `b`** ([`ShellEnvironment`]): the five
+/// fields after the branch, each base64, an empty one for an unset variable.
+/// It arrives with the branch because it changes at the same edges (a
+/// command finishing: `cd`, `activate`, `nvm use`), and on `b` because the
+/// rule above makes it free both ways: a binary that predates it ignores the
+/// fields, and a script that predates it sends none — the report is then
+/// empty, which is "nothing active". A field that does not decode empties
+/// that field alone, the branch's rule.
+///
 /// **Why base64:** the bodies are text the user typed, so they can contain `;`,
 /// `ESC` and C0 bytes — all three break the sequence's framing. base64's alphabet
 /// has none of the three, so the framing rules (the three points above) never
@@ -4877,6 +5108,7 @@ fn parse_dock(
     decoded: &mut Vec<u8>,
     line: &mut DockState,
     branch: &mut String,
+    environment: &mut ShellEnvironment,
 ) -> DockOutcome {
     let mut fields = payload.split(|&b| b == b';');
     let Some(op) = fields.next() else {
@@ -4895,13 +5127,15 @@ fn parse_dock(
         // `b` sequence dropped the input line from the dock and sent it back to the grid
         // (found in review).
         b"b" => {
-            branch.clear();
-            if let Some(field) = fields.next() {
-                decoded.clear();
-                if decode_base64(field, decoded).is_some()
-                    && let Ok(text) = std::str::from_utf8(decoded)
-                {
-                    branch.push_str(text);
+            for slot in std::iter::once(branch).chain(environment.fields_mut()) {
+                slot.clear();
+                if let Some(field) = fields.next() {
+                    decoded.clear();
+                    if decode_base64(field, decoded).is_some()
+                        && let Ok(text) = std::str::from_utf8(decoded)
+                    {
+                        slot.push_str(text);
+                    }
                 }
             }
             DockOutcome::Branch
@@ -5323,8 +5557,13 @@ const STATE_HEADER: &str = "bateri-state";
 ///
 /// Version 4: the grid source's flag ([`ShellLog::dock_grid`]) and the
 /// shell's click announcement ([`ShellLog::click_events`]) cross, so a fish
-/// prompt on screen across an update keeps its dock and its clicks; a version
-/// 3 blob reads as "no grid source".
+/// prompt on screen across an update keeps its dock and its clicks.
+///
+/// Version 5: the context row's active environment crosses — what it shows
+/// ([`DockContext::environment`]) and the report it was resolved from
+/// ([`ShellLog::environment_request`]) —, so `(.venv) 3.12` stays on the row
+/// across an update instead of waiting for the next prompt; a version 4 blob
+/// reads as "nothing active".
 ///
 /// **Only forward once released.** A bateri rolled back to the version
 /// before reads this one as unknown (the reader is strict,
@@ -5332,12 +5571,12 @@ const STATE_HEADER: &str = "bateri-state";
 /// restore path brings its layout back, not its program — and a held pane
 /// takes a fresh shell state ([`crate::AdoptMode`]). A released bump is
 /// therefore never undone, a mistake in it is fixed by the next version.
-const STATE_VERSION: u32 = 4;
+const STATE_VERSION: u32 = 5;
 
-/// The first version that carries the grid source's flag
-/// ([`ShellLog::dock_grid`]). Once [`STATE_OLDEST`] reaches it, the branch
-/// that reads an older blob as "no grid source" is dead and goes.
-const STATE_GRID: u32 = 4;
+/// The first version that carries the active environment
+/// ([`DockContext::environment`]). Once [`STATE_OLDEST`] reaches it, the
+/// branch that reads an older blob as "nothing active" is dead and goes.
+const STATE_ENVIRONMENT: u32 = 5;
 
 /// The oldest version the reader still takes: the current one and the one
 /// before it.
@@ -5518,6 +5757,12 @@ pub(crate) struct Carried {
     remote_shell: Option<RemoteShell>,
     cwd: String,
     branch: String,
+    /// What the row shows of the active environment, and the report and
+    /// directory it was resolved from: the next prompt's same report is then
+    /// no edge, and a setting's change resolves it again.
+    environment: DockEnvironment,
+    reported: ShellEnvironment,
+    reported_cwd: String,
     remote_cwd: String,
     remote_setup: Option<RemoteSetupFault>,
     /// The reconnect offer's host and line; its mark is resolved again.
@@ -5585,6 +5830,21 @@ impl Carried {
             ),
             format!("cwd {}", render_text(Some(&self.cwd))),
             format!("branch {}", render_text(Some(&self.branch))),
+            format!(
+                "environment {}",
+                self.environment
+                    .fields()
+                    .map(|text| render_text(Some(text)))
+                    .join(" ")
+            ),
+            format!(
+                "environment-report {} {}",
+                render_text(Some(&self.reported_cwd)),
+                self.reported
+                    .fields()
+                    .map(|text| render_text(Some(text)))
+                    .join(" ")
+            ),
             format!("remote-cwd {}", render_text(Some(&self.remote_cwd))),
             format!(
                 "remote-setup {}",
@@ -5733,6 +5993,39 @@ impl Carried {
         };
         let cwd = text_of(take("cwd")?)?;
         let branch = text_of(take("branch")?)?;
+        let (environment, reported, reported_cwd) = if version >= STATE_ENVIRONMENT {
+            let texts = |values: Vec<&str>| -> Option<Vec<String>> {
+                values.iter().map(|value| parse_text(value)?).collect()
+            };
+            let [python, python_version, node, node_wanted]: [String; 4] =
+                texts(take("environment")?)?.try_into().ok()?;
+            let [
+                reported_cwd,
+                virtual_env,
+                virtual_env_prompt,
+                conda_prefix,
+                conda_prompt,
+                node_path,
+            ]: [String; 6] = texts(take("environment-report")?)?.try_into().ok()?;
+            (
+                DockEnvironment {
+                    python,
+                    python_version,
+                    node,
+                    node_wanted,
+                },
+                ShellEnvironment {
+                    virtual_env,
+                    virtual_env_prompt,
+                    conda_prefix,
+                    conda_prompt,
+                    node: node_path,
+                },
+                reported_cwd,
+            )
+        } else {
+            Default::default()
+        };
         let remote_cwd = text_of(take("remote-cwd")?)?;
         let remote_setup = match one(take("remote-setup")?)?.as_str() {
             "-" => None,
@@ -5785,11 +6078,7 @@ impl Carried {
         };
         let dock_fresh = flag(take("dock-fresh")?)?;
         let dock_editable = flag(take("editable")?)?;
-        let (dock_grid, click_events) = if version >= STATE_GRID {
-            (flag(take("dock-grid")?)?, flag(take("click-events")?)?)
-        } else {
-            (false, false)
-        };
+        let (dock_grid, click_events) = (flag(take("dock-grid")?)?, flag(take("click-events")?)?);
         let command = one(take("command")?)?.parse().ok()?;
         let login = number(take("login")?)?;
         let remote_up = match take("remote-up")?.as_slice() {
@@ -5813,6 +6102,9 @@ impl Carried {
             remote_shell,
             cwd,
             branch,
+            environment,
+            reported,
+            reported_cwd,
             remote_cwd,
             remote_setup,
             reconnect,
@@ -5842,6 +6134,9 @@ impl ShellLog {
             remote_shell: self.remote_shell,
             cwd: self.context.cwd.clone(),
             branch: self.context.branch.clone(),
+            environment: self.context.environment.clone(),
+            reported: self.environment.reported.clone(),
+            reported_cwd: self.environment.cwd.clone(),
             remote_cwd: self.context.remote_cwd.clone(),
             remote_setup: self.context.remote_setup,
             reconnect: self
@@ -5877,6 +6172,16 @@ impl ShellLog {
         self.remote_shell = carried.remote_shell;
         self.context.cwd = carried.cwd;
         self.context.branch = carried.branch;
+        self.context.environment = carried.environment;
+        // A report of its own generation, so the answer that came with it and
+        // a setting's change resolve against it; an empty one stays "no report".
+        let reported =
+            carried.reported != ShellEnvironment::default() || !carried.reported_cwd.is_empty();
+        self.environment = EnvironmentRequest {
+            generation: u64::from(reported),
+            cwd: carried.reported_cwd,
+            reported: carried.reported,
+        };
         self.context.remote_cwd = carried.remote_cwd;
         self.context.remote_setup = carried.remote_setup;
         self.context.reconnect = carried.reconnect.map(|(host, line)| Reconnect {
@@ -6772,7 +7077,7 @@ mod tests {
                         DockEvent::Update(line) => DockSnapshot::Update(line.clone()),
                         DockEvent::End => DockSnapshot::End,
                         DockEvent::Unavailable(fault) => DockSnapshot::Unavailable(fault),
-                        DockEvent::Branch(branch) => DockSnapshot::Branch(branch.to_owned()),
+                        DockEvent::Branch { branch, .. } => DockSnapshot::Branch(branch.to_owned()),
                         DockEvent::Editable => DockSnapshot::Editable,
                         DockEvent::Grid => DockSnapshot::Grid,
                     });
@@ -7106,6 +7411,171 @@ mod tests {
         scanner.feed(b"\x1b]8133;b;\x07", |event| log.apply_scan(event));
         assert_eq!(log.context.branch, "");
         assert_eq!(log.dock.status, DockStatus::Live);
+    }
+
+    /// The `b` sequence with the environment report after the branch, each
+    /// field base64 like the scripts print it.
+    fn branch_with(branch: &str, fields: [&str; 5]) -> Vec<u8> {
+        let mut out = format!("\x1b]8133;b;{}", b64(branch.as_bytes()));
+        for field in fields {
+            out.push(';');
+            out.push_str(&b64(field.as_bytes()));
+        }
+        out.push('\x07');
+        out.into_bytes()
+    }
+
+    #[test]
+    fn the_branch_op_carries_the_environment_report() {
+        let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
+        let mut scanner = Scanner::new();
+        scanner.feed(b"\x1b]7;file:///Users/me/api\x07", |event| {
+            log.apply_scan(event);
+        });
+        let bytes = branch_with(
+            "main",
+            [
+                "/Users/me/api/.venv",
+                ".venv",
+                "/Users/me/miniconda3",
+                "(base) ",
+                "/Users/me/.nvm/versions/node/v22.11.0/bin/node",
+            ],
+        );
+        let mut outcome = ScanOutcome::default();
+        scanner.feed(&bytes, |event| outcome = log.apply_scan_answering(event, 0));
+        assert!(outcome.environment, "a new report is an edge");
+        assert_eq!(log.context.branch, "main");
+        let request = log.environment_request();
+        assert_eq!(request.generation, 1);
+        assert_eq!(request.cwd, "/Users/me/api");
+        assert_eq!(
+            request.reported,
+            ShellEnvironment {
+                virtual_env: "/Users/me/api/.venv".into(),
+                virtual_env_prompt: ".venv".into(),
+                conda_prefix: "/Users/me/miniconda3".into(),
+                conda_prompt: "(base) ".into(),
+                node: "/Users/me/.nvm/versions/node/v22.11.0/bin/node".into(),
+            }
+        );
+
+        // The same report from the same directory — every ordinary prompt —
+        // is not an edge: nothing is posted, nothing is read again.
+        scanner.feed(&bytes, |event| outcome = log.apply_scan_answering(event, 0));
+        assert!(!outcome.environment, "a repeated report is an edge");
+        assert_eq!(log.environment_request().generation, 1);
+
+        // The same report from another directory is: the Node project is the
+        // directory's question.
+        scanner.feed(b"\x1b]7;file:///Users/me\x07", |event| {
+            log.apply_scan(event);
+        });
+        scanner.feed(&bytes, |event| outcome = log.apply_scan_answering(event, 0));
+        assert!(outcome.environment);
+        assert_eq!(log.environment_request().generation, 2);
+        assert_eq!(log.environment_request().cwd, "/Users/me");
+    }
+
+    #[test]
+    fn the_previous_branch_op_reports_no_environment() {
+        // A shell still running the previous script sends the branch alone:
+        // the report is empty — nothing active — and the branch reads as before.
+        let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
+        let mut scanner = Scanner::new();
+        scanner.feed(
+            &branch_with("main", ["/v", "v", "", "", "/bin/node"]),
+            |event| log.apply_scan(event),
+        );
+        scanner.feed(
+            format!("\x1b]8133;b;{}\x07", b64(b"main")).as_bytes(),
+            |event| log.apply_scan(event),
+        );
+        assert_eq!(log.context.branch, "main");
+        assert_eq!(
+            log.environment_request().reported,
+            ShellEnvironment::default()
+        );
+
+        // A field that does not decode empties that field alone.
+        scanner.feed(
+            format!(
+                "\x1b]8133;b;{};{};!!!!\x07",
+                b64(b"main"),
+                b64(b"/Users/me/api/.venv")
+            )
+            .as_bytes(),
+            |event| log.apply_scan(event),
+        );
+        let reported = log.environment_request().reported;
+        assert_eq!(reported.virtual_env, "/Users/me/api/.venv");
+        assert_eq!(reported.virtual_env_prompt, "");
+        assert_eq!(log.context.branch, "main");
+    }
+
+    #[test]
+    fn an_environment_answer_is_for_its_own_report() {
+        let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
+        let mut scanner = Scanner::new();
+        let shown = DockEnvironment {
+            python: "(.venv)".into(),
+            python_version: "3.12".into(),
+            node: String::new(),
+            node_wanted: String::new(),
+        };
+        // No report yet: generation 0 is the only one an answer can name.
+        scanner.feed(
+            &branch_with("main", ["/a/.venv", "", "", "", ""]),
+            |event| {
+                log.apply_scan(event);
+            },
+        );
+        assert!(!log.set_environment(0, &shown), "a stale answer was taken");
+        assert!(log.set_environment(1, &shown));
+        assert_eq!(log.context.environment, shown);
+        assert!(
+            !log.set_environment(1, &shown),
+            "the same answer is no change"
+        );
+
+        // A control character drops the answer whole: the strings come from
+        // the shell's variables.
+        let broken = DockEnvironment {
+            python: "(.ve\x1bnv)".into(),
+            ..shown.clone()
+        };
+        assert!(!log.set_environment(1, &broken));
+        assert_eq!(log.context.environment, shown);
+
+        // The answer stays while a command runs: it is the prompt's, not the
+        // command's.
+        scanner.feed(b"\x1b]133;C\x07\x1b]133;D;0\x07", |event| {
+            log.apply_scan(event);
+        });
+        assert_eq!(log.context.environment, shown);
+    }
+
+    #[test]
+    fn a_remote_shells_environment_report_is_ignored() {
+        // Behind ssh the only `b` that can arrive is the server's: its paths
+        // name the server's files, not this Mac's.
+        let mut log = ShellLog::new(BLOCK_LOG_FLOOR);
+        let mut scanner = Scanner::new();
+        scanner.feed(
+            &branch_with("main", ["", "", "", "", "/bin/node"]),
+            |event| {
+                log.apply_scan(event);
+            },
+        );
+        log.set_remote(Some(&RemoteTarget::ssh("prod")));
+        let mut outcome = ScanOutcome::default();
+        scanner.feed(
+            &branch_with("dev", ["/srv/.venv", "srv", "", "", ""]),
+            |event| outcome = log.apply_scan_answering(event, 0),
+        );
+        assert!(!outcome.environment);
+        assert_eq!(log.environment_request().reported.node, "/bin/node");
+        assert_eq!(log.environment_request().reported.virtual_env, "");
     }
 
     /// **A fast command produces no handover** — the hold's core claim.
@@ -8226,6 +8696,54 @@ mod tests {
             "the branch stayed empty inside the repository: {:?}",
             log.context.branch
         );
+    }
+
+    #[test]
+    fn the_script_reports_the_environment_after_the_branch() {
+        // The variables as `activate`, conda and a `PATH` with node leave them;
+        // `-f` keeps the user's files out. A `;` in a value would be a field of
+        // its own without the encoding.
+        let bin = std::env::temp_dir().join(format!("bateri-env-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&bin).expect("bin");
+        let node = bin.join("node");
+        std::fs::write(&node, "#!/bin/sh\n").expect("node");
+        std::fs::set_permissions(&node, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let body = "source $ZDOTDIR/bateri.zsh; cd -q -- /; __bateri_branch_print; \
+                    __bateri_branch_print; unset VIRTUAL_ENV; __bateri_branch_print";
+        let bytes = run_script(
+            body,
+            &[
+                ("PATH", &path),
+                ("VIRTUAL_ENV", "/Users/me/a;b/.venv"),
+                ("VIRTUAL_ENV_PROMPT", "(.venv) "),
+                ("CONDA_PREFIX", "/Users/me/miniconda3"),
+                ("CONDA_PROMPT_MODIFIER", "(base) "),
+            ],
+        );
+        let mut scanner = Scanner::new();
+        let mut reports = Vec::new();
+        scanner.feed(&bytes, |event| {
+            if let ScanEvent::Dock(DockEvent::Branch { environment, .. }) = event {
+                reports.push(environment.clone());
+            }
+        });
+        let _ = std::fs::remove_dir_all(&bin);
+        let first = ShellEnvironment {
+            virtual_env: "/Users/me/a;b/.venv".into(),
+            virtual_env_prompt: "(.venv) ".into(),
+            conda_prefix: "/Users/me/miniconda3".into(),
+            conda_prompt: "(base) ".into(),
+            node: node.to_string_lossy().into_owned(),
+        };
+        // The repeated prompt sends the same report from its saved encoding,
+        // and a `deactivate` is seen at the next one.
+        let deactivated = ShellEnvironment {
+            virtual_env: String::new(),
+            ..first.clone()
+        };
+        assert_eq!(reports, [first.clone(), first, deactivated]);
     }
 
     #[test]
@@ -11102,6 +11620,23 @@ mod tests {
         });
         log.context.cwd = "/Users/me/My Drive\\x".to_owned();
         log.context.branch = "feat/ş".to_owned();
+        log.environment = EnvironmentRequest {
+            generation: 4,
+            cwd: "/Users/me/My Drive\\x".to_owned(),
+            reported: ShellEnvironment {
+                virtual_env: "/Users/me/My Drive\\x/.venv".to_owned(),
+                virtual_env_prompt: "(my env) ".to_owned(),
+                conda_prefix: String::new(),
+                conda_prompt: "(base) ".to_owned(),
+                node: String::new(),
+            },
+        };
+        log.context.environment = DockEnvironment {
+            python: "(my env) (base)".to_owned(),
+            python_version: "3.12".to_owned(),
+            node: String::new(),
+            node_wanted: String::new(),
+        };
         log.context.remote_cwd = "/srv/app".to_owned();
         log.context.remote_setup = Some(RemoteSetupFault::Decode);
         log.context.reconnect = Some(Reconnect {
@@ -11204,6 +11739,9 @@ mod tests {
         assert_eq!(fresh.remote_shell, log.remote_shell);
         assert_eq!(fresh.context.cwd, log.context.cwd);
         assert_eq!(fresh.context.branch, log.context.branch);
+        assert_eq!(fresh.context.environment, log.context.environment);
+        assert_eq!(fresh.environment.reported, log.environment.reported);
+        assert_eq!(fresh.environment.cwd, log.environment.cwd);
         // The mark comes from this session's rules, not the blob.
         assert_eq!(
             fresh.context.reconnect.as_ref().map(|offer| offer.mark),
@@ -11360,7 +11898,7 @@ mod tests {
                     "mirror".to_owned()
                 }
                 ScanEvent::Dock(DockEvent::End) => "end".to_owned(),
-                ScanEvent::Dock(DockEvent::Branch(branch)) => format!("branch {branch}"),
+                ScanEvent::Dock(DockEvent::Branch { branch, .. }) => format!("branch {branch}"),
                 ScanEvent::Dock(DockEvent::Editable) => "editable".to_owned(),
                 ScanEvent::Dock(DockEvent::Grid) => "grid".to_owned(),
                 ScanEvent::Dock(DockEvent::Unavailable(fault)) => format!("fault {fault:?}"),
@@ -11405,102 +11943,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_3_fixture_still_reads_and_is_written_as_version_4() {
-        // Written by version 3 — the one before the current: every entry ends in its
-        // block's start, in Unix seconds, `0` when unknown. Here local
-        // block 8, an `ssh` started at 2026-10-04T10:00:00Z, runs the
-        // remote shell; the local block before it finished two minutes
-        // earlier, the remote ones started 10 and 40 seconds into the
-        // session.
-        let fixture = "bateri-state 3\n\
-                       local running 0 1791108000000 6 0/120/1791107880,-/0/0,p/1791108000\n\
-                       remote running 3 1791108040000 1 3/40/1791108010,p/1791108040\n\
-                       remote-shell 8.4242\n\
-                       cwd +/tmp\n\
-                       branch +\n\
-                       remote-cwd +\n\
-                       remote-setup -\n\
-                       reconnect -\n\
-                       dock idle 0 0 - 1\n\
-                       predisplay +\n\
-                       buffer +\n\
-                       postdisplay +\n\
-                       prebuffer +\n\
-                       dock-fresh 0\n\
-                       editable 1\n\
-                       command 8\n\
-                       login -\n\
-                       remote-up -\n\
-                       typed -\n\
-                       ours 1\n\
-                       command-open 1\n\
-                       cleared -\n\
-                       end\n";
-        let carried = Carried::decode(fixture.as_bytes()).unwrap();
-        assert_eq!(
-            carried.local.entries,
-            [
-                Outcome::Finished {
-                    exit: Some(0),
-                    elapsed_ms: 120,
-                    started: 1_791_107_880
-                },
-                Outcome::Finished {
-                    exit: None,
-                    elapsed_ms: 0,
-                    started: 0
-                },
-                Outcome::Pending {
-                    started: 1_791_108_000
-                }
-            ]
-        );
-        assert_eq!(
-            carried.remote.entries,
-            [
-                Outcome::Finished {
-                    exit: Some(3),
-                    elapsed_ms: 40,
-                    started: 1_791_108_010
-                },
-                Outcome::Pending {
-                    started: 1_791_108_040
-                }
-            ]
-        );
-        assert_eq!(carried.remote.running_since_ms, Some(1_791_108_040_000));
-        // A version 3 blob has no grid source; written again it is version 4's
-        // — the same fields and the flag after `editable`.
-        assert!(!carried.dock_grid);
-        let again = String::from_utf8(carried.encode()).unwrap();
-        assert_eq!(
-            again,
-            fixture
-                .replace("bateri-state 3\n", "bateri-state 4\n")
-                .replace("editable 1\n", "editable 1\ndock-grid 0\nclick-events 0\n")
-        );
-        // The starts reach the ledgers.
-        let mut fresh = ShellLog::new(100);
-        fresh.restore(carried, 0);
-        assert_eq!(
-            fresh.local.blocks.get(8),
-            Some(Outcome::Pending {
-                started: 1_791_108_000
-            })
-        );
-        assert_eq!(
-            fresh.remote.blocks.get(1),
-            Some(Outcome::Finished {
-                exit: Some(3),
-                elapsed_ms: 40,
-                started: 1_791_108_010
-            })
-        );
-    }
-
-    #[test]
-    fn the_version_4_fixture_reads_and_writes_byte_for_byte() {
-        // Written by version 4 — the current one: the grid source's flag and
+    fn the_version_4_fixture_still_reads_and_is_written_as_version_5() {
+        // Written by version 4 — the one before the current: the grid source's flag and
         // the click announcement follow `editable`, and a highlight's flags may carry `i` (italic),
         // which only a grid-sourced line sets.
         let fixture = "bateri-state 4\n\
@@ -11532,7 +11976,18 @@ mod tests {
                        end\n";
         let carried = Carried::decode(fixture.as_bytes()).unwrap();
         assert!(carried.dock_grid && carried.click_events && !carried.dock_editable);
-        assert_eq!(carried.encode(), fixture.as_bytes());
+        // A version 4 blob has no environment; written again it is version 5's — the
+        // same fields and the environment's two lines after `branch`.
+        assert_eq!(carried.environment, DockEnvironment::default());
+        assert_eq!(
+            String::from_utf8(carried.encode()).unwrap(),
+            fixture
+                .replace("bateri-state 4\n", "bateri-state 5\n")
+                .replace(
+                    "branch +\n",
+                    "branch +\nenvironment + + + +\nenvironment-report + + + + + +\n"
+                )
+        );
         // It lands in the ledger, and an `A` clears it as it does the editing word.
         let mut fresh = ShellLog::new(100);
         fresh.restore(carried, 0);
@@ -11543,6 +11998,77 @@ mod tests {
             click_events: false,
         });
         assert!(!fresh.dock_grid && !fresh.click_events);
+    }
+
+    #[test]
+    fn the_version_5_fixture_reads_and_writes_byte_for_byte() {
+        // Written by version 5 — the current one: the row's environment and the report
+        // it was resolved from follow `branch`.
+        let fixture = "bateri-state 5\n\
+                       local - - - 0 -\n\
+                       remote - - - 0 -\n\
+                       remote-shell -\n\
+                       cwd +/Users/me/api\n\
+                       branch +main\n\
+                       environment +(.venv) +3.12 +22.11 +.nvmrc\\s22\n\
+                       environment-report +/Users/me/api +/Users/me/api/.venv +.venv + + \
+                       +/Users/me/.nvm/versions/node/v22.11.0/bin/node\n\
+                       remote-cwd +\n\
+                       remote-setup -\n\
+                       reconnect -\n\
+                       dock idle 0 0 - 1\n\
+                       predisplay +\n\
+                       buffer +\n\
+                       postdisplay +\n\
+                       prebuffer +\n\
+                       dock-fresh 0\n\
+                       editable 1\n\
+                       dock-grid 0\n\
+                       click-events 0\n\
+                       command 3\n\
+                       login -\n\
+                       remote-up -\n\
+                       typed -\n\
+                       ours 1\n\
+                       command-open 0\n\
+                       cleared -\n\
+                       end\n";
+        let carried = Carried::decode(fixture.as_bytes()).unwrap();
+        assert_eq!(carried.encode(), fixture.as_bytes());
+        let mut fresh = ShellLog::new(100);
+        fresh.restore(carried, 0);
+        assert_eq!(fresh.context.environment.python, "(.venv)");
+        assert_eq!(fresh.context.environment.node_wanted, ".nvmrc 22");
+        // The report is its own generation: the same report at the next prompt is no
+        // edge, and the answer that came with it still passes the gate.
+        let request = fresh.environment_request();
+        assert_eq!(request.generation, 1);
+        assert_eq!(request.cwd, "/Users/me/api");
+        assert_eq!(request.reported.virtual_env_prompt, ".venv");
+        let shown = fresh.context.environment.clone();
+        assert!(
+            !fresh.set_environment(1, &shown),
+            "the same answer is no change"
+        );
+        let mut scanner = Scanner::new();
+        let mut outcome = ScanOutcome::default();
+        scanner.feed(
+            &branch_with(
+                "main",
+                [
+                    "/Users/me/api/.venv",
+                    ".venv",
+                    "",
+                    "",
+                    "/Users/me/.nvm/versions/node/v22.11.0/bin/node",
+                ],
+            ),
+            |event| outcome = fresh.apply_scan_answering(event, 0),
+        );
+        assert!(
+            !outcome.environment,
+            "the carried report was taken for a new one"
+        );
     }
 
     /// The point of version 2: the time a blob spends in a holder (a night

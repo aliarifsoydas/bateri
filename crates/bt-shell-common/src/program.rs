@@ -1224,16 +1224,7 @@ pub fn parse_version(family: Family, output: &str) -> Option<String> {
 /// bytes read. The type is checked before opening: a FIFO named
 /// `pyvenv.cfg` would block the open.
 fn read_venv_config(path: &Path) -> Option<String> {
-    if !std::fs::metadata(path).ok()?.is_file() {
-        return None;
-    }
-    let mut text = String::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(VENV_CONFIG_MAX)
-        .read_to_string(&mut text)
-        .ok()?;
-    Some(text)
+    crate::environment::read_regular_file(path, VENV_CONFIG_MAX)
 }
 
 /// A `key = value` line's value in `pyvenv.cfg`; `home` (the base

@@ -25,6 +25,22 @@ of every installed copy. A version without a section is not released.
   its own width: a new window, or one a tab is torn off into, starts as wide
   as the window it came from, and the width comes back when bateri restores
   its windows.
+- **The dock shows the Python environment you activated, and the Node
+  version in a Node project.** The dock draws the prompt itself, so the
+  `(.venv)` that `activate` puts in front of a prompt used to be lost; the
+  dock's bottom line now starts with it, as `activate` prints it and in the
+  line's brightest tone, with its Python version: `(.venv) 3.12  ~/api |
+  main`. conda's environment shows the same way, `(base)` too when conda
+  shows it in your prompt. In a folder with a `package.json`, `.nvmrc` or
+  `.node-version` (here or above, up to the repository's root) the Node
+  version that runs follows the branch, `node 22.11`, and turns yellow with
+  what is asked beside it when the project's `.nvmrc` or `.node-version` asks
+  for another (`node 18.20 (.nvmrc 22)`). bateri reads where Node is
+  installed and never runs it; a shim that picks the version per folder
+  (volta, asdf's) shows none. On a narrow line the path shortens first, then
+  the Node version goes, then the Python version, and the environment's name
+  goes last. Turn either off with `python_env` or `node_version` under
+  `[shell]`, or in the settings window's General page.
 
 ## [0.16.0] - 2026-10-16
 

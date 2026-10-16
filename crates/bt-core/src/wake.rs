@@ -156,6 +156,20 @@ pub trait Wake: Send + Sync + 'static {
     /// the three prohibitions above apply.
     fn mirror_changed(&self);
 
+    /// The shell's environment report or the directory it was made in
+    /// changed (`8133;b`'s fields after the branch: a `cd`, an `activate`, a
+    /// `nvm use`): the receiver reads [`crate::Session::environment_request`],
+    /// resolves it off the main thread and writes the answer back with its
+    /// generation ([`crate::Session::set_environment`]).
+    ///
+    /// **Edge-triggered and payload-free** (the precedent is
+    /// [`Wake::command_started`]): a prompt that repeats both is not an edge,
+    /// so an ordinary prompt posts nothing. It arrives on the reader thread
+    /// after the ledger's leaf lock has been released; the contract assumes
+    /// the `Term` lock may be held and the three prohibitions above apply.
+    /// The implementor posts **at most one** job to its queue.
+    fn environment_changed(&self);
+
     /// The remote bootstrap said it runs (`8133;i;up;{nonce}`)
     /// while a command ran: the receiver reads it with
     /// [`crate::Session::remote_up`] and, if the nonce is the wrapped `ssh`'s,

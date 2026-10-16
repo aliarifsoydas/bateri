@@ -76,6 +76,7 @@ use objc2_foundation::{
 use objc2_quartz_core::CAMetalLayer;
 
 use crate::card::{self, FrameBox};
+use crate::environment::Wants;
 
 use crate::clipboard::{self, PendingCopy};
 use crate::focus::Moment;
@@ -953,6 +954,9 @@ struct ShellWake {
     /// The listening ports' probe ([`PortProbe`]): on with `[shell] ports`,
     /// every edge (output, `C`, a prompt) schedules one delayed scan.
     pub(crate) port_probe: Arc<PortProbe>,
+    /// Whether the environment's news is waiting on the main queue
+    /// ([`TerminalPane::resolve_environment`]) — at most one job.
+    environment_pending: Arc<AtomicBool>,
     /// Whether the stale-link news is waiting on the main queue —
     /// `search_pending`'s twin: at most one job.
     link_pending: Arc<AtomicBool>,
@@ -1544,6 +1548,24 @@ impl Wake for ShellWake {
         self.push_state_later();
     }
 
+    fn environment_changed(&self) {
+        // Reader thread, after the ledger's lock: the report or its directory
+        // changed — one job, which reads the report itself.
+        if self.timed || self.environment_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let pending = Arc::clone(&self.environment_pending);
+        let (id, lookup) = (self.id, self.lookup);
+        DispatchQueue::main().exec_async(move || {
+            pending.store(false, Ordering::Release);
+            // audit: a block running on the main queue is on the main thread by definition.
+            let mtm = MainThreadMarker::new().expect("the main queue is the main thread");
+            if let Some(pane) = lookup(mtm, id) {
+                pane.resolve_environment();
+            }
+        });
+    }
+
     fn bell(&self) {
         // Reader thread, under the `Term` lock: one job, no lock taken here.
         if self.timed || self.bell_pending.swap(true, Ordering::AcqRel) {
@@ -2053,6 +2075,9 @@ pub struct PaneIvars {
     /// ([`crate::footer`]): the dock shows their numbers, the ports menu
     /// these records.
     listeners: RefCell<Vec<Listener>>,
+    /// What the context row shows of the active environment
+    /// (`[shell] python_env`, `node_version`; [`crate::environment`]).
+    environment_wants: Cell<Wants>,
     /// The listening processes whose exit is watched — `(pid, start)`, one
     /// thread each ([`crate::footer`]).
     watched: RefCell<HashSet<(u32, u64)>>,
@@ -2498,6 +2523,11 @@ impl TerminalPane {
         let remote_files = settings.remote_files.clone();
         let stats_driver = StatsDriver::new(&settings.remote_stats);
         let ports_on = run.is_none() && settings.shell_ports;
+        // A timed run reads no file for the row, like it scans no port.
+        let environment_wants = Wants {
+            python: run.is_none() && settings.shell_python_env,
+            node: run.is_none() && settings.shell_node_version,
+        };
         let dim = DimOverlay::new(mtm);
         dim.paint(&theme);
         let card_frame = FrameBox::new(mtm, &theme);
@@ -2551,6 +2581,7 @@ impl TerminalPane {
                 program_probe: Arc::default(),
                 identity_probe: Arc::default(),
                 port_probe: Arc::new(PortProbe::new(ports_on)),
+                environment_pending: Arc::default(),
                 link_pending: Arc::default(),
                 pointer_pending: Arc::default(),
                 blocks_pending: Arc::default(),
@@ -2601,6 +2632,7 @@ impl TerminalPane {
             stats_popover: RefCell::new(None),
             stats_closed_at: Cell::new(None),
             listeners: RefCell::new(Vec::new()),
+            environment_wants: Cell::new(environment_wants),
             watched: RefCell::new(HashSet::new()),
             remote_ports: RefCell::new(RemotePorts::default()),
             remote_helper: RefCell::new(RemoteHelper::default()),
@@ -5537,6 +5569,10 @@ impl TerminalPane {
 
     pub(crate) fn listeners(&self) -> &RefCell<Vec<Listener>> {
         &self.ivars().listeners
+    }
+
+    pub(crate) fn environment_wants(&self) -> &Cell<Wants> {
+        &self.ivars().environment_wants
     }
 
     pub(crate) fn watched(&self) -> &RefCell<HashSet<(u32, u64)>> {

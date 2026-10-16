@@ -628,6 +628,7 @@ impl bt_core::Wake for SilentWake {
     fn phase_edge(&self) {}
     fn remote_command_edge(&self) {}
     fn mirror_changed(&self) {}
+    fn environment_changed(&self) {}
     fn blocks_changed(&self) {}
     fn unseen_changed(&self) {}
     fn program_status_changed(&self) {}
@@ -3275,6 +3276,87 @@ pub(crate) mod tests {
             }
             session.shutdown();
         }
+    }
+
+    /// The report a dock prompt sends with the branch, once it changed from `since`.
+    fn environment_after(session: &Session, since: u64) -> bt_core::ShellEnvironment {
+        wait_until("no environment report arrived", || {
+            session.environment_request().generation > since
+        });
+        session.environment_request().reported
+    }
+
+    #[test]
+    fn the_fish_wrapper_reports_the_environment_after_the_branch() {
+        // What `activate.fish` and conda leave in the variables, and the `node` on fish's
+        // `PATH`, reach the terminal at the dock's prompt; `set -e` (what `deactivate`
+        // does) is seen at the next one.
+        let Some(fish) = fish() else { return };
+        let root = TempRoot::new("fish-env");
+        let home = root.0.join("home");
+        let bin = root.0.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        write_program(&bin.join("node"), "#!/bin/sh\n");
+        write_fish_config(
+            &home,
+            &format!(
+                "set -gx PATH {} $PATH\nset -gx VIRTUAL_ENV /p/.venv\n\
+                 set -gx VIRTUAL_ENV_PROMPT .venv\nset -gx CONDA_PROMPT_MODIFIER '(base) '\n",
+                bin.display()
+            ),
+        );
+        let session = spawn_fish(&fish, &home, Some("/a"), &[]);
+        let reported = environment_after(&session, 0);
+        assert_eq!(reported.virtual_env, "/p/.venv");
+        assert_eq!(reported.virtual_env_prompt, ".venv");
+        assert_eq!(reported.conda_prefix, "");
+        assert_eq!(reported.conda_prompt, "(base) ");
+        assert_eq!(Path::new(&reported.node), bin.join("node"));
+        let generation = session.environment_request().generation;
+        session.write(b"set -e VIRTUAL_ENV\n");
+        let reported = environment_after(&session, generation);
+        assert_eq!(reported.virtual_env, "");
+        assert_eq!(
+            reported.conda_prompt, "(base) ",
+            "the other fields keep their places"
+        );
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_bash_wrapper_reports_the_environment_after_the_branch() {
+        // The fish test's claim for bash: `node` is found by walking `PATH`, no fork.
+        let Some(bash) = bash() else { return };
+        let root = TempRoot::new("bash-env");
+        let home = root.0.join("home");
+        let bin = root.0.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        write_program(&bin.join("node"), "#!/bin/sh\n");
+        write_home_file(
+            &home,
+            ".bash_profile",
+            &format!(
+                "PS1='$ '\nexport PATH='{}':\"$PATH\"\nexport VIRTUAL_ENV=/p/.venv\n\
+                 export VIRTUAL_ENV_PROMPT='(.venv) '\nexport CONDA_PREFIX=/opt/conda\n",
+                bin.display()
+            ),
+        );
+        let session = spawn_bash_dock(&bash, &home, &[]);
+        let reported = environment_after(&session, 0);
+        assert_eq!(reported.virtual_env, "/p/.venv");
+        assert_eq!(reported.virtual_env_prompt, "(.venv) ");
+        assert_eq!(reported.conda_prefix, "/opt/conda");
+        assert_eq!(reported.conda_prompt, "");
+        assert_eq!(Path::new(&reported.node), bin.join("node"));
+        let generation = session.environment_request().generation;
+        session.write(b"unset VIRTUAL_ENV\n");
+        let reported = environment_after(&session, generation);
+        assert_eq!(reported.virtual_env, "");
+        assert_eq!(
+            reported.conda_prefix, "/opt/conda",
+            "the other fields keep their places"
+        );
+        session.shutdown();
     }
 
     // ── bash ─────────────────────────────────────────────────────────────

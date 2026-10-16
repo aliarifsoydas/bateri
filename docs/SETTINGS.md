@@ -344,6 +344,16 @@ integration = "auto"
 # it in your browser. Every program started in the tab counts, in the
 # background too; a container's ports and programs run with sudo don't show.
 ports = true
+# true | false. Starts the dock's bottom line with the Python environment you
+# activated, the way activate shows it in front of a prompt: (.venv) 3.12 for
+# a virtual environment, (ml) 3.11 for conda. conda's base shows when conda
+# shows it in your prompt (its changeps1 setting).
+python_env = true
+# true | false. Shows the Node version that runs, after the branch, while you
+# are in a Node project (a package.json, .nvmrc or .node-version here or above,
+# up to the repository's root): node 22.11. It turns yellow when the project's
+# .nvmrc or .node-version asks for another version.
+node_version = true
 
 [remote]
 # Colors the dock of an ssh or mosh session by the host it is on, so a
@@ -1437,12 +1447,16 @@ The rules are the same for all of them:
 [shell]
 integration = "auto"
 ports = true
+python_env = true
+node_version = true
 ```
 
 | key | type | default | meaning |
 |---|---|---|---|
 | `integration` | `"auto"`, `"blocks"` or `"off"` | `"auto"` | whether to set up integration in the shell, and how much |
 | `ports` | `true` or `false` | `true` | whether the dock shows the ports the tab's programs listen on |
+| `python_env` | `true` or `false` | `true` | whether the dock's bottom line starts with the active Python environment |
+| `node_version` | `true` or `false` | `true` | whether the dock's bottom line shows the Node version in a Node project |
 
 > **Retired key:** `[shell] prompt` is no longer read; `integration =
 > "blocks"` replaced it. Leaving it in your file is harmless (no key is ever
@@ -1651,6 +1665,45 @@ Ports are looked up only when something happens in the tab — a command
 starts or ends, or a program prints — never on a timer, so an idle tab costs
 nothing. `ports = false` turns all of this off and the line shows what it
 showed before.
+
+#### Active environment
+
+The dock draws the prompt itself, so the `(.venv)` that `activate` puts in
+front of a prompt would be lost. The dock's bottom line shows it instead, in
+the same place — first — and in the line's brightest tone:
+
+```text
+(.venv) 3.12  ~/Projects/api | main
+```
+
+- **A virtual environment** (`python -m venv`, virtualenv, uv, poetry) shows
+  as its `activate` names it, with the version of its Python. It goes away at
+  the next prompt after `deactivate`.
+- **conda** shows what conda puts in front of your prompt: `(ml) 3.11`, and
+  `(base)` too if conda shows it there. With `conda config --set changeps1
+  false` conda puts nothing there, and nothing shows here either. A virtual
+  environment activated inside a conda one shows both, `(.venv) (base) 3.12`.
+- **Node** shows after the branch, only in a Node project — a `package.json`,
+  `.nvmrc` or `.node-version` in the folder or above it, up to the
+  repository's root (never your home folder itself): `node 22.11`, the
+  version of the `node` the shell would run there. When the nearest `.nvmrc`
+  or `.node-version` asks for a version that is not the one that runs, it
+  shows in yellow with what is asked: `node 18.20 (.nvmrc 22)`. An alias
+  there (`lts/*`) is not compared, and neither is `engines` in `package.json`.
+
+The version is read from where Node is installed — nvm, fnm, n, mise, asdf,
+Homebrew and the installer from nodejs.org all say it — and bateri never runs
+`node` to ask: a project could put its own `node` on your `PATH`. A shim that
+picks the version per folder (volta, or asdf's and mise's shims) does not say
+it, so no version shows there.
+
+On a narrow line the path shortens first, down to its last folder (`…/api`);
+then the Node version goes, then the Python version, then the rest of the
+path and the branch. The environment's name goes last, and no name or
+version is ever cut. Over ssh the line shows the server (`⇄ host`), not your
+Mac's environment. `python_env = false` and `node_version = false` turn each
+part off at once, in every open tab; both are also in the settings window's
+General page.
 
 ### `[remote]`
 

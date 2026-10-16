@@ -118,11 +118,12 @@ pub use settings::{
     TabPosition, UnfocusedCaret, bare_host, expand_home, format_size, parse_size,
 };
 pub use shell::{
-    ButtonState, DockContext, DockFault, DockState, DockStatus, FooterPort, Highlight,
-    HighlightColor, HighlightStyle, ProgramBar, ProgramTone, Reconnect, RemoteKind,
-    RemoteSetupFault, RemoteStats, RemoteTarget, STATS_HISTORY, ShellPhase, ShellState, SignIn,
-    StatsForm, Transfer, TransferAction, TransferControls, TransferTone, TtyModes, counter_period,
-    counter_tier_end, decode_percent, next_tick, running_counter,
+    ButtonState, DockContext, DockEnvironment, DockFault, DockState, DockStatus,
+    EnvironmentRequest, FooterPort, Highlight, HighlightColor, HighlightStyle, ProgramBar,
+    ProgramTone, Reconnect, RemoteKind, RemoteSetupFault, RemoteStats, RemoteTarget, STATS_HISTORY,
+    ShellEnvironment, ShellPhase, ShellState, SignIn, StatsForm, Transfer, TransferAction,
+    TransferControls, TransferTone, TtyModes, counter_period, counter_tier_end, decode_percent,
+    next_tick, running_counter,
 };
 pub use wake::Wake;
 

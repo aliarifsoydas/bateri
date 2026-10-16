@@ -1,5 +1,5 @@
-//! The dock's context row on the pane's side: its controls and the listening
-//! ports.
+//! The dock's context row on the pane's side: its controls, the listening
+//! ports and the active environment.
 //!
 //! **One way in for the row's controls.** The hand cursor's rectangles
 //! ([`TerminalPane::footer_spans`]), the hover ([`TerminalPane::footer_hover`])
@@ -26,10 +26,19 @@
 //! always — also while a full-screen program or an agent hides the dock. An
 //! item opens its address (a server's dim port is forwarded first), its ⌥
 //! alternate copies the address; ⌘-click on a port opens it at once.
+//!
+//! **The active environment** (`(.venv) 3.12`, `node 22.11`): when the
+//! shell's report or its directory changes (`Wake::environment_changed`) the
+//! report is resolved on a queue of its own (`environment::resolve`: a few
+//! small file reads, nothing run) and written back for its generation
+//! (`Session::set_environment`) — an answer for a report the shell has moved
+//! past is dropped there.
 
 use std::sync::OnceLock;
 
-use bt_core::{FooterControl, FooterPort};
+use std::path::Path;
+
+use bt_core::{DockEnvironment, FooterControl, FooterPort};
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -38,11 +47,20 @@ use objc2_app_kit::{NSEventModifierFlags, NSMenu, NSMenuItem, NSPasteboard, NSWo
 use objc2_foundation::{NSPoint, NSString, NSURL, ns_string};
 
 use crate::clipboard;
+use crate::environment::{self, Wants};
 use crate::jobs::{self, SystemTable};
 use crate::pane::TerminalPane;
 use crate::ports::{self, Bound, Listener};
 use crate::program;
 use crate::remote_ports::{RemoteItem, remote_title};
+
+/// The queue the environment's files are read on — serial and shared by
+/// every pane, [`scan_queue`]'s reason; a queue of its own so a large process
+/// tree's scan does not hold a `cd`'s row back.
+fn environment_queue() -> &'static DispatchRetained<DispatchQueue> {
+    static QUEUE: OnceLock<DispatchRetained<DispatchQueue>> = OnceLock::new();
+    QUEUE.get_or_init(|| DispatchQueue::new("dev.bateri.environment", None))
+}
 
 /// The queue the scans run on — serial and shared by every pane: scans are
 /// short and rare, one at a time is enough.
@@ -133,6 +151,59 @@ impl TerminalPane {
             self.end_remote_ports();
             self.show_listeners(Vec::new());
         }
+    }
+
+    /// `[shell] python_env` or `node_version` changed: the row is resolved
+    /// again with what it is to show — a part turned off goes at once.
+    pub(crate) fn set_environment_shown(&self, wants: Wants) {
+        self.environment_wants().set(wants);
+        self.resolve_environment();
+    }
+
+    /// Resolves the shell's last environment report for the row, off the
+    /// main thread; the answer comes back on the main queue, finds the pane
+    /// by its id and is written for the report's generation. With both
+    /// parts off nothing is read and the row loses them now.
+    pub(crate) fn resolve_environment(&self) {
+        let Some(session) = self.session() else {
+            return;
+        };
+        let wants = self.environment_wants().get();
+        let request = session.environment_request();
+        if !wants.any() || request.generation == 0 {
+            if session.set_environment(request.generation, &DockEnvironment::default()) {
+                self.stats_gauge_changed();
+            }
+            return;
+        }
+        let (id, lookup) = (self.id(), self.lookup());
+        environment_queue().exec_async(move || {
+            let shown = environment::resolve(
+                &request.reported,
+                Path::new(&request.cwd),
+                environment::home().as_deref(),
+                wants,
+            );
+            DispatchQueue::main().exec_async(move || {
+                // audit: a block running on the main queue is on the main thread by definition.
+                let mtm = MainThreadMarker::new().expect("the main queue is the main thread");
+                let Some(pane) = lookup(mtm, id) else {
+                    return;
+                };
+                // A setting changed while the files were read: its own
+                // job is behind this one.
+                if pane.environment_wants().get() != wants {
+                    return;
+                }
+                if let Some(session) = pane.session()
+                    && session.set_environment(request.generation, &shown)
+                {
+                    // The lead's width moves what the trailing zone keeps:
+                    // the hand cursor's rectangles follow.
+                    pane.stats_gauge_changed();
+                }
+            });
+        });
     }
 
     /// ⌘-click on a port: the tab's own listener if one has the number,

@@ -2549,6 +2549,9 @@ impl io::Read for TappedPty {
             if outcome.mirrored {
                 wake.mirror_changed();
             }
+            if outcome.environment {
+                wake.environment_changed();
+            }
             if outcome.status {
                 wake.program_status_changed();
             }
@@ -8450,7 +8453,11 @@ impl Session {
     /// [`Session::restore_state_blob`]'s body, on a decoded blob.
     fn restore_carried(&self, carried: Carried) {
         let cleared = carried.cleared;
-        lock(&self.shell).restore(carried, self.key_gen.load(Ordering::Acquire));
+        let reported = {
+            let mut log = lock(&self.shell);
+            log.restore(carried, self.key_gen.load(Ordering::Acquire));
+            log.environment_request().generation > 0
+        };
         // The counter's generations are this process's; only the flag and
         // its stamp cross, and the frame path must not read the replay's
         // `2J`s as a new clear.
@@ -8463,6 +8470,11 @@ impl Session {
         self.screen_clear_history
             .store(cleared.unwrap_or(Self::UNSTAMPED), Ordering::Relaxed);
         self.adapter.0.wake.title_changed();
+        // The carried row resolved again with this run's settings: a part
+        // turned off since goes, the rest is the same answer.
+        if reported {
+            self.adapter.0.wake.environment_changed();
+        }
         self.request_frame();
     }
 
@@ -10139,6 +10151,31 @@ impl Session {
                 true
             }
         };
+        if changed {
+            self.request_frame();
+        }
+        changed
+    }
+
+    /// What the environment's resolver works from: the shell's last report
+    /// (`8133;b`'s fields after the branch), the directory it was made in and
+    /// their generation — `0` until a report came. The receiver of
+    /// [`crate::Wake::environment_changed`] reads it, resolves it off the main
+    /// thread and hands the answer back with the generation
+    /// ([`Session::set_environment`]). Takes only the leaf lock.
+    pub fn environment_request(&self) -> crate::EnvironmentRequest {
+        lock(&self.shell).environment_request()
+    }
+
+    /// Writes what the context row shows of the active environment
+    /// ([`crate::DockContext::environment`]) for the report of `generation`.
+    /// Requests a frame **if it changed** and returns `true`
+    /// ([`Session::set_ports`]'s pattern: the row is not in alacritty's
+    /// damage). An answer for an older report is dropped — the shell moved on
+    /// while the files were read; so is one with a control character in it.
+    /// The leaf lock drops before `request_frame`; `Term` is not touched.
+    pub fn set_environment(&self, generation: u64, shown: &crate::DockEnvironment) -> bool {
+        let changed = lock(&self.shell).set_environment(generation, shown);
         if changed {
             self.request_frame();
         }
@@ -12760,6 +12797,8 @@ mod tests {
         edges: u32,
         /// How many times [`Wake::mirror_changed`] came.
         mirrors: u32,
+        /// How many times [`Wake::environment_changed`] came.
+        environments: u32,
         /// How many times [`Wake::blocks_changed`] came.
         blocks: u32,
         /// How many times [`Wake::unseen_changed`] came.
@@ -12892,6 +12931,11 @@ mod tests {
 
         fn mirror_changed(&self) {
             self.state.lock().unwrap().mirrors += 1;
+            self.cond.notify_all();
+        }
+
+        fn environment_changed(&self) {
+            self.state.lock().unwrap().environments += 1;
             self.cond.notify_all();
         }
 
