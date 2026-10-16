@@ -42,6 +42,14 @@ of every installed copy. A version without a section is not released.
   goes last. Turn either off with `python_env` or `node_version` under
   `[shell]`, or in the settings window's General page.
 
+### Changed
+
+- **A tab with one pane has the same summary card as a split one.** Its pane
+  is a tile like each pane of a split tab: its program's mark, its name and
+  what it is doing over its picture, outlined as the focused pane. The card's
+  lines are a split tab's too — the title, the folder and a marked host — so
+  "Running · npm run dev · 0:12" is now the tile's "Running".
+
 ## [0.16.0] - 2026-10-16
 
 ### Added

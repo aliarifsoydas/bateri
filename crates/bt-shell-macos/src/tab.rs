@@ -63,7 +63,7 @@ use crate::pane::{PaneHost, TerminalPane};
 use crate::program::identity::Kind;
 use crate::restore::{SavedTab, Shape};
 use crate::sheets;
-use crate::split::{Axis, Direction, Placement, Rect, Removal, Tree};
+use crate::split::{Axis, Direction, Placement, Removal, Tree};
 use crate::split_view::SplitView;
 use crate::tab_bar::{Emblem, Upload};
 use crate::tabs::{self, Card, CardCommand, CardPane, Finish, Indicator, Signals, Tally, Unseen};
@@ -1260,9 +1260,8 @@ impl TerminalTab {
 
     /// What the tab's summary card tells, from the focused pane: its title,
     /// directory (`host:path` remotely), newest command, transfer and marked
-    /// host (`tabs::card_lines` lays them out) — and the tiles of the picture
-    /// under them: the map of all the panes of a split tab, the one pane of
-    /// a tab of one ([`Self::card_panes`]). The
+    /// host (`tabs::card_lines` lays them out) — and the map under them, a
+    /// tile per pane, one for a tab of one pane ([`Self::card_panes`]). The
     /// newest command's row is read from the grid — a `Term` round, never
     /// on the frame path: when the card opens and, while it is open, when
     /// what the tab's chip shows changes (`tab_bar::TabBar::show`;
@@ -1351,32 +1350,15 @@ impl TerminalTab {
         }
     }
 
-    /// The card's map: every pane of a split tab where it stands in the tab (the split tree's own
-    /// proportions, so a zoomed pane does not fold the map), with the program it shows, its
-    /// name and what it reports — the tab's indicator rule over the pane's signals alone
-    /// ([`Self::signals_of`]). While a pane shows a tick or a dot the program is the one that
-    /// ended, as the chip's emblem has it ([`Self::emblem`]). A
-    /// failed pane's exit code is read from its newest command's row — a `Term` round, which the
-    /// card's own read allows.
-    ///
-    /// A tab of one pane has one, standing over the whole area: the card's picture of it, with
-    /// nothing else — its lines tell the program's state, so no state is read for it.
+    /// The card's map: every pane of the tab where it stands in the tab (the split tree's own
+    /// proportions, so a zoomed pane does not fold the map; a tab of one pane is a map of one
+    /// tile over the whole area), with the program it shows, its name and what it reports — the
+    /// tab's indicator rule over the pane's signals alone ([`Self::signals_of`]). While a pane
+    /// shows a tick or a dot the program is the one that ended, as the chip's emblem has it
+    /// ([`Self::emblem`]). A failed pane's exit code is read from its newest command's row — a
+    /// `Term` round, which the card's own read allows.
     fn card_panes(&self) -> Vec<CardPane> {
         let panes = self.panes();
-        if let [only] = panes.as_slice() {
-            return vec![CardPane {
-                id: only.id(),
-                place: Rect::new(0.0, 0.0, 1.0, 1.0),
-                kind: only.program_kind(),
-                name: String::new(),
-                indicator: None,
-                exit: None,
-                focused: true,
-            }];
-        }
-        if panes.len() < 2 {
-            return Vec::new();
-        }
         let (hidden, away) = (self.hidden(), self.away());
         let focused = self.focused_pane().id();
         self.container()

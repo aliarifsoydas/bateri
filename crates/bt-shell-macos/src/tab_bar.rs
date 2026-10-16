@@ -4055,8 +4055,8 @@ impl SummaryCard {
         }
     }
 
-    /// Writes `lines` (text and colour) top to bottom and the `map` — the picture of the tab's
-    /// panes, one tile for a tab of one pane — under them, and sizes the card to them
+    /// Writes `lines` (text and colour) top to bottom and the `map` — a tile per pane of the tab,
+    /// a tab of one pane's as much as a split tab's — under them, and sizes the card to them
     /// (`tabs::card_width`, `tabs::card_height`); returns its size.
     fn write(
         &self,
@@ -4159,9 +4159,6 @@ pub(crate) struct TileIvars {
     shot: RefCell<Option<Retained<NSImage>>>,
     /// The scrim's height, points: the tile says a state under its name or does not.
     scrim: Cell<f64>,
-    /// The tile is the whole picture of a tab of one pane: no mark, name, state, scrim or ring
-    /// over it (the card's lines tell what they would), and a press on it shows the tab.
-    solo: Cell<bool>,
     icon: Retained<NSImageView>,
     name: Retained<NSTextField>,
     state: Retained<NSTextField>,
@@ -4245,10 +4242,8 @@ define_class!(
                     image,
                     fraction: if lit { 1.0 } else { MAP_SHOT_DIM },
                     // The face as it looks over the card — opaque, for the scrim to hide the
-                    // picture behind. The picture that is a whole tab has none: nothing is
-                    // written over it.
-                    scrim: (!iv.solo.get())
-                        .then(|| (mix(palette.card.rgb, palette.title, strength), iv.scrim.get())),
+                    // picture behind.
+                    scrim: (mix(palette.card.rgb, palette.title, strength), iv.scrim.get()),
                 }),
                 line,
             );
@@ -4272,7 +4267,6 @@ impl MapTile {
             palette: Cell::new(None),
             shot: RefCell::new(None),
             scrim: Cell::new(MAP_SCRIM_NAME_ONLY),
-            solo: Cell::new(false),
             icon: icon.clone(),
             name: name.clone(),
             state: state.clone(),
@@ -4326,11 +4320,8 @@ impl MapTile {
     fn set(&self, pane: &CardPane, frame: NSRect, map: &MapDraw<'_>, palette: Palette) {
         let iv = self.ivars();
         iv.pane.set(pane.id);
-        // A tab of one pane: its card's lines tell what the mark, name and state would, and
-        // there is no other pane to tell it from, so the picture stands alone.
-        let solo = map.panes.len() == 1;
-        iv.solo.set(solo);
-        iv.focused.set(pane.focused && !solo);
+        // A tab of one pane is a map of one tile: its pane is the focused one and wears the ring.
+        iv.focused.set(pane.focused);
         iv.palette.set(Some(palette));
         self.setFrame(frame);
         let (width, height) = (frame.size.width, frame.size.height);
@@ -4341,7 +4332,7 @@ impl MapTile {
             NSSize::new(LIST_SIDE, LIST_SIDE),
         ));
         iv.icon
-            .setHidden(solo || height < MAP_TILE_AT + LIST_SIDE || width < MAP_TILE_AT + LIST_SIDE);
+            .setHidden(height < MAP_TILE_AT + LIST_SIDE || width < MAP_TILE_AT + LIST_SIDE);
         let room = width - MAP_TEXT_AT - MAP_TEXT_RIGHT;
         let text_ink = if pane.focused {
             palette.title
@@ -4362,7 +4353,7 @@ impl MapTile {
             NSPoint::new(MAP_TEXT_AT, MAP_TILE_AT),
             NSSize::new(room.max(0.0), MAP_NAME_HEIGHT),
         ));
-        name.setHidden(solo || height < MAP_TILE_AT + MAP_NAME_HEIGHT || room < 12.0);
+        name.setHidden(height < MAP_TILE_AT + MAP_NAME_HEIGHT || room < 12.0);
         let state = &iv.state;
         let word = pane.state();
         iv.scrim.set(if word.is_some() {
@@ -4382,11 +4373,8 @@ impl MapTile {
             NSPoint::new(MAP_TEXT_AT, MAP_STATE_AT),
             NSSize::new(room.max(0.0), MAP_STATE_HEIGHT),
         ));
-        state.setHidden(
-            solo || word.is_none() || height < MAP_STATE_AT + MAP_STATE_HEIGHT || room < 12.0,
-        );
+        state.setHidden(word.is_none() || height < MAP_STATE_AT + MAP_STATE_HEIGHT || room < 12.0);
         let said = match &word {
-            _ if solo => "Show this tab".to_owned(),
             Some((text, _)) => format!("{}, {text}", pane.name),
             None => pane.name.clone(),
         };
@@ -4395,17 +4383,17 @@ impl MapTile {
     }
 }
 
-/// What a map tile lays over its face: its pane's picture and how strongly, and — where the tile
-/// has a mark, a name and a state to say — the scrim that quiets the picture's top under them:
-/// the face's own colour, and its height.
+/// What a map tile lays over its face: its pane's picture and how strongly, and the scrim that
+/// quiets the picture's top under the tile's mark, name and state: the face's own colour, and its
+/// height.
 struct TileShot<'a> {
     image: &'a NSImage,
     fraction: f64,
-    scrim: Option<(u32, f64)>,
+    scrim: (u32, f64),
 }
 
 /// A map tile, bottom to top: its face; the pane's picture over it, clipped to the tile's corners;
-/// the scrim, if it has one (opaque for [`MAP_SCRIM_HOLD`] of its height, then fading to nothing);
+/// the scrim (opaque for [`MAP_SCRIM_HOLD`] of its height, then fading to nothing);
 /// and the ring
 /// of the focused pane over all of it — drawn under the picture the picture would cover it. The
 /// mark, name and state are the tile's own subviews, over this.
@@ -4438,7 +4426,8 @@ fn paint_tile(bounds: NSRect, face: Tint, shot: Option<TileShot<'_>>, ring: Opti
                 None,
             );
         }
-        if let Some((rgb, height)) = scrim {
+        {
+            let (rgb, height) = scrim;
             let top = bounds.origin.y;
             let solid = height * MAP_SCRIM_HOLD;
             Tint::of(rgb, MAP_SCRIM_STRENGTH).color().setFill();
@@ -5055,25 +5044,20 @@ struct OpenCard {
 impl OpenCard {
     /// How long the card's command has run now; `None` unless it runs — and, with a map of
     /// panes, the card tells no time (each pane says only that it runs), so the clock has nothing
-    /// to wake for; a tab of one pane's card tells it, under its picture, as it always did.
+    /// to wake for.
     fn running(&self) -> Option<Duration> {
         match &self.card.command {
-            Some(CardCommand::Running { elapsed, .. }) if !self.split() => {
+            Some(CardCommand::Running { elapsed, .. }) if !self.pictured() => {
                 Some(elapsed.saturating_add(self.read_at.elapsed()))
             }
             _ => None,
         }
     }
 
-    /// The card carries a picture of its tab under its lines: a map of its panes, or the one
-    /// picture of a tab of one pane. Pictured, it is a thing the pointer can cross to and press.
+    /// The card carries a map of its tab's panes under its lines. Pictured, it is a thing the
+    /// pointer can cross to and press.
     fn pictured(&self) -> bool {
         self.card.pictured()
-    }
-
-    /// The tab is split: its picture is a map that tells each pane, and its lines do not.
-    fn split(&self) -> bool {
-        self.card.split()
     }
 
     /// The card as it reads now: its running time moved on.
@@ -5489,7 +5473,7 @@ impl TabBar {
             selected,
             notice,
         });
-        let mapped = iv.card.borrow().as_ref().is_some_and(OpenCard::split);
+        let mapped = iv.card.borrow().as_ref().is_some_and(OpenCard::pictured);
         if let Some(tab) = open
             && (mapped || before != told(&iv.shown.borrow(), tab))
         {
@@ -7748,14 +7732,7 @@ mod tests {
     }
 
     fn painted(fraction: f64, ring: Option<Tint>) -> (usize, Vec<[u8; 4]>) {
-        painted_with(fraction, Some((0x00ff00, MAP_SCRIM_NAME_ONLY)), ring)
-    }
-
-    fn painted_with(
-        fraction: f64,
-        scrim: Option<(u32, f64)>,
-        ring: Option<Tint>,
-    ) -> (usize, Vec<[u8; 4]>) {
+        let scrim = (0x00ff00, MAP_SCRIM_NAME_ONLY);
         let image = a_picture();
         in_a_flipped_view(|| {
             paint_tile(
@@ -7817,25 +7794,6 @@ mod tests {
             "the picture is square at the corner"
         );
         assert_eq!(at(&picture, 99.5, 59.5)[3], 0);
-    }
-
-    /// The picture that is a whole tab (a tab of one pane) has nothing written over it: no scrim
-    /// at its top, no ring — the card's lines say what they would — and is still rounded at the
-    /// corners.
-    #[test]
-    fn a_tile_that_is_a_whole_tab_has_no_scrim_and_no_ring() {
-        let picture = painted_with(1.0, None, None);
-        let top = at(&picture, 50.0, 3.0);
-        assert!(
-            top[0] > 240 && top[1] < 15 && top[2] < 15,
-            "something is over the top of the picture: {top:?}"
-        );
-        let edge = at(&picture, 0.25, 45.0);
-        assert!(
-            edge[2] > 240 && edge[0] < 15,
-            "a ring is drawn on the picture: {edge:?}"
-        );
-        assert_eq!(at(&picture, 0.0, 0.0)[3], 0, "the corner is square");
     }
 
     /// The picture lies over the face at 86 % until the pointer is on the tile, then all of it.

@@ -1630,9 +1630,8 @@ pub enum CardCommand {
 
 /// What a tab's summary card tells ([`card_lines`]); the platform shell reads each from the tab's
 /// focused pane. The card also carries a picture of its tab ([`Card::panes`]): the map of its
-/// panes when the tab is split, which takes over what the lines say about a command and a
-/// transfer (each pane tells its own), and for a tab of one pane the one picture under the lines,
-/// which tell everything as they always did.
+/// panes — one tile for a tab of one pane, the same tile a split tab's panes have — which takes
+/// over what the lines say about a command and a transfer (each pane tells its own).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Card {
     pub title: String,
@@ -1645,9 +1644,8 @@ pub struct Card {
     /// A transfer flowing: the item's name, the percentage, and `true` when it is a download.
     pub upload: Option<(String, u8, bool)>,
     pub mark: HostMark,
-    /// The tab's panes in tree order, each the tile of a picture: one standing over the whole
-    /// area for a tab of one pane, which is a picture and nothing else; empty only for a card
-    /// with no picture.
+    /// The tab's panes in tree order, each a tile of the map — a tab of one pane is a map of one
+    /// tile, the same tile a split tab's panes have; empty only for a card with no picture.
     pub panes: Vec<CardPane>,
     /// The tab's content area, its height over its width: the map takes the area's shape
     /// ([`map_height`]).
@@ -1655,20 +1653,15 @@ pub struct Card {
 }
 
 impl Card {
-    /// The card carries a picture of its tab under its lines: one tile per pane.
+    /// The card carries a map of its tab under its lines, one tile per pane: each names its
+    /// pane's program and state, and the lines leave out the command and the transfer it tells.
     pub fn pictured(&self) -> bool {
         !self.panes.is_empty()
     }
-
-    /// The tab holds several panes: the picture is a map that names each pane's program and
-    /// state, and the lines leave out the command and the transfer it tells.
-    pub fn split(&self) -> bool {
-        self.panes.len() > 1
-    }
 }
 
-/// One pane on a summary card's picture: where it stands, the program it runs, its name and
-/// what it is doing (a tab of one pane has the first and not the rest: its lines tell them).
+/// One pane on a summary card's map: where it stands, the program it runs, its name and what it
+/// is doing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CardPane {
     /// The pane's identity in its window — what a press on the map names.
@@ -1807,10 +1800,10 @@ pub enum Tone {
 
 /// The card's lines, top to bottom: the title; the directory (`host:path` in a remote session);
 /// what the newest command did — "Running · {command} · {time}", "Finished · {command} · {time}",
-/// "Exit {n} · {command}"; a flowing transfer; a marked host's kind. A split tab's card keeps only
-/// the title, the directory and the host's kind: what each pane is doing is on its map. A tab of
-/// one pane keeps all of them under its one picture. A part nobody knows is left out rather than
-/// shown empty.
+/// "Exit {n} · {command}"; a flowing transfer; a marked host's kind. A card with a map keeps only
+/// the title, the directory and the host's kind: what each pane is doing is on its map, a tab of
+/// one pane's as much as a split tab's. A card with no picture keeps all of them. A part nobody
+/// knows is left out rather than shown empty.
 pub fn card_lines(card: &Card) -> Vec<(String, Tone)> {
     let mut lines = vec![(card.title.clone(), Tone::Title)];
     let directory = match &card.remote {
@@ -1832,7 +1825,7 @@ pub fn card_lines(card: &Card) -> Vec<(String, Tone)> {
             .collect::<Vec<_>>()
             .join(" · ")
     };
-    let mapped = card.split();
+    let mapped = card.pictured();
     match card.command.as_ref().filter(|_| !mapped) {
         Some(CardCommand::Running { command, elapsed }) => {
             let time = bt_core::running_counter(*elapsed).unwrap_or_default();
@@ -4246,25 +4239,21 @@ mod tests {
                 ("Production host".to_owned(), Tone::Mark),
             ]
         );
-        assert!(card.pictured() && card.split());
+        assert!(card.pictured());
+        // A tab of one pane is a map of one tile: the same lines as a split tab's.
         let one = Card {
             panes: vec![pane_on_the_map(1, Rect::new(0.0, 0.0, 1.0, 1.0), None)],
-            ..card
+            ..card.clone()
         };
-        assert_eq!(
-            card_lines(&one).len(),
-            5,
-            "a tab of one pane keeps its lines: the command, the transfer and the rest"
-        );
-        assert!(
-            one.pictured() && !one.split(),
-            "and carries a picture, which is no map of panes"
-        );
+        assert!(one.pictured());
+        assert_eq!(card_lines(&one), card_lines(&card));
+        // With no picture the lines tell it all: the command, the transfer and the rest.
         let none = Card {
             panes: Vec::new(),
             ..one
         };
-        assert!(!none.pictured() && !none.split());
+        assert!(!none.pictured());
+        assert_eq!(card_lines(&none).len(), 5);
     }
 
     /// A card with a picture is the map's width, and as tall as its lines, the gap, the picture
