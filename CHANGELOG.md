@@ -12,6 +12,8 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-16
+
 ### Added
 
 - **Tabs can stand in a column down the window's left edge.** Choose
