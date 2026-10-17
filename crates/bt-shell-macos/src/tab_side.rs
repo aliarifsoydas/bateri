@@ -36,13 +36,17 @@
 //! over the column (⌥⌘) lights the row it is over the middle of and, between two rows, draws a
 //! line ([`Insertion`]) instead of opening room: a pane's drop is a mark, a tab's is a seat.
 //!
-//! **In a window that has groups a row's drop is a mark too.** A row slid along the rows cannot say
-//! which side of a group's border it is let go on — the end of the group above or the head of the
-//! one below — so a row pulled in such a column, rows picked together and a group's header start a
-//! drag session at once, and the column answers the pointer with a line at the place
-//! ([`crate::groups::Groups::side_spots`], [`crate::groups::Groups::group_spots`]; the bar's
-//! `aim`) — over its own column as over another window's. A window with no group keeps the
-//! rows sliding.
+//! **In a window that has groups a row still slides, to a place of the column.** Where it is let
+//! go is a slot of [`crate::groups::Groups::side_spots`], not a place of the list: a group's
+//! border has two — the end of the group above, the head of the group below — and the pointer
+//! tells them apart by the middle of the header (over its upper half the gap opens above the
+//! header, over its lower half under it); the others make room there, each header over the row it
+//! would stand over ([`crate::groups::Groups::side_preview`]), and the drop is one move that puts
+//! the row in the group that was shown ([`crate::groups::Groups::side_spots`]'s target). Rows
+//! picked together and a group's header are carried, not slid: they start a drag session at once,
+//! and the column answers the pointer with a line at the place (`TabBar::aim`) — over its own
+//! column as over another window's, where a row dragged out of its own window is answered the
+//! same way.
 
 use std::cell::{Cell, RefCell};
 

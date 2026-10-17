@@ -47,12 +47,15 @@ of every installed copy. A version without a section is not released.
   them into a group or a new one, out of their group, to a window of their
   own, or to close them; ⌘W closes the picked tabs and, unlike ⌘W on one tab,
   always asks first (`confirm_close = "never"` still does not). Tabs and groups can
-  be dragged. In the side column a row — or the rows you picked, drawn as a stack
-  with their count — is carried to the line that marks its place: between two rows
-  of a group, at the end of a group or at the head of the next, among the
-  ungrouped tabs, onto a closed group's header; out of the window it becomes a
-  window of its own (ungrouped), and over another window's column or title row it
-  lands in the group it is let go on. A group's header carries the group: between
+  be dragged. In the side column a row slides as it always did, and the rows
+  make room where it would stand: among the rows of a group, among the ungrouped
+  tabs, or at a group's border — over the upper half of a header the gap opens
+  above it, at the end of the group above, over the lower half under it, at the
+  head of the group — and onto a closed group's header it joins that group; out
+  of the window it becomes a window of its own (ungrouped), and over another
+  window's column or title row it lands in the group it is let go on. The rows
+  you picked are drawn as a stack with their count and carried to a line that
+  marks the place the same way. A group's header carries the group: between
   two groups to put them in order (the ungrouped tabs stay first), out of the
   window for a window of its own under the group's name, or onto another window,
   where it comes up under that name (` 2` when that window has a group of it

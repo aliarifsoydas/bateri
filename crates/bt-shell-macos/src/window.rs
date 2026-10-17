@@ -3139,6 +3139,18 @@ impl TerminalWindow {
             .side_spots(&self.ivars().order.borrow(), column)
     }
 
+    /// The column's list with tab `tab` slid to slot `slot` of its spots ([`Groups::side_preview`]).
+    pub(crate) fn side_preview(
+        &self,
+        tab: u64,
+        slot: usize,
+    ) -> Option<crate::groups::SidePreview<u64>> {
+        self.ivars()
+            .groups
+            .borrow()
+            .side_preview(&self.ivars().order.borrow(), tab, slot)
+    }
+
     /// The places the side column `column` takes a carried group at ([`Groups::group_spots`]).
     pub(crate) fn group_spots(&self, column: &Column) -> Vec<GroupSpot> {
         self.ivars()

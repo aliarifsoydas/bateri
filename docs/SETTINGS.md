@@ -548,23 +548,26 @@ shows one group at a time instead (see **In the title row** below).
   Group**, **Move N Tabs to New Window** (ungrouped, in the order they had)
   and **Close N Tabs…**. ⌘W is that last item: it closes the picked tabs, and
   asks **whatever runs in them** (see `confirm_close`).
-- **Dragging.** In the column, press a row and pull: a line marks where it
-  would be let go — between two rows of a group, at the **end** of a group (the
-  line is under its last row) or at the **head** of the next (under its
-  header), among the ungrouped tabs at the top, or onto a closed group's
-  header, which takes it at its end. Pull picked rows and all of them go, drawn
-  as a stack with their count. Over another window's column or title row they
-  land in the group they are let go on; over nothing but the desktop or a pane
-  they become a window of their own, ungrouped, in the order they had. Pull a
-  header and the group goes: between two groups to put them in order (the
+- **Dragging.** In the column, press a row and pull: it slides, and the rows
+  make room where it would stand — among the rows of a group, among the
+  ungrouped tabs at the top, or at a group's border, where the pointer decides
+  by the middle of the header: over its upper half the gap opens above the
+  header, at the **end** of the group above, over its lower half under it, at the
+  **head** of the group. Let go, it stays in the group it was shown in; onto a
+  closed group's header it joins the group at its end. Pull picked rows and all
+  of them go, drawn as a stack with their count, to a line that marks the place
+  the same way. Over another window's column or title row a row or the picked
+  rows land in the group they are let go on; over nothing but the desktop or a
+  pane they become a window of their own, ungrouped, in the order they had. Pull
+  a header and the group goes: between two groups to put them in order (the
   ungrouped tabs stay first), out of the window for a window of its own under
   the group's name, or onto another window, ` 2` after a name it has already. In
   the title row pull the group's button out of the bar for the same, and in the
   list under it a group's row to the line between two groups. A click on a
-  header still opens and closes it; Esc while carrying a row, a header or a button takes
-  the drag back (and in the list under the button, the row's pull). Undo
-  Move takes any of them back (not when a window that held only what was carried
-  closed with it). A window with no group keeps sliding the rows of its column
+  header still opens and closes it; Esc while carrying a row, a header or a
+  button takes the drag back (and in the list under the button, the row's pull).
+  Undo Move takes any of them back (not when a window that held only what was
+  carried closed with it). A window with no group slides the rows of its column
   as it always did.
 - **Elsewhere.** Show All Tabs lists every tab, a closed group's too. The
   groups are saved with the windows and come back with them

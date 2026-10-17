@@ -11,14 +11,13 @@
 //! (`AppDelegate::tab_drag_ended`).
 //!
 //! **What is carried is tabs or a group** ([`Carried`]): a tab, several picked together in the side
-//! column, or a group by its header (or, in the title row, its button). In a window that has
-//! groups a row of the column starts a session as soon as it is pulled, not only when it leaves the
-//! column — the places of a column with groups are a line between two things, not room opening
-//! between two rows ([`crate::groups::Groups::side_spots`]), and a session is what lets the
-//! column answer the pointer with one — and so do several tabs and a group, which are never
-//! slid along a list as one chip is. The bar the pointer is over answers `draggingUpdated:` with
-//! the line, and takes the drop ([`Landed`]); the application carries it out as a move
-//! ([`crate::moves`]), so every one of them is undone with Undo Move.
+//! column, or a group by its header (or, in the title row, its button). Several tabs and a group
+//! are never slid along a list as one chip is: they start a session as soon as they are pulled,
+//! and the bar the pointer is over answers `draggingUpdated:` with a line at the place
+//! ([`crate::groups::Groups::side_spots`]) and takes the drop ([`Landed`]); the application
+//! carries it out as a move ([`crate::moves`]), so every one of them is undone with Undo Move.
+//! One tab pulled out of a column that has groups slides in it as it always did, and becomes a
+//! session when it leaves it.
 //!
 //! **What is on the pasteboard means something in this process only**: ids count from zero in
 //! every process (a tab's, a group's and a window's alike), and a bateri beside a `bateri-dev`

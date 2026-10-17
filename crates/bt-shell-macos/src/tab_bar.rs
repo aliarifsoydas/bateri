@@ -171,7 +171,7 @@ use objc2_quartz_core::{
 use crate::app;
 use crate::arrange;
 use crate::card::{IDENTITY, fitted};
-use crate::groups::{Click, GroupId, group_place, group_spot_at, spot_at};
+use crate::groups::{Click, GroupId, group_place, group_spot_at, spot_at, spot_slot};
 use crate::icon;
 use crate::program::identity::Kind as ProgramKind;
 use crate::search_bar::mix;
@@ -5275,7 +5275,8 @@ struct Dragging {
     tab: u64,
     grip: Grip,
     /// Once the tab moves along the strip: where its chip is drawn (the bar's space) and the
-    /// place it would take if let go now. The other chips lay out around that place.
+    /// place it would take if let go now (a slot of the column's spots, [`Self::grouped`]). The
+    /// other chips lay out around that place.
     at: Option<(f64, usize)>,
     /// The tab came away from the bar: a drag session carries it and its chip waits, faint,
     /// in the place it left until the session ends ([`TabBar::drag_ended`]).
@@ -5284,6 +5285,11 @@ struct Dragging {
     /// session from the first, and a press let go without one is the plain click it would have
     /// been ([`TabBar::release`]).
     multi: bool,
+    /// The press was on a row of the column of a window that has groups: the place the row would
+    /// take ([`Self::at`]) is a slot of [`crate::groups::Groups::side_spots`], not a place of the
+    /// list — the gap opens over a group's header or under it, and a drop puts the row in the
+    /// group that was shown ([`TabBar::release`]).
+    grouped: bool,
 }
 
 pub(crate) struct BarIvars {
@@ -5999,16 +6005,43 @@ impl TabBar {
             .get()
             .filter(|drag| shown.tabs.iter().any(|label| label.tab == drag.tab));
         iv.drag.set(drag);
-        // The tabs in the order the strip shows them now: the dragged one at its place.
+        // The tabs in the order the strip shows them now: the dragged one at its place — in the
+        // column of a window with groups, with each header over the row it would stand over.
         if let Some(Dragging {
             tab,
             at: Some((_, to)),
             torn: false,
+            grouped,
             ..
         }) = drag
         {
             let selected = shown.tabs.get(shown.selected).map(|label| label.tab);
-            if let Some(from) = shown.tabs.iter().position(|label| label.tab == tab) {
+            if grouped {
+                let preview = self
+                    .terminal_window()
+                    .and_then(|window| window.side_preview(tab, to));
+                if let Some(preview) = preview {
+                    let rows: Vec<Label> = preview
+                        .rows
+                        .iter()
+                        .filter_map(|tab| shown.tabs.iter().find(|label| label.tab == *tab))
+                        .cloned()
+                        .collect();
+                    // A list that is not the window's now (it changed under the button) is left.
+                    if rows.len() == shown.tabs.len() {
+                        shown.tabs = rows;
+                        for heading in &mut shown.headings {
+                            if let Some(&(_, first)) = preview
+                                .firsts
+                                .iter()
+                                .find(|(group, _)| *group == heading.group)
+                            {
+                                heading.first_row = first;
+                            }
+                        }
+                    }
+                }
+            } else if let Some(from) = shown.tabs.iter().position(|label| label.tab == tab) {
                 tabs::reordered(&mut shown.tabs, from, to);
             }
             shown.selected = shown
@@ -6905,6 +6938,10 @@ impl TabBar {
                 at: None,
                 torn: false,
                 multi: iv.picks.borrow().tabs.contains(&tab) && self.is_side(),
+                grouped: self.is_side()
+                    && self
+                        .terminal_window()
+                        .is_some_and(|window| window.has_groups()),
             }));
         }
     }
@@ -6924,21 +6961,23 @@ impl TabBar {
             .is_some_and(|drag| drag.tab == tab && drag.multi)
     }
 
-    /// Whether a row pulled out of its place starts a drag session at once: in the column of a
-    /// window with groups, where it is carried to a place of the column — a line between two
-    /// things, one on each side of a group's border — and not slid along the rows
-    /// ([`crate::tab_drag`]).
-    fn carries_first(&self) -> bool {
-        self.is_side()
-            && self
-                .terminal_window()
-                .is_some_and(|window| window.has_groups())
+    /// The slot of the column's places the pointer at height `y` (the bar's space) is over
+    /// ([`crate::groups::Groups::side_spots`]), read on the column as it is: the preview of a
+    /// row slid along it is laid out from the answer, never the other way round. `None` for a
+    /// list the window has changed under the held button.
+    fn column_slot(&self, y: f64) -> Option<usize> {
+        let window = self.terminal_window()?;
+        let column = self.column_with_room(0)?;
+        spot_slot(&window.side_spots(&column), y)
     }
 
     /// The pointer moved with the button down on tab `tab`'s chip ([`Grip::track`]): past
     /// the slop the chip follows it along the strip and the others make room; out of the bar the
-    /// tab is carried away in a drag session — and past the slop at once where rows are carried
-    /// ([`Self::carries_first`], rows picked together).
+    /// tab is carried away in a drag session — and past the slop at once for rows picked together,
+    /// which are carried, not slid. In the column of a window that has groups the place the others
+    /// make room for is a slot of the column ([`Self::column_slot`]): at a group's border it is
+    /// the end of the group above while the pointer is over the upper half of the header, the head
+    /// of the group below while it is over the lower.
     fn drag(&self, tab: u64, event: &NSEvent) {
         let iv = self.ivars();
         let Some(mut drag) = iv.drag.get().filter(|drag| drag.tab == tab && !drag.torn) else {
@@ -6971,7 +7010,14 @@ impl TabBar {
             )
         };
         let tracked = match tracked {
-            Drag::Reorder { .. } if drag.multi || self.carries_first() => Drag::TearOff,
+            Drag::Reorder { .. } if drag.multi => Drag::TearOff,
+            Drag::Reorder { left, to } if drag.grouped => Drag::Reorder {
+                left,
+                to: self
+                    .column_slot(point.y)
+                    .or_else(|| drag.at.map(|(_, slot)| slot))
+                    .unwrap_or(to),
+            },
             other => other,
         };
         match tracked {
@@ -7133,6 +7179,18 @@ impl TabBar {
             .iter()
             .position(|label| label.tab == tab);
         match self.terminal_window() {
+            // A slot of the column: the row goes where the slot's target says, in the group that
+            // was shown — one move, which Undo Move takes back. A slot that changes nothing is
+            // refused, and the row glides back.
+            Some(window) if drag.grouped => {
+                let target = self
+                    .column_with_room(0)
+                    .and_then(|column| window.side_spots(&column).into_iter().nth(to))
+                    .map(|spot| spot.target);
+                if !target.is_some_and(|target| window.regroup_tab(tab, target)) {
+                    self.lay_out();
+                }
+            }
             // The place in the list is the listed tab's in the strip the applier counts.
             Some(window) if now.is_some_and(|now| now != to) => {
                 window.move_tab_listed(tab, to);

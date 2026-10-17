@@ -136,11 +136,15 @@ pub struct Spot<K> {
 /// The spot a pointer at `y` is over: the last whose zone has begun, the first for a pointer above
 /// the list. `None` for no spot at all (a list that is not what the column was laid out from).
 pub fn spot_at<K>(spots: &[Spot<K>], y: f64) -> Option<&Spot<K>> {
+    spot_slot(spots, y).map(|slot| &spots[slot])
+}
+
+/// The index of [`spot_at`]'s spot — the slot [`Groups::side_preview`] takes.
+pub fn spot_slot<K>(spots: &[Spot<K>], y: f64) -> Option<usize> {
     spots
         .iter()
-        .rev()
-        .find(|spot| spot.from <= y)
-        .or(spots.first())
+        .rposition(|spot| spot.from <= y)
+        .or_else(|| (!spots.is_empty()).then_some(0))
 }
 
 /// A place the side column takes a carried group at, among the groups
@@ -163,6 +167,16 @@ pub fn group_spot_at(spots: &[GroupSpot], y: f64) -> Option<&GroupSpot> {
         .rev()
         .find(|spot| spot.from <= y)
         .or(spots.first())
+}
+
+/// The side column's list with one row put at a place of it ([`Groups::side_preview`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidePreview<K> {
+    /// The listed tabs in order, the one that is put among them.
+    pub rows: Vec<K>,
+    /// For each group's header in order, the index in [`Self::rows`] of the row under it — the
+    /// number of rows when there is none (a closed group that lists nothing).
+    pub firsts: Vec<(GroupId, usize)>,
 }
 
 /// The place a group at `from` among the groups takes when it is let go at slot `slot` (before the
@@ -373,18 +387,31 @@ impl<K: Copy + Eq> Groups<K> {
     /// below the last), each naming where the tabs would be put and where the line that marks it
     /// runs. **Two places stand at a group's border**: below the last row of a group is that
     /// group's end, between its header and its first row is its head — a flat place cannot say
-    /// which, and the second is what [`Self::landing`] would have chosen alone. A header and the
-    /// [`tabs::GAP`] under it belong to the head, the lower half of the last row and the gap
-    /// above the next header to the end. Empty when `column` is not what the list lays out to
-    /// (the list changed under a held button): the caller has nothing to drop on then.
+    /// which, and the second is what [`Self::landing`] would have chosen alone. The pointer
+    /// decides by the middle of the header: above it the gap opens over the header, at the end of
+    /// the group above (the lower half of its last row and the gap over the header are the
+    /// same place); below it the gap opens under the header, at the head of the group (with the
+    /// [`tabs::GAP`] under the header and the upper half of its first row). **A closed group's
+    /// header is all the group's**: it lists no row to be the end of, so a pointer anywhere on it
+    /// means the group's end. Empty when `column` is not what the list lays out to (the list
+    /// changed under a held button): the caller has nothing to drop on then.
     ///
     /// The tabs being carried are not named: a place before one of them stands before the next
     /// that stays ([`Self::place`]), and one that changes nothing is refused by the move.
     pub fn side_spots(&self, tabs: &Tabs<K>, column: &Column) -> Vec<Spot<K>> {
         let items = self.side_items(tabs);
-        let Some(frames) = item_frames(&items, column) else {
+        let Some(mut frames) = item_frames(&items, column) else {
             return Vec::new();
         };
+        // An open header is read by its middle, a closed one by its top (all of it is the
+        // group's).
+        for (item, frame) in items.iter().zip(&mut frames) {
+            if let Item::Header(group) = item
+                && self.group(*group).is_some_and(|group| !group.collapsed)
+            {
+                frame.split = (frame.top + frame.bottom) / 2.0;
+            }
+        }
         (0..=items.len())
             .map(|slot| {
                 let line = match slot {
@@ -453,6 +480,37 @@ impl<K: Copy + Eq> Groups<K> {
                 }
             })
             .collect()
+    }
+
+    /// The side column's list as it would stand if `tab` were let go at slot `slot` of
+    /// [`Self::side_spots`] (the same numbering: a place between two things of the list as it is,
+    /// above the first or below the last) — the rows in order and, for each group, the index of
+    /// the row under its header — which a row slid along the column is laid out as while it is
+    /// held, so the others make room where it would stand: over a header, at the end of the group
+    /// above, or under it, at the head of the group. `None` for a tab that is not listed or a slot
+    /// that is not there.
+    ///
+    /// What the drop does is [`Self::place`] of [`Self::slot_target`]; the two agree on where
+    /// the row stands (the tests make each slot say so), so what is shown is what is done.
+    pub fn side_preview(&self, tabs: &Tabs<K>, tab: K, slot: usize) -> Option<SidePreview<K>> {
+        let mut items = self.side_items(tabs);
+        let from = items.iter().position(|item| *item == Item::Tab(tab))?;
+        if slot > items.len() {
+            return None;
+        }
+        items.remove(from);
+        items.insert(if from < slot { slot - 1 } else { slot }, Item::Tab(tab));
+        let mut preview = SidePreview {
+            rows: Vec::new(),
+            firsts: Vec::new(),
+        };
+        for item in items {
+            match item {
+                Item::Tab(tab) => preview.rows.push(tab),
+                Item::Header(group) => preview.firsts.push((group, preview.rows.len())),
+            }
+        }
+        Some(preview)
     }
 
     /// Where a tab (or a pane that becomes one) let go at gap `gap` of what a view lists — before
@@ -1325,8 +1383,8 @@ impl<K: Copy + Eq> Groups<K> {
 struct Frame {
     top: f64,
     bottom: f64,
-    /// A row's middle, a header's top: the pointer is over the place before the thing above this
-    /// point and the place after it below.
+    /// A row's middle, an open header's middle, a closed header's top: the pointer is over the
+    /// place before the thing above this point and the place after it below.
     split: f64,
 }
 
@@ -2631,21 +2689,28 @@ mod tests {
                 before: None
             }
         );
-        // On the header, and on the upper half of web's first row: web's head.
+        // The pointer decides by the middle of the header (24 high): over its upper half the gap
+        // opens above it, api's end; over its lower half, and on the upper half of web's first
+        // row, under it, web's head.
         let head = Target::Group {
             group: web,
             before: Some(4),
         };
-        assert_eq!(over_header(&groups, &tabs, 1, 2.0), head);
-        assert_eq!(over_header(&groups, &tabs, 1, 20.0), head);
+        let end = Target::Group {
+            group: api,
+            before: None,
+        };
+        assert_eq!(over_header(&groups, &tabs, 1, 2.0), end);
+        assert_eq!(over_header(&groups, &tabs, 1, 11.0), end);
+        assert_eq!(over_header(&groups, &tabs, 1, 13.0), head);
+        assert_eq!(over_header(&groups, &tabs, 1, 22.0), head);
         assert_eq!(over_row(&groups, &tabs, 6, 0.25), Some(head));
         // The two lines are apart: the end's is in the group gap, the head's under the header.
-        let end = spot_at(&spots, above).unwrap().line;
-        let head = spot_at(&spots, column.headers[1].rect.y + 2.0)
-            .unwrap()
-            .line;
-        assert!(end < column.headers[1].rect.y, "above the header");
-        assert!(head > column.headers[1].rect.y, "under the header");
+        let top = column.headers[1].rect.y;
+        let end = spot_at(&spots, top + 2.0).unwrap().line;
+        let head = spot_at(&spots, top + 20.0).unwrap().line;
+        assert!(end < top, "above the header");
+        assert!(head > top + 24.0 - 1.0, "under the header");
     }
 
     #[test]
@@ -2897,5 +2962,90 @@ mod tests {
         groups.place(&mut tabs, &[6], target);
         assert_eq!(groups.cluster(&tabs, None), [7, 8, 6]);
         ok(&groups, &tabs);
+    }
+    /// The rows and the row under each header of the list as it stands.
+    fn standing(groups: &Groups<u32>, tabs: &Tabs<u32>) -> SidePreview<u32> {
+        let mut now = SidePreview {
+            rows: Vec::new(),
+            firsts: Vec::new(),
+        };
+        for item in groups.side_items(tabs) {
+            match item {
+                Item::Tab(tab) => now.rows.push(tab),
+                Item::Header(group) => now.firsts.push((group, now.rows.len())),
+            }
+        }
+        now
+    }
+
+    #[test]
+    fn a_row_slid_to_a_groups_border_stands_in_the_group_the_pointer_says() {
+        let (tabs, groups, api, web) = scene();
+        // Listed: `6 7 8 | api 1 2 3 | web 4 5`: slots 0…10, 7 above web's header, 8 under it.
+        // 3 is api's last tab: slid down past its row it is api's end above the header, web's
+        // head under it.
+        let above = groups.side_preview(&tabs, 3, 7).unwrap();
+        assert_eq!(above.rows, [6, 7, 8, 1, 2, 3, 4, 5]);
+        assert_eq!(above.firsts, [(api, 3), (web, 6)]);
+        let under = groups.side_preview(&tabs, 3, 8).unwrap();
+        assert_eq!(under.rows, [6, 7, 8, 1, 2, 3, 4, 5]);
+        assert_eq!(
+            under.firsts,
+            [(api, 3), (web, 5)],
+            "3 is the first row of web"
+        );
+        // An ungrouped tab slid to the same border: the end of api, or the head of web.
+        let end = groups.side_preview(&tabs, 6, 7).unwrap();
+        assert_eq!(end.rows, [7, 8, 1, 2, 3, 6, 4, 5]);
+        assert_eq!(end.firsts, [(api, 2), (web, 6)]);
+        let head = groups.side_preview(&tabs, 6, 8).unwrap();
+        assert_eq!(head.rows, [7, 8, 1, 2, 3, 6, 4, 5]);
+        assert_eq!(head.firsts, [(api, 2), (web, 5)]);
+        // A tab that is not listed and a slot that is not there have no list.
+        assert_eq!(groups.side_preview(&tabs, 99, 3), None);
+        assert_eq!(groups.side_preview(&tabs, 3, 11), None);
+    }
+
+    /// Whatever slot a row is slid to, the list that is shown is the list the drop makes: for each
+    /// tab on screen (the one a press selects, which a closed group lists), each slot of the
+    /// column, with every group open or closed.
+    #[test]
+    fn the_preview_of_a_slot_is_the_list_its_drop_makes() {
+        for closed in [(false, false), (true, false), (false, true), (true, true)] {
+            for tab in 1..=8u32 {
+                let (mut tabs, mut groups, api, web) = scene();
+                groups.set_collapsed(api, closed.0);
+                groups.set_collapsed(web, closed.1);
+                groups.select(&mut tabs, tab);
+                let column = column(&groups, &tabs);
+                let spots = groups.side_spots(&tabs, &column);
+                assert_eq!(spots.len(), groups.side_items(&tabs).len() + 1);
+                for (slot, spot) in spots.iter().enumerate() {
+                    let shown = groups.side_preview(&tabs, tab, slot).unwrap();
+                    let (mut after, mut moved) = (tabs.clone(), groups.clone());
+                    moved.place(&mut after, &[tab], spot.target.clone());
+                    // Where it ends the selection is on it, so a closed group lists it.
+                    let done = standing(&moved, &after);
+                    assert_eq!(
+                        shown.rows, done.rows,
+                        "tab {tab}, slot {slot}, closed {closed:?}: {:?}",
+                        spot.target
+                    );
+                    // A group the tab leaves empty goes with its header: the shown list keeps
+                    // it, empty, for the moment the drop takes.
+                    let kept: Vec<_> = shown
+                        .firsts
+                        .iter()
+                        .copied()
+                        .filter(|(group, _)| moved.group(*group).is_some())
+                        .collect();
+                    assert_eq!(
+                        kept, done.firsts,
+                        "tab {tab}, slot {slot}, closed {closed:?}: {:?}",
+                        spot.target
+                    );
+                }
+            }
+        }
     }
 }
