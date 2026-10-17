@@ -12,10 +12,13 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-17
+
 ### Added
 
 - **Tabs can be gathered into named groups.** Right-click
-  a tab and choose **Move to New Group** (or **Move to Group ▸**), or press
+  a tab — a window's only tab too, where it is the window's title — and choose
+  **Move to New Group** (or **Move to Group ▸**), or press
   ⇧⌘N for a new tab in a group of its own: in the side column the group gets a
   header — an arrow, its name and, with the pointer over it, a `+` that opens
   a tab in it — and its tabs stand under it. Tabs that are in no group stay at
