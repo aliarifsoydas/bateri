@@ -190,6 +190,9 @@ mod tab_side;
 // A group's header in that column.
 #[path = "tab_group.rs"]
 mod tab_group;
+// The group button of the title row and the list of groups under it.
+#[path = "tab_switch.rs"]
+mod tab_switch;
 
 /// Space between the zoom button's right edge and the strip — the design's
 /// strip starts at 84 pt beside lights ending at 72 pt. In full screen the
@@ -5043,6 +5046,34 @@ pub(crate) struct Heading {
     pub(crate) first_row: usize,
 }
 
+/// What the title row of a window with groups adds to the bar: the group button's group and the
+/// list it opens ([`TabBar::show`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Switcher {
+    /// The group on screen, whose tabs the bar lists; `None` on the ungrouped tabs.
+    pub(crate) shown: Option<GroupId>,
+    /// Its name; `None` on the ungrouped tabs, whose button is the stack alone.
+    pub(crate) name: Option<String>,
+    /// What the button's dot says: the most urgent thing that asks for the user in any tab
+    /// outside the group on screen (`tabs::group_indicator`).
+    pub(crate) elsewhere: Option<Indicator>,
+    /// The list's rows: the ungrouped tabs' first, then each group's.
+    pub(crate) rows: Vec<SwitchRow>,
+}
+
+/// One row of the group list.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SwitchRow {
+    /// The group the row brings on screen; `None` for the ungrouped tabs.
+    pub(crate) group: Option<GroupId>,
+    pub(crate) name: String,
+    /// What the group asks of the user (`tabs::group_indicator`).
+    pub(crate) indicator: Option<Indicator>,
+    /// The digit of the key that reaches it with ⌃⌘ ([`tabs::shortcut_digit`]; 0 for the ungrouped
+    /// tabs); none for a group past the ninth that no key reaches.
+    pub(crate) hint: Option<u8>,
+}
+
 /// What the bar shows; the window gives it ([`TabBar::show`]).
 #[derive(Clone, Debug, Default)]
 struct Shown {
@@ -5052,6 +5083,9 @@ struct Shown {
     /// The groups' headers of the column, each with the row it stands above; none in the title
     /// row and none while no group exists.
     headings: Vec<Heading>,
+    /// The group button and its list, in the title row of a window with groups; none in the
+    /// column and none while no group exists.
+    switcher: Option<Switcher>,
     selected: usize,
     /// The settings diagnostic; empty without one.
     notice: String,
@@ -5227,6 +5261,13 @@ pub(crate) struct BarIvars {
     headers: RefCell<Vec<Retained<tab_group::GroupHeader>>>,
     /// The group whose name the field holds, in place of a tab's ([`BarIvars::renaming`]).
     renaming_group: Cell<Option<GroupId>>,
+    /// The group button of the title row, always in the bar and shown only with a switcher.
+    switch: Retained<tab_switch::GroupButton>,
+    /// The list of groups under it and the view over the window that closes it, the list being
+    /// up while the view is in the window ([`TabBar::open_group_list`]).
+    group_list: Retained<tab_switch::GroupList>,
+    scrim: Retained<tab_switch::ListScrim>,
+    list_open: Cell<bool>,
     /// ⌃⌘ is held (past [`HINT_DELAY`]): the headers show their keys.
     group_hints: Cell<bool>,
     /// ⌘'s `hint_wait` and `hint_pending`, for ⌃⌘.
@@ -5326,6 +5367,15 @@ define_class!(
         fn control_end_editing(&self, _notification: &NSNotification) {
             self.end_rename(true);
         }
+
+        /// What is typed over the group button's name widens the button, and the tabs move
+        /// aside for it.
+        #[unsafe(method(controlTextDidChange:))]
+        fn control_changed(&self, _notification: &NSNotification) {
+            if self.ivars().renaming_group.get().is_some() && !self.is_side() {
+                self.lay_out();
+            }
+        }
     }
 
     // The rename field's delegate: both protocols' methods are optional;
@@ -5370,6 +5420,7 @@ define_class!(
 impl TabBar {
     pub(crate) fn new(mtm: MainThreadMarker, window: u64) -> Retained<Self> {
         let new_tab = BarButton::new(mtm, Kind::NewTab);
+        let switch = tab_switch::GroupButton::new(mtm);
         let list = BarButton::new(mtm, Kind::List);
         let warning = BarButton::new(mtm, Kind::Warning);
         let strip = ChipStrip::new(mtm);
@@ -5427,6 +5478,10 @@ impl TabBar {
             hint_pending: Cell::new(false),
             headers: RefCell::new(Vec::new()),
             renaming_group: Cell::new(None),
+            switch: switch.clone(),
+            group_list: tab_switch::GroupList::new(mtm, window),
+            scrim: tab_switch::ListScrim::new(mtm, window),
+            list_open: Cell::new(false),
             group_hints: Cell::new(false),
             group_wait: Cell::new(0),
             group_pending: Cell::new(false),
@@ -5445,6 +5500,7 @@ impl TabBar {
         // Under everything: the title row is the bar's, not the window server's.
         this.addSubview(&RowClaim::new(mtm));
         this.addSubview(&new_tab);
+        this.addSubview(&switch);
         this.addSubview(&list);
         this.addSubview(&warning);
         // The fades over the strip: what runs under an edge dissolves.
@@ -5453,6 +5509,7 @@ impl TabBar {
         this.addSubview(&fade_trailing);
         list.setHidden(true);
         warning.setHidden(true);
+        switch.setHidden(true);
         // SAFETY: `TabBar` implements the field's delegate protocols (the
         // two optional methods it uses are defined above); the field holds
         // its delegate weakly and the bar owns the field.
@@ -5472,9 +5529,11 @@ impl TabBar {
 
     /// Whether a bar of `count` tabs is just the window's title: one tab in the title row. It
     /// has no menu, no card, no ring and no `×`. The side column has no title bar, so there a
-    /// lone tab is a row like the rest.
+    /// lone tab is a row like the rest, and so is the one tab of a group: the group button leads
+    /// the bar then and the tab is a chip beside it.
     fn lone_title(&self, count: usize) -> bool {
-        count < 2 && self.ivars().side.get().is_none()
+        let iv = self.ivars();
+        count < 2 && iv.side.get().is_none() && iv.shown.borrow().switcher.is_none()
     }
 
     /// Reduce Motion now — the setting and the system's answer, one `bool`.
@@ -5495,6 +5554,7 @@ impl TabBar {
         tabs: Vec<Label>,
         selected: usize,
         headings: Vec<Heading>,
+        switcher: Option<Switcher>,
         notice: String,
     ) {
         let iv = self.ivars();
@@ -5515,12 +5575,15 @@ impl TabBar {
                 })
         };
         let before = open.and_then(|tab| told(&iv.shown.borrow(), tab));
+        let listed = iv.list_open.get().then(|| self.listing());
         iv.shown.replace(Shown {
             tabs,
             headings,
+            switcher,
             selected,
             notice,
         });
+        self.refresh_group_list(listed);
         let mapped = iv.card.borrow().as_ref().is_some_and(OpenCard::pictured);
         if let Some(tab) = open
             && (mapped || before != told(&iv.shown.borrow(), tab))
@@ -5616,6 +5679,92 @@ impl TabBar {
         (chips, changed)
     }
 
+    /// The group button's width, in whole points; `None` where the bar has no such button — in
+    /// the column, and while no group exists. It follows the group's name, or what is typed in
+    /// its place ([`tabs::group_button_width`]).
+    fn switch_width(&self) -> Option<f64> {
+        let iv = self.ivars();
+        if iv.side.get().is_some() {
+            return None;
+        }
+        let shown = iv.shown.borrow();
+        let switcher = shown.switcher.as_ref()?;
+        let naming = switcher.shown.is_some() && iv.renaming_group.get() == switcher.shown;
+        let name = match (&switcher.name, naming) {
+            (None, _) => None,
+            (Some(_), true) => Some(iv.switch.text_width(&iv.field.stringValue().to_string())),
+            (Some(name), false) => Some(iv.switch.text_width(name)),
+        };
+        Some(tabs::group_button_width(name, naming))
+    }
+
+    /// What the group button takes of the strip's room: its width and the space after it.
+    fn switch_lead(&self) -> f64 {
+        self.switch_width()
+            .map_or(0.0, |width| width + tabs::GROUP_BUTTON_GAP)
+    }
+
+    /// The strip of `bar`: a lone tab is the window's title, unless a group button leads the bar,
+    /// when it is a chip ([`Bar::layout_chips_with`]).
+    fn strip_for(&self, bar: &Bar, glowing: impl Fn(usize) -> bool) -> Strip {
+        if self.switch_width().is_some() {
+            bar.layout_chips_with(glowing)
+        } else {
+            bar.layout_with(glowing)
+        }
+    }
+
+    /// Puts the group button where the strip starts, with the look its group gives it, and the
+    /// name field in its place while the group is being named; hides it where there is none.
+    fn place_switch(&self, palette: Palette, top: f64) {
+        let iv = self.ivars();
+        let (Some(width), Some(switcher)) =
+            (self.switch_width(), iv.shown.borrow().switcher.clone())
+        else {
+            iv.switch.setHidden(true);
+            return;
+        };
+        let naming = switcher.shown.is_some() && iv.renaming_group.get() == switcher.shown;
+        let frame = NSRect::new(
+            NSPoint::new(self.leading(), top),
+            NSSize::new(width, CHIP_HEIGHT),
+        );
+        iv.switch.setHidden(false);
+        iv.switch.set(
+            frame,
+            &tab_switch::ButtonLook {
+                group: switcher.shown,
+                name: switcher.name,
+                open: iv.list_open.get(),
+                naming,
+                elsewhere: switcher.elsewhere,
+            },
+            palette,
+        );
+        if naming {
+            // Where the name stands, a little wider than the text so the caret has room; the
+            // button's own fill is the field's ground.
+            let field = &iv.field;
+            field.setAlignment(NSTextAlignment::Left);
+            self.dress_field(palette, false);
+            // SAFETY: AppKit's constant font weight.
+            let weight = unsafe { NSFontWeightSemibold };
+            field.setFont(Some(&NSFont::systemFontOfSize_weight(
+                tab_switch::NAME_TEXT,
+                weight,
+            )));
+            let height = field.intrinsicContentSize().height;
+            let x = frame.origin.x + tab_switch::NAME_X - 2.0;
+            field.setFrame(NSRect::new(
+                NSPoint::new(x, top + ((CHIP_HEIGHT - height) / 2.0).max(0.0)),
+                NSSize::new(
+                    (frame.origin.x + frame.size.width - tab_switch::NAME_END / 2.0 - x).max(0.0),
+                    height,
+                ),
+            ));
+        }
+    }
+
     /// The pure layout's input for `count` places: the bar's width, where the strip may start,
     /// the settings diagnostic and the corner, and the scroll as it stands.
     fn bar_for(
@@ -5628,7 +5777,7 @@ impl TabBar {
         let iv = self.ivars();
         Bar {
             width: self.bounds().size.width,
-            leading: self.leading(),
+            leading: self.leading() + self.switch_lead(),
             count,
             selected,
             hovered,
@@ -5674,12 +5823,19 @@ impl TabBar {
             self.end_rename(false);
             return;
         }
-        if let Some(group) = iv.renaming_group.get()
-            && (iv.side.get().is_none()
-                || !shown.headings.iter().any(|heading| heading.group == group))
-        {
-            self.end_rename(false);
-            return;
+        if let Some(group) = iv.renaming_group.get() {
+            let there = if iv.side.get().is_some() {
+                shown.headings.iter().any(|heading| heading.group == group)
+            } else {
+                shown
+                    .switcher
+                    .as_ref()
+                    .is_some_and(|switcher| switcher.shown == Some(group))
+            };
+            if !there {
+                self.end_rename(false);
+                return;
+            }
         }
         let side = iv.side.get();
         let drag = iv
@@ -5759,10 +5915,16 @@ impl TabBar {
             seats
         };
         if let Some(top) = side {
+            iv.switch.setHidden(true);
             let flight = tab_side::Flight { drag, gap };
             self.lay_out_column(top, &shown, &chips, &glowing, reflow, flight);
             return;
         }
+        // The group button leads the strip, beside the lights.
+        self.place_switch(
+            palette,
+            ((self.bounds().size.height - CHIP_HEIGHT) / 2.0).max(0.0),
+        );
         let lit_at = |place: usize| seats.get(place).copied().unwrap_or(false);
         let bar = self.bar_for(
             count + usize::from(gap.is_some()),
@@ -5770,7 +5932,7 @@ impl TabBar {
             hovered.map(seat),
             dragged.map(seat),
         );
-        let mut strip = bar.layout_with(lit_at);
+        let mut strip = self.strip_for(&bar, lit_at);
         let selected_tab = shown.tabs.get(shown.selected).map(|label| label.tab);
         let mut revealed = false;
         let was_overflowing = iv.overflowed.replace(strip.overflow);
@@ -5786,11 +5948,13 @@ impl TabBar {
             if selection_changed || kept_in_sight {
                 let target = strip.revealing(seat(shown.selected));
                 if target != strip.scroll {
-                    strip = Bar {
-                        scroll: target,
-                        ..bar
-                    }
-                    .layout_with(lit_at);
+                    strip = self.strip_for(
+                        &Bar {
+                            scroll: target,
+                            ..bar
+                        },
+                        lit_at,
+                    );
                     revealed = selection_changed;
                 }
             }
@@ -6003,34 +6167,48 @@ impl TabBar {
 
     /// Opens the name field over group `group`'s header, its name selected: a double click on the
     /// header, Rename Group…, a group just made. A name under way elsewhere is kept first, and
-    /// the header is brought into view. Only in the column, which is where headers stand.
+    /// the header is brought into view. In the title row there is no header: the field opens in
+    /// the group button, over its name, and only for the group on screen.
     pub(crate) fn begin_group_rename(&self, group: GroupId) {
         let iv = self.ivars();
-        let Some(heading) = iv
-            .shown
-            .borrow()
-            .headings
-            .iter()
-            .find(|heading| heading.group == group)
-            .cloned()
-        else {
-            return;
-        };
-        if iv.side.get().is_none() || iv.renaming_group.get() == Some(group) {
+        if iv.renaming_group.get() == Some(group) {
             return;
         }
+        // In the column the header, in the title row the group button: the group on screen.
+        let named = {
+            let shown = iv.shown.borrow();
+            if iv.side.get().is_some() {
+                shown
+                    .headings
+                    .iter()
+                    .find(|heading| heading.group == group)
+                    .map(|heading| (heading.name.clone(), Some(heading.first_row)))
+            } else {
+                shown
+                    .switcher
+                    .as_ref()
+                    .filter(|switcher| switcher.shown == Some(group))
+                    .and_then(|switcher| switcher.name.clone())
+                    .map(|name| (name, None))
+            }
+        };
+        let Some((name, first_row)) = named else {
+            return;
+        };
         self.end_rename(true);
         // The row below the header comes into sight with it; a closed group with none shows the
         // header where it is.
-        let to = iv.column.borrow().as_ref().and_then(|column| {
-            (heading.first_row < column.rows.len()).then(|| column.revealing(heading.first_row))
+        let to = first_row.and_then(|first_row| {
+            iv.column.borrow().as_ref().and_then(|column| {
+                (first_row < column.rows.len()).then(|| column.revealing(first_row))
+            })
         });
         if let Some(to) = to {
             iv.scroll.set(to);
         }
         iv.renaming_group.set(Some(group));
-        iv.opened_with.replace(heading.name.clone());
-        iv.field.setStringValue(&NSString::from_str(&heading.name));
+        iv.opened_with.replace(name.clone());
+        iv.field.setStringValue(&NSString::from_str(&name));
         self.addSubview(&iv.field);
         self.lay_out();
         // SAFETY: `selectText:` takes an optional sender, unused.
@@ -6149,9 +6327,7 @@ impl TabBar {
             menu.addItem(&holder);
         }
         add("Rename Tab\u{2026}", sel!(renameTab:));
-        if window.groups_shown() {
-            self.add_group_items(&menu, &window, tab);
-        }
+        self.add_group_items(&menu, &window, tab);
         Some(menu)
     }
 
@@ -6220,7 +6396,10 @@ impl TabBar {
         let add = |title: &str, action: Sel| {
             menu.addItem(&window_item(mtm, &window, title, action, tag));
         };
-        add("New Tab in Group", sel!(newTabInGroup:));
+        // The title row has ⌘T for it: a new tab opens in the group on screen.
+        if self.is_side() {
+            add("New Tab in Group", sel!(newTabInGroup:));
+        }
         add("Rename Group\u{2026}", sel!(renameGroup:));
         add("Ungroup", sel!(ungroupGroup:));
         menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -6345,7 +6524,7 @@ impl TabBar {
     /// ([`Strip::slot_at`]), so the room that opens is under the pointer.
     fn strip_with_room(&self, room: usize) -> Option<Strip> {
         let count = self.ivars().shown.borrow().tabs.len();
-        (count > 0).then(|| self.bar_for(count + room, 0, None, None).layout())
+        (count > 0).then(|| self.strip_for(&self.bar_for(count + room, 0, None, None), |_| false))
     }
 
     /// The place under `point` (the bar's space) of the list as it would be with `room` more
@@ -6509,9 +6688,9 @@ impl TabBar {
             .iter()
             .position(|label| label.tab == tab);
         match self.terminal_window() {
-            // The place in the column is the listed tab's in the strip the applier counts.
+            // The place in the list is the listed tab's in the strip the applier counts.
             Some(window) if now.is_some_and(|now| now != to) => {
-                window.move_tab(tab, window.strip_place(to));
+                window.move_tab_listed(tab, to);
             }
             _ => self.lay_out(),
         }
@@ -7272,6 +7451,7 @@ impl TabBar {
         let iv = self.ivars();
         iv.card_wait.set(iv.card_wait.get().wrapping_add(1));
         self.close_card();
+        self.close_group_list(false);
     }
 
     // ─── ⌘ hints ─────────────────────────────────────────────────────────

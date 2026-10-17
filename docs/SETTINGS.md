@@ -487,12 +487,12 @@ with the windows when bateri restores them.
 
 ### Tab groups
 
-With the tabs at the side (`tab_position = "side"`) a window's tabs can be
-gathered into named groups. A group is a header in the column — an arrow, its
+A window's tabs can be gathered into named groups. At the side
+(`tab_position = "side"`) a group is a header in the column — an arrow, its
 name, and with the pointer over it a `+` — and its tabs stand under it; tabs
 that are in no group stay at the top of the column with no header, and a
-window with no group is the column it always was. The groups' items in the
-menus are grey while the tabs are in the bar.
+window with no group is the column it always was. In the title row the bar
+shows one group at a time instead (see **In the title row** below).
 
 - **Making one.** Right-click a tab ▸ **Move to New Group** (the first group)
   or **Move to Group ▸ New Group…**; Window ▸ **Move Tab to Group ▸ New
@@ -523,6 +523,19 @@ menus are grey while the tabs are in the bar.
   it was closed; ⌃⌘0 goes to the ungrouped tabs, and opens a new one when
   there is none (Window ▸ **Select Group ▸**). Holding ⌃⌘ shows the keys on
   the headers.
+- **In the title row.** The bar lists the tabs of the group on screen, or of
+  the ungrouped tabs, and a button leads it: a stack and the group's name (the
+  ungrouped tabs have the stack alone), and a dot on its corner while some
+  other group has a question, a failure or a finish you have not seen. Click it
+  to list the window's groups — the ungrouped tabs first, the group on screen
+  ticked, each with what it asks of you and its ⌃⌘ key, and **New Group** last;
+  choose one to go to it (on the tab you were last on in it), Esc or a click
+  elsewhere closes the list. A double click on the button opens the name field
+  in its place and the tabs move aside for what you type; right-click ▸
+  **Rename Group…**, **Ungroup** or **Close Group**. Moving the tab on screen
+  into another group, or out of its group, leaves the window where it is, on
+  the group's next tab; into a group of its own, or when it was the group's
+  last tab, the window goes with it. ⌘1–9 count the tabs on the bar.
 - **Elsewhere.** Show All Tabs lists every tab, a closed group's too. The
   groups are saved with the windows and come back with them
   (`restore_windows`); Merge All Windows brings every group with its tabs

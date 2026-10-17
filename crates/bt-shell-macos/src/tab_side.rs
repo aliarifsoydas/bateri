@@ -326,6 +326,8 @@ impl TabBar {
             iv.fade_leading.setHidden(true);
             iv.fade_trailing.setHidden(true);
             iv.list.setHidden(true);
+            iv.switch.setHidden(true);
+            self.close_group_list(false);
         } else {
             // The bar's own: the list had no mask and New Tab a square foot, and no headers.
             iv.mask.clear(&iv.strip);

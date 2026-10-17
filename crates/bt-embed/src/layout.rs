@@ -627,6 +627,7 @@ pub unsafe extern "C" fn bt_world_add_window(
                 tabs: Vec::new(),
                 asking,
                 stays_empty,
+                one_cluster: false,
             });
             true
         })

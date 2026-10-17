@@ -1608,8 +1608,7 @@ define_class!(
             } else if item.action() == Some(sel!(newGroup:))
                 || item.action() == Some(sel!(newUngroupedTab:))
             {
-                // Groups stand in the side column.
-                self.key_window().is_some_and(|window| window.groups_shown())
+                self.key_window().is_some()
             } else if item.action() == Some(sel!(mergeWindows:)) {
                 // Merging needs a second window to take tabs from.
                 self.windows().len() > 1
@@ -1643,22 +1642,15 @@ define_class!(
         /// on screen stands in, after the other groups.
         #[unsafe(method(newGroup:))]
         fn new_group(&self, _sender: Option<&AnyObject>) {
-            if let Some(window) = self.key_window()
-                && window.groups_shown()
-            {
-                let name = window.new_group_name(None);
-                self.new_tab_seated(window.id(), Seat::New(name));
-                // Born with its name field open, to be said better than the folder's.
-                window.rename_shown_group();
+            if let Some(window) = self.key_window() {
+                self.new_group_in(&window);
             }
         }
 
         /// Shell ▸ New Ungrouped Tab: a new tab among the ungrouped ones, after the last of them.
         #[unsafe(method(newUngroupedTab:))]
         fn new_ungrouped_tab(&self, _sender: Option<&AnyObject>) {
-            if let Some(window) = self.key_window()
-                && window.groups_shown()
-            {
+            if let Some(window) = self.key_window() {
                 self.new_tab_seated(window.id(), Seat::Loose);
             }
         }
@@ -4068,6 +4060,15 @@ impl AppDelegate {
         if let Some(window) = self.window(window) {
             self.open_window_or_report(Some(&window), Opening::Tab);
         }
+    }
+
+    /// A new tab in a group of its own in `window`, named for the folder the tab on screen stands
+    /// in, after the other groups: Shell ▸ New Group and the group list's last row.
+    pub(crate) fn new_group_in(&self, window: &TerminalWindow) {
+        let name = window.new_group_name(None);
+        self.new_tab_seated(window.id(), Seat::New(name));
+        // Born with its name field open, to be said better than the folder's.
+        window.rename_shown_group();
     }
 
     /// A new tab in window `window` at `seat` among its groups — ⌘T's job (the tab inherits from

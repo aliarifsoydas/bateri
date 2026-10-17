@@ -69,6 +69,12 @@ pub struct Window {
     /// whose windows are places of their own — a workspace that stays when its last terminal
     /// moves out — keeps them (`true`).
     pub stays_empty: bool,
+    /// The window shows one cluster of its strip at a time — the group on screen, or the
+    /// ungrouped tabs (bateri's tab bar in the title row) — and keeps its place when tabs are
+    /// regrouped away from it: the next tab of the cluster comes forward instead of the screen
+    /// following the tabs ([`Move::RegroupTabs`]). `false` for a window that lists every tab
+    /// (the side column) and for a host that keeps no groups.
+    pub one_cluster: bool,
 }
 
 impl Window {
@@ -945,23 +951,57 @@ fn regroup_tabs(
     let from = window_named(world, window)?;
     let tabs = in_strip(from, tabs);
     let (mut order, mut groups) = (from.order.clone(), from.groups.clone());
-    groups
+    let into = groups
         .place(&mut order, &tabs, target.clone())
         .ok_or(Refusal::Quiet)?;
     if arrangement(&order, &groups) == arrangement(&from.order, &from.groups) {
         return Err(Refusal::Quiet);
     }
+    let after = keep_cluster(from, &tabs, &target, into)
+        .into_iter()
+        .collect();
     Ok(Plan {
         steps: vec![Step::Regroup {
             window,
             tabs,
             target,
         }],
-        after: Vec::new(),
+        after,
         undo: Some(Record {
             scenes: vec![from.scene(&[])],
             born: Vec::new(),
         }),
+    })
+}
+
+/// Where a window that shows one cluster at a time ([`Window::one_cluster`]) stays when `moved`
+/// are regrouped out of the cluster on screen into `into` (what [`Groups::place`] answered): the
+/// tab the cluster comes forward on, if the cluster keeps one — the window does not follow the
+/// tabs, it stays where it is on the next tab of its group ([`Groups::fronting`]). It follows
+/// them when the cluster is left empty (**a group does not stay empty**: the window goes with
+/// the tabs, and the ungrouped tabs, which have no header to be left empty, are no different)
+/// and when they go into a group made for them, which is where the user is going.
+fn keep_cluster(
+    from: &Window,
+    moved: &[u64],
+    target: &Target<u64>,
+    into: Option<GroupId>,
+) -> Option<Step> {
+    if !from.one_cluster || matches!(target, Target::New(_)) {
+        return None;
+    }
+    let shown = from
+        .order
+        .selected()
+        .filter(|shown| moved.contains(shown))?;
+    let here = from.groups.group_of(shown);
+    if into == here {
+        return None;
+    }
+    let next = from.groups.fronting(&from.order, moved)?;
+    (from.groups.group_of(next) == here).then_some(Step::Select {
+        window: from.id,
+        tab: next,
     })
 }
 
@@ -1318,6 +1358,7 @@ mod tests {
             tabs,
             asking: false,
             stays_empty: false,
+            one_cluster: false,
         }
     }
 
@@ -2561,6 +2602,106 @@ mod tests {
             "and the window says so"
         );
         assert_eq!(taken_back.undo, None, "there is no redo");
+    }
+
+    /// What a regrouping of `tabs` of window 1 into `target` asks to come forward, in a window
+    /// that shows one cluster at a time and has tab `shown` on screen.
+    fn kept(shown: u64, tabs: &[u64], target: Target<u64>, one_cluster: bool) -> Vec<Step> {
+        let mut world = grouped();
+        world[0].one_cluster = one_cluster;
+        let one = &mut world[0];
+        one.groups.select(&mut one.order, shown);
+        plan(
+            &world,
+            Move::RegroupTabs {
+                window: 1,
+                tabs: tabs.to_vec(),
+                target,
+            },
+            &Cramped,
+        )
+        .unwrap()
+        .after
+    }
+
+    #[test]
+    fn a_bar_that_shows_one_group_stays_where_it_is_when_its_tab_goes_to_another() {
+        let world = grouped();
+        let (api, web) = (gid(&world[0], "api"), gid(&world[0], "web"));
+        let to_web = || Target::Group {
+            group: web,
+            before: None,
+        };
+        let next = |tab| vec![Step::Select { window: 1, tab }];
+        // api = 11 12, web = 13, ungrouped = 10. Tab 11 on screen goes to web: api keeps 12, the
+        // window stays in api on it, and web's new tab is not on screen.
+        assert_eq!(kept(11, &[11], to_web(), true), next(12));
+        // A window that lists every tab does not move, and follows the tab as it always did.
+        assert_eq!(kept(11, &[11], to_web(), false), []);
+        // Out of the group, among the ungrouped tabs: the same.
+        assert_eq!(
+            kept(11, &[11], Target::Loose { before: None }, true),
+            next(12)
+        );
+        // The one that stays is the neighbour the closing rule names: the next, else the one before.
+        assert_eq!(kept(12, &[12], to_web(), true), next(11));
+        // A tab that is not on screen moves and the screen is where it was.
+        assert_eq!(kept(12, &[11], to_web(), true), []);
+        // Into the group it is in: only the order changes, and the tab stays on screen.
+        assert_eq!(
+            kept(
+                11,
+                &[11],
+                Target::Group {
+                    group: api,
+                    before: None
+                },
+                true
+            ),
+            []
+        );
+        // Into a group made for it, the window goes with it.
+        assert_eq!(kept(11, &[11], Target::New("db".to_owned()), true), []);
+        // The group is left empty (a group does not stay empty): the window follows its tabs.
+        assert_eq!(kept(11, &[11, 12], to_web(), true), []);
+        assert_eq!(kept(13, &[13], Target::Loose { before: None }, true), []);
+        assert_eq!(
+            kept(10, &[10], to_web(), true),
+            [],
+            "the ungrouped tab was alone"
+        );
+    }
+
+    #[test]
+    fn the_bar_that_stays_is_undone_with_the_tab_back_on_screen() {
+        let mut world = grouped();
+        world[0].one_cluster = true;
+        let web = gid(&world[0], "web");
+        let one = &mut world[0];
+        one.groups.select(&mut one.order, 11);
+        let moved = plan(
+            &world,
+            Move::RegroupTabs {
+                window: 1,
+                tabs: vec![11],
+                target: Target::Group {
+                    group: web,
+                    before: None,
+                },
+            },
+            &Cramped,
+        )
+        .unwrap();
+        let record = moved.undo.expect("a regrouping can be taken back");
+        assert_eq!(
+            record.scenes[0].order.selected(),
+            Some(11),
+            "the picture it keeps has the tab on screen, in its group"
+        );
+        assert_eq!(
+            record.scenes[0].groups.group_of(11),
+            world[0].groups.group_of(11)
+        );
     }
 
     #[test]

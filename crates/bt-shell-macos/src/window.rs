@@ -134,7 +134,7 @@ use crate::sheets::{self, Asker};
 use crate::split::{Axis, Direction, Tree};
 use crate::split_view::{Hairline, SplitView};
 use crate::tab::{self, TerminalTab};
-use crate::tab_bar::{Heading, Label, RowClaim, TabBar};
+use crate::tab_bar::{Heading, Label, RowClaim, SwitchRow, Switcher, TabBar};
 use crate::tabs::{self, Card, Finish, Tabs};
 use crate::undo::{Record, Scene, Shape};
 
@@ -1085,16 +1085,13 @@ define_class!(
             let Ok(tag) = u8::try_from(item.tag()) else {
                 return;
             };
-            // Down the column ⌘ counts the tabs as listed, a closed group's hidden ones not at all;
-            // the title row lists every tab, in the order of the strip.
-            let target = if self.bar().is_side() {
-                self.ivars()
-                    .groups
-                    .borrow()
-                    .shortcut(&self.ivars().order.borrow(), View::Side, tag)
-            } else {
-                self.ivars().order.borrow().by_shortcut(tag)
-            };
+            // ⌘ counts the tabs as listed: down the column, a closed group's hidden ones not at
+            // all; along the title row, the group on screen.
+            let target = self
+                .ivars()
+                .groups
+                .borrow()
+                .shortcut(&self.ivars().order.borrow(), self.listing(), tag);
             if let Some(tab) = target {
                 self.select_tab(tab);
             }
@@ -1257,11 +1254,7 @@ define_class!(
             let Ok(tag) = u8::try_from(item.tag()) else {
                 return;
             };
-            if self.select_group(tag) == Reach::NewLoose
-                && let Some(app) = app::delegate(self.mtm())
-            {
-                app.new_tab_seated(self.id(), Seat::Loose);
-            }
+            self.reach_group(tag);
         }
     }
 );
@@ -2171,17 +2164,16 @@ impl TerminalWindow {
     /// checkmark and title. `None` for an item that is not a group's.
     fn validate_group_item(&self, item: &NSMenuItem) -> Option<bool> {
         let action = item.action()?;
-        let offered = self.groups_shown();
         if action == sel!(moveTabToNewGroup:) {
-            return Some(offered);
+            return Some(true);
         }
         if action == sel!(renameGroup:) {
             // The group of the tab on screen, or the header's own: none for an ungrouped tab.
-            return Some(offered && self.menu_group_of(item));
+            return Some(self.menu_group_of(item));
         }
         if action == sel!(removeTabFromGroup:) {
             let tab = self.menu_tab_of(item)?;
-            return Some(offered && self.ivars().groups.borrow().group_of(tab).is_some());
+            return Some(self.ivars().groups.borrow().group_of(tab).is_some());
         }
         if action == sel!(moveTabToGroup:) {
             // The group its own tab is in is checked and grey: it is where the tab is.
@@ -2198,7 +2190,7 @@ impl TerminalWindow {
             } else {
                 NSControlStateValueOff
             });
-            return Some(offered && !here);
+            return Some(!here);
         }
         if action == sel!(selectGroup:) {
             let tag = u8::try_from(item.tag()).ok()?;
@@ -2213,7 +2205,7 @@ impl TerminalWindow {
                 (None, 9) => "Last Group".to_owned(),
                 (None, tag) => format!("Group {tag}"),
             }));
-            return Some(offered && named.is_some());
+            return Some(named.is_some());
         }
         None
     }
@@ -2801,6 +2793,8 @@ impl TerminalWindow {
             asking: !self.selection_free(),
             // A window whose last tab leaves closes: bateri has no window without a tab.
             stays_empty: false,
+            // The title row's bar shows one group at a time; the column lists them all.
+            one_cluster: !self.bar().is_side(),
         }
     }
 
@@ -2972,17 +2966,44 @@ impl TerminalWindow {
         self.ivars().groups.borrow().suggest_name(&title)
     }
 
-    /// Where the `listed`th place of the column is in the strip the appliers count
-    /// ([`Groups::side_place`]); in the title row, which lists every tab, the place itself.
-    pub(crate) fn strip_place(&self, listed: usize) -> usize {
+    /// What the bar lists: every group down the column, the group on screen along the title row.
+    pub(crate) fn listing(&self) -> View {
         if self.bar().is_side() {
-            self.ivars()
-                .groups
-                .borrow()
-                .side_place(&self.ivars().order.borrow(), listed)
+            View::Side
         } else {
-            listed
+            View::Top
         }
+    }
+
+    /// Where the `listed`th place of the bar's list is in the strip the appliers count
+    /// ([`Groups::listed_place`]): the column's lists the tabs under open headers, the title row's
+    /// the tabs of the group on screen.
+    pub(crate) fn strip_place(&self, listed: usize) -> usize {
+        self.ivars().groups.borrow().listed_place(
+            &self.ivars().order.borrow(),
+            self.listing(),
+            listed,
+        )
+    }
+
+    /// **The applier: a place in the bar's list.** Tab `id` takes the `to`th place of what the bar
+    /// lists (a tab let go on its own bar). The column's list is the strip's, place by place
+    /// ([`Self::move_tab`]); the title row lists one group and the tab stays in it, which a place
+    /// of the strip cannot say at the group's end ([`Groups::move_within`]).
+    pub(crate) fn move_tab_listed(&self, id: u64, to: usize) {
+        let in_group = !self.bar().is_side() && !self.ivars().groups.borrow().is_empty();
+        if !in_group {
+            self.move_tab(id, self.strip_place(to));
+            return;
+        }
+        if self.tab(id).is_none()
+            || !self.with_strip(|groups, order| groups.move_within(order, id, to))
+        {
+            return;
+        }
+        self.forget_undo();
+        self.refresh_bar();
+        self.layout_changed();
     }
 
     /// The groups the menus list, in order: the group's tag (its identity), its name, and whether
@@ -3016,12 +3037,6 @@ impl TerminalWindow {
                 .find(|group| isize::try_from(group.id.get()) == Ok(tag))
                 .map(|group| group.id),
         }
-    }
-
-    /// Whether the window offers groups: the column draws their headers; the title row learns to in
-    /// a later step, and until then what only it could not show is not offered.
-    pub(crate) fn groups_shown(&self) -> bool {
-        self.bar().is_side()
     }
 
     /// Move to Group, Move to New Group, Remove from Group: tab `tab` goes where `target` says,
@@ -3070,6 +3085,27 @@ impl TerminalWindow {
             .groups
             .borrow()
             .reach(&self.ivars().order.borrow(), tag);
+        self.arrive(reach)
+    }
+
+    /// A row of the list under the group button: the group `of` (`None`, the ungrouped tabs)
+    /// comes on screen as [`Self::select_group`] brings it, and with no ungrouped tab the first
+    /// row opens one.
+    pub(crate) fn reach_cluster(&self, of: Option<GroupId>) {
+        let reach = self
+            .ivars()
+            .groups
+            .borrow()
+            .reach_in(&self.ivars().order.borrow(), of);
+        if self.arrive(reach) == Reach::NewLoose
+            && let Some(app) = app::delegate(self.mtm())
+        {
+            app.new_tab_seated(self.id(), Seat::Loose);
+        }
+    }
+
+    /// Goes where `reach` says: the tab, a closed group opening first.
+    fn arrive(&self, reach: Reach<u64>) -> Reach<u64> {
         if let Reach::Tab { tab, expand } = reach {
             if let Some(group) = expand {
                 self.set_group_collapsed(group, false);
@@ -3077,6 +3113,16 @@ impl TerminalWindow {
             self.select_tab(tab);
         }
         reach
+    }
+
+    /// ⌃⌘`tag` as the keys do it and the list under the group button does: [`Self::select_group`],
+    /// and with no ungrouped tab for ⌃⌘0 a new one opens.
+    pub(crate) fn reach_group(&self, tag: u8) {
+        if self.select_group(tag) == Reach::NewLoose
+            && let Some(app) = app::delegate(self.mtm())
+        {
+            app.new_tab_seated(self.id(), Seat::Loose);
+        }
     }
 
     /// Close Group: every tab of group `group` closes, under one question when the setting asks.
@@ -3704,17 +3750,21 @@ impl TerminalWindow {
     /// from what it is given — and the sheet gate when a tab's question
     /// starts or stops waiting (`sheets`).
     pub(crate) fn refresh_bar(&self) {
-        let single = self.tab_count() == 1;
+        let single = self.lone_tab();
         let side = self.bar().is_side();
         let label = |tab: &TerminalTab| Self::label_of(tab, single);
         let order = self.ivars().order.borrow();
         let groups = self.ivars().groups.borrow();
-        // The column lists headers and hides a closed group's other tabs; the title row shows every
-        // tab, in the order of the strip, until it shows one group at a time.
+        // The column lists headers and hides a closed group's other tabs; the title row shows the
+        // group on screen — or every tab, in the order of the strip, while no group exists.
         let items: Vec<Item<u64>> = if side {
             groups.side_items(&order)
         } else {
-            order.ids().iter().map(|&tab| Item::Tab(tab)).collect()
+            groups
+                .numbered(&order, View::Top)
+                .into_iter()
+                .map(Item::Tab)
+                .collect()
         };
         let mut labels = Vec::with_capacity(items.len());
         let mut headings = Vec::new();
@@ -3726,18 +3776,12 @@ impl TerminalWindow {
                         continue;
                     };
                     let members = groups.cluster(&order, Some(id));
-                    let signals = tabs::Signals::union(
-                        members
-                            .iter()
-                            .filter_map(|&member| self.tab(member))
-                            .map(|member| member.signals()),
-                    );
                     headings.push(Heading {
                         group: id,
                         name: group.name.clone(),
                         collapsed: group.collapsed,
                         tabs: members.len(),
-                        indicator: tabs::group_indicator(signals),
+                        indicator: self.cluster_indicator(&members),
                         hint: groups
                             .position(id)
                             .and_then(|at| tabs::shortcut_digit(at, groups.len())),
@@ -3750,9 +3794,63 @@ impl TerminalWindow {
             .selected()
             .and_then(|shown| labels.iter().position(|label| label.tab == shown))
             .unwrap_or(0);
+        // The title row of a window with groups leads with the button that switches between them.
+        let switcher = (!side && !groups.is_empty()).then(|| {
+            let on_screen = groups.shown(&order);
+            let rows = std::iter::once((None, "Ungrouped".to_owned(), Some(0)))
+                .chain(groups.groups().iter().enumerate().map(|(at, group)| {
+                    (
+                        Some(group.id),
+                        group.name.clone(),
+                        tabs::shortcut_digit(at, groups.len()),
+                    )
+                }))
+                .map(|(group, name, hint)| SwitchRow {
+                    group,
+                    name,
+                    indicator: self.cluster_indicator(&groups.cluster(&order, group)),
+                    hint,
+                })
+                .collect();
+            let elsewhere: Vec<u64> = order
+                .ids()
+                .iter()
+                .copied()
+                .filter(|&tab| groups.group_of(tab) != on_screen)
+                .collect();
+            Switcher {
+                shown: on_screen,
+                name: on_screen
+                    .and_then(|id| groups.group(id))
+                    .map(|group| group.name.clone()),
+                elsewhere: self.cluster_indicator(&elsewhere),
+                rows,
+            }
+        });
         drop((order, groups));
         let notice = self.ivars().notice.borrow().clone();
-        self.bar().show(labels, selected, headings, notice);
+        self.bar()
+            .show(labels, selected, headings, switcher, notice);
+    }
+
+    /// What a cluster of tabs — a group's, the ungrouped ones, everything outside the group on
+    /// screen — says of itself: the most urgent thing that asks for the user in any of them
+    /// ([`tabs::group_indicator`] of what their panes report together). The signals of every tab
+    /// are read as they are, so a failure is not hidden under a tab's own running command.
+    fn cluster_indicator(&self, members: &[u64]) -> Option<tabs::Indicator> {
+        let signals = tabs::Signals::union(
+            members
+                .iter()
+                .filter_map(|&member| self.tab(member))
+                .map(|member| member.signals()),
+        );
+        tabs::group_indicator(signals)
+    }
+
+    /// Whether the window has one tab and no group: the bar is only its title. With a group the
+    /// tab is a chip beside the group button, as in any other window with groups.
+    fn lone_tab(&self) -> bool {
+        self.tab_count() == 1 && self.ivars().groups.borrow().is_empty()
     }
 
     /// One tab as the bar shows it: a single tab's label is the window's title, an upload's
@@ -3778,7 +3876,7 @@ impl TerminalWindow {
     /// Every tab's label, in the order of the strip — closed groups' hidden tabs too, which the
     /// column does not list: what Show All Tabs lists.
     pub(crate) fn all_labels(&self) -> Vec<Label> {
-        let single = self.tab_count() == 1;
+        let single = self.lone_tab();
         self.tabs()
             .iter()
             .map(|tab| Self::label_of(tab, single))
@@ -4090,6 +4188,7 @@ mod tests {
             ("pub(crate) fn adopt_tab(", "groups.append("),
             ("pub(crate) fn adopt_tab(", "groups.insert_at("),
             ("pub(crate) fn move_tab(", "groups.move_to("),
+            ("pub(crate) fn move_tab_listed(", "groups.move_within("),
             ("pub(crate) fn fold_tab(", "groups.pane_to_tab("),
             ("pub(crate) fn new_tab_of(", "groups.place_new("),
             ("fn leave_order(", "groups.close("),

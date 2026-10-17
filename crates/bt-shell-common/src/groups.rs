@@ -289,16 +289,26 @@ impl<K: Copy + Eq> Groups<K> {
         }
     }
 
-    /// The place in the flat strip of the `listed`th tab the side column lists ([`View::Side`]'s
-    /// order), and the strip's end past the last: what a row dragged or a tab carried to a place of
-    /// the column is let go at, for the appliers that count the strip. A closed group's hidden tabs
-    /// have no place in the column, so the two differ as soon as one is closed; the place is the
-    /// listed tab's own, which puts a tab let go before it beside it (the cluster rule of
-    /// [`Self::insert_at`]).
-    pub fn side_place(&self, tabs: &Tabs<K>, listed: usize) -> usize {
-        self.numbered(tabs, View::Side)
+    /// The place in the flat strip of the `listed`th tab a view lists ([`Self::numbered`]'s
+    /// order), and past the last: what a row dragged or a tab carried to a place of the list is
+    /// let go at, for the appliers that count the strip. The column lists every cluster but hides
+    /// a closed group's tabs, and the bar lists one cluster, so the two differ from the strip
+    /// as soon as one is closed or a cluster is not the whole window; the place is the listed
+    /// tab's own, which puts a tab let go before it beside it (the cluster rule of
+    /// [`Self::insert_at`]). Past the last listed tab it is the strip's end in the column, and in
+    /// the bar the place after the cluster's last tab.
+    pub fn listed_place(&self, tabs: &Tabs<K>, view: View, listed: usize) -> usize {
+        let numbered = self.numbered(tabs, view);
+        numbered
             .get(listed)
             .and_then(|&tab| tabs.index_of(tab))
+            .or_else(|| match view {
+                View::Side => None,
+                View::Top => numbered
+                    .last()
+                    .and_then(|&last| tabs.index_of(last))
+                    .map(|at| at + 1),
+            })
             .unwrap_or_else(|| tabs.len())
     }
 
@@ -319,6 +329,16 @@ impl<K: Copy + Eq> Groups<K> {
                 None => return Reach::Nothing,
             },
         };
+        self.reach_in(tabs, of)
+    }
+
+    /// What reaching cluster `of` comes to: [`Self::reach`] for a cluster named by its identity,
+    /// as the list under the title row's group button names it — it lists a group that no key
+    /// reaches past the ninth. [`Reach::Nothing`] for a group that is not here.
+    pub fn reach_in(&self, tabs: &Tabs<K>, of: Option<GroupId>) -> Reach<K> {
+        if of.is_some_and(|id| self.position(id).is_none()) {
+            return Reach::Nothing;
+        }
         let tab = self
             .resident(of)
             .filter(|&tab| tabs.index_of(tab).is_some() && self.group_of(tab) == of)
@@ -464,6 +484,34 @@ impl<K: Copy + Eq> Groups<K> {
         let target = self.landing(&rest, index.min(rest.len()));
         self.place(tabs, &[tab], target);
         tabs.ids() != before || self.group_of(tab) != group
+    }
+
+    /// A tab takes place `to` among the tabs of **its own cluster** (past the end is the end) and
+    /// stays in it: a tab dragged along the bar, which lists one cluster and so cannot name the
+    /// place at the cluster's end in the strip — [`Self::move_to`] would put it before the next
+    /// cluster's first tab, which is that cluster's. `to` is the place the tab takes among the
+    /// cluster's tabs once it has moved. `true` if the order changed. In a window without groups
+    /// it is [`Tabs::move_to`].
+    pub fn move_within(&mut self, tabs: &mut Tabs<K>, tab: K, to: usize) -> bool {
+        if tabs.index_of(tab).is_none() {
+            return false;
+        }
+        let of = self.group_of(tab);
+        let before = tabs.ids().to_vec();
+        let before_tab = self
+            .cluster(tabs, of)
+            .into_iter()
+            .filter(|&other| other != tab)
+            .nth(to);
+        let target = match of {
+            Some(group) => Target::Group {
+                group,
+                before: before_tab,
+            },
+            None => Target::Loose { before: before_tab },
+        };
+        self.place(tabs, &[tab], target);
+        tabs.ids() != before
     }
 
     /// The tab `source`, whose last pane went into tab `target`, is gone and the screen follows
@@ -1715,20 +1763,123 @@ mod tests {
         let (tabs, mut groups, _, web) = scene();
         for listed in 0..tabs.len() {
             assert_eq!(
-                groups.side_place(&tabs, listed),
+                groups.listed_place(&tabs, View::Side, listed),
                 listed,
                 "nothing is closed"
             );
         }
-        assert_eq!(groups.side_place(&tabs, tabs.len()), tabs.len());
+        assert_eq!(
+            groups.listed_place(&tabs, View::Side, tabs.len()),
+            tabs.len()
+        );
         groups.set_collapsed(web, true);
         // 6 7 8 | api 1 2 3 | web (4 5 hidden): the column lists six tabs.
-        assert_eq!(groups.side_place(&tabs, 5), 5, "tab 3 is the strip's sixth");
         assert_eq!(
-            groups.side_place(&tabs, 6),
+            groups.listed_place(&tabs, View::Side, 5),
+            5,
+            "tab 3 is the strip's sixth"
+        );
+        assert_eq!(
+            groups.listed_place(&tabs, View::Side, 6),
             tabs.len(),
             "past the last listed tab is the strip's end, behind the hidden ones"
         );
+    }
+
+    #[test]
+    fn the_bars_listed_place_is_the_clusters_own_in_the_strip() {
+        let (mut tabs, groups, api, _) = scene();
+        // 6 7 8 | 1 2 3 | 4 5, with api on screen.
+        assert_eq!(groups.shown(&tabs), Some(api));
+        for (listed, place) in [(0, 3), (1, 4), (2, 5)] {
+            assert_eq!(
+                groups.listed_place(&tabs, View::Top, listed),
+                place,
+                "the bar lists api's three tabs, which stand from the strip's fourth place"
+            );
+        }
+        assert_eq!(
+            groups.listed_place(&tabs, View::Top, 3),
+            6,
+            "past the last is right after the cluster's last tab, not the strip's end"
+        );
+        let mut groups = groups;
+        groups.select(&mut tabs, 7);
+        assert_eq!(groups.listed_place(&tabs, View::Top, 0), 0);
+        assert_eq!(groups.listed_place(&tabs, View::Top, 3), 3);
+        groups.select(&mut tabs, 4);
+        assert_eq!(
+            groups.listed_place(&tabs, View::Top, 2),
+            tabs.len(),
+            "web is last: after its last tab is the end"
+        );
+    }
+
+    #[test]
+    fn a_tab_moved_along_its_own_cluster_stays_in_it() {
+        let (mut tabs, mut groups, api, web) = scene();
+        // 6 7 8 | 1 2 3 | 4 5: api's first tab to its end — `move_to` would give it to web.
+        assert!(groups.move_within(&mut tabs, 1, 2));
+        assert_eq!(tabs.ids(), [6, 7, 8, 2, 3, 1, 4, 5]);
+        assert_eq!(groups.group_of(1), Some(api));
+        assert_eq!(tabs.selected(), Some(1), "the selection stays on its tab");
+        ok(&groups, &tabs);
+
+        let mut flat = tabs.clone();
+        let mut other = groups.clone();
+        other.move_to(&mut flat, 3, 5);
+        assert_eq!(
+            flat.ids(),
+            [6, 7, 8, 2, 1, 3, 4, 5].as_slice(),
+            "the same strip as moving within api to its end, ..."
+        );
+        assert_eq!(
+            other.group_of(3),
+            Some(web),
+            "... but the strip's place at a cluster's end is the next cluster's"
+        );
+
+        // Back to the front, past the end, and to where it is.
+        assert!(groups.move_within(&mut tabs, 1, 0));
+        assert_eq!(tabs.ids(), [6, 7, 8, 1, 2, 3, 4, 5]);
+        assert!(groups.move_within(&mut tabs, 1, 99));
+        assert_eq!(
+            tabs.ids(),
+            [6, 7, 8, 2, 3, 1, 4, 5],
+            "past the end is the end"
+        );
+        assert!(!groups.move_within(&mut tabs, 1, 2), "already there");
+        // The ungrouped tabs have a cluster too.
+        assert!(groups.move_within(&mut tabs, 6, 2));
+        assert_eq!(tabs.ids(), [7, 8, 6, 2, 3, 1, 4, 5]);
+        assert_eq!(groups.group_of(6), None);
+        assert!(
+            !groups.move_within(&mut tabs, 42, 0),
+            "a tab that is not here"
+        );
+        ok(&groups, &tabs);
+    }
+
+    #[test]
+    fn without_groups_moving_within_is_moving() {
+        for tab in 1..=5 {
+            for to in 0..6 {
+                let mut flat = Tabs::new(1);
+                for id in 2..=5 {
+                    flat.append(id);
+                }
+                let mut grouped = flat.clone();
+                let mut groups = Groups::new();
+                let moved = groups.move_within(&mut grouped, tab, to);
+                let there = flat.ids().iter().position(|&id| id == tab).unwrap();
+                flat.move_to(tab, to);
+                assert_eq!(grouped.ids(), flat.ids(), "tab {tab} to {to}");
+                assert_eq!(
+                    moved,
+                    there != flat.ids().iter().position(|&id| id == tab).unwrap()
+                );
+            }
+        }
     }
 
     #[test]
@@ -1801,6 +1952,42 @@ mod tests {
         assert_eq!(groups.reach(&tabs, 3), Reach::Nothing);
         assert_eq!(groups.reach(&tabs, 8), Reach::Nothing);
         assert_eq!(groups.group(api).unwrap().resident(), Some(2));
+    }
+
+    #[test]
+    fn a_list_row_reaches_its_cluster_by_identity_as_the_digits_do() {
+        let (mut tabs, mut groups, api, web) = scene();
+        groups.select(&mut tabs, 7);
+        for (of, tag) in [(None, 0), (Some(api), 1), (Some(web), 2)] {
+            assert_eq!(
+                groups.reach_in(&tabs, of),
+                groups.reach(&tabs, tag),
+                "{of:?} is what ⌃⌘{tag} reaches"
+            );
+        }
+        groups.set_collapsed(web, true);
+        assert_eq!(
+            groups.reach_in(&tabs, Some(web)),
+            Reach::Tab {
+                tab: 4,
+                expand: Some(web)
+            }
+        );
+        // The row of a group that went since the list was drawn reaches nothing.
+        groups.close(&mut tabs, &[4, 5]);
+        assert_eq!(groups.reach_in(&tabs, Some(web)), Reach::Nothing);
+        // A twelfth group has a row and no key.
+        for index in 0..11 {
+            groups.open_in_new_group(&mut tabs, 20 + index, &format!("g{index}"));
+        }
+        let twelfth = groups.groups()[11].id;
+        assert_eq!(
+            groups.reach_in(&tabs, Some(twelfth)),
+            Reach::Tab {
+                tab: 30,
+                expand: None
+            }
+        );
     }
 
     #[test]
@@ -1941,7 +2128,7 @@ mod tests {
                     count => groups.groups()[rng.below(count)].id,
                 }
             };
-            let what = rng.below(19);
+            let what = rng.below(20);
             if ids.is_empty() {
                 groups.open(&mut tabs, next);
                 next += 1;
@@ -2025,6 +2212,12 @@ mod tests {
                     18 => {
                         let (source, target) = (some(&mut rng), some(&mut rng));
                         groups.pane_to_tab(&mut tabs, source, true, target);
+                    }
+                    19 => {
+                        let tab = some(&mut rng);
+                        let cluster = groups.group_of(tab);
+                        groups.move_within(&mut tabs, tab, rng.below(ids.len() + 1));
+                        assert_eq!(groups.group_of(tab), cluster, "it stays in its cluster");
                     }
                     _ => {
                         if let Reach::Tab { tab, expand } = groups.reach(&tabs, rng.below(10) as u8)

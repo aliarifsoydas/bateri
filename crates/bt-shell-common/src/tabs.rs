@@ -650,6 +650,18 @@ impl Bar {
     /// and a drag: `glowing(index)` for a tab whose ground fills with a transfer — it has an
     /// edge of its own, so no separator touches it either.
     pub fn layout_with(&self, glowing: impl Fn(usize) -> bool) -> Strip {
+        self.laid(true, glowing)
+    }
+
+    /// [`Self::layout_with`] for a bar that a group button leads: the strip of one group's tabs,
+    /// where a lone tab is a chip like any other, at its widest, and not the window's centred
+    /// title. Tabs that are two or more lay out as they always do.
+    pub fn layout_chips_with(&self, glowing: impl Fn(usize) -> bool) -> Strip {
+        self.laid(false, glowing)
+    }
+
+    /// `titled`: a lone tab is the title, not a chip.
+    fn laid(&self, titled: bool, glowing: impl Fn(usize) -> bool) -> Strip {
         let fit = Fit::of(self.corner);
         let new_tab = self.width - fit.inset - BUTTON;
         let left_of = beside;
@@ -660,7 +672,7 @@ impl Bar {
             )
         };
 
-        if self.count == 1 {
+        if self.count == 1 && titled {
             // The title is centred on the window, as far from both edges as it must be to clear
             // the lights on the left and `+` on the right.
             let margin = self.leading.max(self.width - (new_tab - EDGE));
@@ -1591,6 +1603,103 @@ pub fn group_indicator(signals: Signals) -> Option<Indicator> {
         uploading: false,
         ..signals
     })
+}
+
+// ─── The group button and its list ───────────────────────────────────────
+
+/// The group button's width while the tabs on screen are the ungrouped ones: the stack alone.
+pub const GROUP_LOOSE_WIDTH: f64 = 32.0;
+
+/// The narrowest a button that names its group gets, and the narrowest while the name is being
+/// typed in it.
+pub const GROUP_BUTTON_MIN: f64 = 72.0;
+pub const GROUP_RENAME_MIN: f64 = 120.0;
+
+/// What a named button holds beside the name: its padding, the stack and the space after it
+/// (10 + 14 + 6) and what the name keeps from the right end (4 + 10).
+pub const GROUP_BUTTON_CHROME: f64 = 44.0;
+
+/// The space between the button and the first tab.
+pub const GROUP_BUTTON_GAP: f64 = 8.0;
+
+/// The group button's width, in whole points: `name` is the width of the group's name as set in
+/// the button's type, `None` for the ungrouped tabs, which have no name to give. A name makes it
+/// grow from [`GROUP_BUTTON_MIN`] to a tab's widest ([`MAX_WIDTH`]); while it is typed
+/// (`naming`) the button is at least [`GROUP_RENAME_MIN`], so there is room for the field and
+/// the tabs move aside with what is typed. The one width the button is drawn at and the tabs
+/// lead from ([`Bar::leading`]).
+pub fn group_button_width(name: Option<f64>, naming: bool) -> f64 {
+    match name {
+        None => GROUP_LOOSE_WIDTH,
+        Some(text) => (GROUP_BUTTON_CHROME + text).ceil().clamp(
+            if naming {
+                GROUP_RENAME_MIN
+            } else {
+                GROUP_BUTTON_MIN
+            },
+            MAX_WIDTH,
+        ),
+    }
+}
+
+/// The list of the window's groups under the button: its padding, a row's height and the
+/// space between two rows, and what stands between a row and the rule under it.
+pub const GROUP_LIST_PAD: f64 = 6.0;
+pub const GROUP_ROW: f64 = 30.0;
+const GROUP_ROW_GAP: f64 = 1.0;
+const GROUP_RULE: f64 = 9.0;
+
+/// The list's narrowest and widest, and what a row keeps beside its name (the check, the
+/// indicator, the key and the space between them).
+pub const GROUP_LIST_MIN: f64 = 252.0;
+pub const GROUP_LIST_MAX: f64 = 340.0;
+const GROUP_ROW_CHROME: f64 = 110.0;
+
+/// Where everything in the group list stands ([`group_list`]); the vertical extents are
+/// [`Span`]s whose `x` is the distance from the list's top.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupList {
+    pub width: f64,
+    pub height: f64,
+    /// The ungrouped tabs' row, then each group's.
+    pub rows: Vec<Span>,
+    /// The rules: under the ungrouped row and above New Group.
+    pub rules: Vec<f64>,
+    /// The New Group row.
+    pub new_row: Span,
+}
+
+/// The list's width for its longest name (set in the row's type): wide enough for it, within
+/// [`GROUP_LIST_MIN`] and [`GROUP_LIST_MAX`]; a longer name is cut there.
+pub fn group_list_width(widest: f64) -> f64 {
+    (GROUP_ROW_CHROME + widest)
+        .ceil()
+        .clamp(GROUP_LIST_MIN, GROUP_LIST_MAX)
+}
+
+/// The list for `rows` rows (the ungrouped tabs' first, then one per group) and a longest name
+/// of `widest`: the rows, a rule under the first and another above New Group.
+pub fn group_list(rows: usize, widest: f64) -> GroupList {
+    let mut y = GROUP_LIST_PAD;
+    let mut laid = Vec::with_capacity(rows);
+    let mut rules = Vec::new();
+    for index in 0..rows {
+        laid.push(Span::new(y, GROUP_ROW));
+        y += GROUP_ROW + GROUP_ROW_GAP;
+        if index == 0 {
+            rules.push(y + GROUP_RULE / 2.0);
+            y += GROUP_RULE + GROUP_ROW_GAP;
+        }
+    }
+    rules.push(y + GROUP_RULE / 2.0);
+    y += GROUP_RULE + GROUP_ROW_GAP;
+    GroupList {
+        width: group_list_width(widest),
+        height: y + GROUP_ROW + GROUP_LIST_PAD,
+        rows: laid,
+        rules,
+        new_row: Span::new(y, GROUP_ROW),
+    }
 }
 
 // ─── How an icon's indicator comes and goes ──────────────────────────────
@@ -2665,6 +2774,72 @@ mod tests {
             .iter()
             .map(|chip| (chip.x, chip.width))
             .collect()
+    }
+
+    #[test]
+    fn a_lone_tab_under_a_group_button_is_a_chip() {
+        let leading = 84.0 + 72.0 + GROUP_BUTTON_GAP;
+        let lone = Bar {
+            leading,
+            ..bar(1000.0, 1)
+        };
+        let strip = lone.layout_chips_with(|_| false);
+        assert_eq!(
+            xs(&strip),
+            [(leading, MAX_WIDTH)],
+            "a tab like any other, at its widest, where the button leaves room"
+        );
+        assert!(!strip.overflow && strip.separators.is_empty());
+        assert_eq!(strip.new_tab, 964.0);
+        assert_ne!(
+            lone.layout().chips,
+            strip.chips,
+            "the window's title is the other reading of one tab"
+        );
+        for count in [2, 5, 12] {
+            let many = bar(1000.0, count);
+            assert_eq!(
+                many.layout_chips_with(|_| false),
+                many.layout(),
+                "two tabs or more lay out as they always did"
+            );
+        }
+    }
+
+    #[test]
+    fn the_group_button_grows_with_its_name_between_72_and_a_tabs_widest() {
+        assert_eq!(group_button_width(None, false), 32.0, "the stack alone");
+        assert_eq!(group_button_width(Some(10.0), false), 72.0);
+        assert_eq!(group_button_width(Some(50.2), false), 95.0, "whole points");
+        assert_eq!(group_button_width(Some(400.0), false), MAX_WIDTH);
+        assert_eq!(
+            group_button_width(Some(10.0), true),
+            120.0,
+            "room for the field while the name is typed"
+        );
+        assert_eq!(group_button_width(Some(90.0), true), 134.0);
+        assert_eq!(group_button_width(Some(400.0), true), MAX_WIDTH);
+    }
+
+    #[test]
+    fn the_group_list_stands_in_rows_with_a_rule_under_the_ungrouped_one() {
+        let list = group_list(3, 100.0);
+        assert_eq!(
+            list.rows,
+            [
+                Span::new(6.0, 30.0),
+                Span::new(47.0, 30.0),
+                Span::new(78.0, 30.0)
+            ],
+            "rows 30 pt high, a point apart; the ungrouped row's rule makes room under it"
+        );
+        assert_eq!(list.rules, [41.5, 113.5]);
+        assert_eq!(list.new_row, Span::new(119.0, 30.0));
+        assert_eq!(list.height, 155.0);
+        assert_eq!(list.width, GROUP_LIST_MIN);
+        assert_eq!(group_list(5, 100.0).height, list.height + 2.0 * 31.0);
+        assert_eq!(group_list_width(150.0), 260.0, "wide enough for the name");
+        assert_eq!(group_list_width(300.0), GROUP_LIST_MAX);
     }
 
     #[test]
