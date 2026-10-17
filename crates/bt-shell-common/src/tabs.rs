@@ -777,7 +777,6 @@ impl Laid for Strip {
             overflow: self.overflow,
             scroll: self.scroll,
             max_scroll: self.max_scroll,
-            pad: 0.0,
             slot: self.slot,
             narrowest: MIN_WIDTH,
         }
@@ -801,11 +800,10 @@ pub struct Run<'a> {
     /// The scroll applied, within `0..=max_scroll`.
     scroll: f64,
     max_scroll: f64,
-    /// Space before the first place, in the scrolled content: the column keeps its rows off its
-    /// ends, the strip's tabs start at its edge (0).
-    pad: f64,
-    /// A place's extent plus [`GAP`]: the step from one place to the next; 0 for a run that is
-    /// not a list of tabs (the lone tab's title).
+    /// A place's extent plus [`GAP`]: what the places keep between them where nothing else
+    /// stands there, and 0 for a run that is not a list of tabs (the lone tab's title). The
+    /// places are read where they are, not at multiples of it: a column's headers push the rows
+    /// below them down.
     slot: f64,
     /// The least a place goes along the axis: what stands in for a held tab that has gone from
     /// the list since the press.
@@ -825,7 +823,8 @@ impl Run<'_> {
         let Some(place) = self.places.get(index).filter(|_| self.overflow) else {
             return self.scroll;
         };
-        let left = self.pad + index as f64 * self.slot;
+        // Where the place starts in the unscrolled content, from the run's own start.
+        let left = place.x + self.scroll - self.span.x;
         let right = left + place.width;
         let target = if left < self.scroll + REVEAL_MARGIN {
             left - REVEAL_MARGIN
@@ -839,10 +838,12 @@ impl Run<'_> {
 
     /// The place under `at`: the slot of the run that holds that point, among `0..places.len()` —
     /// the first for a point before the run, the last from its visible end on (over the strip's
-    /// buttons, in the drag margin, below the column's last row). It is a function of the layout
-    /// and `at` alone, so a tab carried over a run can be placed by it while the run is laid out
-    /// **with room made** at the answer: the room opens where the pointer is, and moves nothing
-    /// the answer depends on.
+    /// buttons, in the drag margin, below the column's last row). A place holds its own extent
+    /// and the [`GAP`] after it, and so everything between it and the next place — a column's
+    /// header belongs to the row below it, so a point over a header is over that row's place. It
+    /// is a function of the layout and `at` alone, so a tab carried over a run can be placed by
+    /// it while the run is laid out **with room made** at the answer: the room opens where the
+    /// pointer is, and moves nothing the answer depends on.
     pub fn slot_at(&self, at: f64) -> usize {
         let last = self.places.len().saturating_sub(1);
         if self.slot <= 0.0 || at < self.span.x {
@@ -853,8 +854,10 @@ impl Run<'_> {
             // tabs, whichever of them are scrolled in view.
             return last;
         }
-        let place = ((at - self.span.x - self.pad + self.scroll) / self.slot).floor();
-        (place.max(0.0) as usize).min(last)
+        self.places
+            .iter()
+            .position(|place| at < place.end() + GAP)
+            .unwrap_or(last)
     }
 
     /// What a carried pane at `at` is over: the middle of a tab ([`TAB_CORE_FROM`] to
@@ -983,21 +986,27 @@ impl Grip {
             return Drag::Press;
         }
         self.moving = true;
-        let last = run.places.len().saturating_sub(1);
         let width = run
             .places
             .get(self.from)
             .map_or(run.narrowest, |place| place.width);
         let least = run.span.x;
         let most = (run.span.end() - width)
-            .min(run.span.x - run.scroll + run.pad + last as f64 * run.slot)
+            .min(run.places.last().map_or(least, |place| place.x))
             .max(least);
         let left = (at - self.grab).clamp(least, most);
-        let place = (left - run.span.x + run.scroll - run.pad) / run.slot;
-        Drag::Reorder {
-            left,
-            to: (place.round().max(0.0) as usize).min(last),
-        }
+        // The place that starts nearest to where the tab's edge is drawn; halfway between two,
+        // the later one.
+        let to = run
+            .places
+            .iter()
+            .enumerate()
+            .fold((0, f64::INFINITY), |best, (index, place)| {
+                let away = (place.x - left).abs();
+                if away <= best.1 { (index, away) } else { best }
+            })
+            .0;
+        Drag::Reorder { left, to }
     }
 }
 
@@ -1149,6 +1158,14 @@ pub fn side_width(wanted: f64, window: f64) -> f64 {
 /// title row's foot and off New Tab.
 pub const LIST_PAD: f64 = 6.0;
 
+/// How tall a group's header is in the side column. The header is a row's width ([`EDGE`] in from
+/// the column's sides) and a [`GAP`] stands between it and the first row below it.
+pub const HEADER_HEIGHT: f64 = 24.0;
+
+/// What a group's header keeps above it, beyond the [`GAP`] every row keeps, when anything stands
+/// above it: the groups read as separate blocks. A header that opens the list has none.
+pub const GROUP_GAP: f64 = 10.0;
+
 /// Space between New Tab and the settings warning beside it on the column's foot.
 pub const FOOT_GAP: f64 = 6.0;
 
@@ -1179,7 +1196,9 @@ pub struct Side {
     /// caller reads it from the window, as for the strip's `leading`, and it is the same in full
     /// screen — the rows do not move as the window enters or leaves it.
     pub top: f64,
-    /// How many tabs. A single tab is a row like the rest: there is no title to centre.
+    /// How many tabs [`Side::layout`] stands in the list: all rows, no headers. A single tab is a
+    /// row like the rest: there is no title to centre. [`Side::layout_with`] lays a list with
+    /// headers and ignores this.
     pub count: usize,
     /// The list's scroll, as last stored; clamped here.
     pub scroll: f64,
@@ -1202,6 +1221,22 @@ impl Side {
     /// the diagonal) and its other three are [`TAB_RADIUS`], the rows'. Its [`Fit::inset`] is its
     /// space from the column's left edge and from the window's foot alike.
     pub fn layout(&self) -> Column {
+        self.lay(std::iter::repeat_n(Entry::Tab, self.count))
+    }
+
+    /// [`Self::layout`] for a list that has headers in it: `entries` are what stands in the list,
+    /// top to bottom. A header is [`HEADER_HEIGHT`] high with a [`GAP`] under it, and
+    /// [`GROUP_GAP`] more above it when anything stands above; a list of rows only comes out as
+    /// [`Self::layout`]'s, [`Side::count`] aside.
+    ///
+    /// [`Column::rows`] and everything indexed like it are the **tabs'**, headers not counted —
+    /// the places a point can be over and a tab can be carried to are the tabs'; the headers are
+    /// [`Column::headers`], each knowing the row that follows it.
+    pub fn layout_with(&self, entries: &[Entry]) -> Column {
+        self.lay(entries.iter().copied())
+    }
+
+    fn lay(&self, entries: impl Iterator<Item = Entry>) -> Column {
         let fit = Fit::of(self.corner);
         let foot = self.height - fit.inset - BUTTON;
         let width = self.width;
@@ -1213,26 +1248,69 @@ impl Side {
         let new_tab = Rect::new(fit.inset, foot, (new_tab_end - fit.inset).max(0.0), BUTTON);
 
         let slot = TAB_HEIGHT + GAP;
-        let count = self.count as f64;
-        let content = if self.count == 0 {
-            0.0
+        // The list from the top of its content, unscrolled: the rows' tops, the headers' tops with
+        // the row each is followed by, and the line each "a tab here" gap sits at.
+        let mut cursor = LIST_PAD;
+        let mut started = false;
+        let mut block: Option<f64> = None;
+        let mut rows_at = Vec::new();
+        let mut heads_at = Vec::new();
+        let mut marks_at = Vec::new();
+        for entry in entries {
+            match entry {
+                Entry::Tab => {
+                    marks_at.push(block.take().unwrap_or(cursor) - GAP);
+                    rows_at.push(cursor);
+                    cursor += slot;
+                }
+                Entry::Header => {
+                    if started {
+                        cursor += GROUP_GAP;
+                    }
+                    // The headers in a row (a closed group shows no row of its own) and the row
+                    // after them are one block: the gap before the row is above the first.
+                    block.get_or_insert(cursor);
+                    heads_at.push((cursor, rows_at.len()));
+                    cursor += HEADER_HEIGHT + GAP;
+                }
+            }
+            started = true;
+        }
+        marks_at.push(cursor - GAP);
+        let content = if started {
+            cursor - GAP + LIST_PAD
         } else {
-            2.0 * LIST_PAD + count * slot - GAP
+            0.0
         };
         let max_scroll = (content - list.height).max(0.0);
         let scroll = self.scroll.clamp(0.0, max_scroll);
         let overflow = max_scroll > 0.0;
-        let along: Vec<Span> = (0..self.count)
-            .map(|index| Span::new(list.y + LIST_PAD + index as f64 * slot - scroll, TAB_HEIGHT))
+        let along: Vec<Span> = rows_at
+            .iter()
+            .map(|&at| Span::new(list.y + at - scroll, TAB_HEIGHT))
             .collect();
         let rows = along
             .iter()
             .map(|row| Rect::new(EDGE, row.x, (width - 2.0 * EDGE).max(0.0), row.width))
             .collect();
+        let headers = heads_at
+            .iter()
+            .map(|&(at, first_row)| Header {
+                rect: Rect::new(
+                    EDGE,
+                    list.y + at - scroll,
+                    (width - 2.0 * EDGE).max(0.0),
+                    HEADER_HEIGHT,
+                ),
+                first_row,
+            })
+            .collect();
+        let marks = marks_at.iter().map(|&at| list.y + at - scroll).collect();
         Column {
             width,
             list,
             rows,
+            headers,
             overflow,
             scroll,
             max_scroll,
@@ -1242,9 +1320,29 @@ impl Side {
             warning,
             fit,
             along,
+            marks,
             slot,
         }
     }
+}
+
+/// What stands in the side column's list, in one place of it ([`Side::layout_with`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entry {
+    /// A tab's row.
+    Tab,
+    /// A group's header.
+    Header,
+}
+
+/// A group's header in the side column, where it sits ([`Column::headers`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Header {
+    /// The header, scrolled: a row's width and [`HEADER_HEIGHT`] high.
+    pub rect: Rect,
+    /// The index in [`Column::rows`] of the first row below it. The header of a closed group that
+    /// shows no row has the index of the next row that does, `rows.len()` at the end.
+    pub first_row: usize,
 }
 
 /// Where everything in the side column sits ([`Side::layout`]), in the window's space.
@@ -1255,8 +1353,11 @@ pub struct Column {
     /// The list's visible extent; rows outside it are clipped, and the ends where rows run under
     /// fade.
     pub list: Rect,
-    /// Every row, scrolled.
+    /// Every row, scrolled. Only the tabs' rows: the places a point can be over, and the indices
+    /// everything here answers in.
     pub rows: Vec<Rect>,
+    /// Every group's header, scrolled; none in a list laid by [`Side::layout`].
+    pub headers: Vec<Header>,
     /// The rows no longer fit: the list scrolls.
     pub overflow: bool,
     /// The scroll actually applied, within `0..=max_scroll`.
@@ -1275,12 +1376,16 @@ pub struct Column {
     pub fit: Fit,
     /// The rows' extents along y, which [`Run`] reads.
     along: Vec<Span>,
+    /// Where the line that marks "a tab here" runs for each place `0..=rows.len()`, scrolled
+    /// ([`Column::between`]).
+    marks: Vec<f64>,
     /// A row's height plus [`GAP`]: the step from one row to the next.
     slot: f64,
 }
 
 impl Laid for Column {
-    /// The rows along y, laid [`LIST_PAD`] in from the list's top.
+    /// The rows along y, wherever the list put them ([`LIST_PAD`] in from the list's top, headers
+    /// in between).
     fn run(&self) -> Run<'_> {
         Run {
             span: Span::new(self.list.y, self.list.height),
@@ -1288,7 +1393,6 @@ impl Laid for Column {
             overflow: self.overflow,
             scroll: self.scroll,
             max_scroll: self.max_scroll,
-            pad: LIST_PAD,
             slot: self.slot,
             narrowest: TAB_HEIGHT,
         }
@@ -1326,11 +1430,17 @@ impl Column {
     }
 
     /// Where the line that marks "a new tab here" runs (the window's space): in the [`GAP`] above
-    /// the row at `gap`, below the last for `gap` at the end. It marks the place a carried pane
-    /// would become a tab ([`PaneOver::Between`]) without moving a row — a pane's drop is a line,
-    /// where a tab brought from another window opens room (`tabs::seat`).
+    /// the row at `gap`, below the last for `gap` at the end. Above a row that a header stands
+    /// over, it is above the header — the line is in the gap between two groups, not between the
+    /// header and its row. It marks the place a carried pane would become a tab
+    /// ([`PaneOver::Between`]) without moving a row — a pane's drop is a line, where a tab brought
+    /// from another window opens room (`tabs::seat`). A `gap` past the end continues at the pace
+    /// of rows.
     pub fn between(&self, gap: usize) -> f64 {
-        self.list.y + LIST_PAD + gap as f64 * self.slot - GAP - self.scroll
+        let last = self.marks.len().saturating_sub(1);
+        self.marks.get(gap.min(last)).map_or(0.0, |mark| {
+            mark + gap.saturating_sub(last) as f64 * self.slot
+        })
     }
 }
 
@@ -1468,6 +1578,19 @@ pub fn indicator(signals: Signals) -> Option<Indicator> {
     ]
     .into_iter()
     .find_map(|(on, indicator)| on.then_some(indicator))
+}
+
+/// A group's one indicator, from the signals of all its tabs ([`Signals::union`]): only what asks
+/// for the user — question > failed > finished — and `None` for the rest. A running command and
+/// a transfer are not shown on a group: they say nothing the user has to do, and a group with
+/// tabs in it is always running something. The order is [`indicator`]'s, so the two cannot rank
+/// the same signals differently.
+pub fn group_indicator(signals: Signals) -> Option<Indicator> {
+    indicator(Signals {
+        running: false,
+        uploading: false,
+        ..signals
+    })
 }
 
 // ─── How an icon's indicator comes and goes ──────────────────────────────
@@ -4471,6 +4594,263 @@ mod tests {
         let column = side(600.0, 1).layout();
         assert_eq!(column.rows, [Rect::new(8.0, 46.0, 184.0, 28.0)]);
         assert_eq!(column.slot_at(300.0), 0);
+    }
+
+    #[test]
+    fn a_list_of_rows_only_is_laid_the_same_with_or_without_entries() {
+        for count in [0, 1, 3, 40] {
+            let plain = side(600.0, count);
+            let entries = vec![Entry::Tab; count];
+            assert_eq!(plain.layout_with(&entries), plain.layout(), "{count} rows");
+        }
+        assert!(side(600.0, 3).layout().headers.is_empty());
+    }
+
+    /// Two tabs, a group of two, a group of one: headers at 116 and 212, rows at 46, 76, 142,
+    /// 172 and 238 in a column whose list starts at 40.
+    fn headed() -> Column {
+        side(600.0, 0).layout_with(&[
+            Entry::Tab,
+            Entry::Tab,
+            Entry::Header,
+            Entry::Tab,
+            Entry::Tab,
+            Entry::Header,
+            Entry::Tab,
+        ])
+    }
+
+    #[test]
+    fn a_header_pushes_the_rows_below_it_down() {
+        let column = headed();
+        assert_eq!(
+            column.headers,
+            [
+                Header {
+                    rect: Rect::new(8.0, 116.0, 184.0, 24.0),
+                    first_row: 2
+                },
+                Header {
+                    rect: Rect::new(8.0, 212.0, 184.0, 24.0),
+                    first_row: 4
+                },
+            ],
+            "24 high, 8 in from the sides, a gap and the groups' gap under the last row above"
+        );
+        let tops: Vec<f64> = column.rows.iter().map(|row| row.y).collect();
+        assert_eq!(
+            tops,
+            [46.0, 76.0, 142.0, 172.0, 238.0],
+            "rows are the tabs' only; a header and a gap come between groups"
+        );
+        assert_eq!(
+            column.headers[0].rect.y - (column.rows[1].y + TAB_HEIGHT),
+            GAP + GROUP_GAP
+        );
+        assert_eq!(
+            column.rows[2].y - (column.headers[0].rect.y + HEADER_HEIGHT),
+            GAP
+        );
+        assert!(!column.overflow);
+    }
+
+    #[test]
+    fn a_header_that_opens_the_list_keeps_no_gap_above() {
+        let column = side(600.0, 0).layout_with(&[Entry::Header, Entry::Tab]);
+        assert_eq!(column.headers[0].rect.y, 40.0 + LIST_PAD);
+        assert_eq!(column.headers[0].first_row, 0);
+        assert_eq!(column.rows[0].y, 40.0 + LIST_PAD + HEADER_HEIGHT + GAP);
+    }
+
+    #[test]
+    fn a_point_over_a_header_is_over_the_first_row_below_it() {
+        let column = headed();
+        // Rows: 46..74, 76..104, 142..170, 172..200, 238..266.
+        assert_eq!(column.slot_at(60.0), 0);
+        assert_eq!(column.slot_at(75.9), 0, "the gap after a row is the row's");
+        assert_eq!(column.slot_at(76.0), 1);
+        assert_eq!(column.slot_at(105.0), 1);
+        assert_eq!(
+            column.slot_at(110.0),
+            2,
+            "the gap above a header is the next group's"
+        );
+        assert_eq!(column.slot_at(116.0), 2, "the header's top");
+        assert_eq!(column.slot_at(139.9), 2, "the header's foot");
+        assert_eq!(column.slot_at(150.0), 2);
+        assert_eq!(column.slot_at(172.0), 3);
+        assert_eq!(column.slot_at(220.0), 4, "the second header");
+        assert_eq!(
+            column.slot_at(500.0),
+            4,
+            "below the list's last row: the last"
+        );
+        assert_eq!(column.slot_at(10.0), 0, "above the list: the first");
+    }
+
+    #[test]
+    fn the_line_between_two_groups_is_above_the_header() {
+        let column = headed();
+        assert_eq!(
+            column.between(0),
+            44.0,
+            "above the first row, as without groups"
+        );
+        assert_eq!(column.between(1), 74.0);
+        assert_eq!(
+            column.between(2),
+            column.headers[0].rect.y - GAP,
+            "a gap before the group's first row: above its header"
+        );
+        assert_eq!(column.between(3), 170.0);
+        assert_eq!(column.between(4), column.headers[1].rect.y - GAP);
+        assert_eq!(
+            column.between(5),
+            column.rows[4].y + TAB_HEIGHT,
+            "the end: below the last row"
+        );
+        assert_eq!(
+            column.between(6),
+            column.between(5) + TAB_HEIGHT + GAP,
+            "past the end the places go on at the rows' pace"
+        );
+    }
+
+    #[test]
+    fn headers_of_groups_that_show_no_row_belong_to_the_next_row() {
+        // A tab, a closed group, a closed group, then a group with a row.
+        let column =
+            side(600.0, 0).layout_with(&[Entry::Tab, Entry::Header, Entry::Header, Entry::Tab]);
+        assert_eq!(
+            column
+                .headers
+                .iter()
+                .map(|header| header.first_row)
+                .collect::<Vec<_>>(),
+            [1, 1]
+        );
+        assert_eq!(column.rows.len(), 2);
+        assert_eq!(column.slot_at(column.headers[1].rect.y + 4.0), 1);
+        assert_eq!(
+            column.between(1),
+            column.headers[0].rect.y - GAP,
+            "the line stands over the first header of the block"
+        );
+        // A list that ends in headers: the end is below the last of them.
+        let closed = side(600.0, 0).layout_with(&[Entry::Tab, Entry::Header]);
+        assert_eq!(closed.between(1), closed.headers[0].rect.y + HEADER_HEIGHT);
+        assert_eq!(closed.headers[0].first_row, 1);
+    }
+
+    #[test]
+    fn a_headed_list_scrolls_by_what_it_holds() {
+        let tall = Side {
+            height: 200.0,
+            ..side(600.0, 0)
+        };
+        let entries = [
+            Entry::Tab,
+            Entry::Tab,
+            Entry::Header,
+            Entry::Tab,
+            Entry::Tab,
+            Entry::Header,
+            Entry::Tab,
+        ];
+        let column = tall.layout_with(&entries);
+        // 232 high from the list's top, a list of 116.
+        assert!(column.overflow);
+        assert_eq!(column.max_scroll, 116.0);
+        assert_eq!(column.revealing(0), 0.0);
+        assert_eq!(column.revealing(4), 116.0, "the last row brings the end");
+        let down = Side {
+            scroll: 100.0,
+            ..tall
+        }
+        .layout_with(&entries);
+        assert_eq!(down.rows[0].y, 46.0 - 100.0);
+        assert_eq!(down.headers[0].rect.y, 116.0 - 100.0);
+        assert_eq!(down.between(2), column.between(2) - 100.0);
+        assert_eq!(
+            down.revealing(0),
+            0.0,
+            "a row scrolled out above comes back"
+        );
+        assert!(down.fade_top && down.fade_bottom);
+    }
+
+    #[test]
+    fn a_held_row_goes_to_the_nearest_place_among_the_headed_rows() {
+        let column = headed();
+        let mut grip = Grip::new(&column, 0, 50.0).unwrap();
+        assert_eq!(
+            grip.track(&column, (51.0, 100.0), (600.0, 200.0)),
+            Drag::Press
+        );
+        // Held 4 in: the edge is at 146, nearest the row that starts at 142.
+        assert_eq!(
+            grip.track(&column, (150.0, 100.0), (600.0, 200.0)),
+            Drag::Reorder { left: 146.0, to: 2 }
+        );
+        // Halfway between two places, the later one: 76 and 142 are 66 apart.
+        let halfway = grip.track(&column, (109.0 + 4.0, 100.0), (600.0, 200.0));
+        assert_eq!(halfway, Drag::Reorder { left: 109.0, to: 2 });
+        // Past the last place it stops at the last.
+        assert_eq!(
+            grip.track(&column, (400.0, 100.0), (600.0, 200.0)),
+            Drag::Reorder { left: 238.0, to: 4 }
+        );
+    }
+
+    #[test]
+    fn a_group_shows_only_what_asks_for_the_user() {
+        let on = |signals: Signals| group_indicator(signals);
+        assert_eq!(on(Signals::default()), None);
+        assert_eq!(
+            on(Signals {
+                running: true,
+                uploading: true,
+                ..Signals::default()
+            }),
+            None,
+            "a command that runs and a transfer say nothing to act on"
+        );
+        assert_eq!(
+            on(Signals {
+                finished: true,
+                running: true,
+                ..Signals::default()
+            }),
+            Some(Indicator::Finished)
+        );
+        assert_eq!(
+            on(Signals {
+                finished: true,
+                failed: true,
+                running: true,
+                ..Signals::default()
+            }),
+            Some(Indicator::Failed)
+        );
+        assert_eq!(
+            on(Signals {
+                question: true,
+                failed: true,
+                finished: true,
+                running: true,
+                uploading: true
+            }),
+            Some(Indicator::Question)
+        );
+        // The tab's own rule is untouched: a running command outranks a failure there.
+        assert_eq!(
+            indicator(Signals {
+                running: true,
+                failed: true,
+                ..Signals::default()
+            }),
+            Some(Indicator::Running)
+        );
     }
 
     #[test]

@@ -4,7 +4,8 @@
 //! touching a UI toolkit: the settings file and its diagnostics (`settings`,
 //! `notices`), the split layout tree (`split`), a window's tabs — their order,
 //! selection, ⌘1…⌘9, where the tab strip's parts sit and which indicator a
-//! tab shows (`tabs`), the grid a pane's pixels make (`grid`), what a move of panes and tabs between tabs and windows
+//! tab shows (`tabs`), how the tabs are gathered into named groups and what
+//! that does to opening, closing, numbering and selecting them (`groups`), the grid a pane's pixels make (`grid`), what a move of panes and tabs between tabs and windows
 //! comes to (`moves`), what Undo Move takes back (`undo`), temporary
 //! font size (`zoom`), the mouse gesture ledger (`gesture`), shell quoting
 //! (`quote`), key encoding (`keys`), what a ⌘-clicked link resolves to and
@@ -41,6 +42,7 @@ pub mod environment;
 pub mod focus;
 pub mod gesture;
 pub mod grid;
+pub mod groups;
 pub mod handover;
 pub mod icon;
 pub mod jobs;
