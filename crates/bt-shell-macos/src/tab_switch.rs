@@ -34,15 +34,17 @@ use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send,
 };
 use objc2_app_kit::{
-    NSAccessibility, NSAccessibilityButtonRole, NSAutoresizingMaskOptions, NSBezierPath, NSEvent,
-    NSFont, NSFontWeightMedium, NSFontWeightSemibold, NSMenu, NSShadow, NSTextAlignment,
-    NSTextField, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindowOrderingMode,
+    NSAccessibility, NSAccessibilityButtonRole, NSAnimatablePropertyContainer,
+    NSAutoresizingMaskOptions, NSBezierPath, NSBox, NSEvent, NSFont, NSFontWeightMedium,
+    NSFontWeightSemibold, NSMenu, NSShadow, NSTextAlignment, NSTextField, NSTrackingArea,
+    NSTrackingAreaOptions, NSView, NSWindowOrderingMode,
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
 use super::tab_title::Title;
 use super::{
-    CARD_RADIUS, Palette, SwitchRow, TabBar, Tint, contains, label, rounded, stroke, track_hover,
+    CARD_RADIUS, Palette, SwitchRow, TabBar, Tint, animate, contains, fade, label, plain_box,
+    rounded, still, stroke, track_hover,
 };
 use crate::app;
 use crate::groups::{GroupId, group_place};
@@ -71,6 +73,10 @@ const INDICATOR: f64 = 12.0;
 const KEY_WIDTH: f64 = 34.0;
 const ROW_END: f64 = 8.0;
 const ROW_RADIUS: f64 = 6.0;
+/// How long the highlight takes to go from one row to the next, and to come and go: short, so
+/// the keys and the pointer never wait for it.
+const LIT_SLIDE: f64 = 0.14;
+const LIT_FADE: f64 = 0.08;
 /// What stands between the button's bottom and the list.
 const LIST_DROP: f64 = 6.0;
 /// The list's margin from the window's edge.
@@ -241,6 +247,9 @@ impl GroupButton {
         this.ivars().name.field().setFont(Some(&name_font()));
         this.ivars().gauge.setFont(Some(&name_font()));
         this.addSubview(this.ivars().name.view());
+        // A longer name is set at once and the button widens under it: it shows as the button
+        // comes to it, not past the button's edge.
+        this.setClipsToBounds(true);
         this.setAccessibilityElement(true);
         // SAFETY: AppKit's constant role string, alive for the process.
         this.setAccessibilityRole(Some(unsafe { NSAccessibilityButtonRole }));
@@ -284,10 +293,16 @@ impl GroupButton {
     }
 
     /// Places the button at `frame` (the bar's space) and gives it its look.
-    pub(super) fn set(&self, frame: NSRect, look: &ButtonLook, palette: Palette) {
+    /// Over `secs` when its width changes (another group's name), at once for zero.
+    pub(super) fn set(&self, frame: NSRect, secs: f64, look: &ButtonLook, palette: Palette) {
         let iv = self.ivars();
         if self.frame() != frame {
-            self.setFrame(frame);
+            if secs > 0.0 {
+                let this = self.retain();
+                animate(secs, move || this.animator().setFrame(frame));
+            } else {
+                self.setFrame(frame);
+            }
         }
         let changed = iv.look.borrow().as_ref() != Some(look)
             || iv.palette.replace(Some(palette)) != Some(palette);
@@ -518,6 +533,46 @@ struct Carry {
     slot: usize,
 }
 
+define_class!(
+    // SAFETY: NSView is designed for subclassing; ListMarks has no ivars, implements no `Drop`
+    // and is born with `initWithFrame:`.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "BateriGroupListMarks"]
+    struct ListMarks;
+
+    unsafe impl NSObjectProtocol for ListMarks {}
+
+    impl ListMarks {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        /// The list's marks, drawn over the highlight that moves under them: the check, the
+        /// indicators, New Group's plus, the rules and a carried row's line.
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            // SAFETY: reading the superview; we are on the main thread.
+            if let Some(list) = unsafe { self.superview() }
+                && let Some(list) = list.downcast_ref::<GroupList>()
+            {
+                list.draw_marks();
+            }
+        }
+    }
+);
+
+impl ListMarks {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: `initWithFrame:` is NSView's designated initializer and there are no ivars.
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        this.setAccessibilityElement(false);
+        this
+    }
+}
+
 pub(super) struct ListIvars {
     window: Cell<u64>,
     palette: Cell<Option<Palette>>,
@@ -526,6 +581,10 @@ pub(super) struct ListIvars {
     shown: Cell<Option<GroupId>>,
     layout: RefCell<Option<tabs::GroupList>>,
     hot: Cell<Option<Hot>>,
+    /// The highlight under the row the pointer or the keys are on: a box of its own that slides
+    /// from row to row, under the marks and the names.
+    lit: Retained<NSBox>,
+    marks: Retained<ListMarks>,
     pressed: Cell<Option<Hot>>,
     /// Where the press that is `pressed` went down, in the window's space, and the row it
     /// carries once it has become a pull.
@@ -594,10 +653,10 @@ define_class!(
             let at = self.convertPoint_fromView(event.locationInWindow(), None);
             let iv = self.ivars();
             iv.pressed.set(self.hot_at(at));
-            iv.hot.set(self.hot_at(at));
+            self.light(self.hot_at(at));
             iv.press_at.set(event.locationInWindow());
             iv.carrying.set(None);
-            self.setNeedsDisplay(true);
+            self.redraw();
         }
 
         /// The pointer moves with the button down on a group's row: past [`DRAG_SLOP`] the row is
@@ -626,7 +685,7 @@ define_class!(
             };
             let carry = Carry { row, slot };
             if iv.carrying.replace(Some(carry)) != Some(carry) {
-                self.setNeedsDisplay(true);
+                self.redraw();
             }
         }
 
@@ -636,7 +695,7 @@ define_class!(
             let iv = self.ivars();
             let pressed = iv.pressed.take();
             if let Some(carry) = iv.carrying.take() {
-                self.setNeedsDisplay(true);
+                self.redraw();
                 self.put(carry);
                 return;
             }
@@ -647,10 +706,15 @@ define_class!(
             }
         }
 
+        /// The highlight follows the pointer from row to row; over a rule or the margin it stays
+        /// where it was, so going down the list it slides on and does not blink out between two
+        /// rows. It goes when the pointer leaves the card.
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
             let at = self.convertPoint_fromView(event.locationInWindow(), None);
-            self.light(self.hot_at(at));
+            if let Some(hot) = self.hot_at(at) {
+                self.light(Some(hot));
+            }
         }
 
         #[unsafe(method(mouseExited:))]
@@ -668,7 +732,7 @@ define_class!(
                     let iv = self.ivars();
                     if iv.carrying.take().is_some() {
                         iv.pressed.set(None);
-                        self.setNeedsDisplay(true);
+                        self.redraw();
                     } else if let Some(window) = self.owner() {
                         window.bar().close_group_list(true);
                     }
@@ -693,6 +757,10 @@ define_class!(
 
 impl GroupList {
     pub(super) fn new(mtm: MainThreadMarker, window: u64) -> Retained<Self> {
+        let lit = plain_box(mtm, Tint::of(0, 0.0), ROW_RADIUS);
+        lit.setAlphaValue(0.0);
+        lit.setAccessibilityElement(false);
+        let marks = ListMarks::new(mtm);
         let this = Self::alloc(mtm).set_ivars(ListIvars {
             window: Cell::new(window),
             palette: Cell::new(None),
@@ -700,6 +768,8 @@ impl GroupList {
             shown: Cell::new(None),
             layout: RefCell::new(None),
             hot: Cell::new(None),
+            lit,
+            marks,
             pressed: Cell::new(None),
             press_at: Cell::new(NSPoint::ZERO),
             carrying: Cell::new(None),
@@ -711,6 +781,9 @@ impl GroupList {
         // Its own layer, which carries the shadow, as the summary card's.
         this.setWantsLayer(true);
         this.setAccessibilityElement(true);
+        // The highlight first and the marks over it; the names and keys come over both.
+        this.addSubview(&this.ivars().lit);
+        this.addSubview(&this.ivars().marks);
         let options = NSTrackingAreaOptions::MouseEnteredAndExited
             | NSTrackingAreaOptions::MouseMoved
             | NSTrackingAreaOptions::ActiveAlways
@@ -759,6 +832,7 @@ impl GroupList {
             shadow.setShadowBlurRadius(12.0);
             shadow.setShadowColor(Some(&palette.card_shadow.color()));
             self.setShadow(Some(&shadow));
+            iv.lit.setFillColor(&palette.hover.color());
         }
         iv.rows.replace(rows.to_vec());
         iv.shown.set(shown);
@@ -840,8 +914,11 @@ impl GroupList {
         {
             iv.hot.set(None);
         }
+        // The rows may stand elsewhere now: the highlight goes with its row at once.
+        iv.marks.setFrame(NSRect::new(NSPoint::ZERO, size));
+        self.place_lit(iv.hot.get(), 0.0);
         self.setAccessibilityLabel(Some(&NSString::from_str("Tab groups")));
-        self.setNeedsDisplay(true);
+        self.redraw();
         size
     }
 
@@ -861,10 +938,70 @@ impl GroupList {
         layout.rows.iter().position(over).map(Hot::Row)
     }
 
+    /// The pointer or the keys went to `hot`: the highlight follows — it slides from the row it
+    /// was on, comes in place where there was none and fades where there is none now; at once
+    /// under Reduce Motion.
     fn light(&self, hot: Option<Hot>) {
-        if self.ivars().hot.replace(hot) != hot {
-            self.setNeedsDisplay(true);
+        let was = self.ivars().hot.replace(hot);
+        if was == hot {
+            return;
         }
+        let reduce = self
+            .owner()
+            .is_some_and(|window| window.bar().reduce_motion());
+        let slide = if reduce || was.is_none() {
+            0.0
+        } else {
+            LIT_SLIDE
+        };
+        self.place_lit(hot, slide);
+    }
+
+    /// Puts the highlight under `hot`'s row over `secs` (at once for zero), or fades it out for
+    /// none.
+    fn place_lit(&self, hot: Option<Hot>, secs: f64) {
+        let iv = self.ivars();
+        let reduce = self
+            .owner()
+            .is_some_and(|window| window.bar().reduce_motion());
+        let fading = if reduce { 0.0 } else { LIT_FADE };
+        let rect = hot.and_then(|hot| self.row_rect(hot));
+        let Some(rect) = rect else {
+            fade(&iv.lit, 0.0, fading);
+            return;
+        };
+        if secs > 0.0 {
+            let lit = iv.lit.retain();
+            animate(secs, move || lit.animator().setFrame(rect));
+        } else {
+            // A move under way would carry on to the row it left.
+            if let Some(layer) = iv.lit.layer() {
+                layer.removeAllAnimations();
+            }
+            still(|| iv.lit.setFrame(rect));
+        }
+        fade(&iv.lit, 1.0, fading);
+    }
+
+    /// The box `hot`'s row is highlighted in, in the card's space.
+    fn row_rect(&self, hot: Hot) -> Option<NSRect> {
+        let layout = self.ivars().layout.borrow();
+        let layout = layout.as_ref()?;
+        let span = match hot {
+            Hot::Row(row) => *layout.rows.get(row)?,
+            Hot::New => layout.new_row,
+        };
+        let left = tabs::GROUP_LIST_PAD;
+        Some(NSRect::new(
+            NSPoint::new(left, span.x),
+            NSSize::new(layout.width - 2.0 * left, span.width),
+        ))
+    }
+
+    /// The card and its marks drawn again (the highlight is a view of its own).
+    fn redraw(&self) {
+        self.setNeedsDisplay(true);
+        self.ivars().marks.setNeedsDisplay(true);
     }
 
     /// ↓ (`1`) and ↑ (`-1`): the next row, and New Group after the last.
@@ -931,27 +1068,36 @@ impl GroupList {
         }
     }
 
+    /// The card itself; the highlight and the marks are views over it.
     fn draw(&self) {
+        let Some(palette) = self.ivars().palette.get() else {
+            return;
+        };
+        rounded(
+            self.bounds(),
+            CARD_RADIUS,
+            palette.card,
+            Some(palette.card_line),
+        );
+    }
+
+    /// What stands over the highlight ([`ListMarks`]): the check of the group on screen, the
+    /// indicators, New Group's plus, the rules, and the line a carried row would be let go at.
+    fn draw_marks(&self) {
         let iv = self.ivars();
         let (Some(palette), Some(layout)) = (iv.palette.get(), iv.layout.borrow().clone()) else {
             return;
         };
-        let bounds = self.bounds();
-        rounded(bounds, CARD_RADIUS, palette.card, Some(palette.card_line));
         let left = tabs::GROUP_LIST_PAD;
         let width = layout.width - 2.0 * left;
         let row_rect = |span: &tabs::Span| {
             NSRect::new(NSPoint::new(left, span.x), NSSize::new(width, span.width))
         };
-        let hot = iv.hot.get();
         let rows = iv.rows.borrow();
         let shown = iv.shown.get();
         let carrying = iv.carrying.get();
-        for (at, (row, span)) in rows.iter().zip(&layout.rows).enumerate() {
+        for (row, span) in rows.iter().zip(&layout.rows) {
             let rect = row_rect(span);
-            if hot == Some(Hot::Row(at)) {
-                rounded(rect, ROW_RADIUS, palette.hover, None);
-            }
             let middle = rect.origin.y + rect.size.height / 2.0;
             if row.group == shown {
                 draw_check(
@@ -968,9 +1114,6 @@ impl GroupList {
             }
         }
         let rect = row_rect(&layout.new_row);
-        if hot == Some(Hot::New) {
-            rounded(rect, ROW_RADIUS, palette.hover, None);
-        }
         let (x, y) = (left + 9.0 + 5.5, rect.origin.y + rect.size.height / 2.0);
         let plus = NSBezierPath::bezierPath();
         plus.moveToPoint(NSPoint::new(x - 4.0, y));

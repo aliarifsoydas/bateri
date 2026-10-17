@@ -5906,22 +5906,34 @@ impl TabBar {
 
     /// Puts the group button where the strip starts, with the look its group gives it, and the
     /// name field in its place while the group is being named; hides it where there is none.
-    fn place_switch(&self, palette: Palette, top: f64) {
+    /// Returns how long the button takes to come to its new width (`secs`, the strip's reflow):
+    /// another group's name widens or narrows it, and the strip after it goes along over the
+    /// same time instead of jumping — at once while a name is typed, the first time it shows,
+    /// and under Reduce Motion (`secs` is zero then).
+    fn place_switch(&self, palette: Palette, top: f64, secs: f64) -> f64 {
         let iv = self.ivars();
         let (Some(width), Some(switcher)) =
             (self.switch_width(), iv.shown.borrow().switcher.clone())
         else {
             iv.switch.setHidden(true);
-            return;
+            return 0.0;
         };
         let naming = switcher.shown.is_some() && iv.renaming_group.get() == switcher.shown;
         let frame = NSRect::new(
             NSPoint::new(self.leading(), top),
             NSSize::new(width, CHIP_HEIGHT),
         );
+        let shown = !iv.switch.isHidden();
+        let resized = (iv.switch.frame().size.width - width).abs() > 0.5;
+        let slide = if shown && resized && !naming {
+            secs
+        } else {
+            0.0
+        };
         iv.switch.setHidden(false);
         iv.switch.set(
             frame,
+            slide,
             &tab_switch::ButtonLook {
                 group: switcher.shown,
                 name: switcher.name,
@@ -5953,6 +5965,7 @@ impl TabBar {
                 NSSize::new(width, height),
             ));
         }
+        slide
     }
 
     /// The pure layout's input for `count` places: the bar's width, where the strip may start,
@@ -6138,9 +6151,10 @@ impl TabBar {
             return;
         }
         // The group button leads the strip, beside the lights.
-        self.place_switch(
+        let switched = self.place_switch(
             palette,
             ((self.bounds().size.height - CHIP_HEIGHT) / 2.0).max(0.0),
+            Motion::of(reduce).reflow,
         );
         let lit_at = |place: usize| seats.get(place).copied().unwrap_or(false);
         let bar = self.bar_for(
@@ -6179,11 +6193,22 @@ impl TabBar {
         iv.scroll.set(strip.scroll);
         let bounds = self.bounds();
         let top = ((bounds.size.height - CHIP_HEIGHT) / 2.0).max(0.0);
-        // The chips live in the strip's space: its left edge is theirs.
-        iv.strip.setFrame(NSRect::new(
+        // The chips live in the strip's space: its left edge is theirs, and it goes along with a
+        // group button that is coming to another name's width.
+        let span = NSRect::new(
             NSPoint::new(strip.span.x, 0.0),
             NSSize::new(strip.span.width, bounds.size.height),
-        ));
+        );
+        if switched > 0.0 && iv.strip.frame() != span {
+            let strip = iv.strip.retain();
+            animate(switched, move || strip.animator().setFrame(span));
+        } else if iv.strip.frame() != span {
+            // A slide still on its way would carry on to its old place and snap back.
+            if let Some(layer) = iv.strip.layer() {
+                layer.removeAllAnimations();
+            }
+            iv.strip.setFrame(span);
+        }
         // A window nobody sees turns no ring: the turns are off and come back at the right angle.
         let visible = self
             .terminal_window()
