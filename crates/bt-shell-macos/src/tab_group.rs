@@ -11,8 +11,11 @@
 //! **What it does.** A press on the header opens or closes the group; the second press of a double
 //! click names it ([`TabBar::begin_group_rename`], which puts the bar's name field over the name),
 //! and a right click is the group's menu ([`TabBar::group_menu`]). The `+` is the group's own New
-//! Tab. Nothing here changes the group: the window's appliers do
-//! ([`TerminalWindow::set_group_collapsed`], [`TerminalWindow::rename_group`]).
+//! Tab. A press that moves [`DRAG_SLOP`] before the button comes up is not a click: it carries the
+//! group away in a drag session ([`TabBar::carry_group`]) — among the groups of the column, to a
+//! window of its own, to another window — and opens or closes nothing. Nothing here changes the
+//! group: the window's appliers do ([`TerminalWindow::set_group_collapsed`],
+//! [`TerminalWindow::rename_group`]), and the moves ([`crate::moves`]) a drop comes to.
 //!
 //! **The arrow turns by crossing over**, not by rotating: two pictures of it, one the other's
 //! opacity, over [`TURN_SECS`] — the same Core Animation, on the window server, as every other
@@ -42,7 +45,7 @@ use super::{
     contains, label, paint, rounded, stroke,
 };
 use crate::groups::GroupId;
-use crate::tabs::{self, Indicator};
+use crate::tabs::{self, DRAG_SLOP, Indicator};
 
 /// The arrow's square, and the distance of its middle from the header's left edge.
 const ARROW: f64 = 8.0;
@@ -59,6 +62,8 @@ const END_GAP: f64 = 6.0;
 const DOT: f64 = 6.0;
 /// How long the arrow takes to turn (the design's 160 ms).
 const TURN_SECS: f64 = 0.16;
+/// How much of its ink a header keeps while it is carried away.
+const TORN_ALPHA: f64 = 0.45;
 
 /// What a press on the header began as, and so what its release does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +85,9 @@ pub(super) struct HeaderLook {
     pub(super) reduce: bool,
     /// The reflow's duration when the applier changed the list: an old header slides to its place.
     pub(super) slide: Option<f64>,
+    /// The header is carried away in a drag session: it waits, faint, in its place until the
+    /// session ends.
+    pub(super) torn: bool,
 }
 
 pub(super) struct HeaderIvars {
@@ -92,6 +100,9 @@ pub(super) struct HeaderIvars {
     /// The pointer is over the `+` itself: the stronger fill.
     over_plus: Cell<bool>,
     pressed: Cell<Option<Press>>,
+    /// Where the press that is `pressed` went down, in the window's space: how far the pointer
+    /// has gone from it says whether it is a drag.
+    press_at: Cell<NSPoint>,
     /// Whether the group was open before the last release closed it or opened it, so a double
     /// click can put it back: the first click of a double click toggled the group.
     toggled_from: Cell<Option<bool>>,
@@ -175,6 +186,27 @@ define_class!(
                 iv.toggled_from.set(None);
             }
             iv.pressed.set(Some(press));
+            iv.press_at.set(event.locationInWindow());
+        }
+
+        /// The pointer moves with the button down on the header: past [`DRAG_SLOP`] the press is a
+        /// pull, and the group is carried away — the button's release will find no press to
+        /// open or close the group with.
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            let iv = self.ivars();
+            if iv.pressed.get() != Some(Press::Header) {
+                return;
+            }
+            let (now, from) = (event.locationInWindow(), iv.press_at.get());
+            if (now.x - from.x).hypot(now.y - from.y) < DRAG_SLOP {
+                return;
+            }
+            iv.pressed.set(None);
+            iv.toggled_from.set(None);
+            if let (Some(bar), Some(group)) = (self.bar(), iv.group.get()) {
+                bar.carry_group(group, self, event, true);
+            }
         }
 
         #[unsafe(method(mouseUp:))]
@@ -252,6 +284,7 @@ impl GroupHeader {
             hovered: Cell::new(false),
             over_plus: Cell::new(false),
             pressed: Cell::new(None),
+            press_at: Cell::new(NSPoint::ZERO),
             toggled_from: Cell::new(None),
             fresh: Cell::new(true),
             target: Cell::new(NSRect::ZERO),
@@ -349,6 +382,11 @@ impl GroupHeader {
             }
             _ if moved || fresh => self.setFrame(frame),
             _ => {}
+        }
+        // Faint while carried, full ink again the layout after; a header that fades in is left
+        // to its own fade.
+        if !(fresh && look.slide.is_some()) {
+            self.setAlphaValue(if look.torn { TORN_ALPHA } else { 1.0 });
         }
         iv.group.set(Some(heading.group));
         iv.heading.replace(Some(heading.clone()));

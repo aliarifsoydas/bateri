@@ -166,8 +166,16 @@ pub enum Move {
     /// Pane `pane` becomes a tab of its own in window `window`'s strip, before tab number `gap`
     /// (the strip's length is the end) — Move Split to New Tab, the capsule's tab of its own, a
     /// pane let go between chips of its own window or another's. A tab's only pane is the tab:
-    /// the tab itself moves there, name and identity and all.
-    PaneToNewTab { pane: u64, window: u64, gap: usize },
+    /// the tab itself moves there, name and identity and all. In a window that has groups the
+    /// place of the strip cannot say which side of a group's border the pane was let go on, so
+    /// the one who let it go says where it goes (`target`, [`Groups::gap_target`]); without it the
+    /// tab joins the group of the tab it goes before ([`Groups::insert_at`]).
+    PaneToNewTab {
+        pane: u64,
+        window: u64,
+        gap: usize,
+        target: Option<Target<u64>>,
+    },
     /// Tab `tab` becomes a window of its own — Move Tab to New Window, a tab dragged out of its
     /// strip and let go over nothing. `at` is where it was let go (a point on the screen, in
     /// the platform's coordinates): the new window's title row goes under it; without it the
@@ -215,6 +223,17 @@ pub enum Move {
         group: GroupId,
         into: u64,
         to: usize,
+    },
+    /// Tabs `tabs` of window `window` join window `into` where `target` says (a group of it, or
+    /// among its ungrouped tabs, before one of its tabs or last) — a row, or several picked
+    /// together, let go on another window's bar or column. They leave their window whole and the
+    /// window they leave closes if they were all it had; `into` comes forward on the one that was
+    /// on screen, else the first. In its own window it is [`Move::RegroupTabs`].
+    TabsToWindow {
+        window: u64,
+        tabs: Vec<u64>,
+        into: u64,
+        target: Target<u64>,
     },
     /// Group `group` of window `window` becomes a window of its own with the group's name, as
     /// [`Move::TabToNewWindow`] says for `at`. A window that is only that group stays.
@@ -373,7 +392,12 @@ pub fn plan(world: &[Window], wanted: Move, host: &dyn Host) -> Result<Plan, Ref
     match wanted {
         Move::PaneToTab { pane, into, place } => pane_to_tab(world, pane, into, place, host),
         Move::TabToTab { tab, into, place } => tab_to_tab(world, tab, into, place, host),
-        Move::PaneToNewTab { pane, window, gap } => pane_to_new_tab(world, pane, window, gap, host),
+        Move::PaneToNewTab {
+            pane,
+            window,
+            gap,
+            target,
+        } => pane_to_new_tab(world, pane, window, gap, target, host),
         Move::TabToNewWindow { tab, at } => tab_to_new_window(world, tab, at, host),
         Move::PaneToNewWindow { pane, at } => pane_to_new_window(world, pane, at, host),
         Move::TabToStrip { tab, window, index } => tab_to_strip(world, tab, window, index),
@@ -396,6 +420,12 @@ pub fn plan(world: &[Window], wanted: Move, host: &dyn Host) -> Result<Plan, Ref
         Move::TabsToNewWindow { window, tabs, at } => {
             tabs_to_new_window(world, window, &tabs, at, host)
         }
+        Move::TabsToWindow {
+            window,
+            tabs,
+            into,
+            target,
+        } => tabs_to_window(world, window, &tabs, into, target),
         Move::Undo { record } => undo(world, &record),
     }
 }
@@ -591,6 +621,7 @@ fn pane_to_new_tab(
     pane: u64,
     window: u64,
     gap: usize,
+    target: Option<Target<u64>>,
     host: &dyn Host,
 ) -> Result<Plan, Refusal> {
     let (from, source) = holding_pane(world, pane).ok_or(Refusal::Quiet)?;
@@ -604,6 +635,15 @@ fn pane_to_new_tab(
             // A tab's only pane is the tab: it takes that place in its strip, the way a tab
             // dragged along it does — nothing is shown or hidden, so a question up does not hold
             // it back.
+            if let Some(target) = target {
+                // The place was named by a group's border, not by a number of the strip.
+                let mut plan = regroup_tabs(world, from.id, &[source.tab], target)?;
+                plan.after.push(Step::Pulse {
+                    window: from.id,
+                    tab: source.tab,
+                });
+                return Ok(plan);
+            }
             let at = from.order.index_of(source.tab).ok_or(Refusal::Quiet)?;
             let (mut order, mut groups) = (from.order.clone(), from.groups.clone());
             if !groups.move_to(&mut order, source.tab, gap_to_index(at, gap)) {
@@ -637,19 +677,25 @@ fn pane_to_new_tab(
         {
             return Err(Refusal::Quiet);
         }
+        let mut steps = vec![
+            Step::ReleasePane {
+                window: from.id,
+                tab: source.tab,
+                pane,
+            },
+            Step::NewTab {
+                window: from.id,
+                tab: new,
+                gap,
+            },
+        ];
+        steps.extend(target.map(|target| Step::Regroup {
+            window: from.id,
+            tabs: vec![new],
+            target,
+        }));
         return Ok(Plan {
-            steps: vec![
-                Step::ReleasePane {
-                    window: from.id,
-                    tab: source.tab,
-                    pane,
-                },
-                Step::NewTab {
-                    window: from.id,
-                    tab: new,
-                    gap,
-                },
-            ],
+            steps,
             after: vec![Step::Pulse {
                 window: from.id,
                 tab: new,
@@ -695,6 +741,11 @@ fn pane_to_new_tab(
         tab,
         slot: Slot::At(gap),
     });
+    steps.extend(target.map(|target| Step::Regroup {
+        window: onto.id,
+        tabs: vec![tab],
+        target,
+    }));
     steps.extend(from.close_if_emptied());
     let closes = panes == 1 && from.closes_without(1);
     Ok(Plan {
@@ -1078,6 +1129,64 @@ fn group_to_window(
             Step::Select {
                 window: onto.id,
                 tab: shown_among(from, &tabs, resident),
+            },
+        ],
+        undo: (!closes).then(|| Record {
+            scenes: vec![from.scene(&tabs), onto.scene(&[])],
+            born: Vec::new(),
+        }),
+    })
+}
+
+fn tabs_to_window(
+    world: &[Window],
+    window: u64,
+    tabs: &[u64],
+    into: u64,
+    target: Target<u64>,
+) -> Result<Plan, Refusal> {
+    let from = window_named(world, window)?;
+    let onto = window_named(world, into)?;
+    let tabs = in_strip(from, tabs);
+    if tabs.is_empty() {
+        return Err(Refusal::Quiet);
+    }
+    if from.id == onto.id {
+        return regroup_tabs(world, window, &tabs, target);
+    }
+    if from.asking || onto.asking {
+        return Err(Refusal::Beep);
+    }
+    // The target is the window's own group and tab: played on a copy, a group that is gone or a
+    // place that is not there ends quietly before anything has left its window.
+    let (mut order, mut groups) = (onto.order.clone(), onto.groups.clone());
+    for &tab in &tabs {
+        groups.append(&mut order, tab);
+    }
+    groups
+        .place(&mut order, &tabs, target.clone())
+        .ok_or(Refusal::Quiet)?;
+    let mut steps = releases(from, &tabs);
+    steps.extend(tabs.iter().map(|&tab| Step::AdoptTab {
+        window: onto.id,
+        tab,
+        slot: Slot::End,
+    }));
+    steps.push(Step::Regroup {
+        window: onto.id,
+        tabs: tabs.clone(),
+        target,
+    });
+    steps.extend(from.close_if_emptied());
+    // The window they leave closes if they were all it had, and then there is nothing to undo.
+    let closes = from.closes_without(tabs.len());
+    Ok(Plan {
+        steps,
+        after: vec![
+            Step::Raise { window: onto.id },
+            Step::Select {
+                window: onto.id,
+                tab: shown_among(from, &tabs, None),
             },
         ],
         undo: (!closes).then(|| Record {
@@ -1707,6 +1816,7 @@ mod tests {
                 pane: 101,
                 window: 1,
                 gap: 1,
+                target: None,
             },
             &host,
         )
@@ -1749,6 +1859,7 @@ mod tests {
                 pane: 101,
                 window: 1,
                 gap: 1,
+                target: None,
             },
             &host,
         );
@@ -1763,6 +1874,7 @@ mod tests {
             pane: 110,
             window: 1,
             gap: 0,
+            target: None,
         };
         let plan = plan(&world, to_front.clone(), &host).unwrap();
         assert_eq!(
@@ -1789,7 +1901,8 @@ mod tests {
                     Move::PaneToNewTab {
                         pane: 110,
                         window: 1,
-                        gap
+                        gap,
+                        target: None,
                     },
                     &host
                 ),
@@ -1812,6 +1925,7 @@ mod tests {
                 pane: 101,
                 window: 2,
                 gap: 1,
+                target: None,
             },
             &host,
         )
@@ -1863,6 +1977,7 @@ mod tests {
             pane: 110,
             window: 2,
             gap: 0,
+            target: None,
         };
         let plan = plan(&world, crossing.clone(), &host).unwrap();
         assert_eq!(
@@ -2289,6 +2404,7 @@ mod tests {
                 pane: 101,
                 window: 1,
                 gap: 1,
+                target: None,
             },
             &host,
         )
@@ -2475,6 +2591,7 @@ mod tests {
                 pane: 101,
                 window: 9,
                 gap: 0,
+                target: None,
             },
             Move::TabToNewWindow { tab: 99, at: None },
             Move::PaneToNewWindow {
@@ -3376,5 +3493,286 @@ mod tests {
             tab: 20,
             slot: Slot::At(2)
         }));
+    }
+
+    /// [`grouped`] with window 2's tab 21 in a group of its own, `x`.
+    fn two_grouped() -> Vec<Window> {
+        let mut world = grouped();
+        let two = &mut world[1];
+        two.groups
+            .place(&mut two.order, &[21], Target::New("x".to_owned()));
+        world
+    }
+
+    #[test]
+    fn tabs_let_go_on_another_windows_group_join_it_where_they_were_let_go() {
+        let world = two_grouped();
+        let x = gid(&world[1], "x");
+        let target = Target::Group {
+            group: x,
+            before: Some(21),
+        };
+        let moved = plan(
+            &world,
+            Move::TabsToWindow {
+                window: 1,
+                tabs: vec![12, 11],
+                into: 2,
+                target: target.clone(),
+            },
+            &Cramped,
+        )
+        .unwrap();
+        // They leave in the order of the strip, join at the end and are then put where the target
+        // says; the window they leave closes only if they were all it had.
+        assert_eq!(
+            moved.steps,
+            [
+                Step::ReleaseTab { window: 1, tab: 11 },
+                Step::ReleaseTab { window: 1, tab: 12 },
+                Step::AdoptTab {
+                    window: 2,
+                    tab: 11,
+                    slot: Slot::End
+                },
+                Step::AdoptTab {
+                    window: 2,
+                    tab: 12,
+                    slot: Slot::End
+                },
+                Step::Regroup {
+                    window: 2,
+                    tabs: vec![11, 12],
+                    target
+                },
+                Step::CloseIfEmptied { window: 1 },
+            ]
+        );
+        // The window comes forward on the tab that was on screen if it is among them, else the
+        // first.
+        assert_eq!(
+            moved.after,
+            [
+                Step::Raise { window: 2 },
+                Step::Select { window: 2, tab: 11 }
+            ]
+        );
+        let undo = moved
+            .undo
+            .expect("a move between windows can be taken back");
+        assert_eq!(
+            undo.scenes,
+            [world[0].scene(&[11, 12]), world[1].scene(&[])]
+        );
+        assert_eq!(undo.scenes[1].groups, world[1].groups);
+    }
+
+    #[test]
+    fn tabs_let_go_on_their_own_window_are_regrouped_there() {
+        let world = two_grouped();
+        let api = gid(&world[0], "api");
+        let target = Target::Group {
+            group: api,
+            before: None,
+        };
+        assert_eq!(
+            plan(
+                &world,
+                Move::TabsToWindow {
+                    window: 1,
+                    tabs: vec![10],
+                    into: 1,
+                    target: target.clone()
+                },
+                &Cramped
+            ),
+            plan(
+                &world,
+                Move::RegroupTabs {
+                    window: 1,
+                    tabs: vec![10],
+                    target
+                },
+                &Cramped
+            )
+        );
+    }
+
+    #[test]
+    fn tabs_let_go_where_nothing_is_end_quietly_or_beep() {
+        let mut world = two_grouped();
+        let go = |world: &[Window], target| {
+            plan(
+                world,
+                Move::TabsToWindow {
+                    window: 1,
+                    tabs: vec![11],
+                    into: 2,
+                    target,
+                },
+                &Cramped,
+            )
+        };
+        // A group the window has not, a tab it has not: nothing has left its window.
+        assert_eq!(
+            go(
+                &world,
+                Target::Group {
+                    group: stray(),
+                    before: None
+                }
+            ),
+            Err(Refusal::Quiet)
+        );
+        // None of the tabs is there.
+        assert_eq!(
+            plan(
+                &world,
+                Move::TabsToWindow {
+                    window: 1,
+                    tabs: vec![99],
+                    into: 2,
+                    target: Target::Loose { before: None }
+                },
+                &Cramped
+            ),
+            Err(Refusal::Quiet)
+        );
+        // A question held by either window holds them back.
+        world[1].asking = true;
+        assert_eq!(
+            go(&world, Target::Loose { before: None }),
+            Err(Refusal::Beep)
+        );
+    }
+
+    #[test]
+    fn tabs_that_are_all_a_window_has_close_it_when_they_cross_and_cannot_be_undone() {
+        let mut world = two_grouped();
+        world.push(solo());
+        let moved = plan(
+            &world,
+            Move::TabsToWindow {
+                window: 3,
+                tabs: vec![30],
+                into: 1,
+                target: Target::Loose { before: None },
+            },
+            &Cramped,
+        )
+        .unwrap();
+        assert_eq!(
+            moved.steps.last(),
+            Some(&Step::CloseIfEmptied { window: 3 })
+        );
+        assert_eq!(moved.undo, None);
+    }
+
+    #[test]
+    fn a_pane_let_go_at_a_groups_border_goes_where_the_target_says() {
+        let world = two_grouped();
+        let x = gid(&world[1], "x");
+        let api = gid(&world[0], "api");
+        // Another window: the tab (110's was the only pane of 11) joins it, then goes to the end
+        // of x — the gap before 21 would have been the head of x.
+        let across = plan(
+            &world,
+            Move::PaneToNewTab {
+                pane: 110,
+                window: 2,
+                gap: 1,
+                target: Some(Target::Group {
+                    group: x,
+                    before: None,
+                }),
+            },
+            &Cramped,
+        )
+        .unwrap();
+        assert!(across.steps.contains(&Step::Regroup {
+            window: 2,
+            tabs: vec![11],
+            target: Target::Group {
+                group: x,
+                before: None
+            }
+        }));
+        let adopted = across
+            .steps
+            .iter()
+            .position(|step| matches!(step, Step::AdoptTab { .. }))
+            .unwrap();
+        let regrouped = across
+            .steps
+            .iter()
+            .position(|step| matches!(step, Step::Regroup { .. }))
+            .unwrap();
+        assert!(adopted < regrouped, "it is put where it goes once it is in");
+
+        // Its own window, a tab's only pane: the tab is regrouped, and glows once.
+        let target = Target::Group {
+            group: api,
+            before: None,
+        };
+        let own = plan(
+            &world,
+            Move::PaneToNewTab {
+                pane: 130,
+                window: 1,
+                gap: 3,
+                target: Some(target.clone()),
+            },
+            &Cramped,
+        )
+        .unwrap();
+        assert_eq!(
+            own.steps,
+            [Step::Regroup {
+                window: 1,
+                tabs: vec![13],
+                target: target.clone()
+            }]
+        );
+        assert_eq!(own.after, [Step::Pulse { window: 1, tab: 13 }]);
+
+        // One pane of several becomes a tab, then goes where the target says.
+        let host = Cramped;
+        let made = plan(
+            &world,
+            Move::PaneToNewTab {
+                pane: 101,
+                window: 1,
+                gap: 1,
+                target: Some(target.clone()),
+            },
+            &host,
+        )
+        .unwrap();
+        assert_eq!(
+            made.steps.last(),
+            Some(&Step::Regroup {
+                window: 1,
+                tabs: vec![NEW],
+                target
+            })
+        );
+        // Without a target nothing is asked of the groups: today's plan.
+        let plain = plan(
+            &world,
+            Move::PaneToNewTab {
+                pane: 101,
+                window: 1,
+                gap: 1,
+                target: None,
+            },
+            &host,
+        )
+        .unwrap();
+        assert!(
+            !plain
+                .steps
+                .iter()
+                .any(|step| matches!(step, Step::Regroup { .. }))
+        );
     }
 }

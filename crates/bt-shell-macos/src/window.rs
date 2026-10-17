@@ -122,7 +122,9 @@ use crate::app;
 use crate::arrange::Tool;
 use crate::card::{Ground, Shade, fade_to};
 use crate::embed;
-use crate::groups::{Click, GroupId, Groups, Item, Part, Picked, Reach, Target, View};
+use crate::groups::{
+    Click, GroupId, GroupSpot, Groups, Item, Part, Picked, Reach, Spot, Target, View,
+};
 use crate::jobs::Foreground;
 use crate::launch::Closing;
 use crate::moves::{self, Joins, Move};
@@ -135,7 +137,7 @@ use crate::split::{Axis, Direction, Tree};
 use crate::split_view::{Hairline, SplitView};
 use crate::tab::{self, TerminalTab};
 use crate::tab_bar::{Heading, Label, RowClaim, SwitchRow, Switcher, TabBar, counted};
-use crate::tabs::{self, Card, Finish, Tabs};
+use crate::tabs::{self, Card, Column, Finish, Tabs};
 use crate::undo::{Record, Scene, Shape};
 
 /// Whether the theme's background is dark — the window chrome's appearance
@@ -992,6 +994,7 @@ define_class!(
                 pane: tab.focused_pane().id(),
                 window: self.id(),
                 gap,
+                target: self.beside_target(tab.id()),
             });
         }
 
@@ -2188,6 +2191,7 @@ impl TerminalWindow {
                     pane,
                     window: self.id(),
                     gap,
+                    target: self.beside_target(tab.id()),
                 });
             }
             Tool::Close => {
@@ -3089,6 +3093,82 @@ impl TerminalWindow {
             self.listing(),
             listed,
         )
+    }
+
+    /// Where a tab opened right of tab `tab` goes: its own group, after it
+    /// ([`Groups::beside_target`]); `None` in a window with no group.
+    pub(crate) fn beside_target(&self, tab: u64) -> Option<Target<u64>> {
+        self.ivars()
+            .groups
+            .borrow()
+            .beside_target(&self.ivars().order.borrow(), tab)
+    }
+
+    /// Where a tab (or a pane become one) let go at gap `gap` of what the bar lists goes, in a
+    /// window that has groups ([`Groups::gap_target`]): the gap above a group's header is the end
+    /// of the group above it.
+    pub(crate) fn gap_target(&self, gap: usize) -> Option<Target<u64>> {
+        self.ivars()
+            .groups
+            .borrow()
+            .gap_target(&self.ivars().order.borrow(), self.listing(), gap)
+    }
+
+    /// The window has groups: its side column lists headers, and a row dragged there is carried
+    /// to a place of the column ([`Groups::side_spots`]), not slid along a list.
+    pub(crate) fn has_groups(&self) -> bool {
+        !self.ivars().groups.borrow().is_empty()
+    }
+
+    /// How many groups the window has.
+    pub(crate) fn group_count(&self) -> usize {
+        self.ivars().groups.borrow().len()
+    }
+
+    /// Where group `group` stands among the window's groups.
+    pub(crate) fn group_position(&self, group: GroupId) -> Option<usize> {
+        self.ivars().groups.borrow().position(group)
+    }
+
+    /// The places the side column `column` — as it lays out the window's list — takes carried
+    /// tabs at ([`Groups::side_spots`]).
+    pub(crate) fn side_spots(&self, column: &Column) -> Vec<Spot<u64>> {
+        self.ivars()
+            .groups
+            .borrow()
+            .side_spots(&self.ivars().order.borrow(), column)
+    }
+
+    /// The places the side column `column` takes a carried group at ([`Groups::group_spots`]).
+    pub(crate) fn group_spots(&self, column: &Column) -> Vec<GroupSpot> {
+        self.ivars()
+            .groups
+            .borrow()
+            .group_spots(&self.ivars().order.borrow(), column)
+    }
+
+    /// Where tabs let go at gap `gap` of what the bar lists go: [`Self::gap_target`], and in a
+    /// window with no group, before the tab of that place among the plain list.
+    pub(crate) fn drop_target(&self, gap: usize) -> Target<u64> {
+        self.gap_target(gap).unwrap_or_else(|| {
+            let before = self
+                .ivars()
+                .groups
+                .borrow()
+                .numbered(&self.ivars().order.borrow(), self.listing())
+                .get(gap)
+                .copied();
+            Target::Loose { before }
+        })
+    }
+
+    /// Where tab `tab` of this window, let go on its own title row at `place`, goes
+    /// ([`Groups::own_target`]).
+    pub(crate) fn own_drop_target(&self, tab: u64, place: usize) -> Target<u64> {
+        self.ivars()
+            .groups
+            .borrow()
+            .own_target(&self.ivars().order.borrow(), tab, place)
     }
 
     /// **The applier: a place in the bar's list.** Tab `id` takes the `to`th place of what the bar

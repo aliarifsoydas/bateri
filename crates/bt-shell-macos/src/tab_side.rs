@@ -35,6 +35,14 @@
 //! takes a chip: rows part under the pointer and the landing is `tabs::landing`'s. A pane carried
 //! over the column (⌥⌘) lights the row it is over the middle of and, between two rows, draws a
 //! line ([`Insertion`]) instead of opening room: a pane's drop is a mark, a tab's is a seat.
+//!
+//! **In a window that has groups a row's drop is a mark too.** A row slid along the rows cannot say
+//! which side of a group's border it is let go on — the end of the group above or the head of the
+//! one below — so a row pulled in such a column, rows picked together and a group's header start a
+//! drag session at once, and the column answers the pointer with a line at the place
+//! ([`crate::groups::Groups::side_spots`], [`crate::groups::Groups::group_spots`]; the bar's
+//! `aim`) — over its own column as over another window's. A window with no group keeps the
+//! rows sliding.
 
 use std::cell::{Cell, RefCell};
 
@@ -508,6 +516,7 @@ impl TabBar {
                     naming,
                     reduce,
                     slide,
+                    torn: iv.group_torn.get() == Some(heading.group),
                 },
             );
             if naming {
@@ -537,10 +546,12 @@ impl TabBar {
         }
         iv.insertion.set(
             &iv.strip,
-            // `between` is the gap's top; the line's middle is half a gap down.
+            // `between` is the gap's top; the line's middle is half a gap down. A line a carry
+            // over the column named stands at its own height of the content, scrolled as the rows.
             iv.mark
                 .get()
-                .map(|gap| column.between(gap) + tabs::GAP / 2.0 - column.list.y),
+                .map(|gap| column.between(gap) + tabs::GAP / 2.0 - column.list.y)
+                .or_else(|| iv.cast.get().map(|content| content - column.scroll)),
             column.row_width(),
             palette,
         );

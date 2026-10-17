@@ -7,14 +7,19 @@
 //! something that asks for the user: a question, a failure, an unseen finish
 //! (`tabs::group_indicator`), whichever group it is — the list says which. A press opens the list
 //! ([`TabBar::toggle_group_list`]); a double click names the group (the bar's name field over the
-//! name, [`TabBar::begin_group_rename`]); a right click is the group's menu. The button's width
+//! name, [`TabBar::begin_group_rename`]); a right click is the group's menu; pulled out of the bar
+//! it carries the group away in a drag session ([`TabBar::carry_group`]) — to a window of its
+//! own, to another window — which a press that wanders a few points is not. The button's width
 //! follows its name ([`tabs::group_button_width`]) and grows while the name is typed, so the
 //! tabs move aside rather than being covered.
 //!
 //! **The list** is a card under the button, the summary card's own face: the ungrouped tabs'
 //! row first, a rule, then each group by name with what asks for the user in it and the key that
 //! reaches it (⌃⌘0…⌃⌘9), the group on screen checked; and New Group last. A press on a row brings
-//! the group on screen ([`TerminalWindow::reach_cluster`]); a press anywhere else closes the list
+//! the group on screen ([`TerminalWindow::reach_cluster`]); a press on a group's row that moves
+//! [`tabs::DRAG_SLOP`] before the button comes up is a pull — the groups are put in order by
+//! carrying a row to the line between two of them, which is one move ([`Move::MoveGroup`]),
+//! the ungrouped tabs' row staying first; a press anywhere else closes the list
 //! and is taken by it — except on the button itself, which is let through, so a second press
 //! closes it and a double click still names the group. Esc closes it, ↑ ↓ and Return choose. It
 //! stands on a transparent view over the whole window ([`ListScrim`]), which is what catches the
@@ -39,8 +44,9 @@ use super::{
     CARD_RADIUS, Palette, SwitchRow, TabBar, Tint, contains, label, rounded, stroke, track_hover,
 };
 use crate::app;
-use crate::groups::GroupId;
-use crate::tabs::{self, Indicator, TAB_RADIUS};
+use crate::groups::{GroupId, group_place};
+use crate::moves::Move;
+use crate::tabs::{self, DRAG_SLOP, Indicator, TAB_RADIUS};
 
 /// The name's type size, in the button and in the list's rows; the keys' and the rows' hint.
 pub(super) const NAME_TEXT: f64 = 12.5;
@@ -149,6 +155,28 @@ define_class!(
                 return;
             }
             iv.pressed.set(true);
+        }
+
+        /// The pointer moves with the button down: out of the bar by [`tabs::TEAR_DISTANCE`] the
+        /// group is carried away, as a tab is. Within the bar nothing is a pull — the button stands
+        /// where it does, and a press that wanders is still a click.
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            let iv = self.ivars();
+            if !iv.pressed.get() {
+                return;
+            }
+            let group = iv.look.borrow().as_ref().and_then(|look| look.group);
+            let Some((bar, group)) = self.bar().zip(group) else {
+                return;
+            };
+            let at = bar.convertPoint_fromView(event.locationInWindow(), None);
+            let size = bar.bounds().size;
+            if tabs::distance_outside(at.x, at.y, size.width, size.height) <= tabs::TEAR_DISTANCE {
+                return;
+            }
+            iv.pressed.set(false);
+            bar.carry_group(group, self, event, false);
         }
 
         #[unsafe(method(mouseUp:))]
@@ -466,6 +494,14 @@ enum Hot {
     New,
 }
 
+/// A group's row carried along the list: which row, and the slot among the groups the pointer
+/// would let it go at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Carry {
+    row: usize,
+    slot: usize,
+}
+
 pub(super) struct ListIvars {
     window: Cell<u64>,
     palette: Cell<Option<Palette>>,
@@ -475,6 +511,10 @@ pub(super) struct ListIvars {
     layout: RefCell<Option<tabs::GroupList>>,
     hot: Cell<Option<Hot>>,
     pressed: Cell<Option<Hot>>,
+    /// Where the press that is `pressed` went down, in the window's space, and the row it
+    /// carries once it has become a pull.
+    press_at: Cell<NSPoint>,
+    carrying: Cell<Option<Carry>>,
     /// A name and a key per row, and New Group's last.
     names: RefCell<Vec<Retained<NSTextField>>>,
     keys: RefCell<Vec<Retained<NSTextField>>>,
@@ -539,13 +579,51 @@ define_class!(
             let iv = self.ivars();
             iv.pressed.set(self.hot_at(at));
             iv.hot.set(self.hot_at(at));
+            iv.press_at.set(event.locationInWindow());
+            iv.carrying.set(None);
             self.setNeedsDisplay(true);
+        }
+
+        /// The pointer moves with the button down on a group's row: past [`DRAG_SLOP`] the row is
+        /// carried, and the line between two groups says where it would be let go. The ungrouped
+        /// tabs' row, New Group and the margin are no pulls.
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            let iv = self.ivars();
+            let Some(Hot::Row(row)) = iv.pressed.get() else {
+                return;
+            };
+            let carrying = iv.carrying.get();
+            let (now, from) = (event.locationInWindow(), iv.press_at.get());
+            if carrying.is_none() && (now.x - from.x).hypot(now.y - from.y) < DRAG_SLOP {
+                return;
+            }
+            let group = iv.rows.borrow().get(row).and_then(|row| row.group);
+            let at = self.convertPoint_fromView(now, None);
+            let slot = iv
+                .layout
+                .borrow()
+                .as_ref()
+                .map(|layout| layout.group_slot(at.y));
+            let (Some(_), Some(slot)) = (group, slot) else {
+                return;
+            };
+            let carry = Carry { row, slot };
+            if iv.carrying.replace(Some(carry)) != Some(carry) {
+                self.setNeedsDisplay(true);
+            }
         }
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, event: &NSEvent) {
             let at = self.convertPoint_fromView(event.locationInWindow(), None);
-            let pressed = self.ivars().pressed.take();
+            let iv = self.ivars();
+            let pressed = iv.pressed.take();
+            if let Some(carry) = iv.carrying.take() {
+                self.setNeedsDisplay(true);
+                self.put(carry);
+                return;
+            }
             if let Some(pressed) = pressed
                 && self.hot_at(at) == Some(pressed)
             {
@@ -570,7 +648,12 @@ define_class!(
         fn key_down(&self, event: &NSEvent) {
             match event.keyCode() {
                 ESCAPE => {
-                    if let Some(window) = self.owner() {
+                    // Esc while a row is carried takes the pull back; the list stays up.
+                    let iv = self.ivars();
+                    if iv.carrying.take().is_some() {
+                        iv.pressed.set(None);
+                        self.setNeedsDisplay(true);
+                    } else if let Some(window) = self.owner() {
                         window.bar().close_group_list(true);
                     }
                 }
@@ -602,6 +685,8 @@ impl GroupList {
             layout: RefCell::new(None),
             hot: Cell::new(None),
             pressed: Cell::new(None),
+            press_at: Cell::new(NSPoint::ZERO),
+            carrying: Cell::new(None),
             names: RefCell::new(Vec::new()),
             keys: RefCell::new(Vec::new()),
         });
@@ -787,6 +872,26 @@ impl GroupList {
         }));
     }
 
+    /// A group's row let go at its slot: the group takes that place among the groups, as the move
+    /// that can be undone ([`Move::MoveGroup`]); the list stays up and shows the new order.
+    fn put(&self, carry: Carry) {
+        let group = self
+            .ivars()
+            .rows
+            .borrow()
+            .get(carry.row)
+            .and_then(|row| row.group);
+        let Some((window, group)) = self.owner().zip(group) else {
+            return;
+        };
+        // Row 0 is the ungrouped tabs': the group at row `n` is the `n - 1`th.
+        window.make_move(Move::MoveGroup {
+            window: window.id(),
+            group,
+            to: group_place(carry.row - 1, carry.slot),
+        });
+    }
+
     /// A row chosen: the list closes and the window goes where the row says.
     fn choose(&self, hot: Hot) {
         let group = match hot {
@@ -825,6 +930,7 @@ impl GroupList {
         let hot = iv.hot.get();
         let rows = iv.rows.borrow();
         let shown = iv.shown.get();
+        let carrying = iv.carrying.get();
         for (at, (row, span)) in rows.iter().zip(&layout.rows).enumerate() {
             let rect = row_rect(span);
             if hot == Some(Hot::Row(at)) {
@@ -861,6 +967,19 @@ impl GroupList {
             line.moveToPoint(NSPoint::new(left + 6.0, rule));
             line.lineToPoint(NSPoint::new(layout.width - left - 6.0, rule));
             stroke(&line, 1.0, palette.separator);
+        }
+        // A group's row on its way: the line between two groups where it would be let go.
+        if let Some(carry) = carrying {
+            let y = layout.slot_line(carry.slot);
+            rounded(
+                NSRect::new(
+                    NSPoint::new(left + 6.0, y - 1.0),
+                    NSSize::new(width - 12.0, 2.0),
+                ),
+                1.0,
+                Tint::of(palette.accent, 1.0),
+                None,
+            );
         }
     }
 }

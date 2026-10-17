@@ -1669,6 +1669,31 @@ pub struct GroupList {
     pub new_row: Span,
 }
 
+impl GroupList {
+    /// The slot among the groups a group's row held by the pointer at `y` (the list's space)
+    /// would be let go at: before the group at that index of the rows as they are, `len` at the
+    /// end — a pointer above a row's middle is before it, below it after. The ungrouped tabs' row
+    /// is first and fixed, so slot 0 is the one under it.
+    pub fn group_slot(&self, y: f64) -> usize {
+        self.rows
+            .iter()
+            .skip(1)
+            .filter(|row| row.x + row.width / 2.0 < y)
+            .count()
+    }
+
+    /// Where the line that marks slot `slot` runs (the list's space): in the gap above the group's
+    /// row it stands before, below the last row for the end.
+    pub fn slot_line(&self, slot: usize) -> f64 {
+        match self.rows.get(slot + 1) {
+            Some(row) => row.x - GROUP_ROW_GAP / 2.0,
+            None => self.rows.last().map_or(GROUP_LIST_PAD, |row| {
+                row.x + row.width + GROUP_ROW_GAP / 2.0
+            }),
+        }
+    }
+}
+
 /// The list's width for its longest name (set in the row's type): wide enough for it, within
 /// [`GROUP_LIST_MIN`] and [`GROUP_LIST_MAX`]; a longer name is cut there.
 pub fn group_list_width(widest: f64) -> f64 {
@@ -2840,6 +2865,25 @@ mod tests {
         assert_eq!(group_list(5, 100.0).height, list.height + 2.0 * 31.0);
         assert_eq!(group_list_width(150.0), 260.0, "wide enough for the name");
         assert_eq!(group_list_width(300.0), GROUP_LIST_MAX);
+    }
+
+    #[test]
+    fn a_group_row_held_over_the_list_is_let_go_by_the_middles_of_the_rows() {
+        // Rows: ungrouped (6..36), api (47..77), web (78..108): two groups, three slots.
+        let list = group_list(3, 100.0);
+        // Over the ungrouped row and the upper half of api's: before api.
+        assert_eq!(list.group_slot(10.0), 0);
+        assert_eq!(list.group_slot(50.0), 0);
+        // Below api's middle, above web's: between them.
+        assert_eq!(list.group_slot(70.0), 1);
+        assert_eq!(list.group_slot(80.0), 1);
+        // Below web's middle and past the rows: the end.
+        assert_eq!(list.group_slot(100.0), 2);
+        assert_eq!(list.group_slot(500.0), 2);
+        // The lines: in the gap above api's row, above web's, and under the last.
+        assert_eq!(list.slot_line(0), 46.5);
+        assert_eq!(list.slot_line(1), 77.5);
+        assert_eq!(list.slot_line(2), 108.5);
     }
 
     #[test]

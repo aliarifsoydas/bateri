@@ -1122,7 +1122,12 @@ pub unsafe extern "C" fn bt_move_tab_to_tab_planned(
 #[unsafe(no_mangle)]
 pub extern "C" fn bt_move_pane_to_new_tab(pane: u64, window: u64, gap: usize) -> *mut BtMove {
     guarded(null_mut(), || {
-        owned(BtMove(Move::PaneToNewTab { pane, window, gap }))
+        owned(BtMove(Move::PaneToNewTab {
+            pane,
+            window,
+            gap,
+            target: None,
+        }))
     })
 }
 

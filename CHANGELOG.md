@@ -46,7 +46,20 @@ of every installed copy. A version without a section is not released.
   in the terminal lets the picks go. Right-click a picked row to move all of
   them into a group or a new one, out of their group, to a window of their
   own, or to close them; ⌘W closes the picked tabs and, unlike ⌘W on one tab,
-  always asks first (`confirm_close = "never"` still does not).
+  always asks first (`confirm_close = "never"` still does not). Tabs and groups can
+  be dragged. In the side column a row — or the rows you picked, drawn as a stack
+  with their count — is carried to the line that marks its place: between two rows
+  of a group, at the end of a group or at the head of the next, among the
+  ungrouped tabs, onto a closed group's header; out of the window it becomes a
+  window of its own (ungrouped), and over another window's column or title row it
+  lands in the group it is let go on. A group's header carries the group: between
+  two groups to put them in order (the ungrouped tabs stay first), out of the
+  window for a window of its own under the group's name, or onto another window,
+  where it comes up under that name (` 2` when that window has a group of it
+  already); in the title row the group's button is pulled out of the bar for the
+  same, and in the list under it a group's row is carried to the line between two
+  groups. A click on a header still opens and closes it, and every drag is undone
+  with Undo Move.
 
 ## [0.17.0] - 2026-10-17
 

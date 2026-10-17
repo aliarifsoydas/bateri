@@ -23,7 +23,7 @@
 //! remembers the tab the user was last on in it (its *resident*), which is where ⌃⌘N and a closed
 //! tab's successor group come back to.
 
-use crate::tabs::{self, Entry, Tabs};
+use crate::tabs::{self, Column, Entry, Tabs};
 
 /// The name a group takes when nothing better is known.
 pub const UNTITLED: &str = "Untitled";
@@ -117,6 +117,60 @@ pub enum Target<K> {
     /// Into a group of their own, made for them after the others, with this name (made unique,
     /// [`Groups::unique_name`]).
     New(String),
+}
+
+/// A place the side column takes carried tabs at ([`Groups::side_spots`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Spot<K> {
+    /// From this y (the column's space, top-down) down to the next spot's `from`, a pointer
+    /// means this place: the zones tile the column, the first reaching up past its top and the
+    /// last down past its foot.
+    pub from: f64,
+    /// Where the line that marks the place runs: in the gap between the two things the tabs
+    /// would stand between.
+    pub line: f64,
+    /// Where the tabs would be put.
+    pub target: Target<K>,
+}
+
+/// The spot a pointer at `y` is over: the last whose zone has begun, the first for a pointer above
+/// the list. `None` for no spot at all (a list that is not what the column was laid out from).
+pub fn spot_at<K>(spots: &[Spot<K>], y: f64) -> Option<&Spot<K>> {
+    spots
+        .iter()
+        .rev()
+        .find(|spot| spot.from <= y)
+        .or(spots.first())
+}
+
+/// A place the side column takes a carried group at, among the groups
+/// ([`Groups::group_spots`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroupSpot {
+    /// As [`Spot::from`].
+    pub from: f64,
+    /// As [`Spot::line`]: the gap above the header of the group it stands before, below the last
+    /// group at the end.
+    pub line: f64,
+    /// The slot among the groups: before the group at this index, `len` at the end.
+    pub slot: usize,
+}
+
+/// The spot of `spots` that a pointer at `y` is over, for groups ([`spot_at`]'s twin).
+pub fn group_spot_at(spots: &[GroupSpot], y: f64) -> Option<&GroupSpot> {
+    spots
+        .iter()
+        .rev()
+        .find(|spot| spot.from <= y)
+        .or(spots.first())
+}
+
+/// The place a group at `from` among the groups takes when it is let go at slot `slot` (before the
+/// group at that index of the list as it is, `len` for the end): the index [`Groups::move_group`]
+/// takes — a slot after the group counts one more than the place it ends at, as the group is not
+/// in the way once it has been taken out.
+pub fn group_place(from: usize, slot: usize) -> usize {
+    if slot > from { slot - 1 } else { slot }
 }
 
 /// What ⌃⌘0…⌃⌘9 reaches ([`Groups::reach`]).
@@ -310,6 +364,195 @@ impl<K: Copy + Eq> Groups<K> {
                     .map(|at| at + 1),
             })
             .unwrap_or_else(|| tabs.len())
+    }
+
+    // ─── Where a drop lands ──────────────────────────────────────────────
+
+    /// The places the side column takes carried tabs at, top to bottom, for `column` laid out from
+    /// [`Self::side_items`]: a place between every two things the list holds (and above the first,
+    /// below the last), each naming where the tabs would be put and where the line that marks it
+    /// runs. **Two places stand at a group's border**: below the last row of a group is that
+    /// group's end, between its header and its first row is its head — a flat place cannot say
+    /// which, and the second is what [`Self::landing`] would have chosen alone. A header and the
+    /// [`tabs::GAP`] under it belong to the head, the lower half of the last row and the gap
+    /// above the next header to the end. Empty when `column` is not what the list lays out to
+    /// (the list changed under a held button): the caller has nothing to drop on then.
+    ///
+    /// The tabs being carried are not named: a place before one of them stands before the next
+    /// that stays ([`Self::place`]), and one that changes nothing is refused by the move.
+    pub fn side_spots(&self, tabs: &Tabs<K>, column: &Column) -> Vec<Spot<K>> {
+        let items = self.side_items(tabs);
+        let Some(frames) = item_frames(&items, column) else {
+            return Vec::new();
+        };
+        (0..=items.len())
+            .map(|slot| {
+                let line = match slot {
+                    0 => frames[0].top - tabs::GAP / 2.0,
+                    slot if slot == items.len() => frames[slot - 1].bottom + tabs::GAP / 2.0,
+                    slot => (frames[slot - 1].bottom + frames[slot].top) / 2.0,
+                };
+                Spot {
+                    from: if slot == 0 {
+                        f64::NEG_INFINITY
+                    } else {
+                        frames[slot - 1].split
+                    },
+                    line,
+                    target: self.slot_target(tabs, &items, slot),
+                }
+            })
+            .collect()
+    }
+
+    /// The places the side column takes a carried group at: before each group and after the last,
+    /// the pointer deciding by the middle of each group's block (its header and the rows under it)
+    /// — over the upper half of a block the group stands before it, over the lower half after it.
+    /// The ungrouped tabs stay above whatever place is named: the first place is below them. Empty
+    /// as [`Self::side_spots`] is.
+    pub fn group_spots(&self, tabs: &Tabs<K>, column: &Column) -> Vec<GroupSpot> {
+        let items = self.side_items(tabs);
+        let Some(frames) = item_frames(&items, column) else {
+            return Vec::new();
+        };
+        // A block runs from its header to the item before the next one.
+        let heads: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| matches!(item, Item::Header(_)))
+            .map(|(at, _)| at)
+            .collect();
+        if heads.is_empty() {
+            return Vec::new();
+        }
+        let block = |index: usize| {
+            let end = heads.get(index + 1).copied().unwrap_or(items.len());
+            (frames[heads[index]].top, frames[end - 1].bottom)
+        };
+        (0..=heads.len())
+            .map(|slot| {
+                let line = match slot {
+                    slot if slot == heads.len() => block(slot - 1).1 + tabs::GAP / 2.0,
+                    slot => {
+                        let top = frames[heads[slot]].top;
+                        match heads[slot] {
+                            0 => top - tabs::GAP / 2.0,
+                            at => (frames[at - 1].bottom + top) / 2.0,
+                        }
+                    }
+                };
+                GroupSpot {
+                    from: if slot == 0 {
+                        f64::NEG_INFINITY
+                    } else {
+                        let (top, bottom) = block(slot - 1);
+                        (top + bottom) / 2.0
+                    },
+                    line,
+                    slot,
+                }
+            })
+            .collect()
+    }
+
+    /// Where a tab (or a pane that becomes one) let go at gap `gap` of what a view lists — before
+    /// the `gap`th listed tab, `len` for the end — is put, **for a window that has groups**: in the
+    /// column the gap is the line above the headers that stand over that tab (the gap between two
+    /// groups, [`tabs::Column::between`]), so it is the **end** of the group above; in the bar it is
+    /// a place of the cluster on screen, whose end is its own. `None` for a plain list of tabs,
+    /// where the strip's place says everything.
+    pub fn gap_target(&self, tabs: &Tabs<K>, view: View, gap: usize) -> Option<Target<K>> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(match view {
+            View::Side => {
+                let items = self.side_items(tabs);
+                let mut listed = 0;
+                let mut slot = items.len();
+                for (at, item) in items.iter().enumerate() {
+                    if listed == gap {
+                        slot = at;
+                        break;
+                    }
+                    if matches!(item, Item::Tab(_)) {
+                        listed += 1;
+                    }
+                }
+                self.slot_target(tabs, &items, slot)
+            }
+            View::Top => {
+                let of = self.shown(tabs);
+                let before = self.cluster(tabs, of).get(gap).copied();
+                match of {
+                    Some(group) => Target::Group { group, before },
+                    None => Target::Loose { before },
+                }
+            }
+        })
+    }
+
+    /// Where `tab`, let go on its own title row at `place` of what the bar lists, goes: the place
+    /// it ends at, as a chip dragged along the bar takes ([`Self::move_within`]) — the `place`th
+    /// of its cluster's tabs once it has gone, its end past the last. The bar lists the tab
+    /// with the tab in it, which [`Self::gap_target`] counts for a tab coming from elsewhere;
+    /// for a tab that is already there a place to the right is one more of the list than the
+    /// gap before the tab it names.
+    pub fn own_target(&self, tabs: &Tabs<K>, tab: K, place: usize) -> Target<K> {
+        let of = self.group_of(tab);
+        let before = self
+            .cluster(tabs, of)
+            .into_iter()
+            .filter(|&other| other != tab)
+            .nth(place);
+        match of {
+            Some(group) => Target::Group { group, before },
+            None => Target::Loose { before },
+        }
+    }
+
+    /// Where a tab opened right of `tab` goes in a window that has groups: `tab`'s own cluster,
+    /// after it — not the next cluster's head, which is where a bare place of the strip would put
+    /// it when `tab` is the last of its cluster. `None` for a plain list of tabs.
+    pub fn beside_target(&self, tabs: &Tabs<K>, tab: K) -> Option<Target<K>> {
+        if self.is_empty() {
+            return None;
+        }
+        let of = self.group_of(tab);
+        let cluster = self.cluster(tabs, of);
+        let before = cluster
+            .iter()
+            .position(|&other| other == tab)
+            .and_then(|at| cluster.get(at + 1))
+            .copied();
+        Some(match of {
+            Some(group) => Target::Group { group, before },
+            None => Target::Loose { before },
+        })
+    }
+
+    /// Where tabs let go at `slot` of `items` (between the item before it and the one at it) are
+    /// put ([`Self::side_spots`]).
+    fn slot_target(&self, tabs: &Tabs<K>, items: &[Item<K>], slot: usize) -> Target<K> {
+        let of = |group: Option<GroupId>, before: Option<K>| match group {
+            Some(group) => Target::Group { group, before },
+            None => Target::Loose { before },
+        };
+        let prev = slot.checked_sub(1).and_then(|at| items.get(at));
+        match (prev, items.get(slot)) {
+            // Under a header, before a row: the head of the group, whatever is the row listed first
+            // (a closed group lists only the tab on screen).
+            (Some(&Item::Header(group)), Some(Item::Tab(_))) => of(
+                Some(group),
+                self.cluster(tabs, Some(group)).first().copied(),
+            ),
+            // Among rows of one cluster, or above the first row.
+            (_, Some(&Item::Tab(next))) => of(self.group_of(next), Some(next)),
+            // At the end of what is listed, or above a header: the end of the cluster above.
+            (Some(&Item::Tab(last)), _) => of(self.group_of(last), None),
+            (Some(&Item::Header(group)), _) => of(Some(group), None),
+            (None, _) => of(None, None),
+        }
     }
 
     /// The tab ⌘`tag` reaches ([`tabs::tab_index`]: ⌘9 is the last).
@@ -644,6 +887,19 @@ impl<K: Copy + Eq> Groups<K> {
             }
             Target::New(name) => (Some(self.create(&name)), None),
         };
+        // A tab to stand before that is itself on the move is not there to stand before: the
+        // next of the cluster that stays is (a row let go on its own place).
+        let before = before.and_then(|before| {
+            if !moving.contains(&before) {
+                return Some(before);
+            }
+            let cluster = self.cluster(tabs, into);
+            let at = cluster.iter().position(|&tab| tab == before)?;
+            cluster[at + 1..]
+                .iter()
+                .copied()
+                .find(|tab| !moving.contains(tab))
+        });
         for &tab in &moving {
             let from = self.group_of(tab);
             if from != into {
@@ -1062,6 +1318,38 @@ impl<K: Copy + Eq> Groups<K> {
         self.groups
             .retain(|group| members.iter().any(|&(_, id)| id == group.id));
     }
+}
+
+/// Where one thing of the side column's list stands, and where the zone of the place below it
+/// begins ([`Groups::side_spots`]).
+struct Frame {
+    top: f64,
+    bottom: f64,
+    /// A row's middle, a header's top: the pointer is over the place before the thing above this
+    /// point and the place after it below.
+    split: f64,
+}
+
+/// The frames of `items` in `column`, in the list's order; `None` when the column does not have as
+/// many rows and headers as the list has tabs and headers.
+fn item_frames<K>(items: &[Item<K>], column: &Column) -> Option<Vec<Frame>> {
+    let (mut rows, mut heads) = (column.rows.iter(), column.headers.iter());
+    let frames: Option<Vec<Frame>> = items
+        .iter()
+        .map(|item| match item {
+            Item::Tab(_) => rows.next().map(|row| Frame {
+                top: row.y,
+                bottom: row.y + row.height,
+                split: row.y + row.height / 2.0,
+            }),
+            Item::Header(_) => heads.next().map(|head| Frame {
+                top: head.rect.y,
+                bottom: head.rect.y + head.rect.height,
+                split: head.rect.y,
+            }),
+        })
+        .collect();
+    (rows.next().is_none() && heads.next().is_none() && !items.is_empty()).then_some(frames?)
 }
 
 #[cfg(test)]
@@ -2262,5 +2550,352 @@ mod tests {
             most = most.max(groups.len());
         }
         most
+    }
+
+    // ─── Where a drop lands ──────────────────────────────────────────────
+
+    /// The column the list lays out to, as the bar lays it.
+    fn column(groups: &Groups<u32>, tabs: &Tabs<u32>) -> Column {
+        let items = groups.side_items(tabs);
+        tabs::Side {
+            width: tabs::SIDE_WIDTH,
+            height: 900.0,
+            top: 40.0,
+            count: 0,
+            scroll: 0.0,
+            warning: false,
+            corner: 20.5,
+        }
+        .layout_with(&items.iter().map(Item::entry).collect::<Vec<_>>())
+    }
+
+    /// Where a drop with the pointer `at` of row `row`'s height (0 its top, 1 its foot) lands.
+    fn over_row(
+        groups: &Groups<u32>,
+        tabs: &Tabs<u32>,
+        row: usize,
+        at: f64,
+    ) -> Option<Target<u32>> {
+        let column = column(groups, tabs);
+        let y = column.rows[row].y + column.rows[row].height * at;
+        spot_at(&groups.side_spots(tabs, &column), y).map(|spot| spot.target.clone())
+    }
+
+    fn over_header(groups: &Groups<u32>, tabs: &Tabs<u32>, header: usize, dy: f64) -> Target<u32> {
+        let column = column(groups, tabs);
+        let y = column.headers[header].rect.y + dy;
+        spot_at(&groups.side_spots(tabs, &column), y)
+            .unwrap()
+            .target
+            .clone()
+    }
+
+    #[test]
+    fn rows_of_one_cluster_name_the_row_they_would_stand_before() {
+        // The column lists `6 7 8 | api: 1 2 3 | web: 4 5`; rows 0…7.
+        let (tabs, groups, api, _) = scene();
+        let group = |before| Target::Group { group: api, before };
+        // The upper half of 2's row: between 1 and 2.
+        assert_eq!(over_row(&groups, &tabs, 4, 0.25), Some(group(Some(2))));
+        // Its lower half: between 2 and 3.
+        assert_eq!(over_row(&groups, &tabs, 4, 0.75), Some(group(Some(3))));
+        // Above everything, among the ungrouped: before the first.
+        let loose = |before| Target::Loose { before };
+        let column = column(&groups, &tabs);
+        let spots = groups.side_spots(&tabs, &column);
+        assert_eq!(
+            spot_at(&spots, -100.0).map(|spot| &spot.target),
+            Some(&loose(Some(6)))
+        );
+    }
+
+    #[test]
+    fn a_groups_border_has_two_places_its_end_and_the_next_ones_head() {
+        let (tabs, groups, api, web) = scene();
+        // The lower half of the last row of api (3, row 5) and the gap above web's header: api's
+        // end — what a flat place would have given to web's head.
+        assert_eq!(
+            over_row(&groups, &tabs, 5, 0.75),
+            Some(Target::Group {
+                group: api,
+                before: None
+            })
+        );
+        let column = column(&groups, &tabs);
+        let above = column.headers[1].rect.y - 4.0;
+        let spots = groups.side_spots(&tabs, &column);
+        assert_eq!(
+            spot_at(&spots, above).unwrap().target,
+            Target::Group {
+                group: api,
+                before: None
+            }
+        );
+        // On the header, and on the upper half of web's first row: web's head.
+        let head = Target::Group {
+            group: web,
+            before: Some(4),
+        };
+        assert_eq!(over_header(&groups, &tabs, 1, 2.0), head);
+        assert_eq!(over_header(&groups, &tabs, 1, 20.0), head);
+        assert_eq!(over_row(&groups, &tabs, 6, 0.25), Some(head));
+        // The two lines are apart: the end's is in the group gap, the head's under the header.
+        let end = spot_at(&spots, above).unwrap().line;
+        let head = spot_at(&spots, column.headers[1].rect.y + 2.0)
+            .unwrap()
+            .line;
+        assert!(end < column.headers[1].rect.y, "above the header");
+        assert!(head > column.headers[1].rect.y, "under the header");
+    }
+
+    #[test]
+    fn the_ungrouped_tabs_end_above_the_first_header_and_the_last_group_below_its_last_row() {
+        let (tabs, groups, _, web) = scene();
+        // The lower half of 8's row: the end of the ungrouped.
+        assert_eq!(
+            over_row(&groups, &tabs, 2, 0.75),
+            Some(Target::Loose { before: None })
+        );
+        // Far below the list: the end of web.
+        let column = column(&groups, &tabs);
+        let spots = groups.side_spots(&tabs, &column);
+        assert_eq!(
+            spot_at(&spots, 10_000.0).unwrap().target,
+            Target::Group {
+                group: web,
+                before: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_closed_group_takes_a_drop_on_its_header_at_its_end() {
+        let (mut tabs, mut groups, api, web) = scene();
+        groups.set_collapsed(web, true);
+        // 1 is on screen in api: web lists no row. The header is the last thing in the list.
+        let items = groups.side_items(&tabs);
+        assert_eq!(items.last(), Some(&Item::Header(web)));
+        assert_eq!(
+            over_header(&groups, &tabs, 1, 4.0),
+            Target::Group {
+                group: web,
+                before: None
+            }
+        );
+        // The gap above it is still api's end.
+        let column = column(&groups, &tabs);
+        let spots = groups.side_spots(&tabs, &column);
+        assert_eq!(
+            spot_at(&spots, column.headers[1].rect.y - 3.0)
+                .unwrap()
+                .target,
+            Target::Group {
+                group: api,
+                before: None
+            }
+        );
+        // With web's second tab on screen the header lists it, and the head is before web's first.
+        groups.select(&mut tabs, 5);
+        assert_eq!(
+            over_header(&groups, &tabs, 1, 4.0),
+            Target::Group {
+                group: web,
+                before: Some(4)
+            }
+        );
+    }
+
+    #[test]
+    fn a_column_that_is_not_the_list_has_nowhere_to_drop() {
+        let (tabs, groups, _, _) = scene();
+        let mut other = groups.clone();
+        other.set_collapsed(other.groups()[1].id, true);
+        let stale = column(&other, &tabs);
+        // 1 on screen in api: closing web takes its two rows out of the list.
+        assert!(groups.side_spots(&tabs, &stale).is_empty());
+        assert!(groups.group_spots(&tabs, &stale).is_empty());
+        assert_eq!(spot_at::<u32>(&[], 5.0), None);
+    }
+
+    #[test]
+    fn a_tab_let_go_before_itself_stays_and_one_before_a_moving_tab_stands_before_the_next() {
+        let (mut tabs, mut groups, api, _) = scene();
+        groups.place(
+            &mut tabs,
+            &[2],
+            Target::Group {
+                group: api,
+                before: Some(2),
+            },
+        );
+        assert_eq!(tabs.ids(), [6, 7, 8, 1, 2, 3, 4, 5]);
+        // Two rows let go before the first of them: before the one that stays.
+        groups.place(
+            &mut tabs,
+            &[1, 2],
+            Target::Group {
+                group: api,
+                before: Some(2),
+            },
+        );
+        assert_eq!(tabs.ids(), [6, 7, 8, 1, 2, 3, 4, 5]);
+        // The end of the group, behind its own last tab.
+        groups.place(
+            &mut tabs,
+            &[1],
+            Target::Group {
+                group: api,
+                before: None,
+            },
+        );
+        assert_eq!(tabs.ids(), [6, 7, 8, 2, 3, 1, 4, 5]);
+        ok(&groups, &tabs);
+    }
+
+    #[test]
+    fn a_group_is_let_go_before_a_block_over_its_upper_half_and_after_it_over_the_lower() {
+        let (tabs, groups, _, _) = scene();
+        let column = column(&groups, &tabs);
+        let spots = groups.group_spots(&tabs, &column);
+        assert_eq!(spots.len(), 3, "before api, before web, after web");
+        let (api, web) = (column.headers[0].rect, column.headers[1].rect);
+        let slot = |y: f64| group_spot_at(&spots, y).unwrap().slot;
+        // Over the ungrouped tabs: before the first group (they stay first).
+        assert_eq!(slot(column.rows[0].y), 0);
+        // Over api's header and its first rows: before api; over its last row: after it.
+        assert_eq!(slot(api.y + 4.0), 0);
+        assert_eq!(slot(column.rows[5].y + 20.0), 1);
+        // The same for web: its header and first row, its second.
+        assert_eq!(slot(web.y + 4.0), 1);
+        assert_eq!(slot(column.rows[7].y + 20.0), 2);
+        assert_eq!(slot(10_000.0), 2);
+        // The lines: above api's header, above web's, below the last row.
+        assert!(spots[0].line < api.y && spots[0].line > column.rows[2].y);
+        assert!(spots[1].line < web.y && spots[1].line > column.rows[5].y);
+        assert!(spots[2].line > column.rows[7].y);
+    }
+
+    #[test]
+    fn a_groups_slot_is_the_place_it_takes_among_the_groups() {
+        // [a, b, c]: a at 0 let go before c (slot 2) ends at 1; c let go before a ends at 0; a
+        // group let go before or after itself stays.
+        assert_eq!(group_place(0, 2), 1);
+        assert_eq!(group_place(2, 0), 0);
+        assert_eq!(group_place(1, 1), 1);
+        assert_eq!(group_place(1, 2), 1);
+        assert_eq!(group_place(0, 3), 2);
+        let (mut tabs, mut groups, api, web) = scene();
+        assert!(groups.move_group(&mut tabs, api, group_place(0, 2)));
+        assert_eq!(groups.position(api), Some(1));
+        assert_eq!(groups.position(web), Some(0));
+        // web is first now; let go before itself or after itself it stays.
+        assert!(!groups.move_group(&mut tabs, web, group_place(0, 0)));
+        assert!(!groups.move_group(&mut tabs, web, group_place(0, 1)));
+        ok(&groups, &tabs);
+    }
+
+    #[test]
+    fn a_gap_of_the_column_is_the_line_above_the_headers_and_the_bars_is_its_clusters() {
+        let (tabs, groups, api, web) = scene();
+        let at = |gap| groups.gap_target(&tabs, View::Side, gap);
+        // Before the first row: before it, among the ungrouped.
+        assert_eq!(at(0), Some(Target::Loose { before: Some(6) }));
+        // Before api's first row (gap 3): the line is above api's header, the end of the ungrouped.
+        assert_eq!(at(3), Some(Target::Loose { before: None }));
+        // Between two rows of api: before the second.
+        assert_eq!(
+            at(5),
+            Some(Target::Group {
+                group: api,
+                before: Some(3)
+            })
+        );
+        // Before web's first row: the end of api. Past the last: the end of web.
+        assert_eq!(
+            at(6),
+            Some(Target::Group {
+                group: api,
+                before: None
+            })
+        );
+        assert_eq!(
+            at(8),
+            Some(Target::Group {
+                group: web,
+                before: None
+            })
+        );
+        // The bar lists the cluster on screen (api): a place of it, its end past the last.
+        let top = |gap| groups.gap_target(&tabs, View::Top, gap);
+        assert_eq!(
+            top(0),
+            Some(Target::Group {
+                group: api,
+                before: Some(1)
+            })
+        );
+        assert_eq!(
+            top(3),
+            Some(Target::Group {
+                group: api,
+                before: None
+            })
+        );
+        // A plain list of tabs has no clusters to name.
+        let plain = Groups::<u32>::new();
+        assert_eq!(plain.gap_target(&tabs, View::Side, 2), None);
+        assert_eq!(plain.gap_target(&tabs, View::Top, 2), None);
+    }
+
+    #[test]
+    fn a_tab_opened_beside_the_last_of_a_group_stays_in_it() {
+        let (tabs, groups, api, _) = scene();
+        assert_eq!(
+            groups.beside_target(&tabs, 3),
+            Some(Target::Group {
+                group: api,
+                before: None
+            })
+        );
+        assert_eq!(
+            groups.beside_target(&tabs, 1),
+            Some(Target::Group {
+                group: api,
+                before: Some(2)
+            })
+        );
+        assert_eq!(
+            groups.beside_target(&tabs, 8),
+            Some(Target::Loose { before: None })
+        );
+        assert_eq!(Groups::<u32>::new().beside_target(&tabs, 8), None);
+    }
+    #[test]
+    fn a_tab_let_go_on_its_own_bar_ends_at_the_place_it_was_let_go_at() {
+        let (mut tabs, mut groups, _, _) = scene();
+        // api is `1 2 3`: 1 let go on the third place ends third, on the second second, and 3 on
+        // the first first — a place to the right of the tab is not the gap before the tab there.
+        for (tab, place, wanted) in [
+            (1, 2, [2, 3, 1]),
+            (1, 1, [2, 1, 3]),
+            (3, 0, [3, 1, 2]),
+            (2, 2, [1, 3, 2]),
+            (2, 1, [1, 2, 3]),
+        ] {
+            let (mut tabs, mut groups) = (tabs.clone(), groups.clone());
+            let target = groups.own_target(&tabs, tab, place);
+            groups.place(&mut tabs, &[tab], target);
+            assert_eq!(
+                groups.cluster(&tabs, groups.group_of(tab)),
+                wanted,
+                "{tab} at {place}"
+            );
+            ok(&groups, &tabs);
+        }
+        // An ungrouped tab stays among the ungrouped.
+        let target = groups.own_target(&tabs, 6, 2);
+        groups.place(&mut tabs, &[6], target);
+        assert_eq!(groups.cluster(&tabs, None), [7, 8, 6]);
+        ok(&groups, &tabs);
     }
 }

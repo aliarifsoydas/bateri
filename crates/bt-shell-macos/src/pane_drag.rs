@@ -1198,6 +1198,9 @@ impl Session {
                             window: window.id(),
                             // The column's place, in the strip the move counts.
                             gap: window.strip_place(gap),
+                            // In a window with groups the side of a group's border it was let go
+                            // on.
+                            target: window.gap_target(gap),
                         });
                     }
                     Lands::Back => {}
@@ -1244,6 +1247,7 @@ impl Session {
                             pane: self.pane,
                             window: target.id(),
                             gap: target.strip_place(gap),
+                            target: target.gap_target(gap),
                         });
                     }
                     Lands::Back => {}

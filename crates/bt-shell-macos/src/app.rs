@@ -60,7 +60,7 @@ use crate::settings_window::SettingsWindow;
 use crate::split::{Axis, Direction, Tree};
 use crate::ssh_route::{self, Masters};
 use crate::tab::{Histories, TabHost, TerminalTab};
-use crate::tab_drag::TabDragSource;
+use crate::tab_drag::{Carried, Landed, TabDragSource};
 use crate::tab_merge::{End, Merge};
 use crate::tabs::{self, Landing};
 use crate::undo::Record;
@@ -1139,11 +1139,10 @@ pub(crate) struct Ivars {
     /// the poll that reads the keys while the session runs ([`crate::tab_merge`]).
     pub(crate) tab_merge: RefCell<Option<Merge>>,
     pub(crate) tab_poll: Cell<u64>,
-    /// Where the carried tab was let go on a bar — the window and the decision
-    /// ([`tabs::landing`](crate::tabs::landing)) — until the session ends and
-    /// [`AppDelegate::tab_drag_ended`] carries it out: the windows are not
-    /// touched inside the drop.
-    tab_drop: Cell<Option<(u64, Landing)>>,
+    /// Where what is carried was let go on a bar — the window and the decision
+    /// ([`Landed`]) — until the session ends and [`AppDelegate::tab_drag_ended`] carries it out:
+    /// the windows are not touched inside the drop.
+    tab_drop: RefCell<Option<(u64, Landed)>>,
     /// What Undo Move takes back: the last move of panes between tabs and
     /// windows, as a picture of what it changed ([`Record`]). One step, and
     /// dropped by every other change of the tab list
@@ -2543,7 +2542,7 @@ impl AppDelegate {
             tab_drag: RefCell::new(None),
             tab_merge: RefCell::new(None),
             tab_poll: Cell::new(0),
-            tab_drop: Cell::new(None),
+            tab_drop: RefCell::new(None),
             undo: RefCell::new(None),
             pane_drag: RefCell::new(None),
         });
@@ -3949,21 +3948,20 @@ impl AppDelegate {
         self.ivars().tab_drag.replace(Some(source));
     }
 
-    /// The carried tab was let go on window `onto`'s bar with the decision `landing`
-    /// ([`crate::tabs::landing`]); carried out when the session ends
-    /// ([`AppDelegate::tab_drag_ended`]).
-    pub(crate) fn tab_dropped(&self, onto: u64, landing: Landing) {
-        self.ivars().tab_drop.set(Some((onto, landing)));
+    /// What is carried was let go on window `onto`'s bar with the decision `landed`
+    /// ([`Landed`]); carried out when the session ends ([`AppDelegate::tab_drag_ended`]).
+    pub(crate) fn tab_dropped(&self, onto: u64, landed: Landed) {
+        self.ivars().tab_drop.replace(Some((onto, landed)));
     }
 
-    /// The carried tab's session ended at screen point `at` with `operation`, `taken_back` if the
-    /// user ended it with Esc ([`crate::tab_drag::TabDragSource`]). Carried
+    /// The carried tabs' or group's session ended at screen point `at` with `operation`,
+    /// `taken_back` if the user ended it with Esc ([`crate::tab_drag::TabDragSource`]). Carried
     /// out one main-queue turn later, outside AppKit's teardown of the session: a drop on a bar
-    /// lands the tab where it was let go ([`AppDelegate::land_tab`]); a drop on nothing makes it a
-    /// window there; a tab taken back stays in its strip.
+    /// lands what was carried where it was let go ([`AppDelegate::land`]); a drop on nothing
+    /// makes it a window there; what is taken back stays where it is.
     pub(crate) fn tab_drag_ended(
         &self,
-        tab: u64,
+        carried: Carried,
         at: NSPoint,
         operation: NSDragOperation,
         taken_back: bool,
@@ -3981,33 +3979,101 @@ impl AppDelegate {
             };
             // The session is over; its source may go.
             drop(app.ivars().tab_drag.take());
-            // With ⌥⌘ down over panes, a drop on nothing is the block's.
-            // The block lands where the pointer let go, as the regions it showed were read.
-            let end =
-                app.tab_merge_end(app.tab_merge_take(), tab, NSEvent::mouseLocation(), detach);
-            if let Some(from) = app.window_holding(tab) {
+            // With ⌥⌘ down over panes, a drop on nothing is the block's — of one tab: several
+            // tabs and a group have no block to merge. The block lands where the pointer let go,
+            // as the regions it showed were read.
+            let end = match carried.lone() {
+                Some(tab) => {
+                    app.tab_merge_end(app.tab_merge_take(), tab, NSEvent::mouseLocation(), detach)
+                }
+                None => {
+                    drop(app.tab_merge_take());
+                    End::Free
+                }
+            };
+            if let Some(from) = app.window(carried.window()) {
                 from.bar().drag_ended();
             }
             match dropped {
-                Some((onto, landing)) => {
+                Some((onto, landed)) => {
                     if let Some(onto) = app.window(onto) {
-                        app.land_tab(tab, &onto, landing);
+                        app.land(&carried, &onto, landed);
                     }
                 }
-                None if detach && end == End::Free => {
-                    app.make_move(Move::TabToNewWindow {
-                        tab,
-                        at: Some((at.x, at.y)),
-                    });
-                }
+                None if detach && end == End::Free => app.detach(&carried, at),
                 None => {}
             }
-            // The room a carried tab made on a bar closes — where it landed the window already
-            // took the tab into it, and where it did not (a refusal, a vow taken back) this does.
+            // The room a carried tab made on a bar closes, and the line that marked a place goes —
+            // where it landed the window already took it in, and where it did not (a refusal, a
+            // vow taken back) this does.
             for window in app.windows() {
-                window.bar().open_gap(None);
+                window.bar().clear_drop();
             }
         });
+    }
+
+    /// What was carried lands on window `onto` as `landed` says
+    /// ([`Landed`]): the planner's moves ([`Move::TabsToWindow`], [`Move::RegroupTabs`],
+    /// [`Move::GroupToWindow`], [`Move::MoveGroup`]), each undone with Undo Move.
+    fn land(&self, carried: &Carried, onto: &TerminalWindow, landed: Landed) {
+        match (carried, landed) {
+            (Carried::Tabs { tabs, .. }, Landed::Strip(landing)) => {
+                if let [tab] = tabs.as_slice() {
+                    self.land_tab(*tab, onto, landing);
+                }
+            }
+            (Carried::Tabs { window, tabs }, Landed::Tabs(target)) => {
+                let moved = self.make_move(Move::TabsToWindow {
+                    window: *window,
+                    tabs: tabs.clone(),
+                    into: onto.id(),
+                    target,
+                });
+                // Rows picked together were carried: they have been put, and are picked no more.
+                if let Some(from) = moved.then(|| self.window(*window)).flatten() {
+                    from.bar().drop_picks();
+                }
+            }
+            (Carried::Group { window, group }, Landed::Group(to)) => {
+                self.make_move(Move::GroupToWindow {
+                    window: *window,
+                    group: *group,
+                    into: onto.id(),
+                    to,
+                });
+            }
+            // A bar decides what it takes of what is carried; the others are no landing.
+            _ => {}
+        }
+    }
+
+    /// What was carried was let go over nothing of ours, at screen point `at`: it becomes a window
+    /// there — a tab as it is, several tabs and a group as [`Move::TabsToNewWindow`] and
+    /// [`Move::GroupToNewWindow`] say (the group under its name).
+    fn detach(&self, carried: &Carried, at: NSPoint) {
+        let at = Some((at.x, at.y));
+        match carried {
+            Carried::Tabs { tabs, .. } if tabs.len() == 1 => {
+                self.make_move(Move::TabToNewWindow { tab: tabs[0], at });
+            }
+            Carried::Tabs { window, tabs } => {
+                let moved = self.make_move(Move::TabsToNewWindow {
+                    window: *window,
+                    tabs: tabs.clone(),
+                    at,
+                });
+                if let Some(from) = moved.then(|| self.window(*window)).flatten() {
+                    from.bar().drop_picks();
+                }
+            }
+            Carried::Group { window, group } => {
+                self.make_move(Move::GroupToNewWindow {
+                    window: *window,
+                    group: *group,
+                    at,
+                });
+            }
+        }
     }
 
     /// A carried tab lands on window `onto`'s strip ([`crate::tabs::Landing`]): in its own

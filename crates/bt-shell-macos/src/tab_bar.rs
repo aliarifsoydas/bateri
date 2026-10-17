@@ -171,12 +171,12 @@ use objc2_quartz_core::{
 use crate::app;
 use crate::arrange;
 use crate::card::{IDENTITY, fitted};
-use crate::groups::{Click, GroupId};
+use crate::groups::{Click, GroupId, group_place, group_spot_at, spot_at};
 use crate::icon;
 use crate::program::identity::Kind as ProgramKind;
 use crate::search_bar::mix;
 use crate::split::Rect;
-use crate::tab_drag;
+use crate::tab_drag::{self, Carried, Landed};
 use crate::tabs::{
     self, BUTTON, Bar, CHIP_PAD, Card, CardCommand, CardPane, Clock, Column, Drag, Ending, FADE,
     Finish, Grip, Indicator, Over, Stir, Strip, TAB_RADIUS, Tide, Tone, Turn,
@@ -3150,13 +3150,19 @@ define_class!(
         /// puts the summary card away. The second press of a double click
         /// names the tab; any other may become a drag. With ⇧ or ⌘ held, in the side
         /// column, it picks the row together with others instead and selects nothing
-        /// ([`TabBar::pick`]).
+        /// ([`TabBar::pick`]); a plain press on a row that is picked waits for the button to
+        /// come up — what it selects would let the picks go before they could be carried
+        /// ([`TabBar::hold_picked`]).
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             if let Some(bar) = self.bar() {
                 let tab = self.ivars().tab.get();
                 bar.pressed(tab);
-                if pick_click(event.modifierFlags()).is_some_and(|click| bar.pick(tab, click)) {
+                let chord = pick_click(event.modifierFlags());
+                if chord.is_some_and(|click| bar.pick(tab, click)) {
+                    return;
+                }
+                if chord.is_none() && event.clickCount() < 2 && bar.hold_picked(tab, event) {
                     return;
                 }
             }
@@ -5246,6 +5252,23 @@ pub(crate) enum PaneTarget {
     Between(usize),
 }
 
+/// What a carry over a bar would come to ([`TabBar::aim`]).
+#[derive(Default)]
+struct Aim {
+    /// Room opens at this slot of the list (a tab from another window, on a plain strip).
+    room: Option<usize>,
+    /// A line marks the place at this height of the column's content ([`content_line`]).
+    line: Option<f64>,
+    /// What the bar takes the drop as; `None`: nothing comes of it, though it is taken.
+    landed: Option<Landed>,
+}
+
+/// `line` (the window's space, from the column's own geometry) as a height in the list's content
+/// — not scrolled and from its top — which is where the bar keeps the line that marks a place.
+fn content_line(line: f64, column: &Column) -> f64 {
+    line - column.list.y + column.scroll
+}
+
 /// A press on a chip that may be, or has become, a drag ([`TabBar::grip`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Dragging {
@@ -5257,6 +5280,10 @@ struct Dragging {
     /// The tab came away from the bar: a drag session carries it and its chip waits, faint,
     /// in the place it left until the session ends ([`TabBar::drag_ended`]).
     torn: bool,
+    /// The press was on a row picked together with others: the pull carries them all, as a
+    /// session from the first, and a press let go without one is the plain click it would have
+    /// been ([`TabBar::release`]).
+    multi: bool,
 }
 
 pub(crate) struct BarIvars {
@@ -5280,6 +5307,12 @@ pub(crate) struct BarIvars {
     mark: Cell<Option<usize>>,
     /// The line's views.
     insertion: tab_side::Insertion,
+    /// In the side column, where a line marks the place what is carried over the column would be
+    /// put (in the list's content, not scrolled; [`TabBar::show_cast`]).
+    cast: Cell<Option<f64>>,
+    /// The group whose header is carried away in a session: its header waits, faint, in its place
+    /// until the session ends ([`TabBar::drag_ended`]).
+    group_torn: Cell<Option<GroupId>>,
     /// The side column's mode: `Some(top)` — the title row's height, where the list starts —
     /// puts the tabs in a column the window's height at its left edge, `None` in the bar in
     /// the title row ([`TabBar::set_side`]; `tab_side.rs`).
@@ -5524,7 +5557,7 @@ define_class!(
         /// The tab went away from this bar (or was taken back): the gap closes.
         #[unsafe(method(draggingExited:))]
         fn dragging_exited(&self, _info: Option<&ProtocolObject<dyn NSDraggingInfo>>) {
-            self.open_gap(None);
+            self.clear_drop();
         }
 
         #[unsafe(method(performDragOperation:))]
@@ -5608,6 +5641,8 @@ impl TabBar {
             dwelling: Cell::new(None),
             mark: Cell::new(None),
             insertion: tab_side::Insertion::default(),
+            cast: Cell::new(None),
+            group_torn: Cell::new(None),
             side: Cell::new(None),
             column: RefCell::new(None),
             mask: tab_side::Mask::default(),
@@ -6869,13 +6904,41 @@ impl TabBar {
                 grip,
                 at: None,
                 torn: false,
+                multi: iv.picks.borrow().tabs.contains(&tab) && self.is_side(),
             }));
         }
     }
 
+    /// A plain press on tab `tab`'s row, with rows picked together: if it is one of them the
+    /// press is the picks' to carry, and nothing is selected until it is known not to be a pull
+    /// ([`Self::release`]). `false` for any other row, or when nothing can be pulled (the
+    /// window holds a question, a name is being typed): the press is then a plain one.
+    fn hold_picked(&self, tab: u64, event: &NSEvent) -> bool {
+        if !self.is_side() || !self.ivars().picks.borrow().tabs.contains(&tab) {
+            return false;
+        }
+        self.grip(tab, event);
+        self.ivars()
+            .drag
+            .get()
+            .is_some_and(|drag| drag.tab == tab && drag.multi)
+    }
+
+    /// Whether a row pulled out of its place starts a drag session at once: in the column of a
+    /// window with groups, where it is carried to a place of the column — a line between two
+    /// things, one on each side of a group's border — and not slid along the rows
+    /// ([`crate::tab_drag`]).
+    fn carries_first(&self) -> bool {
+        self.is_side()
+            && self
+                .terminal_window()
+                .is_some_and(|window| window.has_groups())
+    }
+
     /// The pointer moved with the button down on tab `tab`'s chip ([`Grip::track`]): past
     /// the slop the chip follows it along the strip and the others make room; out of the bar the
-    /// tab is carried away in a drag session.
+    /// tab is carried away in a drag session — and past the slop at once where rows are carried
+    /// ([`Self::carries_first`], rows picked together).
     fn drag(&self, tab: u64, event: &NSEvent) {
         let iv = self.ivars();
         let Some(mut drag) = iv.drag.get().filter(|drag| drag.tab == tab && !drag.torn) else {
@@ -6907,6 +6970,10 @@ impl TabBar {
                 laid.span.x,
             )
         };
+        let tracked = match tracked {
+            Drag::Reorder { .. } if drag.multi || self.carries_first() => Drag::TearOff,
+            other => other,
+        };
         match tracked {
             Drag::Press => iv.drag.set(Some(drag)),
             Drag::Reorder { left, to } => {
@@ -6932,7 +6999,7 @@ impl TabBar {
             Drag::TearOff => {
                 // Only a tab a session has taken is torn: were none started, the press goes on
                 // as a drag along the strip and no faint place is left behind.
-                if self.tear_off(tab, event) {
+                if self.tear_off(tab, drag.multi, event) {
                     drag.at = None;
                     drag.torn = true;
                     iv.drag.set(Some(drag));
@@ -6944,14 +7011,93 @@ impl TabBar {
     }
 
     /// The tab leaves the bar: a drag session carries it (`tab_drag`), and the application keeps
-    /// the session's source until it ends. `false` if none could start.
-    fn tear_off(&self, tab: u64, event: &NSEvent) -> bool {
-        let (Some(chip), Some(app)) = (self.chip(tab), app::delegate(self.mtm())) else {
+    /// the session's source until it ends. With `multi` the rows picked together are carried
+    /// with it, drawn as a stack with their count. `false` if none could start.
+    fn tear_off(&self, tab: u64, multi: bool, event: &NSEvent) -> bool {
+        let iv = self.ivars();
+        let (Some(chip), Some(app), Some(palette)) =
+            (self.chip(tab), app::delegate(self.mtm()), iv.palette.get())
+        else {
             return false;
         };
-        app.hold_tab_drag(tab_drag::begin(&chip, tab, event));
-        app.tab_merge_begin(tab);
+        let tabs = if multi { self.picks() } else { vec![tab] };
+        if tabs.is_empty() {
+            return false;
+        }
+        let carried = Carried::Tabs {
+            window: iv.window,
+            tabs,
+        };
+        let lone = carried.lone();
+        let face = tab_drag::picture(&chip);
+        let count = match &carried {
+            Carried::Tabs { tabs, .. } => tabs.len(),
+            Carried::Group { .. } => 1,
+        };
+        let image = match face {
+            Some(face) if count > 1 => Some(tab_drag::stack(
+                &face,
+                count,
+                palette.accent,
+                crate::pane_drag::ink_on(palette.accent),
+            )),
+            face => face,
+        };
+        let size = image
+            .as_ref()
+            .map_or(chip.bounds().size, |image| image.size());
+        app.hold_tab_drag(tab_drag::begin(
+            &chip,
+            carried,
+            event,
+            image.as_deref(),
+            size,
+        ));
+        // The block of one tab can be merged into panes with ⌥⌘; several tabs have none.
+        if let Some(tab) = lone {
+            app.tab_merge_begin(tab);
+        }
         true
+    }
+
+    /// A group's header — or, in the title row, its button `view` — is pulled: the group is
+    /// carried in a drag session, with all its tabs, and the header waits, faint, in its place
+    /// until the session ends ([`Self::drag_ended`]). `faced` for a header, which has no face of
+    /// its own to be drawn with.
+    pub(crate) fn carry_group(&self, group: GroupId, view: &NSView, event: &NSEvent, faced: bool) {
+        let iv = self.ivars();
+        let (Some(app), Some(window), Some(palette)) = (
+            app::delegate(self.mtm()),
+            self.terminal_window(),
+            iv.palette.get(),
+        ) else {
+            return;
+        };
+        if !window.selection_free() || iv.renaming_group.get().is_some() {
+            return;
+        }
+        self.close_group_list(false);
+        let face = tab_drag::picture(view);
+        let image = match face {
+            Some(face) if faced => Some(tab_drag::faced(&face, palette.card, palette.card_line)),
+            face => face,
+        };
+        let size = image
+            .as_ref()
+            .map_or(view.bounds().size, |image| image.size());
+        let carried = Carried::Group {
+            window: iv.window,
+            group,
+        };
+        app.hold_tab_drag(tab_drag::begin(
+            view,
+            carried,
+            event,
+            image.as_deref(),
+            size,
+        ));
+        iv.group_torn.set(Some(group));
+        self.lay_out();
     }
 
     /// The button is let go on tab `tab`'s chip: a tab moved along the strip settles in the place
@@ -6967,6 +7113,12 @@ impl TabBar {
             return;
         }
         iv.drag.set(None);
+        if drag.multi {
+            // A press on a picked row that never pulled them: the plain click it would have been,
+            // which opens the tab and lets the picks go.
+            self.select(tab);
+            return;
+        }
         // A click that never moved the tab is only a click.
         let Some((_, to)) = drag.at else {
             return;
@@ -6999,6 +7151,7 @@ impl TabBar {
     pub(crate) fn drag_ended(&self) {
         let iv = self.ivars();
         iv.drag.set(None);
+        iv.group_torn.set(None);
         let under = self.window().and_then(|window| {
             let point =
                 self.convertPoint_fromView(window.mouseLocationOutsideOfEventStream(), None);
@@ -7014,6 +7167,29 @@ impl TabBar {
         let iv = self.ivars();
         if iv.gap.replace(gap) != gap {
             iv.glide.set(true);
+            self.lay_out();
+        }
+    }
+
+    /// Puts the line that marks a place of the column at `content` — a place of the list's
+    /// content, not scrolled ([`content_line`]) — what is carried over the column would be put
+    /// there; or takes it away (`None`). A layout finds the line again where it was, whatever the
+    /// column's scroll.
+    pub(crate) fn show_cast(&self, content: Option<f64>) {
+        if self.ivars().cast.replace(content) != content {
+            self.lay_out();
+        }
+    }
+
+    /// What a carry over the bar showed, room opened or a line, goes: the carry left, or ended.
+    pub(crate) fn clear_drop(&self) {
+        let iv = self.ivars();
+        let room = iv.gap.replace(None).is_some();
+        let line = iv.cast.replace(None).is_some();
+        if room {
+            iv.glide.set(true);
+        }
+        if room || line {
             self.lay_out();
         }
     }
@@ -7134,54 +7310,156 @@ impl TabBar {
         self.ivars().before.get().filter(|before| *before != tab)
     }
 
-    /// `draggingEntered:` and `draggingUpdated:`: the carried tab over this bar. A tab from
-    /// another window opens room at the slot under the pointer **of the strip it would make**, so
-    /// the room is under the pointer and the answer does not depend on the room; one of this
-    /// window's own shows no gap (its faint chip is its place) and is simply taken. Anything that
-    /// is not a tab of this process, or that this window cannot take now (it holds a question
-    /// of its own), is not taken: the drop is then on nothing, and the tab becomes a window.
+    /// What a carry at `point` (the bar's space) would come to on this bar `window`, which both
+    /// halves of a drop read — the pointer over the bar ([`Self::carried_over`]) and the drop
+    /// ([`Self::accept_drop`]) — so what is shown is what is done.
+    ///
+    /// **One tab on a window with no group** is the strip's own: room opens at the slot under the
+    /// pointer of the strip it would make (a tab from another window), the window's own tab shows
+    /// no gap (its faint chip is its place), and the place is the strip's ([`tabs::landing`]).
+    /// Everything else — several tabs, a group, any tab on a window that has groups — is a place
+    /// the column names ([`crate::groups::Groups::side_spots`], marked by a line, or among the
+    /// groups, [`crate::groups::Groups::group_spots`]) or, in the title row, a place of the
+    /// cluster on screen.
+    fn aim(&self, carried: &Carried, window: &TerminalWindow, point: NSPoint) -> Aim {
+        let own = carried.window() == window.id();
+        match carried {
+            Carried::Group { .. } if !self.is_side() => {
+                // The title row has no place among groups to point at: another window takes the
+                // group last, and a window's own group is where it is.
+                Aim {
+                    landed: (!own).then(|| Landed::Group(window.group_count())),
+                    ..Aim::default()
+                }
+            }
+            Carried::Group { group, .. } => {
+                let Some(column) = self.column_with_room(0) else {
+                    return Aim::default();
+                };
+                let spots = window.group_spots(&column);
+                let Some(spot) = group_spot_at(&spots, point.y) else {
+                    // A window with no group takes the first one below its tabs.
+                    let last = column.rows.last();
+                    return Aim {
+                        line: (!own && window.group_count() == 0).then(|| {
+                            content_line(
+                                last.map_or(column.list.y, |row| row.y + row.height)
+                                    + tabs::GAP / 2.0,
+                                &column,
+                            )
+                        }),
+                        landed: (!own && window.group_count() == 0).then_some(Landed::Group(0)),
+                        ..Aim::default()
+                    };
+                };
+                let to = match window.group_position(*group) {
+                    Some(from) if own => group_place(from, spot.slot),
+                    _ => spot.slot,
+                };
+                Aim {
+                    line: Some(content_line(spot.line, &column)),
+                    landed: Some(Landed::Group(to)),
+                    ..Aim::default()
+                }
+            }
+            Carried::Tabs { tabs, .. } if tabs.len() == 1 && !window.has_groups() => {
+                let tab = tabs[0];
+                if window.index_of(tab).is_some() {
+                    let place = window.strip_place(self.slot_under(0, point));
+                    Aim {
+                        landed: Some(Landed::Strip(tabs::landing(Some(Over::Own { place })))),
+                        ..Aim::default()
+                    }
+                } else {
+                    let gap = self.slot_under(1, point);
+                    let place = window.strip_place(gap);
+                    Aim {
+                        room: Some(gap),
+                        landed: Some(Landed::Strip(tabs::landing(Some(Over::Other {
+                            gap: place,
+                        })))),
+                        ..Aim::default()
+                    }
+                }
+            }
+            Carried::Tabs { .. } if self.is_side() => {
+                let Some(column) = self.column_with_room(0) else {
+                    return Aim::default();
+                };
+                let spots = window.side_spots(&column);
+                let Some(spot) = spot_at(&spots, point.y) else {
+                    return Aim::default();
+                };
+                Aim {
+                    line: Some(content_line(spot.line, &column)),
+                    landed: Some(Landed::Tabs(spot.target.clone())),
+                    ..Aim::default()
+                }
+            }
+            Carried::Tabs { .. } => {
+                // The title row lists the cluster on screen: the place is one of it, its end the
+                // cluster's own. A tab of this window ends at the place under the pointer; one
+                // from another is put before the tab there.
+                let gap = self.slot_under(usize::from(!own), point);
+                let target = match carried
+                    .lone()
+                    .filter(|tab| own && window.index_of(*tab).is_some())
+                {
+                    Some(tab) => window.own_drop_target(tab, gap),
+                    None => window.drop_target(gap),
+                };
+                Aim {
+                    room: (!own).then_some(gap),
+                    landed: Some(Landed::Tabs(target)),
+                    ..Aim::default()
+                }
+            }
+        }
+    }
+
+    /// `draggingEntered:` and `draggingUpdated:`: what is carried over this bar ([`Self::aim`]):
+    /// a tab from another window opens room at the slot under the pointer **of the strip it
+    /// would make**, so the room is under the pointer and the answer does not depend on the room;
+    /// a window's own tab shows no gap (its faint chip is its place); in the column of a window
+    /// with groups, and for several tabs or a group, a line marks the place. Anything that is not
+    /// tabs or a group of this process, or that this window cannot take now (it holds a question
+    /// of its own), is not taken: the drop is then on nothing, and what is carried becomes a
+    /// window.
     fn carried_over(&self, info: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
-        let Some(tab) = tab_drag::carried(info) else {
+        let Some(carried) = tab_drag::carried(info) else {
             return NSDragOperation::None;
         };
         let Some(window) = self
             .terminal_window()
             .filter(|window| window.selection_free())
         else {
-            self.open_gap(None);
+            self.clear_drop();
             return NSDragOperation::None;
         };
-        let gap = window.index_of(tab).is_none().then(|| {
-            let point = self.convertPoint_fromView(info.draggingLocation(), None);
-            self.slot_under(1, point)
-        });
-        self.open_gap(gap);
+        let point = self.convertPoint_fromView(info.draggingLocation(), None);
+        let aim = self.aim(&carried, &window, point);
+        self.show_cast(aim.line);
+        self.open_gap(aim.room);
         NSDragOperation::Move
     }
 
-    /// `performDragOperation:`: the carried tab is let go here. What it comes to is decided now
-    /// ([`tabs::landing`]) and carried out when the session has ended, in a turn of its own; the
-    /// gap stays open until then, so the strip does not close up and open again. Always
-    /// accepted if it is a tab this window takes: a refusal would read as a drop on nothing and
-    /// make a window.
+    /// `performDragOperation:`: what is carried is let go here. What it comes to is decided now
+    /// ([`Self::aim`]) and carried out when the session has ended, in a turn of its own; the
+    /// gap or the line stays until then, so the list does not close up and open again. Always
+    /// accepted if it is tabs or a group this window takes: a refusal would read as a drop on
+    /// nothing and make a window — a group let go on its own title row decides nothing, and is
+    /// accepted all the same.
     fn accept_drop(&self, info: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
-        let Some(tab) = tab_drag::carried(info) else {
+        let Some(carried) = tab_drag::carried(info) else {
             return false;
         };
         let (Some(window), Some(app)) = (self.terminal_window(), app::delegate(self.mtm())) else {
             return false;
         };
         let point = self.convertPoint_fromView(info.draggingLocation(), None);
-        let over = if window.index_of(tab).is_some() {
-            Over::Own {
-                place: window.strip_place(self.slot_under(0, point)),
-            }
-        } else {
-            Over::Other {
-                gap: window.strip_place(self.slot_under(1, point)),
-            }
-        };
-        app.tab_dropped(window.id(), tabs::landing(Some(over)));
+        if let Some(landed) = self.aim(&carried, &window, point).landed {
+            app.tab_dropped(window.id(), landed);
+        }
         true
     }
 
@@ -7864,8 +8142,8 @@ mod tests {
         CARD_SCALE, CARD_SLIDE, CHIP_ABOVE, CHIP_HEIGHT, DISCS, Emblem, GLYPH_OVERHANG, GlyphLook,
         HOLLOW_ROOM, IconStyle, Label, Motion, Palette, Picks, ROW_LEFT, Spin, TAB_RADIUS,
         TILE_BADGE_INSET, TILE_ROOM, Tint, TitleAction, badge_centre, card_arrival, card_beside,
-        card_x, command_alone, contains, counted, disc_side, glyph_slot, inks, kept_picks,
-        line_span, pick_click, single_label, spin_of, title_double_click,
+        card_x, command_alone, contains, content_line, counted, disc_side, glyph_slot, inks,
+        kept_picks, line_span, pick_click, single_label, spin_of, title_double_click,
     };
     use super::{MAP_SCRIM_NAME_ONLY, TileShot, paint_tile};
     use crate::groups::Click;
@@ -8607,5 +8885,59 @@ mod tests {
         assert_eq!(counted("Close", 3, "\u{2026}"), "Close 3 Tabs\u{2026}");
         assert_eq!(counted("Move", 2, " to Group"), "Move 2 Tabs to Group");
         assert_eq!(counted("Close", 1, ""), "Close 1 Tab");
+    }
+    /// The line that marks a carried drop's place is kept in the list's content, so a layout that
+    /// finds the column scrolled somewhere else puts it back at the same place of the rows.
+    #[test]
+    fn a_drops_line_is_kept_in_the_content_and_comes_back_at_any_scroll() {
+        let column = |scroll: f64| {
+            tabs::Side {
+                width: tabs::SIDE_WIDTH,
+                height: 200.0,
+                top: 40.0,
+                count: 12,
+                scroll,
+                warning: false,
+                corner: 20.5,
+            }
+            .layout()
+        };
+        let still = column(0.0);
+        // The gap above the fifth row, as the column says it.
+        let line = still.between(4);
+        let content = content_line(line, &still);
+        assert_eq!(content, line - still.list.y);
+        // Scrolled 30 points: the same place of the rows is 30 higher in the window.
+        let moved = column(30.0);
+        assert_eq!(moved.scroll, 30.0);
+        assert_eq!(moved.between(4), line - 30.0);
+        assert_eq!(
+            content_line(moved.between(4), &moved),
+            content,
+            "the content's height does not move with the wheel"
+        );
+        // What the layout draws it at: the list's space.
+        assert_eq!(content - moved.scroll, moved.between(4) - moved.list.y);
+    }
+
+    /// What a carry shows over a bar and what the bar takes the drop as are read by one function:
+    /// were each to read the pointer for itself, room or a line would open at one place and the
+    /// tabs go to another.
+    #[test]
+    fn a_carry_over_a_bar_shows_what_the_drop_does() {
+        let source = include_str!("tab_bar.rs");
+        let body = |name: &str| {
+            let at = source
+                .find(&format!("    fn {name}("))
+                .unwrap_or_else(|| panic!("{name} is a method of the bar"));
+            let rest = &source[at..];
+            &rest[..rest.find("\n    }\n").expect("the method ends")]
+        };
+        for name in ["carried_over", "accept_drop"] {
+            assert!(
+                body(name).contains("self.aim("),
+                "{name} reads the carry's place from `aim`, as its other half does"
+            );
+        }
     }
 }
