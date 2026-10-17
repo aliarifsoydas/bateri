@@ -4310,9 +4310,12 @@ impl TerminalWindow {
     /// column in place, and the content takes the rest — its container's frame changes once.
     /// The content's width and height change with it, so under `resize_in_steps` the window
     /// takes the step of the new area at once ([`TerminalWindow::fit_to_cells`], a no-op when
-    /// the setting is off).
+    /// the setting is off). What the bar lists is read again: the column lists every group under
+    /// its header, the title row only the group on screen, and a bar that kept the other place's
+    /// list showed the title row's one cluster in the column until something else refreshed it.
     pub(crate) fn apply_tab_position(&self) {
         self.ivars().root.lay_out();
+        self.refresh_bar();
         self.fit_to_cells();
     }
 
@@ -4434,6 +4437,21 @@ mod tests {
             !naming.contains("self.forget_undo()") && naming.contains("name_in_undo("),
             "naming a new group keeps the record and tells it the name"
         );
+    }
+
+    /// What the bar lists depends on its place (the column's groups and headers, the title row's
+    /// one cluster): a change of place reads the list again, or the column shows the title row's
+    /// cluster until a later refresh. An AppKit path with no window to test it in, so a source
+    /// scan.
+    #[test]
+    fn a_change_of_place_reads_the_bars_list_again() {
+        let source = include_str!("window.rs");
+        let code = &source[..source.find("#[cfg(test)]").expect("the tests follow")];
+        let start = code
+            .find("pub(crate) fn apply_tab_position(")
+            .expect("the setting's applier");
+        let body = &code[start..start + code[start..].find("\n    }").expect("its end")];
+        assert!(body.contains("self.refresh_bar()"), "{body}");
     }
 
     /// The guard of "the strip changes with its groups": the groups sit beside the strip and a
