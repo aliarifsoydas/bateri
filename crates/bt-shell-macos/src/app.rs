@@ -65,7 +65,7 @@ use crate::tab_merge::{End, Merge};
 use crate::tabs::{self, Landing};
 use crate::undo::Record;
 use crate::watch::{Notify, Watch};
-use crate::window::{self, CloseScope, Placement, TerminalWindow};
+use crate::window::{self, CloseScope, Placement, Seat, TerminalWindow};
 use crate::zoom::Zoom;
 use crate::{Options, Run, Workload};
 use crate::{child, focus, jobs, settings};
@@ -1605,6 +1605,11 @@ define_class!(
                         config_root: Some(_)
                     }
                 )
+            } else if item.action() == Some(sel!(newGroup:))
+                || item.action() == Some(sel!(newUngroupedTab:))
+            {
+                // Groups stand in the side column.
+                self.key_window().is_some_and(|window| window.groups_shown())
             } else if item.action() == Some(sel!(mergeWindows:)) {
                 // Merging needs a second window to take tabs from.
                 self.windows().len() > 1
@@ -1632,6 +1637,30 @@ define_class!(
         #[unsafe(method(newTab:))]
         fn new_tab(&self, _sender: Option<&AnyObject>) {
             self.open_from_key_window(Opening::Tab);
+        }
+
+        /// Shell ▸ New Group (⇧⌘N): a new tab in a group of its own, named for the folder the tab
+        /// on screen stands in, after the other groups.
+        #[unsafe(method(newGroup:))]
+        fn new_group(&self, _sender: Option<&AnyObject>) {
+            if let Some(window) = self.key_window()
+                && window.groups_shown()
+            {
+                let name = window.new_group_name(None);
+                self.new_tab_seated(window.id(), Seat::New(name));
+                // Born with its name field open, to be said better than the folder's.
+                window.rename_shown_group();
+            }
+        }
+
+        /// Shell ▸ New Ungrouped Tab: a new tab among the ungrouped ones, after the last of them.
+        #[unsafe(method(newUngroupedTab:))]
+        fn new_ungrouped_tab(&self, _sender: Option<&AnyObject>) {
+            if let Some(window) = self.key_window()
+                && window.groups_shown()
+            {
+                self.new_tab_seated(window.id(), Seat::Loose);
+            }
         }
 
         /// Window ▸ Merge All Windows: every other window's tabs join the key
@@ -2779,6 +2808,15 @@ impl AppDelegate {
             .unwrap_or_default()
     }
 
+    /// The groups of the key window and whether its tab on screen is in each — the list Window ▸
+    /// Move Tab to Group ▸ is filled with on opening; empty when no terminal window is key or it
+    /// has no group.
+    pub(crate) fn key_group_targets(&self) -> Vec<(isize, String, bool)> {
+        self.key_window()
+            .map(|window| window.group_targets(window.try_selected_tab().map(|tab| tab.id())))
+            .unwrap_or_default()
+    }
+
     /// The ports of the key tab's focused pane — its programs' and, in a
     /// remote session, the server's: the input of Shell ▸ Open Port ▸; empty
     /// when no terminal window is key.
@@ -3417,7 +3455,12 @@ impl AppDelegate {
     /// selection guard's (`TerminalWindow::selection_free`) — the new tab
     /// would come up under the question. If the session cannot be born the
     /// tab closes again and the error returns.
-    fn open_tab(&self, window: &TerminalWindow, opening: Opening) -> Result<(), String> {
+    fn open_tab(
+        &self,
+        window: &TerminalWindow,
+        opening: Opening,
+        seat: &Seat,
+    ) -> Result<(), String> {
         if !window.selection_free() {
             crate::preview::beep();
             return Ok(());
@@ -3430,7 +3473,7 @@ impl AppDelegate {
             embed::open(mtm, crate::window::initial_rect(), launch).map_err(|e| e.to_string())?;
         let tab = TerminalTab::new(mtm, tab_id, window.id(), &pane);
         let edge = self.settings().content_edge;
-        window.add_tab(&tab, (theme, edge));
+        window.add_tab_seated(&tab, (theme, edge), seat);
         // After the container is attached and sized: the geometry is built
         // from the final frame (`TerminalWindow::with_pane`'s order).
         pane.observe_frame();
@@ -4027,6 +4070,18 @@ impl AppDelegate {
         }
     }
 
+    /// A new tab in window `window` at `seat` among its groups — ⌘T's job (the tab inherits from
+    /// the one on screen, a remote host included) with the place named: the `+` of a group's
+    /// header, Shell ▸ New Ungrouped Tab, ⌃⌘0 with no ungrouped tab, Shell ▸ New Group.
+    pub(crate) fn new_tab_seated(&self, window: u64, seat: Seat) {
+        let Some(window) = self.window(window) else {
+            return;
+        };
+        if let Err(e) = self.open_tab(&window, Opening::Tab, &seat) {
+            eprintln!("bateri: {e}");
+        }
+    }
+
     /// The new pane's birth package and its theme — the single source
     /// for both the window-spawning path and splitting. All inputs are here, the pane
     /// does not reach into `AppDelegate`. The pane identity comes from the same counter as
@@ -4118,7 +4173,7 @@ impl AppDelegate {
     fn open_window_or_report(&self, from: Option<&TerminalWindow>, opening: Opening) {
         let result = match from {
             Some(from) if opening != Opening::Window || prefers_tabs(self.mtm(), from) => {
-                self.open_tab(from, opening)
+                self.open_tab(from, opening, &Seat::Beside)
             }
             _ => self.open_window(from, opening).map(drop),
         };
@@ -5548,6 +5603,9 @@ impl AppDelegate {
             window
                 .bar()
                 .command_held(hold == Hold::Command && Some(window.id()) == key);
+            window
+                .bar()
+                .group_held(hold == Hold::Group && Some(window.id()) == key);
         }
         self.arrange_hold(hold == Hold::Arrange);
     }

@@ -76,6 +76,9 @@ pub(crate) enum Hold {
     Command,
     /// ⌥⌘ and nothing else: the arrangement, after the same wait.
     Arrange,
+    /// ⌃⌘ and nothing else: the column's group headers show their keys (⌃⌘1…⌃⌘9), after the
+    /// same wait.
+    Group,
 }
 
 /// How long ⌥⌘ is held before the panes lift: the ⌘ hint's wait and for the
@@ -84,7 +87,7 @@ pub(crate) enum Hold {
 pub(crate) const HOLD_DELAY: Duration = HINT_DELAY;
 
 /// What `flags` hold: ⌘ alone ([`tab_bar::command_alone`]: Caps Lock and the
-/// keypad's and the function key's bits do not count), ⌥⌘ and no ⇧ or ⌃, or
+/// keypad's and the function key's bits do not count), ⌥⌘ and no ⇧ or ⌃, ⌃⌘ and no ⇧ or ⌥, or
 /// neither.
 pub(crate) fn hold_of(flags: NSEventModifierFlags) -> Hold {
     let chord = NSEventModifierFlags::Command
@@ -97,6 +100,10 @@ pub(crate) fn hold_of(flags: NSEventModifierFlags) -> Hold {
         == NSEventModifierFlags::Command | NSEventModifierFlags::Option
     {
         Hold::Arrange
+    } else if flags.intersection(chord)
+        == NSEventModifierFlags::Command | NSEventModifierFlags::Control
+    {
+        Hold::Group
     } else {
         Hold::Nothing
     }
@@ -1284,6 +1291,15 @@ mod tests {
         );
         assert_eq!(
             hold_of(command | option | NSEventModifierFlags::Control),
+            Hold::Nothing
+        );
+        assert_eq!(
+            hold_of(command | NSEventModifierFlags::Control),
+            Hold::Group,
+            "⌃⌘ alone shows the groups' keys"
+        );
+        assert_eq!(
+            hold_of(command | NSEventModifierFlags::Control | NSEventModifierFlags::Shift),
             Hold::Nothing
         );
         assert_eq!(hold_of(option), Hold::Nothing);

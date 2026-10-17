@@ -171,6 +171,7 @@ use objc2_quartz_core::{
 use crate::app;
 use crate::arrange;
 use crate::card::{IDENTITY, fitted};
+use crate::groups::GroupId;
 use crate::icon;
 use crate::program::identity::Kind as ProgramKind;
 use crate::search_bar::mix;
@@ -180,12 +181,15 @@ use crate::tabs::{
     self, BUTTON, Bar, CHIP_PAD, Card, CardCommand, CardPane, Clock, Column, Drag, Ending, FADE,
     Finish, Grip, Indicator, Over, Stir, Strip, TAB_RADIUS, Tide, Tone, Turn,
 };
-use crate::window::{TerminalWindow, is_dark_background};
+use crate::window::{Seat, TerminalWindow, is_dark_background};
 
 // The bar's other mode, the tabs in a column down the window's left edge. A child module, not a
 // sibling, for the bar's private state it works on.
 #[path = "tab_side.rs"]
 mod tab_side;
+// A group's header in that column.
+#[path = "tab_group.rs"]
+mod tab_group;
 
 /// Space between the zoom button's right edge and the strip — the design's
 /// strip starts at 84 pt beside lights ending at 72 pt. In full screen the
@@ -5020,11 +5024,34 @@ pub(crate) struct Label {
     pub(crate) mark: HostMark,
 }
 
+/// One group's header as the bar shows it ([`TabBar::show`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Heading {
+    pub(crate) group: GroupId,
+    pub(crate) name: String,
+    /// The column lists the header and, while the tab on screen is of the group, that tab.
+    pub(crate) collapsed: bool,
+    /// How many tabs the group holds, the hidden ones too.
+    pub(crate) tabs: usize,
+    /// What a closed group's dot says: the most urgent thing that asks for the user in any of its
+    /// tabs (`tabs::group_indicator`).
+    pub(crate) indicator: Option<Indicator>,
+    /// The digit of the key that reaches the group with ⌃⌘ ([`tabs::shortcut_digit`]).
+    pub(crate) hint: Option<u8>,
+    /// The index in [`Shown::tabs`] of the first row below the header; the number of rows when
+    /// nothing is below it (a closed group whose tab is not the one on screen).
+    pub(crate) first_row: usize,
+}
+
 /// What the bar shows; the window gives it ([`TabBar::show`]).
 #[derive(Clone, Debug, Default)]
 struct Shown {
-    /// Every tab, in strip order.
+    /// The tabs the bar lists, in the order it lists them: every tab in the title row, and in the
+    /// column those under an open header or the one on screen under a closed one.
     tabs: Vec<Label>,
+    /// The groups' headers of the column, each with the row it stands above; none in the title
+    /// row and none while no group exists.
+    headings: Vec<Heading>,
     selected: usize,
     /// The settings diagnostic; empty without one.
     notice: String,
@@ -5196,6 +5223,15 @@ pub(crate) struct BarIvars {
     hint_wait: Cell<u64>,
     /// A show is pending ([`HINT_DELAY`]).
     hint_pending: Cell<bool>,
+    /// One header per group of the column, in order, each keeping its group.
+    headers: RefCell<Vec<Retained<tab_group::GroupHeader>>>,
+    /// The group whose name the field holds, in place of a tab's ([`BarIvars::renaming`]).
+    renaming_group: Cell<Option<GroupId>>,
+    /// ⌃⌘ is held (past [`HINT_DELAY`]): the headers show their keys.
+    group_hints: Cell<bool>,
+    /// ⌘'s `hint_wait` and `hint_pending`, for ⌃⌘.
+    group_wait: Cell<u64>,
+    group_pending: Cell<bool>,
 }
 
 define_class!(
@@ -5389,6 +5425,11 @@ impl TabBar {
             hints: Cell::new(false),
             hint_wait: Cell::new(0),
             hint_pending: Cell::new(false),
+            headers: RefCell::new(Vec::new()),
+            renaming_group: Cell::new(None),
+            group_hints: Cell::new(false),
+            group_wait: Cell::new(0),
+            group_pending: Cell::new(false),
             target: Cell::new(None),
             dwelling: Cell::new(None),
             mark: Cell::new(None),
@@ -5449,7 +5490,13 @@ impl TabBar {
     /// streams. A card with a map of panes reads at every news: what a pane reports
     /// can change while the chip, which shows the most urgent of them, does
     /// not. Lays out.
-    pub(crate) fn show(&self, tabs: Vec<Label>, selected: usize, notice: String) {
+    pub(crate) fn show(
+        &self,
+        tabs: Vec<Label>,
+        selected: usize,
+        headings: Vec<Heading>,
+        notice: String,
+    ) {
         let iv = self.ivars();
         let open = iv.card.borrow().as_ref().map(|open| open.tab);
         let told = |shown: &Shown, tab: u64| {
@@ -5470,6 +5517,7 @@ impl TabBar {
         let before = open.and_then(|tab| told(&iv.shown.borrow(), tab));
         iv.shown.replace(Shown {
             tabs,
+            headings,
             selected,
             notice,
         });
@@ -5618,9 +5666,17 @@ impl TabBar {
         if count == 0 {
             return;
         }
-        // A tab gone takes its name field away, and its drag.
+        // A tab gone takes its name field away, and its drag; so does a group gone, or a column
+        // gone that held the group's header.
         if let Some(tab) = iv.renaming.get()
             && !shown.tabs.iter().any(|label| label.tab == tab)
+        {
+            self.end_rename(false);
+            return;
+        }
+        if let Some(group) = iv.renaming_group.get()
+            && (iv.side.get().is_none()
+                || !shown.headings.iter().any(|heading| heading.group == group))
         {
             self.end_rename(false);
             return;
@@ -5945,11 +6001,64 @@ impl TabBar {
         unsafe { iv.field.selectText(None) };
     }
 
+    /// Opens the name field over group `group`'s header, its name selected: a double click on the
+    /// header, Rename Group…, a group just made. A name under way elsewhere is kept first, and
+    /// the header is brought into view. Only in the column, which is where headers stand.
+    pub(crate) fn begin_group_rename(&self, group: GroupId) {
+        let iv = self.ivars();
+        let Some(heading) = iv
+            .shown
+            .borrow()
+            .headings
+            .iter()
+            .find(|heading| heading.group == group)
+            .cloned()
+        else {
+            return;
+        };
+        if iv.side.get().is_none() || iv.renaming_group.get() == Some(group) {
+            return;
+        }
+        self.end_rename(true);
+        // The row below the header comes into sight with it; a closed group with none shows the
+        // header where it is.
+        let to = iv.column.borrow().as_ref().and_then(|column| {
+            (heading.first_row < column.rows.len()).then(|| column.revealing(heading.first_row))
+        });
+        if let Some(to) = to {
+            iv.scroll.set(to);
+        }
+        iv.renaming_group.set(Some(group));
+        iv.opened_with.replace(heading.name.clone());
+        iv.field.setStringValue(&NSString::from_str(&heading.name));
+        self.addSubview(&iv.field);
+        self.lay_out();
+        // SAFETY: `selectText:` takes an optional sender, unused.
+        unsafe { iv.field.selectText(None) };
+    }
+
     /// Takes the name field away — Return and a lost keyboard keep what was
     /// typed (`commit`), Esc leaves the tab as it was. The window's applier
     /// decides what the text means ([`TerminalWindow::rename_tab`]).
     fn end_rename(&self, commit: bool) {
         let iv = self.ivars();
+        // A group's name is the field's too: the window's applier decides what it comes to.
+        if let Some(group) = iv.renaming_group.take() {
+            let draft = iv.field.stringValue().to_string();
+            let commit = commit && draft != *iv.opened_with.borrow();
+            let window = self.terminal_window();
+            if iv.field.currentEditor().is_some()
+                && let Some(window) = &window
+            {
+                window.focus_selected_tab();
+            }
+            iv.field.removeFromSuperview();
+            if commit && let Some(window) = &window {
+                window.rename_group(group, &draft);
+            }
+            self.lay_out();
+            return;
+        }
         // Taken first: handing the keyboard back ends the field's editing,
         // which says so again ([`TabBar`]'s `controlTextDidEndEditing:`).
         let Some(tab) = iv.renaming.take() else {
@@ -6040,6 +6149,82 @@ impl TabBar {
             menu.addItem(&holder);
         }
         add("Rename Tab\u{2026}", sel!(renameTab:));
+        if window.groups_shown() {
+            self.add_group_items(&menu, &window, tab);
+        }
+        Some(menu)
+    }
+
+    /// The chip menu's group items for tab `tab`: Move to New Group while no group exists, else
+    /// Move to Group ▸ (the groups, the tab's own ticked and grey, and New Group…), and Remove
+    /// from Group for a grouped tab. The submenu's group items name their group by `tag`
+    /// ([`TerminalWindow::group_targets`]); the tab is the one its parent item names.
+    fn add_group_items(&self, menu: &NSMenu, window: &TerminalWindow, tab: u64) {
+        let mtm = self.mtm();
+        let tag = tabs::menu_tag(tab);
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let targets = window.group_targets(Some(tab));
+        if targets.is_empty() {
+            menu.addItem(&window_item(
+                mtm,
+                window,
+                "Move to New Group",
+                sel!(moveTabToNewGroup:),
+                tag,
+            ));
+            return;
+        }
+        let submenu = NSMenu::new(mtm);
+        for (group, name, _) in &targets {
+            submenu.addItem(&window_item(
+                mtm,
+                window,
+                name,
+                sel!(moveTabToGroup:),
+                *group,
+            ));
+        }
+        submenu.addItem(&NSMenuItem::separatorItem(mtm));
+        submenu.addItem(&window_item(
+            mtm,
+            window,
+            "New Group\u{2026}",
+            sel!(moveTabToNewGroup:),
+            tag,
+        ));
+        let holder = NSMenuItem::new(mtm);
+        holder.setTitle(&NSString::from_str("Move to Group"));
+        holder.setTag(tag);
+        holder.setSubmenu(Some(&submenu));
+        menu.addItem(&holder);
+        if targets.iter().any(|(_, _, here)| *here) {
+            menu.addItem(&window_item(
+                mtm,
+                window,
+                "Remove from Group",
+                sel!(removeTabFromGroup:),
+                tag,
+            ));
+        }
+    }
+
+    /// A group header's menu — what can be done to that group: a tab in it, its name, its
+    /// dissolving and its closing. Every item names the group in its `tag`.
+    fn group_menu(&self, group: GroupId) -> Option<Retained<NSMenu>> {
+        let window = self.terminal_window()?;
+        // A menu is no place for the card.
+        self.close_card();
+        let mtm = self.mtm();
+        let menu = NSMenu::new(mtm);
+        let tag = isize::try_from(group.get()).unwrap_or(isize::MAX);
+        let add = |title: &str, action: Sel| {
+            menu.addItem(&window_item(mtm, &window, title, action, tag));
+        };
+        add("New Tab in Group", sel!(newTabInGroup:));
+        add("Rename Group\u{2026}", sel!(renameGroup:));
+        add("Ungroup", sel!(ungroupGroup:));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        add("Close Group", sel!(closeGroup:));
         Some(menu)
     }
 
@@ -6063,15 +6248,17 @@ impl TabBar {
         else {
             return;
         };
-        let count = shown.tabs.len();
-        if count < 2 {
+        // Every tab, a closed group's hidden ones too; the keys are the listed tabs' own.
+        let labels = window.all_labels();
+        if labels.len() < 2 {
             return;
         }
+        let on_screen = shown.tabs.get(shown.selected).map(|label| label.tab);
         self.close_card();
         let mtm = self.mtm();
         let style = IconStyle::current(mtm);
         let menu = NSMenu::new(mtm);
-        for (index, label) in shown.tabs.iter().enumerate() {
+        for label in &labels {
             let item = window_item(
                 mtm,
                 &window,
@@ -6079,13 +6266,14 @@ impl TabBar {
                 sel!(pickTab:),
                 tabs::menu_tag(label.tab),
             );
-            if index == shown.selected {
+            if Some(label.tab) == on_screen {
                 item.setState(NSControlStateValueOn);
             }
             // Every row has an image, so the titles start at one x: the tab's icon, or
             // without icons a status dot — a clear one where the tab reports nothing.
             item.setImage(Some(&list_image(label, style, palette)));
-            if let Some(digit) = tabs::shortcut_digit(index, count) {
+            let listed = shown.tabs.iter().position(|shown| shown.tab == label.tab);
+            if let Some(digit) = listed.and_then(|at| tabs::shortcut_digit(at, shown.tabs.len())) {
                 item.setKeyEquivalent(&NSString::from_str(&digit.to_string()));
                 item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
             }
@@ -6321,7 +6509,10 @@ impl TabBar {
             .iter()
             .position(|label| label.tab == tab);
         match self.terminal_window() {
-            Some(window) if now.is_some_and(|now| now != to) => window.move_tab(tab, to),
+            // The place in the column is the listed tab's in the strip the applier counts.
+            Some(window) if now.is_some_and(|now| now != to) => {
+                window.move_tab(tab, window.strip_place(to));
+            }
             _ => self.lay_out(),
         }
         // No enter or exit comes while the button is down: the chip under the pointer now is
@@ -6511,11 +6702,11 @@ impl TabBar {
         let point = self.convertPoint_fromView(info.draggingLocation(), None);
         let over = if window.index_of(tab).is_some() {
             Over::Own {
-                place: self.slot_under(0, point),
+                place: window.strip_place(self.slot_under(0, point)),
             }
         } else {
             Over::Other {
-                gap: self.slot_under(1, point),
+                gap: window.strip_place(self.slot_under(1, point)),
             }
         };
         app.tab_dropped(window.id(), tabs::landing(Some(over)));
@@ -6543,6 +6734,18 @@ impl TabBar {
             let mtm = MainThreadMarker::new().expect("the main queue is the main thread");
             if let Some(app) = app::delegate(mtm) {
                 app.new_tab_in(window);
+            }
+        });
+    }
+
+    /// A header's `+`: a tab at the end of group `group`, a turn later.
+    fn new_tab_in_group(&self, group: GroupId) {
+        let window = self.ivars().window;
+        DispatchQueue::main().exec_async(move || {
+            // audit: a block running on the main queue is on the main thread by definition.
+            let mtm = MainThreadMarker::new().expect("the main queue is the main thread");
+            if let Some(app) = app::delegate(mtm) {
+                app.new_tab_seated(window, Seat::Group(group));
             }
         });
     }
@@ -7065,6 +7268,7 @@ impl TabBar {
     /// release of ⌘ or the pointer's leaving may reach another application.
     pub(crate) fn resigned(&self) {
         self.command_held(false);
+        self.group_held(false);
         let iv = self.ivars();
         iv.card_wait.set(iv.card_wait.get().wrapping_add(1));
         self.close_card();
@@ -7099,6 +7303,37 @@ impl TabBar {
             if iv.hint_wait.get() == generation {
                 iv.hint_pending.set(false);
                 if !iv.hints.replace(true) {
+                    bar.lay_out();
+                }
+            }
+        });
+    }
+}
+
+impl TabBar {
+    /// ⌃⌘ is held in this window (`true`) or not: [`Self::command_held`] for the groups' keys
+    /// (⌃⌘1…⌃⌘9), which the column's headers show.
+    pub(crate) fn group_held(&self, held: bool) {
+        let iv = self.ivars();
+        if !held {
+            if iv.group_pending.replace(false) {
+                iv.group_wait.set(iv.group_wait.get().wrapping_add(1));
+            }
+            if iv.group_hints.replace(false) {
+                self.lay_out();
+            }
+            return;
+        }
+        if iv.group_hints.get() || iv.group_pending.replace(true) {
+            return;
+        }
+        let generation = iv.group_wait.get().wrapping_add(1);
+        iv.group_wait.set(generation);
+        after(HINT_DELAY, iv.window, move |bar| {
+            let iv = bar.ivars();
+            if iv.group_wait.get() == generation {
+                iv.group_pending.set(false);
+                if !iv.group_hints.replace(true) {
                     bar.lay_out();
                 }
             }

@@ -40,17 +40,21 @@ use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadOnly};
-use objc2_app_kit::{NSAccessibility, NSBezierPath, NSBox, NSColor, NSTextAlignment, NSView};
+use objc2_app_kit::{
+    NSAccessibility, NSBezierPath, NSBox, NSColor, NSFont, NSFontWeightSemibold, NSTextAlignment,
+    NSView,
+};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::{CALayer, CATransaction};
 
+use super::tab_group::{GroupHeader, HeaderLook};
 use super::{
-    Chip, Dragging, IconStyle, Motion, Palette, Seen, Shown, Standing, TabBar, Tint, paint_in,
-    plain_box,
+    Chip, Dragging, Heading, IconStyle, Motion, Palette, Seen, Shown, Standing, TabBar, Tint,
+    paint_in, plain_box,
 };
 use crate::card;
 use crate::split::Rect;
-use crate::tabs::{self, Column, FADE, Side, TAB_RADIUS};
+use crate::tabs::{self, Column, Entry, FADE, Side, TAB_RADIUS};
 
 /// A model rectangle as the view's: both are top-down, in points.
 pub(super) fn ns_rect(rect: Rect) -> NSRect {
@@ -323,11 +327,45 @@ impl TabBar {
             iv.fade_trailing.setHidden(true);
             iv.list.setHidden(true);
         } else {
-            // The bar's own: the list had no mask and New Tab a square foot.
+            // The bar's own: the list had no mask and New Tab a square foot, and no headers.
             iv.mask.clear(&iv.strip);
             iv.new_tab.set_foot(None);
+            for header in iv.headers.take() {
+                header.removeFromSuperview();
+            }
             iv.strip.setNeedsDisplay(true);
         }
+    }
+
+    /// Whether the bar is the side column.
+    pub(crate) fn is_side(&self) -> bool {
+        self.ivars().side.get().is_some()
+    }
+
+    /// One header per group, in order, each keeping its group across changes of the list: a group
+    /// keeps its header, a new group gets one and a group gone loses its own.
+    fn headers_for(&self, headings: &[Heading]) -> Vec<Retained<GroupHeader>> {
+        let iv = self.ivars();
+        let mut old = iv.headers.take();
+        let mut headers = Vec::with_capacity(headings.len());
+        for heading in headings {
+            match old
+                .iter()
+                .position(|header| header.group() == Some(heading.group))
+            {
+                Some(at) => headers.push(old.remove(at)),
+                None => {
+                    let header = GroupHeader::new(self.mtm(), heading.group);
+                    iv.strip.addSubview(&header);
+                    headers.push(header);
+                }
+            }
+        }
+        for gone in old {
+            gone.removeFromSuperview();
+        }
+        iv.headers.replace(headers.clone());
+        headers
     }
 
     /// Places every part from the pure column ([`Side::layout`]) and gives the chips their tabs
@@ -356,7 +394,10 @@ impl TabBar {
         // The row's place in the layout: past the gap a carried tab opens, one on.
         let seat = |index: usize| tabs::seat(index, flight.gap);
         let side = self.side_for(top, count + usize::from(flight.gap.is_some()));
-        let mut column = side.layout();
+        // The list's places, headers among them: a carried tab's room opens before the row it is
+        // over, below any header that stands there.
+        let entries = side_entries(&shown.headings, count, flight.gap, 0);
+        let mut column = side.layout_with(&entries);
         let selected_tab = shown.tabs.get(shown.selected).map(|label| label.tab);
         let was_overflowing = iv.overflowed.replace(column.overflow);
         let resized = (iv.width.replace(bounds.size.height) - bounds.size.height).abs() > 0.5;
@@ -372,7 +413,7 @@ impl TabBar {
                     scroll: target,
                     ..side
                 }
-                .layout();
+                .layout_with(&entries);
                 revealed = selection_changed;
             }
         }
@@ -447,6 +488,28 @@ impl TabBar {
                 self.place_row_field(row, palette);
             }
         }
+        let headers = self.headers_for(&shown.headings);
+        for ((header, heading), laid) in headers.iter().zip(&shown.headings).zip(&column.headers) {
+            let naming = iv.renaming_group.get() == Some(heading.group);
+            let frame = NSRect::new(
+                NSPoint::new(laid.rect.x - column.list.x, laid.rect.y - column.list.y),
+                NSSize::new(laid.rect.width, laid.rect.height),
+            );
+            header.set(
+                frame,
+                heading,
+                palette,
+                HeaderLook {
+                    hints: iv.group_hints.get(),
+                    naming,
+                    reduce,
+                    slide,
+                },
+            );
+            if naming {
+                self.place_group_field(laid.rect, palette);
+            }
+        }
         iv.strip.set_separators(Vec::new(), palette);
         let scale = self
             .window()
@@ -505,8 +568,10 @@ impl TabBar {
     /// would make ([`TabBar::strip_with_room`]'s upright half).
     pub(super) fn column_with_room(&self, room: usize) -> Option<Column> {
         let top = self.ivars().side.get()?;
-        let count = self.ivars().shown.borrow().tabs.len();
-        (count > 0).then(|| self.side_for(top, count + room).layout())
+        let shown = self.ivars().shown.borrow();
+        let count = shown.tabs.len();
+        let entries = side_entries(&shown.headings, count, None, room);
+        (count > 0).then(|| self.side_for(top, count + room).layout_with(&entries))
     }
 
     /// Puts the name field over `row` (the bar's space), in the type the selected row's title
@@ -525,5 +590,124 @@ impl TabBar {
             ),
             NSSize::new(covers.width, height),
         ));
+    }
+}
+
+impl TabBar {
+    /// Puts the name field over the name of the header at `rect` (the bar's space), in the type
+    /// the header's name wears, left-aligned where the name starts.
+    fn place_group_field(&self, rect: Rect, palette: Palette) {
+        let field = &self.ivars().field;
+        field.setAlignment(NSTextAlignment::Left);
+        self.dress_field(palette, false);
+        // SAFETY: AppKit's constant font weight.
+        let weight = unsafe { NSFontWeightSemibold };
+        field.setFont(Some(&NSFont::systemFontOfSize_weight(
+            super::tab_group::NAME_TEXT,
+            weight,
+        )));
+        let height = field.intrinsicContentSize().height;
+        field.setFrame(NSRect::new(
+            NSPoint::new(
+                rect.x + super::tab_group::NAME_X - 2.0,
+                rect.y + ((rect.height - height) / 2.0).max(0.0),
+            ),
+            NSSize::new(
+                (rect.width - super::tab_group::NAME_X - super::tab_group::END_PAD).max(0.0),
+                height,
+            ),
+        ));
+    }
+}
+
+/// What stands in the column's list, top to bottom, for `count` tabs listed under `headings`:
+/// each header just above the row it stands over, and `room` more rows at the end. A tab carried
+/// in from another window opens its room as a row **at** place `gap` — below any header that
+/// stands over that place — and none when `gap` is `None`.
+fn side_entries(headings: &[Heading], count: usize, gap: Option<usize>, room: usize) -> Vec<Entry> {
+    let mut entries = Vec::with_capacity(count + headings.len() + room + 1);
+    let mut headers = headings.iter().peekable();
+    for index in 0..=count {
+        while headers
+            .next_if(|heading| heading.first_row <= index)
+            .is_some()
+        {
+            entries.push(Entry::Header);
+        }
+        if gap == Some(index) {
+            entries.push(Entry::Tab);
+        }
+        if index < count {
+            entries.push(Entry::Tab);
+        }
+    }
+    entries.extend(std::iter::repeat_n(Entry::Tab, room));
+    entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::groups::{Groups, Target};
+    use crate::tabs::Tabs;
+
+    /// A heading over the row at `first_row`, for a group of its own.
+    fn heading(first_row: usize) -> Heading {
+        let mut tabs = Tabs::new(1u64);
+        let mut groups = Groups::new();
+        groups.place(&mut tabs, &[1], Target::New("g".to_owned()));
+        Heading {
+            group: groups.groups()[0].id,
+            name: "g".to_owned(),
+            collapsed: false,
+            tabs: 1,
+            indicator: None,
+            hint: None,
+            first_row,
+        }
+    }
+
+    const TAB: Entry = Entry::Tab;
+    const HEAD: Entry = Entry::Header;
+
+    #[test]
+    fn a_column_without_groups_is_rows_alone() {
+        assert_eq!(side_entries(&[], 3, None, 0), [TAB, TAB, TAB]);
+        assert_eq!(side_entries(&[], 3, None, 1), [TAB, TAB, TAB, TAB]);
+    }
+
+    #[test]
+    fn a_header_stands_just_above_the_row_it_names() {
+        let headings = [heading(2), heading(3)];
+        assert_eq!(
+            side_entries(&headings, 4, None, 0),
+            [TAB, TAB, HEAD, TAB, HEAD, TAB]
+        );
+        // A closed group with nothing listed under it names the row past the last: its header
+        // ends the list.
+        assert_eq!(
+            side_entries(&[heading(0), heading(2)], 2, None, 0),
+            [HEAD, TAB, TAB, HEAD]
+        );
+    }
+
+    #[test]
+    fn a_carried_tabs_room_opens_below_the_header_that_stands_there() {
+        let headings = [heading(2)];
+        assert_eq!(
+            side_entries(&headings, 3, Some(2), 0),
+            [TAB, TAB, HEAD, TAB, TAB],
+            "before the first row of the group: at the group's head"
+        );
+        assert_eq!(
+            side_entries(&headings, 3, Some(1), 0),
+            [TAB, TAB, TAB, HEAD, TAB],
+            "among the ungrouped rows"
+        );
+        assert_eq!(
+            side_entries(&headings, 3, Some(3), 0),
+            [TAB, TAB, HEAD, TAB, TAB],
+            "past the last row"
+        );
     }
 }

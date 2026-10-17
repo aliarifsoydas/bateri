@@ -1196,7 +1196,8 @@ impl Session {
                         done = window.make_move(Move::PaneToNewTab {
                             pane: self.pane,
                             window: window.id(),
-                            gap,
+                            // The column's place, in the strip the move counts.
+                            gap: window.strip_place(gap),
                         });
                     }
                     Lands::Back => {}
@@ -1242,7 +1243,7 @@ impl Session {
                         done = app.make_move(Move::PaneToNewTab {
                             pane: self.pane,
                             window: target.id(),
-                            gap,
+                            gap: target.strip_place(gap),
                         });
                     }
                     Lands::Back => {}

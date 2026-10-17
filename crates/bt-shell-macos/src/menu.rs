@@ -106,6 +106,9 @@ use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
 /// menu ([`ShellMenuDelegate`]): the list is the key window's other tabs, built
 /// on opening.
 const MOVE_TO_TAB_TITLE: &str = "Move Split to Tab";
+/// The title that tells Window ▸ Move Tab to Group ▸ from the other submenus
+/// ([`ShellMenuDelegate`] fills it on opening).
+const MOVE_TO_GROUP_TITLE: &str = "Move Tab to Group";
 
 /// The `tag` of the Shell ▸ Mark … as ▸ holder: [`ShellMenuDelegate`] finds it in
 /// the Shell menu with this.
@@ -270,6 +273,11 @@ define_class!(
                 fill_move_targets(self.mtm(), menu, &targets.unwrap_or_default());
                 return;
             }
+            if menu.title().to_string() == MOVE_TO_GROUP_TITLE {
+                let targets = app.as_ref().map(|app| app.key_group_targets());
+                fill_group_targets(self.mtm(), menu, &targets.unwrap_or_default());
+                return;
+            }
             // Open Port ▸: the focused pane's listening ports, grey without
             // one — also while a full-screen program hides the dock.
             if let Some(holder) = menu.itemWithTag(PORTS_HOLDER_TAG) {
@@ -325,6 +333,27 @@ fn fill_move_targets(mtm: MainThreadMarker, menu: &NSMenu, targets: &[(u64, Stri
         none.setEnabled(false);
         menu.addItem(&none);
     }
+}
+
+/// Fills Window ▸ Move Tab to Group ▸ with the key window's groups: one item each, its `tag` the
+/// group ([`crate::window::TerminalWindow::group_targets`]) — the window's `moveTabToGroup:` reads
+/// it, and ticks and greys the group the tab is in — then New Group…, which makes one.
+fn fill_group_targets(mtm: MainThreadMarker, menu: &NSMenu, targets: &[(isize, String, bool)]) {
+    menu.removeAllItems();
+    for (group, name, _) in targets {
+        let entry = item(mtm, name, sel!(moveTabToGroup:), "");
+        entry.setTag(*group);
+        menu.addItem(&entry);
+    }
+    if !targets.is_empty() {
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+    }
+    menu.addItem(&item(
+        mtm,
+        "New Group\u{2026}",
+        sel!(moveTabToNewGroup:),
+        "",
+    ));
 }
 
 impl ShellMenuDelegate {
@@ -503,6 +532,13 @@ pub(crate) fn install(
                 item(mtm, "New Local Tab", sel!(newLocalTab:), "t"),
                 command | NSEventModifierFlags::Option,
             ),
+            // Groups stand in the side column (greyed elsewhere, the app delegate's
+            // `validateMenuItem:`).
+            with_modifiers(
+                item(mtm, "New Group", sel!(newGroup:), "n"),
+                command | NSEventModifierFlags::Shift,
+            ),
+            item(mtm, "New Ungrouped Tab", sel!(newUngroupedTab:), ""),
             NSMenuItem::separatorItem(mtm),
             // Its title and grey state on opening ([`ShellMenuDelegate`]); the items go to the
             // app delegate with `markHost:` (the active tab's host).
@@ -565,6 +601,39 @@ pub(crate) fn install(
         })
         .collect();
     select_tab.push(tagged(item(mtm, "Last Tab", sel!(selectTab:), "9"), 9));
+    // ⌃⌘1…⌃⌘8 the nth group, ⌃⌘9 the last, ⌃⌘0 the ungrouped tabs. Static, with the title and the
+    // grey state written by the window's `validateMenuItem:` — a shortcut is found in an item that
+    // is there when the key is pressed, not in one made as a menu opens.
+    let command_control = command | NSEventModifierFlags::Control;
+    let mut select_group: Vec<_> = (1..=8)
+        .map(|n| {
+            with_modifiers(
+                tagged(
+                    item(
+                        mtm,
+                        &format!("Group {n}"),
+                        sel!(selectGroup:),
+                        &n.to_string(),
+                    ),
+                    n,
+                ),
+                command_control,
+            )
+        })
+        .collect();
+    select_group.push(with_modifiers(
+        tagged(item(mtm, "Last Group", sel!(selectGroup:), "9"), 9),
+        command_control,
+    ));
+    select_group.push(with_modifiers(
+        tagged(item(mtm, "Ungrouped", sel!(selectGroup:), "0"), 0),
+        command_control,
+    ));
+    let move_to_group = submenu(
+        mtm,
+        MOVE_TO_GROUP_TITLE,
+        &[item(mtm, "New Group\u{2026}", sel!(moveTabToNewGroup:), "")],
+    );
     // Direction items: `tag` is the order of `split::Direction::from_tag` (left,
     // right, up, down); the shortcut is AppKit's arrow-key code points
     // (`NSLeftArrowFunctionKey` U+F702, `NSRightArrowFunctionKey` U+F703,
@@ -620,6 +689,9 @@ pub(crate) fn install(
                 NSEventModifierFlags::Control,
             )),
             submenu(mtm, "Select Tab", &select_tab),
+            submenu(mtm, "Select Group", &select_group),
+            move_to_group.clone(),
+            item(mtm, "Rename Group\u{2026}", sel!(renameGroup:), ""),
             // `|` is the Shift character of `\`: the menu matches ⇧⌘\. Grey with a single
             // tab (`TerminalWindow`'s `validateMenuItem:`).
             item(mtm, "Show All Tabs", sel!(showTabList:), "|"),
@@ -691,6 +763,9 @@ pub(crate) fn install(
         menu.setDelegate(Some(ProtocolObject::from_ref(&*shell_delegate)));
     }
     if let Some(menu) = move_to_tab.submenu() {
+        menu.setDelegate(Some(ProtocolObject::from_ref(&*shell_delegate)));
+    }
+    if let Some(menu) = move_to_group.submenu() {
         menu.setDelegate(Some(ProtocolObject::from_ref(&*shell_delegate)));
     }
     shell_delegate

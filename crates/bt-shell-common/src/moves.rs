@@ -177,8 +177,10 @@ pub enum Move {
     /// selected.
     TabToStrip { tab: u64, window: u64, index: usize },
     /// Every other window's tabs join window `into`'s at its end, in strip order, the
-    /// selection staying where it was; the windows they leave close. They join as ungrouped
-    /// tabs: a group belongs to its window.
+    /// selection staying where it was; the windows they leave close. Ungrouped tabs join the
+    /// ungrouped ones; a group comes with its tabs under its own name, made unique where a group
+    /// of that name is there already ([`Groups::unique_name`]). Nothing is undone: the windows
+    /// that close are no picture.
     MergeAllWindows { into: u64 },
     /// Tabs `tabs` of window `window` go where `target` says ([`Groups::place`]): into a group
     /// (before one of its tabs, or last), into a group made for them with a name, or out of any
@@ -858,6 +860,15 @@ fn merge_all_windows(world: &[Window], into: u64) -> Result<Plan, Refusal> {
                 window: into,
                 tab,
                 slot: Slot::End,
+            });
+        }
+        // They joined among the ungrouped; each group's tabs go on into a group of their own,
+        // in the groups' order, so the window keeps the user's grouping and its sequence.
+        for group in other.groups.groups() {
+            steps.push(Step::Regroup {
+                window: into,
+                tabs: other.groups.cluster(&other.order, Some(group.id)),
+                target: Target::New(group.name.clone()),
             });
         }
         steps.extend(other.close_if_emptied());
@@ -2065,6 +2076,84 @@ mod tests {
         assert_eq!(
             super::plan(&world, Move::MergeAllWindows { into: 2 }, &Cramped),
             Err(Refusal::Beep)
+        );
+    }
+
+    #[test]
+    fn merging_all_windows_brings_the_groups_with_their_names() {
+        let mut world = grouped();
+        let mut three = window(
+            3,
+            vec![
+                shape(30, Tree::Leaf(300), 300),
+                shape(31, Tree::Leaf(310), 310),
+            ],
+            30,
+        );
+        three
+            .groups
+            .place(&mut three.order, &[31], Target::New("api".to_owned()));
+        world.push(three);
+        let plan = plan(&world, Move::MergeAllWindows { into: 2 }, &Cramped).unwrap();
+        let end = |tab| Step::AdoptTab {
+            window: 2,
+            tab,
+            slot: Slot::End,
+        };
+        let regroup = |tabs: Vec<u64>, name: &str| Step::Regroup {
+            window: 2,
+            tabs,
+            target: Target::New(name.to_owned()),
+        };
+        assert_eq!(
+            plan.steps,
+            vec![
+                Step::ReleaseTab { window: 1, tab: 11 },
+                Step::ReleaseTab { window: 1, tab: 12 },
+                Step::ReleaseTab { window: 1, tab: 13 },
+                Step::ReleaseTab { window: 1, tab: 10 },
+                end(10),
+                end(11),
+                end(12),
+                end(13),
+                regroup(vec![11, 12], "api"),
+                regroup(vec![13], "web"),
+                Step::CloseIfEmptied { window: 1 },
+                Step::ReleaseTab { window: 3, tab: 31 },
+                Step::ReleaseTab { window: 3, tab: 30 },
+                end(30),
+                end(31),
+                // The same name: the window gives it its own number when the step is played.
+                regroup(vec![31], "api"),
+                Step::CloseIfEmptied { window: 3 },
+            ],
+            "the ungrouped tabs adopt as they did; each group follows them under its name, in \
+             the groups' order"
+        );
+        assert_eq!(plan.undo, None, "the windows that close are no picture");
+
+        // Played on a copy of window 2: the second `api` is made unique where it lands.
+        let mut two = world[1].clone();
+        for tab in [10, 11, 12, 13, 30, 31] {
+            two.groups.append(&mut two.order, tab);
+        }
+        for step in &plan.steps {
+            if let Step::Regroup { tabs, target, .. } = step {
+                two.groups.place(&mut two.order, tabs, target.clone());
+            }
+        }
+        let names: Vec<&str> = two
+            .groups
+            .groups()
+            .iter()
+            .map(|group| group.name.as_str())
+            .collect();
+        assert_eq!(names, ["api", "web", "api 2"]);
+        assert_eq!(two.groups.check(&two.order), Ok(()));
+        assert_eq!(
+            two.groups.cluster(&two.order, None).len(),
+            world[1].order.len() + 2,
+            "the ungrouped tabs of the windows joined the ungrouped"
         );
     }
 

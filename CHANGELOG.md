@@ -12,6 +12,28 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **Tabs can be gathered into named groups in the side column.** Right-click
+  a tab and choose **Move to New Group** (or **Move to Group ▸**), or press
+  ⇧⌘N for a new tab in a group of its own: the group gets a header in the
+  column — an arrow, its name and, with the pointer over it, a `+` that opens
+  a tab in it — and its tabs stand under it. Tabs that are in no group stay at
+  the top of the column with no header, and a window with no group looks as it
+  always did. A new group is named for the folder of its first tab (`~` is
+  `home`, a remote tab gives its host), with its name field already open.
+  Click a header to close the group: it keeps its tab count, a dot when one of
+  its tabs has a question, a failure or a finish you have not seen, and the
+  tab on screen stays listed under it. Double-click a header, or right-click
+  it, to rename the group, add a tab to it, ungroup it or close it. ⌘T opens a
+  tab beside the one on screen, in its group; Shell ▸ New Ungrouped Tab opens
+  one among the ungrouped tabs; ⌘1–9 count the tabs as the column lists them;
+  ⌃⌘1–9 go to the nth group (⌃⌘9 the last), to the tab you were last on in it,
+  and ⌃⌘0 to the ungrouped tabs; hold ⌃⌘ to see the keys on the headers. Moving
+  a tab into or out of a group is undone with Undo Move, the groups come back
+  with the windows when bateri restores them, and Merge All Windows brings
+  every group along under its own name.
+
 ## [0.17.0] - 2026-10-17
 
 ### Added

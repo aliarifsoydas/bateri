@@ -1043,6 +1043,14 @@ impl TerminalTab {
     /// tab adds its own memory of what ended unseen ([`TabIvars::unseen`]): a
     /// pane that closed with its tick on it leaves the tick on the tab.
     pub(crate) fn indicator(&self) -> Option<Indicator> {
+        tabs::indicator(self.signals())
+    }
+
+    /// What the tab reports, all of it: the panes' signals together plus the tab's own memory of
+    /// what ended unseen. The chip reads one indicator off it ([`Self::indicator`]); a group's
+    /// header reads another off all its tabs' together (`tabs::group_indicator`), which a tab's
+    /// one indicator could not give — a failure under a running command would be lost.
+    pub(crate) fn signals(&self) -> Signals {
         let Unseen {
             finished, failed, ..
         } = self.ivars().unseen.get();
@@ -1054,7 +1062,7 @@ impl TerminalTab {
         );
         all.finished |= finished;
         all.failed |= failed;
-        tabs::indicator(all)
+        all
     }
 
     /// Whether the tab is off the screen (its container hidden, or an ancestor's).

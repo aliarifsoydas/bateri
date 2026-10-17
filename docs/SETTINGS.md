@@ -485,6 +485,49 @@ double click there brings it back to 200 pt. Each window keeps its own width,
 a window opened from another starts with that one's, and the width is saved
 with the windows when bateri restores them.
 
+### Tab groups
+
+With the tabs at the side (`tab_position = "side"`) a window's tabs can be
+gathered into named groups. A group is a header in the column — an arrow, its
+name, and with the pointer over it a `+` — and its tabs stand under it; tabs
+that are in no group stay at the top of the column with no header, and a
+window with no group is the column it always was. The groups' items in the
+menus are grey while the tabs are in the bar.
+
+- **Making one.** Right-click a tab ▸ **Move to New Group** (the first group)
+  or **Move to Group ▸ New Group…**; Window ▸ **Move Tab to Group ▸ New
+  Group…** does the same for the tab on screen; Shell ▸ **New Group** (⇧⌘N)
+  opens a new tab in a group of its own. A group is named for the folder of
+  its first tab — `~` is `home`, a remote tab gives its host, nothing to take
+  is `Untitled`, and a name already taken gets ` 2` — and its name field is
+  open on the header so you can type another.
+- **Moving a tab.** Right-click ▸ **Move to Group ▸** a group (the tab's own is
+  ticked and grey) or **Remove from Group**; Window ▸ **Move Tab to Group ▸**
+  does it for the tab on screen. A group that loses its last tab goes. Undo
+  Move takes any of these back.
+- **The header.** A click closes the group or opens it again; a closed group
+  shows how many tabs it holds and, if one of them has a question, a failure,
+  or a finish you have not seen, a dot in that colour — a running command does
+  not show — and the tab on screen stays listed under the header, so you do
+  not lose where you are. The `+` opens a tab at the end of the group. A
+  double click, or right-click ▸ **Rename Group…** (also Window ▸ **Rename
+  Group…** for the group of the tab on screen), opens the name field; the
+  header's menu also has **New Tab in Group**, **Ungroup** (the tabs stay,
+  among the ungrouped) and **Close Group**, which asks the way Close Other
+  Tabs does.
+- **Keys.** ⌘T and New Tab at the foot of the column open beside the tab on
+  screen, in its group (a closed group opens); Shell ▸ **New Ungrouped Tab**
+  opens among the ungrouped tabs. ⌘1–9 count the tabs as the column lists
+  them — a closed group's hidden tabs take no number. ⌃⌘1–8 go to the nth
+  group and ⌃⌘9 to the last, on the tab you were last on in it, opening it if
+  it was closed; ⌃⌘0 goes to the ungrouped tabs, and opens a new one when
+  there is none (Window ▸ **Select Group ▸**). Holding ⌃⌘ shows the keys on
+  the headers.
+- **Elsewhere.** Show All Tabs lists every tab, a closed group's too. The
+  groups are saved with the windows and come back with them
+  (`restore_windows`); Merge All Windows brings every group with its tabs
+  under its own name, ` 2` after one that is taken.
+
 ## If something goes wrong
 
 The error appears in English in the window's title bar. With a single tab it

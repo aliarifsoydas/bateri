@@ -289,6 +289,19 @@ impl<K: Copy + Eq> Groups<K> {
         }
     }
 
+    /// The place in the flat strip of the `listed`th tab the side column lists ([`View::Side`]'s
+    /// order), and the strip's end past the last: what a row dragged or a tab carried to a place of
+    /// the column is let go at, for the appliers that count the strip. A closed group's hidden tabs
+    /// have no place in the column, so the two differ as soon as one is closed; the place is the
+    /// listed tab's own, which puts a tab let go before it beside it (the cluster rule of
+    /// [`Self::insert_at`]).
+    pub fn side_place(&self, tabs: &Tabs<K>, listed: usize) -> usize {
+        self.numbered(tabs, View::Side)
+            .get(listed)
+            .and_then(|&tab| tabs.index_of(tab))
+            .unwrap_or_else(|| tabs.len())
+    }
+
     /// The tab ⌘`tag` reaches ([`tabs::tab_index`]: ⌘9 is the last).
     pub fn shortcut(&self, tabs: &Tabs<K>, view: View, tag: u8) -> Option<K> {
         let numbered = self.numbered(tabs, view);
@@ -1694,6 +1707,27 @@ mod tests {
                 .filter(|entry| *entry == Entry::Header)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn a_column_place_is_the_listed_tabs_place_in_the_strip() {
+        let (tabs, mut groups, _, web) = scene();
+        for listed in 0..tabs.len() {
+            assert_eq!(
+                groups.side_place(&tabs, listed),
+                listed,
+                "nothing is closed"
+            );
+        }
+        assert_eq!(groups.side_place(&tabs, tabs.len()), tabs.len());
+        groups.set_collapsed(web, true);
+        // 6 7 8 | api 1 2 3 | web (4 5 hidden): the column lists six tabs.
+        assert_eq!(groups.side_place(&tabs, 5), 5, "tab 3 is the strip's sixth");
+        assert_eq!(
+            groups.side_place(&tabs, 6),
+            tabs.len(),
+            "past the last listed tab is the strip's end, behind the hidden ones"
         );
     }
 

@@ -122,7 +122,7 @@ use crate::app;
 use crate::arrange::Tool;
 use crate::card::{Ground, Shade, fade_to};
 use crate::embed;
-use crate::groups::{GroupId, Groups, Part, Target};
+use crate::groups::{GroupId, Groups, Item, Part, Reach, Target, View};
 use crate::jobs::Foreground;
 use crate::launch::Closing;
 use crate::moves::{self, Joins, Move};
@@ -134,7 +134,7 @@ use crate::sheets::{self, Asker};
 use crate::split::{Axis, Direction, Tree};
 use crate::split_view::{Hairline, SplitView};
 use crate::tab::{self, TerminalTab};
-use crate::tab_bar::{Label, RowClaim, TabBar};
+use crate::tab_bar::{Heading, Label, RowClaim, TabBar};
 use crate::tabs::{self, Card, Finish, Tabs};
 use crate::undo::{Record, Scene, Shape};
 
@@ -173,6 +173,21 @@ pub(crate) enum Placement {
     End,
     /// At this place in the strip, and the tab is the one on screen: a tab let go on the strip.
     At(usize),
+}
+
+/// Where a new tab sits among the groups ([`TerminalWindow::add_tab_seated`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Seat {
+    /// Beside the tab on screen and in its group, a closed group opening for it: ⌘T, New Tab,
+    /// the foot's `+`.
+    Beside,
+    /// Among the ungrouped tabs, after the last of them: Shell ▸ New Ungrouped Tab, and ⌃⌘0 when
+    /// there is none.
+    Loose,
+    /// At the end of a group, which opens: the `+` of its header.
+    Group(GroupId),
+    /// In a group made for it after the others, with this name: Shell ▸ New Group.
+    New(String),
 }
 
 /// Title of the Shell ▸ Close Tab item: with several panes ⌘W
@@ -899,7 +914,8 @@ define_class!(
                 // lone pane of a lone tab has nothing to leave.
                 tab.panes().len() > 1 || self.ivars().order.borrow().len() > 1
             } else {
-                true
+                // A group item says for itself; an unknown item is `true`.
+                self.validate_group_item(item).unwrap_or(true)
             }
         }
 
@@ -1069,7 +1085,16 @@ define_class!(
             let Ok(tag) = u8::try_from(item.tag()) else {
                 return;
             };
-            let target = self.ivars().order.borrow().by_shortcut(tag);
+            // Down the column ⌘ counts the tabs as listed, a closed group's hidden ones not at all;
+            // the title row lists every tab, in the order of the strip.
+            let target = if self.bar().is_side() {
+                self.ivars()
+                    .groups
+                    .borrow()
+                    .shortcut(&self.ivars().order.borrow(), View::Side, tag)
+            } else {
+                self.ivars().order.borrow().by_shortcut(tag)
+            };
             if let Some(tab) = target {
                 self.select_tab(tab);
             }
@@ -1148,6 +1173,94 @@ define_class!(
             let target = self.ivars().order.borrow().adjacent(false);
             if let Some(tab) = target {
                 self.select_tab(tab);
+            }
+        }
+
+        /// Window ▸ Rename Group… (the group on screen) and a header menu's (the header's): the
+        /// name field opens over the header.
+        #[unsafe(method(renameGroup:))]
+        fn rename_group_action(&self, sender: Option<&AnyObject>) {
+            if let Some(group) = self.menu_group(sender) {
+                self.bar().begin_group_rename(group);
+            }
+        }
+
+        /// Move to Group ▸ a group: the item's `tag` names the group, the tab is its menu's
+        /// ([`Self::submenu_tab`]). A turn later: the move changes the list the menu came from.
+        #[unsafe(method(moveTabToGroup:))]
+        fn move_tab_to_group_action(&self, sender: Option<&AnyObject>) {
+            if let (Some(group), Some(tab)) = (self.menu_group(sender), self.submenu_tab(sender)) {
+                self.later(move |window| {
+                    window.regroup_tab(
+                        tab,
+                        Target::Group {
+                            group,
+                            before: None,
+                        },
+                    );
+                });
+            }
+        }
+
+        /// Move to New Group and Move Tab to Group ▸ New Group…: the tab is in a group of its own
+        /// and the name field is open on its header.
+        #[unsafe(method(moveTabToNewGroup:))]
+        fn move_tab_to_new_group_action(&self, sender: Option<&AnyObject>) {
+            if let Some(tab) = self.menu_tab(sender) {
+                self.later(move |window| window.move_to_new_group(tab));
+            }
+        }
+
+        /// Remove from Group: the tab goes among the ungrouped ones.
+        #[unsafe(method(removeTabFromGroup:))]
+        fn remove_tab_from_group_action(&self, sender: Option<&AnyObject>) {
+            if let Some(tab) = self.menu_tab(sender) {
+                self.later(move |window| {
+                    window.regroup_tab(tab, Target::Loose { before: None });
+                });
+            }
+        }
+
+        /// A header menu's Ungroup: the group's tabs stay, ungrouped.
+        #[unsafe(method(ungroupGroup:))]
+        fn ungroup_group_action(&self, sender: Option<&AnyObject>) {
+            if let Some(group) = self.menu_group(sender) {
+                self.later(move |window| window.ungroup(group));
+            }
+        }
+
+        /// A header menu's Close Group: every tab of the group, under one question.
+        #[unsafe(method(closeGroup:))]
+        fn close_group_action(&self, sender: Option<&AnyObject>) {
+            if let Some(group) = self.menu_group(sender) {
+                self.later(move |window| window.close_group(group));
+            }
+        }
+
+        /// A header menu's New Tab in Group: a tab at the group's end, the group open.
+        #[unsafe(method(newTabInGroup:))]
+        fn new_tab_in_group_action(&self, sender: Option<&AnyObject>) {
+            if let Some(group) = self.menu_group(sender)
+                && let Some(app) = app::delegate(self.mtm())
+            {
+                app.new_tab_seated(self.id(), Seat::Group(group));
+            }
+        }
+
+        /// Window ▸ Select Group ▸ (⌃⌘1…⌃⌘9, ⌃⌘0 the ungrouped tabs): the item's `tag`
+        /// ([`Groups::reach`]); with no ungrouped tab ⌃⌘0 opens one.
+        #[unsafe(method(selectGroup:))]
+        fn select_group_action(&self, sender: Option<&AnyObject>) {
+            let Some(item) = sender.and_then(|sender| sender.downcast_ref::<NSMenuItem>()) else {
+                return;
+            };
+            let Ok(tag) = u8::try_from(item.tag()) else {
+                return;
+            };
+            if self.select_group(tag) == Reach::NewLoose
+                && let Some(app) = app::delegate(self.mtm())
+            {
+                app.new_tab_seated(self.id(), Seat::Loose);
             }
         }
     }
@@ -2042,6 +2155,87 @@ impl TerminalWindow {
         }
     }
 
+    /// The tab an item of a submenu acts on: the one its parent item names (the chip menu's
+    /// Move to Group ▸ is tagged with its tab), else the selected one (the menu bar's).
+    fn submenu_tab(&self, sender: Option<&AnyObject>) -> Option<u64> {
+        let item = sender?.downcast_ref::<NSMenuItem>()?;
+        // SAFETY: reading the item's parent, on the main thread.
+        let parent = unsafe { item.parentItem() };
+        match parent.and_then(|parent| tabs::tab_of_menu_tag(parent.tag())) {
+            Some(id) => self.tab(id).map(|_| id),
+            None => self.try_selected_tab().map(|tab| tab.id()),
+        }
+    }
+
+    /// What the group items of the menus say of themselves: whether they are offered, their
+    /// checkmark and title. `None` for an item that is not a group's.
+    fn validate_group_item(&self, item: &NSMenuItem) -> Option<bool> {
+        let action = item.action()?;
+        let offered = self.groups_shown();
+        if action == sel!(moveTabToNewGroup:) {
+            return Some(offered);
+        }
+        if action == sel!(renameGroup:) {
+            // The group of the tab on screen, or the header's own: none for an ungrouped tab.
+            return Some(offered && self.menu_group_of(item));
+        }
+        if action == sel!(removeTabFromGroup:) {
+            let tab = self.menu_tab_of(item)?;
+            return Some(offered && self.ivars().groups.borrow().group_of(tab).is_some());
+        }
+        if action == sel!(moveTabToGroup:) {
+            // The group its own tab is in is checked and grey: it is where the tab is.
+            let tab = self.submenu_tab_of(item)?;
+            let own = self
+                .ivars()
+                .groups
+                .borrow()
+                .group_of(tab)
+                .map(|group| isize::try_from(group.get()).unwrap_or(isize::MAX));
+            let here = own == Some(item.tag());
+            item.setState(if here {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+            return Some(offered && !here);
+        }
+        if action == sel!(selectGroup:) {
+            let tag = u8::try_from(item.tag()).ok()?;
+            let groups = self.ivars().groups.borrow();
+            let named = match tag {
+                0 => Some("Ungrouped".to_owned()),
+                tag => tabs::tab_index(tag, groups.len())
+                    .map(|index| groups.groups()[index].name.clone()),
+            };
+            item.setTitle(&NSString::from_str(&match (&named, tag) {
+                (Some(name), _) => name.clone(),
+                (None, 9) => "Last Group".to_owned(),
+                (None, tag) => format!("Group {tag}"),
+            }));
+            return Some(offered && named.is_some());
+        }
+        None
+    }
+
+    /// Whether the group a bar item names exists ([`Self::menu_group`] for an item in hand).
+    fn menu_group_of(&self, item: &NSMenuItem) -> bool {
+        let object: &AnyObject = item;
+        self.menu_group(Some(object)).is_some()
+    }
+
+    /// [`Self::menu_tab`] for an item in hand.
+    fn menu_tab_of(&self, item: &NSMenuItem) -> Option<u64> {
+        let object: &AnyObject = item;
+        self.menu_tab(Some(object))
+    }
+
+    /// [`Self::submenu_tab`] for an item in hand.
+    fn submenu_tab_of(&self, item: &NSMenuItem) -> Option<u64> {
+        let object: &AnyObject = item;
+        self.submenu_tab(Some(object))
+    }
+
     /// Whether tab `id` is the selected one — the tab the user left on
     /// screen, whether or not the window is in front.
     pub(crate) fn is_selected(&self, id: u64) -> bool {
@@ -2082,11 +2276,6 @@ impl TerminalWindow {
         if let Some(tab) = self.tab(id) {
             tab.release_card_shots();
         }
-    }
-
-    /// The selected tab's position in the strip.
-    pub(crate) fn selected_index(&self) -> usize {
-        self.ivars().order.borrow().selected_index().unwrap_or(0)
     }
 
     /// Every tab's panes, tab by tab in tree order — the window-wide
@@ -2190,6 +2379,18 @@ impl TerminalWindow {
     /// separator and line take them here. The caller checked
     /// [`Self::selection_free`] before building the tab.
     pub(crate) fn add_tab(&self, tab: &TerminalTab, look: (Theme, ContentEdge)) {
+        self.add_tab_seated(tab, look, &Seat::Beside);
+    }
+
+    /// [`Self::add_tab`] with the place among the groups named: right of the selected tab
+    /// ([`Seat::Beside`], the rule of every plain new tab) or in the group or among the ungrouped
+    /// tabs the user asked for. A group made for the tab, or one it joins, is on screen with it.
+    pub(crate) fn add_tab_seated(
+        &self,
+        tab: &TerminalTab,
+        look: (Theme, ContentEdge),
+        seat: &Seat,
+    ) {
         let (theme, edge) = look;
         self.forget_undo();
         let old = self.ivars().order.borrow().selected();
@@ -2202,7 +2403,14 @@ impl TerminalWindow {
         self.ivars().root.add_container(tab.container());
         // The window's list is the tab's owner.
         self.ivars().tabs.borrow_mut().push(tab.retain());
-        self.with_strip(|groups, order| groups.open(order, tab.id()));
+        self.with_strip(|groups, order| match seat {
+            Seat::Beside => groups.open(order, tab.id()),
+            Seat::Loose => groups.open_loose(order, tab.id()),
+            Seat::Group(group) => groups.open_in(order, tab.id(), *group),
+            Seat::New(name) => {
+                groups.open_in_new_group(order, tab.id(), name);
+            }
+        });
         self.switch(old.as_deref());
         self.layout_changed();
     }
@@ -2723,6 +2931,182 @@ impl TerminalWindow {
         self.layout_changed();
     }
 
+    /// **The applier: a group's name.** Group `group` is called what `draft` says, trimmed; an
+    /// empty name keeps the old one. The strip is not touched, so this does not go through
+    /// [`Self::with_strip`]; the layout it is part of is told, and a record of a move that
+    /// captured the old name is dropped.
+    pub(crate) fn rename_group(&self, group: GroupId, draft: &str) {
+        if !self.ivars().groups.borrow_mut().rename(group, draft) {
+            return;
+        }
+        self.forget_undo();
+        self.refresh_bar();
+        self.layout_changed();
+    }
+
+    /// **The applier: a group opens or closes** in the column. Which tab is on screen does not
+    /// change: a closed group keeps listing it under its header. As [`Self::rename_group`], the
+    /// strip is untouched.
+    pub(crate) fn set_group_collapsed(&self, group: GroupId, collapsed: bool) {
+        if !self
+            .ivars()
+            .groups
+            .borrow_mut()
+            .set_collapsed(group, collapsed)
+        {
+            return;
+        }
+        self.forget_undo();
+        self.refresh_bar();
+        self.layout_changed();
+    }
+
+    /// The group named `name` for the tab on screen: the folder it stands in, made unique
+    /// ([`Groups::suggest_name`]).
+    pub(crate) fn new_group_name(&self, tab: Option<u64>) -> String {
+        let title = tab
+            .and_then(|id| self.tab(id))
+            .or_else(|| self.try_selected_tab())
+            .and_then(|tab| tab.automatic_title())
+            .unwrap_or_default();
+        self.ivars().groups.borrow().suggest_name(&title)
+    }
+
+    /// Where the `listed`th place of the column is in the strip the appliers count
+    /// ([`Groups::side_place`]); in the title row, which lists every tab, the place itself.
+    pub(crate) fn strip_place(&self, listed: usize) -> usize {
+        if self.bar().is_side() {
+            self.ivars()
+                .groups
+                .borrow()
+                .side_place(&self.ivars().order.borrow(), listed)
+        } else {
+            listed
+        }
+    }
+
+    /// The groups the menus list, in order: the group's tag (its identity), its name, and whether
+    /// `tab` is in it ([`Groups::group_of`]).
+    pub(crate) fn group_targets(&self, tab: Option<u64>) -> Vec<(isize, String, bool)> {
+        let groups = self.ivars().groups.borrow();
+        let in_group = tab.and_then(|tab| groups.group_of(tab));
+        groups
+            .groups()
+            .iter()
+            .map(|group| {
+                (
+                    isize::try_from(group.id.get()).unwrap_or(isize::MAX),
+                    group.name.clone(),
+                    in_group == Some(group.id),
+                )
+            })
+            .collect()
+    }
+
+    /// The group a menu item names by its `tag` ([`Self::group_targets`]); a bar item (zero) names
+    /// the group of the tab on screen.
+    fn menu_group(&self, sender: Option<&AnyObject>) -> Option<GroupId> {
+        let tag = sender?.downcast_ref::<NSMenuItem>()?.tag();
+        let groups = self.ivars().groups.borrow();
+        match tag {
+            0 => groups.shown(&self.ivars().order.borrow()),
+            tag => groups
+                .groups()
+                .iter()
+                .find(|group| isize::try_from(group.id.get()) == Ok(tag))
+                .map(|group| group.id),
+        }
+    }
+
+    /// Whether the window offers groups: the column draws their headers; the title row learns to in
+    /// a later step, and until then what only it could not show is not offered.
+    pub(crate) fn groups_shown(&self) -> bool {
+        self.bar().is_side()
+    }
+
+    /// Move to Group, Move to New Group, Remove from Group: tab `tab` goes where `target` says,
+    /// as the move [`moves::Move::RegroupTabs`] — the record Undo Move keeps is the plan's.
+    /// `true` if it moved.
+    pub(crate) fn regroup_tab(&self, tab: u64, target: Target<u64>) -> bool {
+        self.make_move(Move::RegroupTabs {
+            window: self.id(),
+            tabs: vec![tab],
+            target,
+        })
+    }
+
+    /// Move Tab to New Group: the tab is the only one in a group of its own, named for its folder,
+    /// and the name field opens on the header so the user can say better.
+    pub(crate) fn move_to_new_group(&self, tab: u64) {
+        let name = self.new_group_name(Some(tab));
+        if !self.regroup_tab(tab, Target::New(name)) {
+            return;
+        }
+        let made = self.ivars().groups.borrow().group_of(tab);
+        if let Some(made) = made {
+            self.bar().begin_group_rename(made);
+        }
+    }
+
+    /// The name field opens over the header of the group the tab on screen is in: a group that
+    /// was just made opens it the way a group made by Move to New Group does.
+    pub(crate) fn rename_shown_group(&self) {
+        let group = self
+            .ivars()
+            .groups
+            .borrow()
+            .shown(&self.ivars().order.borrow());
+        if let Some(group) = group {
+            self.bar().begin_group_rename(group);
+        }
+    }
+
+    /// ⌃⌘`tag`: the group `tag` names (⌃⌘0 the ungrouped tabs) comes on screen, on the tab the user
+    /// was last on in it ([`Groups::reach`]); a closed group opens first. What it reached comes
+    /// back so the caller can open a tab for ⌃⌘0 where there is none.
+    pub(crate) fn select_group(&self, tag: u8) -> Reach<u64> {
+        let reach = self
+            .ivars()
+            .groups
+            .borrow()
+            .reach(&self.ivars().order.borrow(), tag);
+        if let Reach::Tab { tab, expand } = reach {
+            if let Some(group) = expand {
+                self.set_group_collapsed(group, false);
+            }
+            self.select_tab(tab);
+        }
+        reach
+    }
+
+    /// Close Group: every tab of group `group` closes, under one question when the setting asks.
+    pub(crate) fn close_group(&self, group: GroupId) {
+        let tabs = self
+            .ivars()
+            .groups
+            .borrow()
+            .cluster(&self.ivars().order.borrow(), Some(group));
+        self.close_tabs_asking(tabs);
+    }
+
+    /// Ungroup: the group's tabs stay, among the ungrouped ones, in their order — a regrouping
+    /// like any other, undone with Undo Move.
+    pub(crate) fn ungroup(&self, group: GroupId) {
+        let tabs = self
+            .ivars()
+            .groups
+            .borrow()
+            .cluster(&self.ivars().order.borrow(), Some(group));
+        if tabs.is_empty() {
+            return;
+        }
+        self.make_move(Move::RegroupTabs {
+            window: self.id(),
+            tabs,
+            target: Target::Loose { before: None },
+        });
+    }
+
     /// The window's groups as they stand — what session restore saves
     /// ([`crate::restore::saved_groups`]).
     pub(crate) fn groups(&self) -> Groups<u64> {
@@ -2815,31 +3199,39 @@ impl TerminalWindow {
             .map(|tab| tab.id())
             .filter(|&id| id != keep)
             .collect();
-        let Some(app) = app::delegate(self.mtm()) else {
-            return;
-        };
         if others.is_empty() || !self.select_tab(keep) {
             return;
         }
+        self.close_tabs_asking(others);
+    }
+
+    /// Closes the tabs `ids`, under one question when the setting asks
+    /// ([`foregrounds_to_ask`]) — Close Other Tabs, Close Group. All of the window's tabs are the
+    /// window's close ([`close_scope`]). The question is the window's, from the gate
+    /// ([`Self::ask`]).
+    pub(crate) fn close_tabs_asking(&self, ids: Vec<u64>) {
+        if self.asking() || ids.is_empty() {
+            return;
+        }
+        let Some(app) = app::delegate(self.mtm()) else {
+            return;
+        };
         let confirm = app.settings().confirm_close;
-        let panes: Vec<Retained<TerminalPane>> = others
+        let panes: Vec<Retained<TerminalPane>> = ids
             .iter()
             .filter_map(|&id| self.tab(id))
             .flat_map(|tab| tab.panes())
             .collect();
         let Some(foregrounds) = foregrounds_to_ask(self.ivars().run.is_some(), confirm, &panes)
         else {
-            for id in others {
+            for id in ids {
                 self.close_tab_now(id);
             }
             return;
         };
-        let scope = close_scope(others.len(), self.tab_count());
-        let unit = unit_for(panes.len(), others.len());
-        self.ask(
-            &prompt(scope, unit, &foregrounds),
-            CloseTarget::Tabs(others),
-        );
+        let scope = close_scope(ids.len(), self.tab_count());
+        let unit = unit_for(panes.len(), ids.len());
+        self.ask(&prompt(scope, unit, &foregrounds), CloseTarget::Tabs(ids));
     }
 
     /// Move Split to Previous / Next Tab: the focused pane goes to the
@@ -3312,30 +3704,85 @@ impl TerminalWindow {
     /// from what it is given — and the sheet gate when a tab's question
     /// starts or stops waiting (`sheets`).
     pub(crate) fn refresh_bar(&self) {
-        let tabs = self.tabs();
-        let single = tabs.len() == 1;
-        let labels = tabs
-            .iter()
-            .map(|tab| {
-                let title = if single {
-                    tab.title()
-                } else {
-                    tab.session_title()
-                };
-                let indicator = tab.indicator();
-                Label {
-                    tab: tab.id(),
-                    title: title.unwrap_or_else(|| "bateri".to_owned()),
-                    indicator,
-                    emblem: tab.emblem(indicator),
-                    running: tab.running_for(),
-                    upload: tab.upload(),
-                    mark: tab.host_mark(),
+        let single = self.tab_count() == 1;
+        let side = self.bar().is_side();
+        let label = |tab: &TerminalTab| Self::label_of(tab, single);
+        let order = self.ivars().order.borrow();
+        let groups = self.ivars().groups.borrow();
+        // The column lists headers and hides a closed group's other tabs; the title row shows every
+        // tab, in the order of the strip, until it shows one group at a time.
+        let items: Vec<Item<u64>> = if side {
+            groups.side_items(&order)
+        } else {
+            order.ids().iter().map(|&tab| Item::Tab(tab)).collect()
+        };
+        let mut labels = Vec::with_capacity(items.len());
+        let mut headings = Vec::new();
+        for item in items {
+            match item {
+                Item::Tab(id) => labels.extend(self.tab(id).map(|tab| label(&tab))),
+                Item::Header(id) => {
+                    let Some(group) = groups.group(id) else {
+                        continue;
+                    };
+                    let members = groups.cluster(&order, Some(id));
+                    let signals = tabs::Signals::union(
+                        members
+                            .iter()
+                            .filter_map(|&member| self.tab(member))
+                            .map(|member| member.signals()),
+                    );
+                    headings.push(Heading {
+                        group: id,
+                        name: group.name.clone(),
+                        collapsed: group.collapsed,
+                        tabs: members.len(),
+                        indicator: tabs::group_indicator(signals),
+                        hint: groups
+                            .position(id)
+                            .and_then(|at| tabs::shortcut_digit(at, groups.len())),
+                        first_row: labels.len(),
+                    });
                 }
-            })
-            .collect();
+            }
+        }
+        let selected = order
+            .selected()
+            .and_then(|shown| labels.iter().position(|label| label.tab == shown))
+            .unwrap_or(0);
+        drop((order, groups));
         let notice = self.ivars().notice.borrow().clone();
-        self.bar().show(labels, self.selected_index(), notice);
+        self.bar().show(labels, selected, headings, notice);
+    }
+
+    /// One tab as the bar shows it: a single tab's label is the window's title, an upload's
+    /// prefix included; among several each tab shows its session title.
+    fn label_of(tab: &TerminalTab, single: bool) -> Label {
+        let title = if single {
+            tab.title()
+        } else {
+            tab.session_title()
+        };
+        let indicator = tab.indicator();
+        Label {
+            tab: tab.id(),
+            title: title.unwrap_or_else(|| "bateri".to_owned()),
+            indicator,
+            emblem: tab.emblem(indicator),
+            running: tab.running_for(),
+            upload: tab.upload(),
+            mark: tab.host_mark(),
+        }
+    }
+
+    /// Every tab's label, in the order of the strip — closed groups' hidden tabs too, which the
+    /// column does not list: what Show All Tabs lists.
+    pub(crate) fn all_labels(&self) -> Vec<Label> {
+        let single = self.tab_count() == 1;
+        self.tabs()
+            .iter()
+            .map(|tab| Self::label_of(tab, single))
+            .collect()
     }
 
     /// A transfer of tab `tab` ended as `finish` says (`TerminalTab::upload_ended`): the bar plays
@@ -3586,9 +4033,11 @@ mod tests {
             "selecting a tab must not drop the undo record"
         );
         for applier in [
-            "pub(crate) fn add_tab(",
+            "pub(crate) fn add_tab_seated(",
             "pub(crate) fn close_tab_now(",
             "pub(crate) fn rename_tab(",
+            "pub(crate) fn rename_group(",
+            "pub(crate) fn set_group_collapsed(",
             "pub(crate) fn release_tab(",
             "pub(crate) fn adopt_tab(",
             "pub(crate) fn move_tab(",
@@ -3633,7 +4082,10 @@ mod tests {
         };
         for (applier, operation) in [
             ("pub(crate) fn select_tab(", "groups.select("),
-            ("pub(crate) fn add_tab(", "groups.open("),
+            ("pub(crate) fn add_tab_seated(", "groups.open("),
+            ("pub(crate) fn add_tab_seated(", "groups.open_loose("),
+            ("pub(crate) fn add_tab_seated(", "groups.open_in("),
+            ("pub(crate) fn add_tab_seated(", "groups.open_in_new_group("),
             ("pub(crate) fn release_tab(", "groups.close("),
             ("pub(crate) fn adopt_tab(", "groups.append("),
             ("pub(crate) fn adopt_tab(", "groups.insert_at("),
