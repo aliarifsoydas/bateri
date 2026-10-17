@@ -536,6 +536,18 @@ shows one group at a time instead (see **In the title row** below).
   into another group, or out of its group, leaves the window where it is, on
   the group's next tab; into a group of its own, or when it was the group's
   last tab, the window goes with it. ⌘1–9 count the tabs on the bar.
+- **Picking several tabs.** In the column, ⇧-click picks the rows from the tab on
+  screen to the one clicked, and ⌘-click adds a row to the picks or takes it
+  out; the picked rows wear a quiet accent tone. The picks stay within one
+  group (or the ungrouped tabs): a ⇧- or ⌘-click on a row of another group is a
+  plain click, which opens that tab, and so is any click without ⇧ or ⌘. The
+  tab on screen does not change while you pick, and a click in the terminal,
+  or the tab on screen becoming another, lets the picks go. Right-click a
+  picked row for what can be done to all of them: **Move N Tabs to Group ▸** a
+  group or **New Group…** (one Undo Move takes it back), **Remove N Tabs from
+  Group**, **Move N Tabs to New Window** (ungrouped, in the order they had)
+  and **Close N Tabs…**. ⌘W is that last item: it closes the picked tabs, and
+  asks **whatever runs in them** (see `confirm_close`).
 - **Elsewhere.** Show All Tabs lists every tab, a closed group's too. The
   groups are saved with the windows and come back with them
   (`restore_windows`); Merge All Windows brings every group with its tabs
@@ -790,6 +802,9 @@ cancels.
   counts, because closing also ends the remote session. At an empty prompt the
   tab closes without asking.
 - `"always"` asks at an empty prompt too; `"never"` never asks.
+- ⌘W over tabs picked together in the side column (⇧-click, ⌘-click) asks
+  under `"running"` too, at an empty prompt: a row of tabs gone at once is
+  asked about every time. `"never"` still never asks.
 - Typing `exit` in the shell asks under **no** value: the one asking to close
   is the shell itself.
 - Not counted: background jobs (`sleep 100 &` — zsh warns about those itself

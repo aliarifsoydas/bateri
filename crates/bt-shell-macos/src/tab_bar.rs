@@ -171,7 +171,7 @@ use objc2_quartz_core::{
 use crate::app;
 use crate::arrange;
 use crate::card::{IDENTITY, fitted};
-use crate::groups::GroupId;
+use crate::groups::{Click, GroupId};
 use crate::icon;
 use crate::program::identity::Kind as ProgramKind;
 use crate::search_bar::mix;
@@ -414,6 +414,10 @@ struct Palette {
     lifted_line: Tint,
     lift_shadow: Tint,
     hover: Tint,
+    /// A row picked together with others in the side column: the accent's quiet tone, a face
+    /// under the selected one's.
+    picked: Tint,
+    picked_line: Tint,
     close: Tint,
     close_hover: Tint,
     button: Tint,
@@ -452,6 +456,8 @@ impl Palette {
             lifted_line: ink(0.10),
             lift_shadow: Tint::of(0x000000, 0.6),
             hover: ink(0.05),
+            picked: Tint::of(theme.accent, 0.16),
+            picked_line: Tint::of(theme.accent, 0.28),
             close: ink(0.07),
             close_hover: ink(0.16),
             button: ink(0.06),
@@ -3067,6 +3073,8 @@ pub(crate) struct ChipIvars {
     tab: Cell<u64>,
     selected: Cell<bool>,
     hovered: Cell<bool>,
+    /// Picked together with other tabs in the side column ([`TabBar::pick`]).
+    picked: Cell<bool>,
     /// The one-tab form: a centred title, no fill, no `×`, no click.
     single: Cell<bool>,
     /// Born in this layout: it fades in rather than sliding from nowhere.
@@ -3076,6 +3084,8 @@ pub(crate) struct ChipIvars {
     palette: Cell<Option<Palette>>,
     /// The hover fill, below everything: its own view, so it fades.
     hover: Retained<ChipFace>,
+    /// The picked fill, above the hover and below the selected one.
+    pick: Retained<ChipFace>,
     /// The selected fill, below the label: its own view so the light
     /// theme's shadow falls from the face alone, not from the text.
     face: Retained<ChipFace>,
@@ -3138,11 +3148,17 @@ define_class!(
 
         /// A press selects — on the press, like the system's tabs — and
         /// puts the summary card away. The second press of a double click
-        /// names the tab; any other may become a drag.
+        /// names the tab; any other may become a drag. With ⇧ or ⌘ held, in the side
+        /// column, it picks the row together with others instead and selects nothing
+        /// ([`TabBar::pick`]).
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             if let Some(bar) = self.bar() {
-                bar.pressed(self.ivars().tab.get());
+                let tab = self.ivars().tab.get();
+                bar.pressed(tab);
+                if pick_click(event.modifierFlags()).is_some_and(|click| bar.pick(tab, click)) {
+                    return;
+                }
             }
             let selected = self.select_tab();
             let Some(bar) = self.bar() else {
@@ -3223,6 +3239,7 @@ impl CloseButton {
 impl Chip {
     fn new(mtm: MainThreadMarker, tab: u64) -> Retained<Self> {
         let hover = ChipFace::new(mtm, Face::Hovered);
+        let pick = ChipFace::new(mtm, Face::Picked);
         let face = ChipFace::new(mtm, Face::Selected);
         let lift = ChipFace::new(mtm, Face::Lifted);
         let lines = ChipLines::new(mtm);
@@ -3235,11 +3252,13 @@ impl Chip {
             tab: Cell::new(tab),
             selected: Cell::new(false),
             hovered: Cell::new(false),
+            picked: Cell::new(false),
             single: Cell::new(false),
             fresh: Cell::new(true),
             target: Cell::new(NSRect::ZERO),
             palette: Cell::new(None),
             hover: hover.clone(),
+            pick: pick.clone(),
             face: face.clone(),
             lift: lift.clone(),
             ghost: Cell::new(false),
@@ -3256,11 +3275,13 @@ impl Chip {
         // ivars are set.
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
         hover.setAlphaValue(0.0);
+        pick.setHidden(true);
         lift.setHidden(true);
         let resizing = NSAutoresizingMaskOptions::ViewWidthSizable
             | NSAutoresizingMaskOptions::ViewHeightSizable;
         for view in [
             &**hover as &NSView,
+            &**pick,
             &**face,
             &**lift,
             &**fill_view,
@@ -3269,6 +3290,7 @@ impl Chip {
             view.setAutoresizingMask(resizing);
         }
         this.addSubview(&hover);
+        this.addSubview(&pick);
         this.addSubview(&face);
         this.addSubview(&lift);
         this.addSubview(&fill_view);
@@ -3433,6 +3455,7 @@ impl Chip {
             spoken,
             selected,
             hovered,
+            picked,
             single,
             lifted,
             ghost,
@@ -3440,6 +3463,8 @@ impl Chip {
         } = look;
         let (style, side) = (*style, *side);
         let (selected, hovered, single) = (*selected, *hovered, *single);
+        // Picked is a side row's: the one-tab form has no face to tint.
+        let picked = *picked && !single;
         let (lifted, ghost) = (*lifted && !single, *ghost && !single);
         let glowing = *glowing && !single;
         // The one-tab form is today's title bar: no indicator, no lines, no
@@ -3450,6 +3475,7 @@ impl Chip {
         let iv = self.ivars();
         let changed = iv.selected.replace(selected) != selected
             || iv.hovered.replace(hovered) != hovered
+            || iv.picked.replace(picked) != picked
             || iv.single.replace(single) != single
             || iv.glowing.replace(glowing) != glowing
             || iv.palette.replace(Some(palette)) != Some(palette);
@@ -3490,6 +3516,7 @@ impl Chip {
         if placed {
             let whole = NSRect::new(NSPoint::ZERO, size);
             iv.hover.setFrame(whole);
+            iv.pick.setFrame(whole);
             iv.face.setFrame(whole);
             iv.lift.setFrame(whole);
             iv.fill.setFrame(whole);
@@ -3501,6 +3528,9 @@ impl Chip {
             f64::from(u8::from(hovered && !selected && !single)),
             motion.hover,
         );
+        iv.pick.set(palette);
+        // The tab on screen keeps its own face: picked or not, it is the one the others pick from.
+        iv.pick.setHidden(!picked || selected || lifted);
         iv.face.set(palette);
         iv.face.setHidden(single || !selected || lifted);
         iv.lift.set(palette);
@@ -3532,7 +3562,7 @@ impl Chip {
                 CHIP_PAD,
             )
         } else {
-            let color = if hovered || glowing {
+            let color = if hovered || glowing || picked {
                 palette.title
             } else {
                 palette.dim
@@ -3686,6 +3716,8 @@ struct Look<'a> {
     spoken: String,
     selected: bool,
     hovered: bool,
+    /// Picked together with other tabs ([`TabBar::pick`]): a quiet accent face and full ink.
+    picked: bool,
     /// The one-tab form: a centred title, no fill, no `×`, no click.
     single: bool,
     /// Lifted by the pointer: the tab is being dragged along the strip.
@@ -3717,6 +3749,8 @@ struct Standing {
     naming: bool,
     selected: bool,
     hovered: bool,
+    /// Picked together with other tabs ([`Look::picked`]).
+    picked: bool,
     glowing: bool,
     single: bool,
     lifted: bool,
@@ -3734,6 +3768,7 @@ impl Seen {
             naming,
             selected,
             hovered,
+            picked,
             glowing,
             single,
             lifted,
@@ -3777,6 +3812,7 @@ impl Seen {
             ),
             selected,
             hovered,
+            picked,
             single,
             lifted,
             ghost,
@@ -3790,6 +3826,8 @@ impl Seen {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Face {
     Hovered,
+    /// A row picked together with others: the accent's quiet tone.
+    Picked,
     Selected,
     /// A chip lifted by the pointer: the fill of a tab being dragged.
     Lifted,
@@ -3825,6 +3863,12 @@ define_class!(
             let bounds = self.bounds();
             match self.ivars().face {
                 Face::Hovered => rounded(bounds, TAB_RADIUS, palette.hover, None),
+                Face::Picked => rounded(
+                    bounds,
+                    TAB_RADIUS,
+                    palette.picked,
+                    Some(palette.picked_line),
+                ),
                 Face::Selected => rounded(
                     bounds,
                     TAB_RADIUS,
@@ -3871,7 +3915,7 @@ impl ChipFace {
         let shadow = match iv.face {
             Face::Selected => palette.shadow.map(|tint| cast(tint, 2.0, 1.0)),
             Face::Lifted => Some(cast(palette.lift_shadow, 5.0, 2.0)),
-            Face::Hovered => None,
+            Face::Hovered | Face::Picked => None,
         };
         self.setShadow(shadow.as_deref());
         self.setNeedsDisplay(true);
@@ -5091,6 +5135,65 @@ struct Shown {
     notice: String,
 }
 
+/// The tabs picked together in the side column, and the tab on screen when they were picked: the
+/// selection ends the moment that tab is another ([`kept_picks`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Picks {
+    /// In the order the column lists them.
+    tabs: Vec<u64>,
+    shown: Option<u64>,
+}
+
+/// What of `picks` holds when the bar is shown anew (`selected` indexes `tabs`): nothing in the
+/// title row, where tabs are not picked together; nothing once the tab on screen is another than
+/// the one the picks were made from — a pick is relative to the tab on screen, ⇧ counts from it;
+/// the picked tabs still listed otherwise (a closed group hides its tabs, a closed tab is
+/// gone); and nothing when what is left is the tab on screen alone, which is no selection.
+fn kept_picks(picks: &Picks, tabs: &[Label], selected: usize, side: bool) -> Picks {
+    let screen = tabs.get(selected).map(|label| label.tab);
+    if !side || picks.shown != screen {
+        return Picks::default();
+    }
+    let kept: Vec<u64> = picks
+        .tabs
+        .iter()
+        .copied()
+        .filter(|&tab| tabs.iter().any(|label| label.tab == tab))
+        .collect();
+    if kept.is_empty() || kept.as_slice() == screen.as_slice() {
+        return Picks::default();
+    }
+    Picks {
+        tabs: kept,
+        shown: screen,
+    }
+}
+
+/// How a press on a row with `flags` held picks, if it does: ⇧ (a range from the tab on screen)
+/// or ⌘ (the row joins or leaves), with nothing else a shortcut uses — ⌥⌘ is the arrangement's,
+/// ⌃ a context menu's, and Caps Lock and the like do not count. ⇧⌘ is ⇧: a range, as in a list.
+fn pick_click(flags: NSEventModifierFlags) -> Option<Click> {
+    let chord = NSEventModifierFlags::Command
+        | NSEventModifierFlags::Shift
+        | NSEventModifierFlags::Option
+        | NSEventModifierFlags::Control;
+    let held = flags.intersection(chord);
+    let other = NSEventModifierFlags::Option | NSEventModifierFlags::Control;
+    if held.is_empty() || !held.intersection(other).is_empty() {
+        None
+    } else if held.contains(NSEventModifierFlags::Shift) {
+        Some(Click::Range)
+    } else {
+        Some(Click::Toggle)
+    }
+}
+
+/// A menu title that counts tabs: "Close 3 Tabs…".
+pub(crate) fn counted(verb: &str, count: usize, tail: &str) -> String {
+    let noun = if count == 1 { "Tab" } else { "Tabs" };
+    format!("{verb} {count} {noun}{tail}")
+}
+
 /// The open summary card: whose, and what it tells (`TerminalTab::card`,
 /// read again when what the tab's chip shows changes; between two reads its
 /// running time moves by the time since the read — the command's own clock
@@ -5273,6 +5376,20 @@ pub(crate) struct BarIvars {
     /// ⌘'s `hint_wait` and `hint_pending`, for ⌃⌘.
     group_wait: Cell<u64>,
     group_pending: Cell<bool>,
+    /// The tabs picked together in the column ([`TabBar::pick`]).
+    picks: RefCell<Picks>,
+    /// The watch of presses that lets the picks go when one lands off the column: a local monitor
+    /// that is there only while something is picked.
+    pick_watch: RefCell<Option<Retained<AnyObject>>>,
+}
+
+impl Drop for BarIvars {
+    fn drop(&mut self) {
+        if let Some(token) = self.pick_watch.get_mut().take() {
+            // SAFETY: the token is the one `addLocalMonitor…` gave.
+            unsafe { NSEvent::removeMonitor(&token) };
+        }
+    }
 }
 
 define_class!(
@@ -5485,6 +5602,8 @@ impl TabBar {
             group_hints: Cell::new(false),
             group_wait: Cell::new(0),
             group_pending: Cell::new(false),
+            picks: RefCell::new(Picks::default()),
+            pick_watch: RefCell::new(None),
             target: Cell::new(None),
             dwelling: Cell::new(None),
             mark: Cell::new(None),
@@ -5576,6 +5695,8 @@ impl TabBar {
         };
         let before = open.and_then(|tab| told(&iv.shown.borrow(), tab));
         let listed = iv.list_open.get().then(|| self.listing());
+        let kept = kept_picks(&iv.picks.borrow(), &tabs, selected, self.is_side());
+        self.store_picks(kept);
         iv.shown.replace(Shown {
             tabs,
             headings,
@@ -6014,6 +6135,7 @@ impl TabBar {
                         || carried.is_some()
                         || iv.target.get() == Some(label.tab))
                         && !naming,
+                    picked: false,
                     glowing: glowing[index],
                     single,
                     lifted: carried.is_some(),
@@ -6301,6 +6423,11 @@ impl TabBar {
         // A menu is no place for the card; and the pointer resting on the
         // chip after it closes is not a reason to open it.
         self.pressed(tab);
+        // A row among the ones picked together speaks for all of them.
+        let picks = self.picks();
+        if picks.contains(&tab) {
+            return Some(self.picks_menu(&window, &picks));
+        }
         let mtm = self.mtm();
         let menu = NSMenu::new(mtm);
         let tag = tabs::menu_tag(tab);
@@ -6329,6 +6456,79 @@ impl TabBar {
         add("Rename Tab\u{2026}", sel!(renameTab:));
         self.add_group_items(&menu, &window, tab);
         Some(menu)
+    }
+
+    /// The menu of the tabs picked together, on a right click on one of them: what can be done
+    /// to all of them at once — into a group, out of it, to a window of their own, closed. The
+    /// items act on the picks as they stand when one is chosen ([`TabBar::picks`]); the picks
+    /// are of one cluster, so the first one's group is theirs ([`TerminalWindow::group_targets`]).
+    fn picks_menu(&self, window: &TerminalWindow, picks: &[u64]) -> Retained<NSMenu> {
+        let mtm = self.mtm();
+        let menu = NSMenu::new(mtm);
+        let count = picks.len();
+        let targets = window.group_targets(picks.first().copied());
+        if targets.is_empty() {
+            menu.addItem(&window_item(
+                mtm,
+                window,
+                &counted("Move", count, " to New Group"),
+                sel!(movePickedToNewGroup:),
+                0,
+            ));
+        } else {
+            let submenu = NSMenu::new(mtm);
+            for (group, name, _) in &targets {
+                submenu.addItem(&window_item(
+                    mtm,
+                    window,
+                    name,
+                    sel!(movePickedToGroup:),
+                    *group,
+                ));
+            }
+            submenu.addItem(&NSMenuItem::separatorItem(mtm));
+            submenu.addItem(&window_item(
+                mtm,
+                window,
+                "New Group\u{2026}",
+                sel!(movePickedToNewGroup:),
+                0,
+            ));
+            let holder = NSMenuItem::new(mtm);
+            holder.setTitle(&NSString::from_str(&counted("Move", count, " to Group")));
+            holder.setSubmenu(Some(&submenu));
+            menu.addItem(&holder);
+        }
+        if targets.iter().any(|(_, _, here)| *here) {
+            menu.addItem(&window_item(
+                mtm,
+                window,
+                &counted("Remove", count, " from Group"),
+                sel!(removePickedFromGroup:),
+                0,
+            ));
+        }
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        menu.addItem(&window_item(
+            mtm,
+            window,
+            &counted("Move", count, " to New Window"),
+            sel!(detachPicked:),
+            0,
+        ));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let close = window_item(
+            mtm,
+            window,
+            &counted("Close", count, "\u{2026}"),
+            sel!(closePicked:),
+            0,
+        );
+        // The key that does it from the keyboard: ⌘W closes what is picked.
+        close.setKeyEquivalent(ns_string!("w"));
+        close.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+        menu.addItem(&close);
+        menu
     }
 
     /// The chip menu's group items for tab `tab`: Move to New Group while no group exists, else
@@ -6485,10 +6685,103 @@ impl TabBar {
         }
     }
 
-    /// A chip was pressed: the window's applier selects it; `false` if it would not.
+    /// A chip was pressed: the window's applier selects it; `false` if it would not. Whatever
+    /// was picked together lets go: a press that opens a tab is a plain one.
     fn select(&self, tab: u64) -> bool {
+        self.drop_picks();
         self.terminal_window()
             .is_some_and(|window| window.select_tab(tab))
+    }
+
+    // ─── Picking tabs together ───────────────────────────────────────────
+
+    /// The tabs picked together in the column, in its order; none while nothing is.
+    pub(crate) fn picks(&self) -> Vec<u64> {
+        self.ivars().picks.borrow().tabs.clone()
+    }
+
+    /// A press on tab `tab`'s row with ⇧ or ⌘ held: `true` if it picked (the tab on screen stays
+    /// where it is and the press is no drag), `false` if it comes to a plain press — a press of
+    /// another cluster than the picks', or one in the title row — which the caller goes on to
+    /// handle as it always did. The rule is [`TerminalWindow::pick`]'s, [`crate::groups::Groups::pick`].
+    fn pick(&self, tab: u64, click: Click) -> bool {
+        if !self.is_side() {
+            return false;
+        }
+        let Some(window) = self.terminal_window() else {
+            return false;
+        };
+        let picked = window.pick(&self.picks(), click, tab);
+        if picked.open.is_some() {
+            return false;
+        }
+        let shown = window.try_selected_tab().map(|selected| selected.id());
+        self.ivars().drag.set(None);
+        self.store_picks(Picks {
+            tabs: picked.picks,
+            shown,
+        });
+        self.lay_out();
+        true
+    }
+
+    /// Lets the picks go, if there are any.
+    pub(crate) fn drop_picks(&self) {
+        if !self.ivars().picks.borrow().tabs.is_empty() {
+            self.store_picks(Picks::default());
+            self.lay_out();
+        }
+    }
+
+    /// Keeps `picks`, with the watch of presses there while something is picked. No layout: the
+    /// callers have one coming or ask for it.
+    fn store_picks(&self, picks: Picks) {
+        let iv = self.ivars();
+        let picked = !picks.tabs.is_empty();
+        if iv.picks.replace(picks.clone()) == picks {
+            return;
+        }
+        let watching = iv.pick_watch.borrow().is_some();
+        if picked && !watching {
+            let window = iv.window;
+            let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+                // audit: a local monitor runs on the main thread, before `sendEvent:`.
+                let mtm =
+                    MainThreadMarker::new().expect("a local event monitor runs on the main thread");
+                if let Some(window) = app::delegate(mtm).and_then(|app| app.window(window)) {
+                    // SAFETY: AppKit gives the monitor a valid event.
+                    window.bar().pressed_off_picks(unsafe { event.as_ref() });
+                }
+                event.as_ptr()
+            });
+            // SAFETY: the block returns the valid event it was given.
+            let token = unsafe {
+                NSEvent::addLocalMonitorForEventsMatchingMask_handler(
+                    NSEventMask::LeftMouseDown,
+                    &block,
+                )
+            };
+            iv.pick_watch.replace(token);
+        } else if !picked && let Some(token) = iv.pick_watch.take() {
+            // SAFETY: the token is the one `addLocalMonitor…` gave.
+            unsafe { NSEvent::removeMonitor(&token) };
+        }
+    }
+
+    /// A press of the window, as the watch sees it before the window does: one that lands off
+    /// the column — in the terminal — lets the picks go, and goes on to its own work. A press in
+    /// the column is the rows' and the headers' to take.
+    fn pressed_off_picks(&self, event: &NSEvent) {
+        let (Some(own), Some(from)) = (self.window(), event.window(self.mtm())) else {
+            return;
+        };
+        if !std::ptr::eq(&*own, &*from) {
+            return;
+        }
+        let at = self.convertPoint_fromView(event.locationInWindow(), None);
+        if !contains(self.bounds(), at) {
+            self.drop_picks();
+        }
     }
 
     // ─── Dragging a tab ──────────────────────────────────────────────────
@@ -7569,12 +7862,13 @@ mod tests {
     use super::{
         BADGE_DOT, BADGE_HALO, BADGE_SIDE, Badge, CARD_BESIDE, CARD_EDGE, CARD_PAD_X, CARD_RISE,
         CARD_SCALE, CARD_SLIDE, CHIP_ABOVE, CHIP_HEIGHT, DISCS, Emblem, GLYPH_OVERHANG, GlyphLook,
-        HOLLOW_ROOM, IconStyle, Motion, Palette, ROW_LEFT, Spin, TAB_RADIUS, TILE_BADGE_INSET,
-        TILE_ROOM, Tint, TitleAction, badge_centre, card_arrival, card_beside, card_x,
-        command_alone, contains, disc_side, glyph_slot, inks, line_span, single_label, spin_of,
-        title_double_click,
+        HOLLOW_ROOM, IconStyle, Label, Motion, Palette, Picks, ROW_LEFT, Spin, TAB_RADIUS,
+        TILE_BADGE_INSET, TILE_ROOM, Tint, TitleAction, badge_centre, card_arrival, card_beside,
+        card_x, command_alone, contains, counted, disc_side, glyph_slot, inks, kept_picks,
+        line_span, pick_click, single_label, spin_of, title_double_click,
     };
     use super::{MAP_SCRIM_NAME_ONLY, TileShot, paint_tile};
+    use crate::groups::Click;
     use crate::icon;
     use crate::program::identity::{Agent, Kind as ProgramKind};
     use crate::split::Rect;
@@ -8232,5 +8526,86 @@ mod tests {
         assert!(!command_alone(command | NSEventModifierFlags::Shift));
         assert!(!command_alone(command | NSEventModifierFlags::Option));
         assert!(!command_alone(NSEventModifierFlags::empty()));
+    }
+
+    /// ⇧ picks a range and ⌘ one row, alone or with Caps Lock; ⌥⌘ is the arrangement's and ⌃ opens
+    /// a context menu, so neither picks; no modifier is a plain press.
+    #[test]
+    fn shift_and_command_pick_and_nothing_else_does() {
+        let (shift, command) = (NSEventModifierFlags::Shift, NSEventModifierFlags::Command);
+        assert_eq!(pick_click(shift), Some(Click::Range));
+        assert_eq!(pick_click(command), Some(Click::Toggle));
+        assert_eq!(pick_click(command | shift), Some(Click::Range));
+        assert_eq!(
+            pick_click(command | NSEventModifierFlags::CapsLock),
+            Some(Click::Toggle)
+        );
+        assert_eq!(pick_click(NSEventModifierFlags::empty()), None);
+        assert_eq!(pick_click(NSEventModifierFlags::CapsLock), None);
+        assert_eq!(pick_click(command | NSEventModifierFlags::Option), None);
+        assert_eq!(pick_click(shift | NSEventModifierFlags::Control), None);
+    }
+
+    fn row(tab: u64) -> Label {
+        Label {
+            tab,
+            title: format!("tab {tab}"),
+            indicator: None,
+            emblem: Emblem {
+                kind: ProgramKind::Shell,
+                edges: 1,
+            },
+            running: None,
+            upload: None,
+            mark: bt_core::HostMark::None,
+        }
+    }
+
+    /// The picks live with the tab on screen they were made from: another tab on screen, a mode
+    /// without a column, a tab no longer listed, or what is left being the tab on screen alone
+    /// ends them; otherwise what is listed stays.
+    #[test]
+    fn picks_hold_only_while_the_tab_they_count_from_is_on_screen() {
+        let rows: Vec<Label> = (1..=5).map(row).collect();
+        let picks = Picks {
+            tabs: vec![2, 3, 4],
+            shown: Some(2),
+        };
+        // The tab on screen is the third row's tab 3: the picks were made from tab 2.
+        assert_eq!(kept_picks(&picks, &rows, 2, true), Picks::default());
+        assert_eq!(kept_picks(&picks, &rows, 1, true), picks);
+        // In the title row nothing is picked together.
+        assert_eq!(kept_picks(&picks, &rows, 1, false), Picks::default());
+        // A closed tab or a closed group's hidden tab leaves the picks.
+        let fewer: Vec<Label> = [1, 2, 4, 5].into_iter().map(row).collect();
+        assert_eq!(
+            kept_picks(&picks, &fewer, 1, true),
+            Picks {
+                tabs: vec![2, 4],
+                shown: Some(2),
+            }
+        );
+        // What is left being the tab on screen alone is no selection; none left is none.
+        let alone: Vec<Label> = [1, 2, 5].into_iter().map(row).collect();
+        assert_eq!(kept_picks(&picks, &alone, 1, true), Picks::default());
+        let none: Vec<Label> = [1, 2, 5].into_iter().map(row).collect();
+        let others = Picks {
+            tabs: vec![3, 4],
+            shown: Some(2),
+        };
+        assert_eq!(kept_picks(&others, &none, 1, true), Picks::default());
+        // A pick that is not the tab on screen survives alone: ⌘ took the tab on screen out.
+        let apart = Picks {
+            tabs: vec![4],
+            shown: Some(2),
+        };
+        assert_eq!(kept_picks(&apart, &rows, 1, true), apart);
+    }
+
+    #[test]
+    fn menu_titles_count_the_tabs() {
+        assert_eq!(counted("Close", 3, "\u{2026}"), "Close 3 Tabs\u{2026}");
+        assert_eq!(counted("Move", 2, " to Group"), "Move 2 Tabs to Group");
+        assert_eq!(counted("Close", 1, ""), "Close 1 Tab");
     }
 }

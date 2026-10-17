@@ -122,7 +122,7 @@ use crate::app;
 use crate::arrange::Tool;
 use crate::card::{Ground, Shade, fade_to};
 use crate::embed;
-use crate::groups::{GroupId, Groups, Item, Part, Reach, Target, View};
+use crate::groups::{Click, GroupId, Groups, Item, Part, Picked, Reach, Target, View};
 use crate::jobs::Foreground;
 use crate::launch::Closing;
 use crate::moves::{self, Joins, Move};
@@ -134,7 +134,7 @@ use crate::sheets::{self, Asker};
 use crate::split::{Axis, Direction, Tree};
 use crate::split_view::{Hairline, SplitView};
 use crate::tab::{self, TerminalTab};
-use crate::tab_bar::{Heading, Label, RowClaim, SwitchRow, Switcher, TabBar};
+use crate::tab_bar::{Heading, Label, RowClaim, SwitchRow, Switcher, TabBar, counted};
 use crate::tabs::{self, Card, Finish, Tabs};
 use crate::undo::{Record, Scene, Shape};
 
@@ -197,6 +197,12 @@ pub(crate) fn close_title(panes: usize) -> &'static str {
     if panes > 1 { "Close" } else { "Close Tab" }
 }
 
+/// Title of the Shell ▸ Close Tab item while tabs are picked together in the side column: ⌘W
+/// closes all of them ([`TerminalWindow::close_picked`]).
+pub(crate) fn close_picked_title(count: usize) -> String {
+    counted("Close", count, "")
+}
+
 /// What is being closed — chooses the question's title and confirm button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CloseScope {
@@ -236,9 +242,15 @@ pub(crate) fn close_scope(requested: usize, tabs: usize) -> CloseScope {
 /// `running`, and a headless question with no guard set up would hang `make
 /// smoke`. The process table (`running`) is read only if the answer depends
 /// on it, i.e. only under `running`.
+///
+/// **The one exception** is `selected`, ⌘W over tabs the user picked together in the side
+/// column: it asks under `running` too, with nothing running in them (`never` still does not).
+/// The hand that reaches for ⌘W to close one tab reaches for it to close five, and a row of
+/// tabs gone for good at an empty prompt is not a thing to undo.
 pub(crate) fn should_ask(
     timed: bool,
     confirm: ConfirmClose,
+    selected: bool,
     running: impl FnOnce() -> bool,
 ) -> bool {
     if timed {
@@ -247,7 +259,7 @@ pub(crate) fn should_ask(
     match confirm {
         ConfirmClose::Never => false,
         ConfirmClose::Always => true,
-        ConfirmClose::Running => running(),
+        ConfirmClose::Running => selected || running(),
     }
 }
 
@@ -264,6 +276,17 @@ pub(crate) fn foregrounds_to_ask(
     confirm: ConfirmClose,
     panes: &[Retained<TerminalPane>],
 ) -> Option<Vec<Foreground>> {
+    foregrounds_to_ask_for(timed, confirm, false, panes)
+}
+
+/// [`foregrounds_to_ask`] for a close that may be of tabs picked together (`selected`,
+/// [`should_ask`]'s exception).
+pub(crate) fn foregrounds_to_ask_for(
+    timed: bool,
+    confirm: ConfirmClose,
+    selected: bool,
+    panes: &[Retained<TerminalPane>],
+) -> Option<Vec<Foreground>> {
     let read = || {
         panes
             .iter()
@@ -271,7 +294,7 @@ pub(crate) fn foregrounds_to_ask(
             .collect::<Vec<_>>()
     };
     let mut seen = None;
-    let ask = should_ask(timed, confirm, || {
+    let ask = should_ask(timed, confirm, selected, || {
         let foregrounds = read();
         let running = foregrounds
             .iter()
@@ -851,7 +874,12 @@ define_class!(
             let tab = self.selected_tab();
             // No `return`: `define_class!` converts the `bool` at the end of the body.
             if action == Some(sel!(closeTab:)) {
-                item.setTitle(&NSString::from_str(close_title(tab.panes().len())));
+                let picked = self.bar().picks().len();
+                item.setTitle(&NSString::from_str(&if picked > 0 {
+                    close_picked_title(picked)
+                } else {
+                    close_title(tab.panes().len()).to_owned()
+                }));
                 true
             } else if [
                 sel!(showNextTab:),
@@ -1056,9 +1084,13 @@ define_class!(
         /// Shell ▸ Close Tab (⌘W): with several panes the **focused pane**,
         /// with one pane **only this tab** (the window in its last tab);
         /// asking if needed. The question and the closing take the same path
-        /// as the tab's `×`.
+        /// as the tab's `×`. With tabs picked together in the side column it is **all of
+        /// them**, and it always asks ([`should_ask`]).
         #[unsafe(method(closeTab:))]
         fn close_tab(&self, _sender: Option<&AnyObject>) {
+            if self.close_picked() {
+                return;
+            }
             let tab = self.selected_tab();
             if tab.panes().len() > 1 {
                 self.close_pane_asking(&tab);
@@ -1140,6 +1172,62 @@ define_class!(
             if let Some(id) = self.menu_tab(sender) {
                 self.later(move |window| window.close_other_tabs(id));
             }
+        }
+
+        /// The picked tabs' menu: Close N Tabs… A turn later, as every action that takes tabs
+        /// out from under the menu's chip.
+        #[unsafe(method(closePicked:))]
+        fn close_picked_action(&self, _sender: Option<&AnyObject>) {
+            self.later(|window| {
+                window.close_picked();
+            });
+        }
+
+        /// The picked tabs' menu: Move N Tabs to New Window, ungrouped, in the order they had.
+        #[unsafe(method(detachPicked:))]
+        fn detach_picked_action(&self, _sender: Option<&AnyObject>) {
+            self.later(|window| {
+                let tabs = window.bar().picks();
+                if !tabs.is_empty() {
+                    window.make_move(Move::TabsToNewWindow {
+                        window: window.id(),
+                        tabs,
+                        at: None,
+                    });
+                }
+            });
+        }
+
+        /// The picked tabs' menu: Move N Tabs to Group ▸ a group (the item's `tag`).
+        #[unsafe(method(movePickedToGroup:))]
+        fn move_picked_to_group_action(&self, sender: Option<&AnyObject>) {
+            if let Some(group) = self.menu_group(sender) {
+                self.later(move |window| {
+                    window.regroup_picked(Target::Group {
+                        group,
+                        before: None,
+                    });
+                });
+            }
+        }
+
+        /// The picked tabs' menu: Move N Tabs to New Group (and Move to Group ▸ New Group…).
+        #[unsafe(method(movePickedToNewGroup:))]
+        fn move_picked_to_new_group_action(&self, _sender: Option<&AnyObject>) {
+            self.later(|window| {
+                let tabs = window.bar().picks();
+                if window.move_tabs_to_new_group(&tabs) {
+                    window.bar().drop_picks();
+                }
+            });
+        }
+
+        /// The picked tabs' menu: Remove N Tabs from Group.
+        #[unsafe(method(removePickedFromGroup:))]
+        fn remove_picked_from_group_action(&self, _sender: Option<&AnyObject>) {
+            self.later(|window| {
+                window.regroup_picked(Target::Loose { before: None });
+            });
         }
 
         /// Window ▸ Move Tab to New Window (the selected tab) and the chip
@@ -2192,6 +2280,23 @@ impl TerminalWindow {
             });
             return Some(!here);
         }
+        if action == sel!(movePickedToGroup:) {
+            // Where every picked tab already is, the group is checked and grey.
+            let picks = self.bar().picks();
+            let groups = self.ivars().groups.borrow();
+            let here = !picks.is_empty()
+                && picks.iter().all(|&tab| {
+                    groups
+                        .group_of(tab)
+                        .is_some_and(|group| isize::try_from(group.get()) == Ok(item.tag()))
+                });
+            item.setState(if here {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+            return Some(!here);
+        }
         if action == sel!(selectGroup:) {
             let tag = u8::try_from(item.tag()).ok()?;
             let groups = self.ivars().groups.borrow();
@@ -3053,14 +3158,67 @@ impl TerminalWindow {
     /// Move Tab to New Group: the tab is the only one in a group of its own, named for its folder,
     /// and the name field opens on the header so the user can say better.
     pub(crate) fn move_to_new_group(&self, tab: u64) {
-        let name = self.new_group_name(Some(tab));
-        if !self.regroup_tab(tab, Target::New(name)) {
-            return;
+        self.move_tabs_to_new_group(&[tab]);
+    }
+
+    /// The tabs `tabs` are the tabs of a group of their own, in the order they had, named for the
+    /// first one's folder; the name field opens on the header. `true` if they moved.
+    pub(crate) fn move_tabs_to_new_group(&self, tabs: &[u64]) -> bool {
+        let Some(&first) = tabs.first() else {
+            return false;
+        };
+        let name = self.new_group_name(Some(first));
+        let moved = self.make_move(Move::RegroupTabs {
+            window: self.id(),
+            tabs: tabs.to_vec(),
+            target: Target::New(name),
+        });
+        if !moved {
+            return false;
         }
-        let made = self.ivars().groups.borrow().group_of(tab);
+        let made = self.ivars().groups.borrow().group_of(first);
         if let Some(made) = made {
             self.bar().begin_group_rename(made);
         }
+        true
+    }
+
+    /// The tabs picked together in the side column go where `target` says, as one move
+    /// ([`moves::Move::RegroupTabs`], one Undo Move); the picks let go once they have moved.
+    fn regroup_picked(&self, target: Target<u64>) {
+        let tabs = self.bar().picks();
+        if tabs.is_empty() {
+            return;
+        }
+        if self.make_move(Move::RegroupTabs {
+            window: self.id(),
+            tabs,
+            target,
+        }) {
+            self.bar().drop_picks();
+        }
+    }
+
+    /// What a ⇧ or ⌘ press on the row of `tab` comes to, given the tabs picked together now
+    /// ([`Groups::pick`]).
+    pub(crate) fn pick(&self, picks: &[u64], click: Click, tab: u64) -> Picked<u64> {
+        let ivars = self.ivars();
+        ivars
+            .groups
+            .borrow()
+            .pick(&ivars.order.borrow(), picks, click, tab)
+    }
+
+    /// ⌘W with tabs picked together in the side column: they close, all of them, under one
+    /// question that comes whatever runs in them ([`should_ask`]). `false` when nothing is
+    /// picked, and ⌘W is the usual one.
+    pub(crate) fn close_picked(&self) -> bool {
+        let tabs = self.bar().picks();
+        if tabs.is_empty() {
+            return false;
+        }
+        self.close_tabs_with(tabs, true);
+        true
     }
 
     /// The name field opens over the header of the group the tab on screen is in: a group that
@@ -3256,6 +3414,12 @@ impl TerminalWindow {
     /// window's close ([`close_scope`]). The question is the window's, from the gate
     /// ([`Self::ask`]).
     pub(crate) fn close_tabs_asking(&self, ids: Vec<u64>) {
+        self.close_tabs_with(ids, false);
+    }
+
+    /// [`Self::close_tabs_asking`], for `selected` tabs the user picked together too: that asks
+    /// under `confirm_close = "running"` with nothing running ([`should_ask`]).
+    fn close_tabs_with(&self, ids: Vec<u64>, selected: bool) {
         if self.asking() || ids.is_empty() {
             return;
         }
@@ -3268,7 +3432,8 @@ impl TerminalWindow {
             .filter_map(|&id| self.tab(id))
             .flat_map(|tab| tab.panes())
             .collect();
-        let Some(foregrounds) = foregrounds_to_ask(self.ivars().run.is_some(), confirm, &panes)
+        let Some(foregrounds) =
+            foregrounds_to_ask_for(self.ivars().run.is_some(), confirm, selected, &panes)
         else {
             for id in ids {
                 self.close_tab_now(id);
@@ -4347,7 +4512,7 @@ mod tests {
         for confirm in ALL {
             for busy in [false, true] {
                 let reads = Cell::new(0);
-                let ask = should_ask(true, confirm, || {
+                let ask = should_ask(true, confirm, true, || {
                     reads.set(reads.get() + 1);
                     busy
                 });
@@ -4365,8 +4530,8 @@ mod tests {
                 reads.set(reads.get() + 1);
                 busy
             };
-            assert!(!should_ask(false, ConfirmClose::Never, read));
-            assert!(should_ask(false, ConfirmClose::Always, read));
+            assert!(!should_ask(false, ConfirmClose::Never, false, read));
+            assert!(should_ask(false, ConfirmClose::Always, false, read));
             assert_eq!(reads.get(), 0, "read while the decision is table-free");
         }
     }
@@ -4375,7 +4540,7 @@ mod tests {
     fn running_asks_only_while_a_job_runs() {
         let reads = Cell::new(0);
         let ask = |busy| {
-            should_ask(false, ConfirmClose::Running, || {
+            should_ask(false, ConfirmClose::Running, false, || {
                 reads.set(reads.get() + 1);
                 busy
             })
@@ -4383,6 +4548,30 @@ mod tests {
         assert!(ask(true));
         assert!(!ask(false));
         assert_eq!(reads.get(), 2);
+    }
+
+    #[test]
+    fn tabs_picked_together_ask_under_running_but_never_under_never() {
+        // ⌘W over a selection is the one asking that ignores what runs: an empty prompt asks
+        // under `running`, and the table is not read for the decision. `never` stays never, and a
+        // timed run (no settings, a headless question would hang) still does not ask.
+        let reads = Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            false
+        };
+        assert!(should_ask(false, ConfirmClose::Running, true, read));
+        assert!(should_ask(false, ConfirmClose::Always, true, read));
+        assert!(!should_ask(false, ConfirmClose::Never, true, read));
+        assert!(!should_ask(true, ConfirmClose::Running, true, read));
+        assert_eq!(
+            reads.get(),
+            0,
+            "the table was read for a decision it does not make"
+        );
+        // One tab alone asks only while something runs, as it always did.
+        assert!(!should_ask(false, ConfirmClose::Running, false, read));
+        assert_eq!(reads.get(), 1);
     }
 
     #[test]

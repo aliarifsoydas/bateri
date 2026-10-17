@@ -39,7 +39,14 @@ of every installed copy. A version without a section is not released.
   it to list the window's groups — choose one to go to it, or New Group —
   double-click it to rename the group, right-click it to ungroup or close it.
   Moving the tab on screen into another group leaves the window where it is,
-  on the group's next tab.
+  on the group's next tab. In the side column ⇧-click picks the rows from the
+  tab on screen to the one you click and ⌘-click adds a row or takes it out,
+  within one group (or among the ungrouped tabs) — the tab on screen stays
+  where it is, and a plain click, a click on a row of another group or a click
+  in the terminal lets the picks go. Right-click a picked row to move all of
+  them into a group or a new one, out of their group, to a window of their
+  own, or to close them; ⌘W closes the picked tabs and, unlike ⌘W on one tab,
+  always asks first (`confirm_close = "never"` still does not).
 
 ## [0.17.0] - 2026-10-17
 

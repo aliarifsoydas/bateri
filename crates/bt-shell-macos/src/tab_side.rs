@@ -438,6 +438,7 @@ impl TabBar {
         };
         // The rows live in the list's space: its top-left corner is theirs.
         iv.strip.setFrame(ns_rect(column.list));
+        let picks = iv.picks.borrow().tabs.clone();
         for (index, chip) in chips.iter().enumerate() {
             let label = &shown.tabs[index];
             let naming = iv.renaming.get() == Some(label.tab);
@@ -470,6 +471,7 @@ impl TabBar {
                         || carried.is_some()
                         || iv.target.get() == Some(label.tab))
                         && !naming,
+                    picked: picks.contains(&label.tab) && !naming,
                     glowing: glowing[index],
                     single: false,
                     lifted: carried.is_some(),
