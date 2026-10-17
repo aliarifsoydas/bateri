@@ -196,7 +196,6 @@ define_class!(
         fn mouse_entered(&self, _event: &NSEvent) {
             let iv = self.ivars();
             iv.hot.set(true);
-            iv.name.hover(true, self.reduce_motion());
             self.setNeedsDisplay(true);
         }
 
@@ -204,7 +203,6 @@ define_class!(
         fn mouse_exited(&self, _event: &NSEvent) {
             let iv = self.ivars();
             iv.hot.set(false);
-            iv.name.hover(false, self.reduce_motion());
             self.setNeedsDisplay(true);
         }
 
@@ -254,11 +252,6 @@ impl GroupButton {
     fn bar(&self) -> Option<Retained<TabBar>> {
         // SAFETY: reading the superview; we are on the main thread.
         unsafe { self.superview() }?.downcast::<TabBar>().ok()
-    }
-
-    /// Reduce Motion, as the bar the button is in has it.
-    fn reduce_motion(&self) -> bool {
-        self.bar().is_some_and(|bar| bar.reduce_motion())
     }
 
     /// A double click: the group's name opens under the field.
@@ -318,8 +311,6 @@ impl GroupButton {
                 NSSize::new(width, natural.height),
             ),
             natural.width,
-            iv.hot.get(),
-            self.reduce_motion(),
         );
         let words = match &look.name {
             Some(name) => format!("Tab group {name}, show the window\u{2019}s groups"),

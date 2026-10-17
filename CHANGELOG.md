@@ -66,10 +66,7 @@ of every installed copy. A version without a section is not released.
   groups. A click on a header still opens and closes it, and every drag is undone
   with Undo Move. A tab's name in the title row or the side column, and a group
   button's name, no longer ends in "…" when it does not fit: its last stretch
-  fades out, and with the pointer resting on it for a moment the name slides
-  along to show the rest, stops at its end and goes back when the pointer
-  leaves. With Reduce Motion on the name does not slide — the fade stays and
-  hovering a tab shows its whole name as a tooltip. Group headers and the lists
+  fades out, and the whole name is in the tooltip. Group headers and the lists
   keep their "…".
 
 ## [0.17.0] - 2026-10-17

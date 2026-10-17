@@ -532,8 +532,8 @@ pub(crate) fn install(
                 item(mtm, "New Local Tab", sel!(newLocalTab:), "t"),
                 command | NSEventModifierFlags::Option,
             ),
-            // Groups stand in the side column (greyed elsewhere, the app delegate's
-            // `validateMenuItem:`).
+            // Greyed only without a key window (the app delegate's `validateMenuItem:`): in the
+            // title row it is the way to a window's first group, whose button comes with it.
             with_modifiers(
                 item(mtm, "New Group", sel!(newGroup:), "n"),
                 command | NSEventModifierFlags::Shift,

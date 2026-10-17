@@ -3622,11 +3622,10 @@ impl Chip {
                 NSSize::new(text_width, natural.height),
             ),
             natural.width,
-            hovered,
-            *reduce,
         );
-        // With Reduce Motion nothing slides to show what the fade hides: the tooltip says it.
-        let tip = (iv.title.overflows() && *reduce).then(|| title.to_string());
+        // The fade hides the end of a title that does not fit, and nothing moves to show it: the
+        // tooltip says the whole of it.
+        let tip = iv.title.overflows().then(|| title.to_string());
         if self.toolTip().map(|now| now.to_string()) != tip {
             self.setToolTip(tip.as_deref().map(NSString::from_str).as_deref());
         }
@@ -5502,6 +5501,18 @@ define_class!(
             }
         }
 
+        /// A right click on the single tab's title: the tab's own menu, as on a chip — the way
+        /// to rename the window's only tab or start its first group there. The press that moves
+        /// the window stays the row's ([`Self::mouse_down`]); the row's empty part has no menu.
+        #[unsafe(method_id(menuForEvent:))]
+        fn menu_for_event(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            // No `?`: `define_class!` converts the body's last expression.
+            self.tab_under(point)
+                .filter(|_| self.lone_title(self.ivars().shown.borrow().tabs.len()))
+                .and_then(|tab| self.tab_menu(tab))
+        }
+
         /// A wheel or a trackpad moves the strip once the tabs no longer fit
         /// ([`Strip::wheeled`]: a vertical wheel scrolls it too). Without
         /// overflow nothing scrolls and the event goes on.
@@ -6507,10 +6518,16 @@ impl TabBar {
     /// or not it is selected. Every item names it in its `tag`
     /// ([`tabs::menu_tag`]) and acts through the window's applier.
     fn context_menu(&self, tab: u64) -> Option<Retained<NSMenu>> {
-        let window = self.terminal_window()?;
         if self.lone_title(self.ivars().shown.borrow().tabs.len()) {
             return None;
         }
+        self.tab_menu(tab)
+    }
+
+    /// [`Self::context_menu`]'s body, which the single tab's title gives too: its press is the
+    /// row's, so its menu comes from the bar ([`TabBar`]'s `menuForEvent:`), not from the chip.
+    fn tab_menu(&self, tab: u64) -> Option<Retained<NSMenu>> {
+        let window = self.terminal_window()?;
         // A menu is no place for the card; and the pointer resting on the
         // chip after it closes is not a reason to open it.
         self.pressed(tab);

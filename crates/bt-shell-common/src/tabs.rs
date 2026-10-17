@@ -511,39 +511,17 @@ pub fn title_row(inner: f64, text: f64, lead: Option<f64>) -> (Option<f64>, f64,
 /// room, the whole of it when the room is narrower.
 pub const TITLE_FADE: f64 = 22.0;
 
-/// How long the pointer rests on a title that does not fit before it starts to slide, how fast it
-/// slides (points a second) and how long it takes to come back when the pointer leaves.
-pub const TITLE_DWELL: f64 = 0.35;
-pub const TITLE_SPEED: f64 = 40.0;
-pub const TITLE_RETURN: f64 = 0.25;
-
 /// The stretch of a title's room that fades out at its right end when the title does not fit.
 pub fn title_fade(room: f64) -> f64 {
     TITLE_FADE.min(room.max(0.0))
 }
 
-/// The slide of a title that does not fit its room: how far it goes left and how long that takes.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Slide {
-    pub distance: f64,
-    pub secs: f64,
-}
-
-/// What a title `text` wide (as the type sets it) does in a `room` wide place: `None` when it
-/// fits and stands as it is, otherwise the slide that shows the rest. It ends with the title's
-/// end clear of the fade at the right, so the last word is read whole and not through the fade
-/// that hid it at rest. The one rule for the chips, the side rows and the group button; the fade
-/// and the slide are drawn by the shell, the arithmetic is here.
-pub fn title_slide(text: f64, room: f64) -> Option<Slide> {
-    let over = text.ceil() - room;
-    if room < 1.0 || over <= 0.0 {
-        return None;
-    }
-    let distance = over + title_fade(room);
-    Some(Slide {
-        distance,
-        secs: distance / TITLE_SPEED,
-    })
+/// Whether a title `text` wide (as the type sets it) overflows a `room` wide place: then its end
+/// fades out over [`title_fade`] and the whole of it is in the tooltip. It never moves to show the
+/// rest — a title that slides leaves the tab showing only its tail. The one rule for the chips,
+/// the side rows and the group button; the fade is drawn by the shell, the arithmetic is here.
+pub fn title_overflows(text: f64, room: f64) -> bool {
+    room >= 1.0 && text.ceil() > room
 }
 
 /// What a title may take of the `inner` width after the leading element (`lead` wide, with its
@@ -2706,26 +2684,21 @@ mod tests {
     }
 
     #[test]
-    fn a_title_that_fits_its_room_neither_fades_nor_slides() {
-        assert_eq!(title_slide(100.0, 100.0), None, "to the edge");
-        assert_eq!(title_slide(99.2, 100.0), None);
-        assert_eq!(title_slide(0.0, 0.0), None, "no room, nothing to show");
-        assert_eq!(
-            title_slide(40.0, 0.5),
-            None,
+    fn a_title_that_fits_its_room_does_not_fade() {
+        assert!(!title_overflows(100.0, 100.0), "to the edge");
+        assert!(!title_overflows(99.2, 100.0));
+        assert!(!title_overflows(0.0, 0.0), "no room, nothing to show");
+        assert!(
+            !title_overflows(40.0, 0.5),
             "a room under a point is no room"
         );
     }
 
     #[test]
-    fn a_title_that_does_not_fit_slides_until_its_end_clears_the_fade() {
-        let slide = title_slide(160.0, 140.0).expect("20 pt too long");
-        // The 20 pt that are over, and the fade the end must come out of.
-        assert_eq!(slide.distance, 20.0 + TITLE_FADE);
-        assert_eq!(slide.secs, slide.distance / TITLE_SPEED);
+    fn a_title_that_does_not_fit_fades() {
+        assert!(title_overflows(160.0, 140.0));
         // The type's width is whole points to the frame that holds it.
-        let slide = title_slide(140.2, 140.0).expect("a point over once it is rounded up");
-        assert_eq!(slide.distance, 1.0 + TITLE_FADE);
+        assert!(title_overflows(140.2, 140.0));
     }
 
     #[test]
@@ -2733,8 +2706,6 @@ mod tests {
         assert_eq!(title_fade(140.0), TITLE_FADE);
         assert_eq!(title_fade(10.0), 10.0);
         assert_eq!(title_fade(-4.0), 0.0);
-        let slide = title_slide(50.0, 10.0).expect("over");
-        assert_eq!(slide.distance, 40.0 + 10.0);
     }
 
     #[test]
