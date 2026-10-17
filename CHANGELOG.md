@@ -32,7 +32,9 @@ of every installed copy. A version without a section is not released.
   and ⌃⌘0 to the ungrouped tabs; hold ⌃⌘ to see the keys on the headers. Moving
   a tab into or out of a group is undone with Undo Move, the groups come back
   with the windows when bateri restores them, and Merge All Windows brings
-  every group along under its own name. With the tabs in the title row the bar
+  every group along under its own name. The name you type in the field a new
+  group opens with is part of the move — Undo Move still takes the move back —
+  while renaming a group later is not. With the tabs in the title row the bar
   shows one group at a time: a button at its start names the group on screen
   (the ungrouped tabs have the stack alone), with a dot on its corner while
   another group has a question, a failure or a finish you have not seen. Click

@@ -22,7 +22,7 @@
 //! Panes and tabs are named by the in-process identities, which mean nothing in another
 //! process; a record never reaches the disk.
 
-use crate::groups::Groups;
+use crate::groups::{GroupId, Groups};
 use crate::split::Tree;
 use crate::tabs::Tabs;
 
@@ -80,6 +80,22 @@ pub struct Now {
 }
 
 impl Record {
+    /// Group `group` of window `window` has been called `name` since the move: the pictures the
+    /// record puts back carry the name too, so that taking the move back does not give the group
+    /// its old name again. A group the move made is in no picture — taking the move back removes
+    /// it — and there is nothing to say; windows number their groups alone, so the window is part
+    /// of the question. `name` is a name the window's groups already took
+    /// ([`Groups::rename`]'s trimmed one).
+    pub fn named(&mut self, window: u64, group: GroupId, name: &str) {
+        for scene in self
+            .scenes
+            .iter_mut()
+            .filter(|scene| scene.window == window)
+        {
+            scene.groups.rename(group, name);
+        }
+    }
+
     /// Whether window `window` takes part: a window where the step can be taken from.
     pub fn involves(&self, window: u64) -> bool {
         self.born.contains(&window) || self.scenes.iter().any(|scene| scene.window == window)
@@ -290,5 +306,65 @@ mod tests {
             !record.holds(&[now(1, &[(1, &[10])]), now(5, &[])]),
             "and left empty"
         );
+    }
+
+    #[test]
+    fn a_name_given_since_the_move_is_put_back_with_the_groups_that_knew_it() {
+        // Window 1 and window 2 each have a group `api` and number their groups alone: both are
+        // group 0.
+        let grouped = |window: u64| {
+            let mut order = strip(&[1, 2]);
+            let mut groups = Groups::new();
+            groups.place(
+                &mut order,
+                &[2],
+                crate::groups::Target::New("api".to_owned()),
+            );
+            Scene {
+                window,
+                order,
+                groups,
+                shapes: Vec::new(),
+            }
+        };
+        let (one, two) = (grouped(1), grouped(2));
+        let id = one.groups.group_of(2).expect("tab 2 is in a group");
+        assert_eq!(Some(id), two.groups.group_of(2), "the ids are the same");
+        let mut record = Record {
+            scenes: vec![one, two],
+            born: Vec::new(),
+        };
+        record.named(1, id, "  backend ");
+        let name = |scene: usize| {
+            record.scenes[scene]
+                .groups
+                .group(id)
+                .map(|g| g.name.clone())
+        };
+        assert_eq!(
+            name(0),
+            Some("backend".to_owned()),
+            "trimmed, as the window's own"
+        );
+        assert_eq!(
+            name(1),
+            Some("api".to_owned()),
+            "another window's group is its own"
+        );
+        // A group that no picture knows — the move made it — is not made up.
+        let mut order = strip(&[1, 2, 3]);
+        let mut born = Groups::new();
+        for tab in [2, 3] {
+            born.place(
+                &mut order,
+                &[tab],
+                crate::groups::Target::New(format!("g{tab}")),
+            );
+        }
+        let made = born.group_of(3).expect("tab 3 is in a group");
+        assert_ne!(Some(made), record.scenes[0].groups.group_of(2));
+        let mut unchanged = record.clone();
+        unchanged.named(1, made, "x");
+        assert_eq!(unchanged, record);
     }
 }

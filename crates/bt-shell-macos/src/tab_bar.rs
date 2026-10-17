@@ -5416,6 +5416,9 @@ pub(crate) struct BarIvars {
     headers: RefCell<Vec<Retained<tab_group::GroupHeader>>>,
     /// The group whose name the field holds, in place of a tab's ([`BarIvars::renaming`]).
     renaming_group: Cell<Option<GroupId>>,
+    /// The name field of `renaming_group` was opened by the move that made the group: what it
+    /// says is the group's birth name, not a rename ([`TerminalWindow::name_new_group`]).
+    renaming_born: Cell<bool>,
     /// The group button of the title row, always in the bar and shown only with a switcher.
     switch: Retained<tab_switch::GroupButton>,
     /// The list of groups under it and the view over the window that closes it, the list being
@@ -5647,6 +5650,7 @@ impl TabBar {
             hint_pending: Cell::new(false),
             headers: RefCell::new(Vec::new()),
             renaming_group: Cell::new(None),
+            renaming_born: Cell::new(false),
             switch: switch.clone(),
             group_list: tab_switch::GroupList::new(mtm, window),
             scrim: tab_switch::ListScrim::new(mtm, window),
@@ -6372,7 +6376,7 @@ impl TabBar {
     /// header, Rename Group…, a group just made. A name under way elsewhere is kept first, and
     /// the header is brought into view. In the title row there is no header: the field opens in
     /// the group button, over its name, and only for the group on screen.
-    pub(crate) fn begin_group_rename(&self, group: GroupId) {
+    pub(crate) fn begin_group_rename(&self, group: GroupId, born: bool) {
         let iv = self.ivars();
         if iv.renaming_group.get() == Some(group) {
             return;
@@ -6410,6 +6414,7 @@ impl TabBar {
             iv.scroll.set(to);
         }
         iv.renaming_group.set(Some(group));
+        iv.renaming_born.set(born);
         iv.opened_with.replace(name.clone());
         iv.field.setStringValue(&NSString::from_str(&name));
         self.addSubview(&iv.field);
@@ -6427,6 +6432,7 @@ impl TabBar {
         if let Some(group) = iv.renaming_group.take() {
             let draft = iv.field.stringValue().to_string();
             let commit = commit && draft != *iv.opened_with.borrow();
+            let born = iv.renaming_born.take();
             let window = self.terminal_window();
             if iv.field.currentEditor().is_some()
                 && let Some(window) = &window
@@ -6435,7 +6441,11 @@ impl TabBar {
             }
             iv.field.removeFromSuperview();
             if commit && let Some(window) = &window {
-                window.rename_group(group, &draft);
+                if born {
+                    window.name_new_group(group, &draft);
+                } else {
+                    window.rename_group(group, &draft);
+                }
             }
             self.lay_out();
             return;

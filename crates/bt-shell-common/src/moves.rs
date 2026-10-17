@@ -2721,6 +2721,66 @@ mod tests {
         assert_eq!(taken_back.undo, None, "there is no redo");
     }
 
+    #[test]
+    fn the_name_a_new_group_is_born_asking_for_is_part_of_its_move() {
+        let before = grouped();
+        let record = |wanted| plan(&before, wanted, &Cramped).unwrap().undo.unwrap();
+        let regroup = |name: &str| Move::RegroupTabs {
+            window: 1,
+            tabs: vec![10],
+            target: Target::New(name.to_owned()),
+        };
+        // Tab 10 is made a group of its own, named for its folder; the name field it opens is
+        // answered "ten": the picture the move left has the group by that name now.
+        let mut undo = record(regroup("home"));
+        let mut now = before.clone();
+        let one = &mut now[0];
+        one.groups
+            .place(&mut one.order, &[10], Target::New("home".to_owned()));
+        let made = one.groups.group_of(10).expect("tab 10 is in a group");
+        assert!(one.groups.rename(made, "ten"));
+        undo.named(1, made, "ten");
+        // Undo Move still takes the move back: the group goes, and no name comes back for it.
+        assert!(standing(&now, &undo));
+        let taken_back = undoing(&now, undo).expect("the move can still be taken back");
+        assert!(taken_back.steps.contains(&Step::PutStrip {
+            window: 1,
+            order: before[0].order.clone(),
+            groups: before[0].groups.clone(),
+        }));
+
+        // A move that follows records the picture with the group in it; the name typed after it
+        // is what Undo Move puts back, not the name the picture was taken with.
+        let mut later = plan(
+            &now,
+            Move::RegroupTabs {
+                window: 1,
+                tabs: vec![13],
+                target: Target::Group {
+                    group: made,
+                    before: None,
+                },
+            },
+            &Cramped,
+        )
+        .unwrap()
+        .undo
+        .unwrap();
+        let called = |record: &Record| {
+            record.scenes[0]
+                .groups
+                .group(made)
+                .map(|group| group.name.clone())
+        };
+        assert_eq!(called(&later), Some("ten".to_owned()));
+        later.named(1, made, "tenth");
+        assert_eq!(
+            called(&later),
+            Some("tenth".to_owned()),
+            "the picture says what the group is called now"
+        );
+    }
+
     /// What a regrouping of `tabs` of window 1 into `target` asks to come forward, in a window
     /// that shows one cluster at a time and has tab `shown` on screen.
     fn kept(shown: u64, tabs: &[u64], target: Target<u64>, one_cluster: bool) -> Vec<Step> {

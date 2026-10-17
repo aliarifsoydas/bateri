@@ -504,7 +504,9 @@ shows one group at a time instead (see **In the title row** below).
 - **Moving a tab.** Right-click ▸ **Move to Group ▸** a group (the tab's own is
   ticked and grey) or **Remove from Group**; Window ▸ **Move Tab to Group ▸**
   does it for the tab on screen. A group that loses its last tab goes. Undo
-  Move takes any of these back.
+  Move takes any of these back, also after you typed a name in the field the
+  new group opened with; renaming a group later is not part of a move and
+  leaves nothing to undo.
 - **The header.** A click closes the group or opens it again; a closed group
   shows how many tabs it holds and, if one of them has a question, a failure,
   or a finish you have not seen, a dot in that colour — a running command does

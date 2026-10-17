@@ -3865,6 +3865,15 @@ impl AppDelegate {
         self.ivars().undo.replace(None);
     }
 
+    /// The group `group` of window `window` was named `name` in the field it was born with
+    /// ([`TerminalWindow::name_new_group`]): the record of the move that made it carries the
+    /// name where an earlier picture knew the group ([`Record::named`]) and stands.
+    pub(crate) fn name_in_undo(&self, window: u64, group: crate::groups::GroupId, name: &str) {
+        if let Some(record) = self.ivars().undo.borrow_mut().as_mut() {
+            record.named(window, group, name);
+        }
+    }
+
     /// Window `id` is gone: a record that names it is dropped.
     fn forget_undo_of(&self, id: u64) {
         let named = self

@@ -1270,7 +1270,7 @@ define_class!(
         #[unsafe(method(renameGroup:))]
         fn rename_group_action(&self, sender: Option<&AnyObject>) {
             if let Some(group) = self.menu_group(sender) {
-                self.bar().begin_group_rename(group);
+                self.bar().begin_group_rename(group, false);
             }
         }
 
@@ -3048,6 +3048,30 @@ impl TerminalWindow {
         self.layout_changed();
     }
 
+    /// **The applier: the name a group is born asking for.** A group a move made opens its name
+    /// field on its header ([`TabBar::begin_group_rename`]); the name typed there is part of the
+    /// move, not a change after it. Like [`Self::rename_group`] it names the group, but the move's
+    /// record stands: it is told the name ([`AppDelegate::name_in_undo`]) so that Undo Move still
+    /// takes the move back — the group and its name go — and does not put an old name back where
+    /// the group was known to an earlier picture.
+    pub(crate) fn name_new_group(&self, group: GroupId, draft: &str) {
+        let named = {
+            let mut groups = self.ivars().groups.borrow_mut();
+            groups
+                .rename(group, draft)
+                .then(|| groups.group(group).map(|group| group.name.clone()))
+                .flatten()
+        };
+        let Some(name) = named else {
+            return;
+        };
+        if let Some(app) = app::delegate(self.mtm()) {
+            app.name_in_undo(self.id(), group, &name);
+        }
+        self.refresh_bar();
+        self.layout_changed();
+    }
+
     /// **The applier: a group opens or closes** in the column. Which tab is on screen does not
     /// change: a closed group keeps listing it under its header. As [`Self::rename_group`], the
     /// strip is untouched.
@@ -3271,7 +3295,7 @@ impl TerminalWindow {
         }
         let made = self.ivars().groups.borrow().group_of(first);
         if let Some(made) = made {
-            self.bar().begin_group_rename(made);
+            self.bar().begin_group_rename(made, true);
         }
         true
     }
@@ -3323,7 +3347,7 @@ impl TerminalWindow {
             .borrow()
             .shown(&self.ivars().order.borrow());
         if let Some(group) = group {
-            self.bar().begin_group_rename(group);
+            self.bar().begin_group_rename(group, true);
         }
     }
 
@@ -4403,6 +4427,13 @@ mod tests {
                 "{applier} drops the record"
             );
         }
+        // The name a group is born asking for belongs to the move that made it: the record
+        // stands and is told the name, where a later rename (above) drops it.
+        let naming = body("pub(crate) fn name_new_group(");
+        assert!(
+            !naming.contains("self.forget_undo()") && naming.contains("name_in_undo("),
+            "naming a new group keeps the record and tells it the name"
+        );
     }
 
     /// The guard of "the strip changes with its groups": the groups sit beside the strip and a

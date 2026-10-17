@@ -612,7 +612,7 @@ impl GroupHeader {
         if let (Some(was), Some(window)) = (iv.toggled_from.take(), bar.terminal_window()) {
             window.set_group_collapsed(group, was);
         }
-        bar.begin_group_rename(group);
+        bar.begin_group_rename(group, false);
     }
 }
 

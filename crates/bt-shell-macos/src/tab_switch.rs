@@ -271,7 +271,7 @@ impl GroupButton {
             .and_then(|look| look.group);
         if let (Some(bar), Some(group)) = (self.bar(), group) {
             bar.close_group_list(false);
-            bar.begin_group_rename(group);
+            bar.begin_group_rename(group, false);
         }
     }
 
