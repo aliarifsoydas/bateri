@@ -122,6 +122,7 @@ use crate::app;
 use crate::arrange::Tool;
 use crate::card::{Ground, Shade, fade_to};
 use crate::embed;
+use crate::groups::{GroupId, Groups, Part, Target};
 use crate::jobs::Foreground;
 use crate::launch::Closing;
 use crate::moves::{self, Joins, Move};
@@ -523,6 +524,10 @@ pub(crate) struct WindowIvars {
     /// (`tabs::Tabs`); [`WindowIvars::tabs`] holds the objects. Never empty
     /// while the window lives: closing the last tab closes the window.
     order: RefCell<Tabs<u64>>,
+    /// The tabs' groups — the pure model (`groups::Groups`) beside [`WindowIvars::order`]: which
+    /// tabs are gathered under which name. The strip changes only together with them
+    /// ([`TerminalWindow::with_strip`]).
+    groups: RefCell<Groups<u64>>,
     /// The window's tabs — the only strong references to the tab objects;
     /// the list finds them through the window ([`TerminalWindow::tabs`]).
     /// Their order is [`WindowIvars::order`]'s, not this vector's.
@@ -1798,6 +1803,7 @@ impl TerminalWindow {
             root,
             toolbar,
             order: RefCell::new(Tabs::new(tab.id())),
+            groups: RefCell::new(Groups::new()),
             tabs: RefCell::new(vec![tab]),
             retired: RefCell::new(Vec::new()),
             notice: RefCell::new(String::new()),
@@ -2151,7 +2157,7 @@ impl TerminalWindow {
             return false;
         }
         let old = current.and_then(|current| self.tab(current));
-        self.ivars().order.borrow_mut().select(id);
+        self.with_strip(|groups, order| groups.select(order, id));
         self.switch(old.as_deref());
         self.layout_changed();
         true
@@ -2196,7 +2202,7 @@ impl TerminalWindow {
         self.ivars().root.add_container(tab.container());
         // The window's list is the tab's owner.
         self.ivars().tabs.borrow_mut().push(tab.retain());
-        self.ivars().order.borrow_mut().insert(tab.id());
+        self.with_strip(|groups, order| groups.open(order, tab.id()));
         self.switch(old.as_deref());
         self.layout_changed();
     }
@@ -2289,7 +2295,7 @@ impl TerminalWindow {
         if self.tab_count() > 1 {
             self.leave_order(&tab);
         } else {
-            self.ivars().order.borrow_mut().close(id);
+            self.with_strip(|groups, order| groups.close(order, &[id]));
             tab.container().setHidden(true);
             tab.apply_visibility(self.window_visible());
             tab.leave_screen();
@@ -2322,7 +2328,7 @@ impl TerminalWindow {
         self.ivars().tabs.borrow_mut().push(tab.clone());
         match placement {
             Placement::End => {
-                self.ivars().order.borrow_mut().append(tab.id());
+                self.with_strip(|groups, order| groups.append(order, tab.id()));
                 tab.refresh_geometry();
                 tab.apply_visibility(self.window_visible());
                 self.refresh_bar();
@@ -2332,7 +2338,7 @@ impl TerminalWindow {
                 let old = old.and_then(|old| self.tab(old));
                 // The gap the tab was carried over is the place it takes now.
                 self.bar().close_gap_quietly();
-                self.ivars().order.borrow_mut().insert_at(tab.id(), index);
+                self.with_strip(|groups, order| groups.insert_at(order, tab.id(), index));
                 tab.refresh_geometry();
                 self.switch(old.as_deref());
             }
@@ -2344,7 +2350,9 @@ impl TerminalWindow {
     /// window's strip); what is on screen does not change. A layout edge — once for the
     /// drag, not for every place it passed on the way.
     pub(crate) fn move_tab(&self, id: u64, index: usize) {
-        if self.tab(id).is_none() || !self.ivars().order.borrow_mut().move_to(id, index) {
+        if self.tab(id).is_none()
+            || !self.with_strip(|groups, order| groups.move_to(order, id, index))
+        {
             return;
         }
         self.forget_undo();
@@ -2506,12 +2514,7 @@ impl TerminalWindow {
     pub(crate) fn fold_tab(&self, source: u64, into: u64) -> Option<Vec<Retained<TerminalPane>>> {
         let from = self.tab(source)?;
         let was_selected = self.is_selected(source);
-        if !self
-            .ivars()
-            .order
-            .borrow_mut()
-            .pane_to_tab(source, true, into)
-        {
+        if !self.with_strip(|groups, order| groups.pane_to_tab(order, source, true, into)) {
             return None;
         }
         if was_selected {
@@ -2534,7 +2537,7 @@ impl TerminalWindow {
     /// A layout edge.
     pub(crate) fn new_tab_of(&self, pane: &TerminalPane, id: u64, gap: usize) {
         let tab = self.born_tab(id, pane);
-        self.ivars().order.borrow_mut().place_new(id, gap);
+        self.with_strip(|groups, order| groups.place_new(order, id, gap));
         self.settle_born(&tab, pane);
         self.announce(&format!("{} moved to a new tab", pane_name(pane)));
         self.refresh_title();
@@ -2576,6 +2579,7 @@ impl TerminalWindow {
         moves::Window {
             id: self.id(),
             order: self.ivars().order.borrow().clone(),
+            groups: self.ivars().groups.borrow().clone(),
             tabs: self
                 .tabs()
                 .iter()
@@ -2674,17 +2678,91 @@ impl TerminalWindow {
     }
 
     /// **The applier: the strip as it was** ([`moves::Step::PutStrip`]): the
-    /// tabs in `order`, its selection with it — what was on screen leaves it
-    /// first, the selected tab comes up ([`Self::switch`]).
-    pub(crate) fn put_strip(&self, order: Tabs<u64>) {
+    /// tabs in `order`, its selection and its `groups` with it — what was on
+    /// screen leaves it first, the selected tab comes up ([`Self::switch`]).
+    pub(crate) fn put_strip(&self, order: Tabs<u64>, groups: Groups<u64>) {
         let old = self
             .ivars()
             .order
             .borrow()
             .selected()
             .and_then(|id| self.tab(id));
+        debug_assert!(
+            groups.check(&order).is_ok(),
+            "a picture's groups agree with its strip"
+        );
         self.ivars().order.replace(order);
+        self.ivars().groups.replace(groups);
         self.switch(old.as_deref());
+    }
+
+    /// **The applier: tabs regroup** ([`moves::Step::Regroup`]): `tabs` go where
+    /// `target` says ([`Groups::place`]) — into a group, into a group made for
+    /// them, out of any group. What is on screen does not change. A layout
+    /// edge. It does not drop Undo Move's record: the record is the plan's, and
+    /// is written after the step.
+    pub(crate) fn regroup(&self, tabs: &[u64], target: Target<u64>) {
+        if self
+            .with_strip(|groups, order| groups.place(order, tabs, target))
+            .is_none()
+        {
+            return;
+        }
+        self.refresh_bar();
+        self.layout_changed();
+    }
+
+    /// **The applier: a group's place** ([`moves::Step::MoveGroup`]): `group`
+    /// takes place `to` among the groups, its tabs with it. As
+    /// [`Self::regroup`] it leaves the record to the plan.
+    pub(crate) fn move_group(&self, group: GroupId, to: usize) {
+        if !self.with_strip(|groups, order| groups.move_group(order, group, to)) {
+            return;
+        }
+        self.refresh_bar();
+        self.layout_changed();
+    }
+
+    /// The window's groups as they stand — what session restore saves
+    /// ([`crate::restore::saved_groups`]).
+    pub(crate) fn groups(&self) -> Groups<u64> {
+        self.ivars().groups.borrow().clone()
+    }
+
+    /// Session restore: the groups the saved layout names, over the tabs that
+    /// were built ([`crate::restore::SavedWindow::parts`]). Parts that are not
+    /// a grouping of the strip leave the tabs ungrouped, as a window without
+    /// groups — the layout is dropped as a whole when it is read, so this is
+    /// only a guard.
+    pub(crate) fn restore_groups(&self, parts: Vec<Part<u64>>) {
+        if parts.is_empty() {
+            return;
+        }
+        let groups = Groups::from_parts(&self.ivars().order.borrow(), parts);
+        match groups {
+            Some(groups) => {
+                self.ivars().groups.replace(groups);
+                self.refresh_bar();
+            }
+            None => eprintln!("bateri: saved tab groups did not fit the restored tabs"),
+        }
+    }
+
+    /// **The strip's one door.** Runs `change` on the groups and the strip they
+    /// sit beside, and — in a debug build — asks the groups' own rule whether the
+    /// two still agree. Every applier that changes the tabs' order goes through
+    /// here, or through [`Self::put_strip`] which puts a picture back whole; a
+    /// change of the strip by itself would leave a group's tabs apart.
+    fn with_strip<R>(&self, change: impl FnOnce(&mut Groups<u64>, &mut Tabs<u64>) -> R) -> R {
+        let mut order = self.ivars().order.borrow_mut();
+        let mut groups = self.ivars().groups.borrow_mut();
+        let result = change(&mut groups, &mut order);
+        debug_assert!(
+            groups.check(&order).is_ok(),
+            "the groups and the strip agree: {:?}",
+            groups.check(&order)
+        );
+        result
     }
 
     /// Tab `id`'s panes, if they no longer fit their smallest on this
@@ -2816,7 +2894,7 @@ impl TerminalWindow {
     /// so the window is never left without a responder.
     fn leave_order(&self, tab: &TerminalTab) {
         let was_selected = self.ivars().order.borrow().selected() == Some(tab.id());
-        self.ivars().order.borrow_mut().close(tab.id());
+        self.with_strip(|groups, order| groups.close(order, &[tab.id()]));
         if was_selected {
             self.switch(Some(tab));
         }
@@ -3518,6 +3596,74 @@ mod tests {
             assert!(
                 body(applier).contains("self.forget_undo()"),
                 "{applier} drops the record"
+            );
+        }
+    }
+
+    /// The guard of "the strip changes with its groups": the groups sit beside the strip and a
+    /// change of the strip by itself would leave a group's tabs apart, with nothing to say so
+    /// but a window that draws wrong. Every applier of the tab list goes through
+    /// `with_strip` (or puts a whole picture back, `put_strip`), and each one asks the group
+    /// operation that keeps the rule its plain counterpart had — a new tab beside the one on
+    /// screen and in its group, a closed tab's neighbour inside its group first.
+    #[test]
+    fn the_strip_changes_only_with_its_groups() {
+        let source = include_str!("window.rs");
+        let code = &source[..source.find("#[cfg(test)]").expect("the tests follow")];
+        assert_eq!(
+            code.matches("order.borrow_mut()").count(),
+            1,
+            "the strip is borrowed for change in `with_strip` and nowhere else"
+        );
+        assert_eq!(
+            code.matches(".order.replace(").count(),
+            1,
+            "the strip is replaced in `put_strip` and nowhere else"
+        );
+        // A method's text, up to the next method of the impl, public or not.
+        let body = |signature: &str| {
+            let start = code.find(signature).expect("the applier is in this file");
+            let rest = &code[start + signature.len()..];
+            let end = ["\n    pub(crate) fn ", "\n    fn "]
+                .iter()
+                .filter_map(|next| rest.find(next))
+                .min()
+                .unwrap_or(rest.len());
+            &rest[..end]
+        };
+        for (applier, operation) in [
+            ("pub(crate) fn select_tab(", "groups.select("),
+            ("pub(crate) fn add_tab(", "groups.open("),
+            ("pub(crate) fn release_tab(", "groups.close("),
+            ("pub(crate) fn adopt_tab(", "groups.append("),
+            ("pub(crate) fn adopt_tab(", "groups.insert_at("),
+            ("pub(crate) fn move_tab(", "groups.move_to("),
+            ("pub(crate) fn fold_tab(", "groups.pane_to_tab("),
+            ("pub(crate) fn new_tab_of(", "groups.place_new("),
+            ("fn leave_order(", "groups.close("),
+            ("pub(crate) fn regroup(", "groups.place("),
+            ("pub(crate) fn move_group(", "groups.move_group("),
+            ("pub(crate) fn picture(", "groups:"),
+            ("pub(crate) fn put_strip(", "groups.replace(groups)"),
+        ] {
+            assert!(
+                body(applier).contains(operation),
+                "{applier} does not call {operation}"
+            );
+        }
+        // A closed tab goes through the same door: `close_tab_now` leaves the order by
+        // `leave_order`, and that is checked above.
+        assert!(body("pub(crate) fn close_tab_now(").contains("self.leave_order("));
+        // The plan writes the record of a regrouping, after its step: an applier that dropped
+        // the record would drop it before the plan could write it.
+        for applier in [
+            "pub(crate) fn regroup(",
+            "pub(crate) fn move_group(",
+            "pub(crate) fn put_strip(",
+        ] {
+            assert!(
+                !body(applier).contains("self.forget_undo()"),
+                "{applier} leaves the record to the plan"
             );
         }
     }

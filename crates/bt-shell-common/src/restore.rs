@@ -2,7 +2,7 @@
 //! the directory that holds it.
 //!
 //! **The model** is what comes back after a quit: windows (frame, selected tab,
-//! key, the side column's width), tabs (the split tree's shape, focus, zoom) and panes (the persistent `PaneUuid`, the local
+//! key, the side column's width, its tab groups), tabs (the split tree's shape, focus, zoom) and panes (the persistent `PaneUuid`, the local
 //! directory, the point-size step, the remote target's line, whether a history file was written).
 //! The tree's leaves are **indices** into the tab's pane list ([`Shape`]): the in-process `u64`
 //! pane identity means nothing in the next process, so it never reaches the disk —
@@ -12,13 +12,20 @@
 //! **The format** follows `remote-hosts` (`ssh_wrap`): line based, the first line names the
 //! version ([`HEADER`] + [`VERSION`]), then one `W` line per window, one `T` line per tab under it
 //! and one `P` line per pane under that; the tree is a pre-order token run (`S h|v {ratio} … L
-//! {index}`). **Every version the writer still writes is read**: version 3 gave a window the width
-//! its side column was dragged to (a `W` line's seventh field), version 2 a tab its own name (a
-//! `T` line's third field), version 1 has neither. The writer says the oldest version that holds
-//! what there is — 1 while no tab is named and no column was resized, 2 while only names are, 3
-//! once a width is — so a session that uses nothing new stays readable by the bateri before it,
-//! whose reader drops any other number and, with it, a holder's programs. A version's frozen text
-//! stays in the tests: its reader must keep reading it. Text fields (directory, remote line) are escaped so that a field never holds a
+//! {index}`). **Every version the writer still writes is read**: version 4 gave a window its tab
+//! groups (a `G {name} {collapsed} {resident}` line each, right after the `W` line and before any
+//! of its tabs, and a group field on every `T` line: the group's index among them, `-` for an
+//! ungrouped tab), version 3 the width its side column was dragged to (a `W` line's seventh
+//! field), version 2 a tab its own name (a `T` line's third field), version 1 has none of them.
+//! The writer says the oldest version that holds what there is — 1 while no tab is named, no
+//! column was resized and no group exists, 2 while only names are, 3 once a width is, 4 once a
+//! window has a group — so a session that uses nothing new stays readable by the bateri before
+//! it, whose reader drops any other number and, with it, a holder's programs. A version's frozen
+//! text stays in the tests: its reader must keep reading it. The strip a window saves is the
+//! flat order the groups were kept in (`groups::Groups::check`: the ungrouped tabs, then each
+//! group's tabs together, in the groups' order), and the reader builds the grouping through that
+//! check — one copy of the rule. A group remembers the tab the user was last on in it; the
+//! ungrouped tabs' own is not kept (the first one is entered again). Text fields (directory, remote line) are escaped so that a field never holds a
 //! space, a tab or a line break ([`escape`]); an absent field is `-`, a present one `+` followed
 //! by the escaped text, so the empty string and absence stay apart. Reading is strict: an
 //! unknown version, a malformed line, an index out of range, a tree whose leaves are not exactly
@@ -55,22 +62,28 @@ use std::path::{Path, PathBuf};
 
 use bt_core::PaneUuid;
 
+use crate::groups::{Groups, Part};
 use crate::split::{Axis, Tree};
+use crate::tabs::Tabs;
 
 /// The first line's word; the version follows it after one space.
 pub const HEADER: &str = "bateri-session";
 
-/// The format's current version: a window may carry its side column's width. The ones before it
-/// ([`NAMED`], [`UNNAMED`]) are read too; any other number is not read (a newer bateri's file after
-/// a downgrade is dropped, not misread).
-pub const VERSION: u32 = 3;
+/// The format's current version: a window may carry its tab groups. The ones before it
+/// ([`SIDED`], [`NAMED`], [`UNNAMED`]) are read too; any other number is not read (a newer
+/// bateri's file after a downgrade is dropped, not misread).
+pub const VERSION: u32 = 4;
 
-/// The version before widths, which a session with a named tab and no resized column is still
-/// written in.
+/// The version before groups, which a session with no group and a resized column is still written
+/// in.
+const SIDED: u32 = 3;
+
+/// The version before widths, which a session with a named tab and no resized column or group is
+/// still written in.
 const NAMED: u32 = 2;
 
-/// The version before names, which a session with no named tab and no resized column is still
-/// written in.
+/// The version before names, which a session with no named tab, no resized column and no group is
+/// still written in.
 const UNNAMED: u32 = 1;
 
 /// The layout file's name inside the directory.
@@ -115,6 +128,19 @@ pub struct SavedWindow {
     /// `None` keeps the default. Kept while the tabs are in the title row as well, so the column
     /// comes back as it was.
     pub side_width: Option<f64>,
+    /// The window's tab groups in the order they are listed; none for a plain list of tabs. The
+    /// tabs name theirs by index ([`SavedTab::group`]).
+    pub groups: Vec<SavedGroup>,
+}
+
+/// A group of a window's tabs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedGroup {
+    pub name: String,
+    /// The column shows the header and, while it is of the group, the tab on screen only.
+    pub collapsed: bool,
+    /// The tab the user was last on in the group: its index in [`SavedWindow::tabs`].
+    pub resident: Option<usize>,
 }
 
 /// A tab: the split tree's shape over `panes`.
@@ -129,6 +155,8 @@ pub struct SavedTab {
     pub zoomed: Option<usize>,
     /// The name the user gave the tab; `None` shows the tab's own title.
     pub name: Option<String>,
+    /// The group the tab is in: its index in [`SavedWindow::groups`]; `None` for an ungrouped tab.
+    pub group: Option<usize>,
 }
 
 /// A pane.
@@ -324,6 +352,7 @@ impl Saved {
         let mut windows = Vec::new();
         for window in &self.windows {
             let mut tabs = Vec::new();
+            let mut kept = Vec::new();
             let mut selected = None;
             for (index, tab) in window.tabs.iter().enumerate() {
                 let keep: Vec<bool> = tab
@@ -339,9 +368,14 @@ impl Saved {
                     selected = Some(tabs.len());
                 }
                 tabs.push(tab);
+                kept.push(index);
             }
             if tabs.is_empty() {
                 continue;
+            }
+            let (groups, grouped) = window.keeping(&kept);
+            for (tab, group) in tabs.iter_mut().zip(grouped) {
+                tab.group = group;
             }
             windows.push(SavedWindow {
                 frame: window.frame,
@@ -349,6 +383,7 @@ impl Saved {
                 selected: selected.unwrap_or(0),
                 key: window.key,
                 side_width: window.side_width,
+                groups,
             });
         }
         Saved { windows }
@@ -381,7 +416,138 @@ impl SavedTab {
             zoomed: self.zoomed.filter(|index| kept(*index)).map(moved),
             panes,
             name: self.name.clone(),
+            group: self.group,
         })
+    }
+}
+
+/// A live window's groups as the save keeps them, over the tabs that are saved: `kept` names
+/// them (ids, in strip order). A group none of them is in is left out, the others count again,
+/// and a group's resident that is not saved is forgotten. The second list is the saved group of
+/// each tab of `kept` ([`SavedTab::group`]).
+pub fn saved_groups<K: Copy + Eq>(
+    groups: &Groups<K>,
+    kept: &[K],
+) -> (Vec<SavedGroup>, Vec<Option<usize>>) {
+    let mut saved = Vec::new();
+    let mut grouped = vec![None; kept.len()];
+    for group in groups.groups() {
+        let members: Vec<usize> = (0..kept.len())
+            .filter(|&index| groups.group_of(kept[index]) == Some(group.id))
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        for index in members {
+            grouped[index] = Some(saved.len());
+        }
+        saved.push(SavedGroup {
+            name: group.name.clone(),
+            collapsed: group.collapsed,
+            resident: group
+                .resident()
+                .and_then(|tab| kept.iter().position(|&candidate| candidate == tab)),
+        });
+    }
+    (saved, grouped)
+}
+
+impl SavedWindow {
+    /// The groups over the tabs that were built again: `built` pairs a tab's index here with the
+    /// id it was given. A group none of them is in is left out; a resident that was not built is
+    /// forgotten. Tabs left out leave the rest a grouping of the strip — a part of one is.
+    pub fn parts(&self, built: &[(usize, u64)]) -> Vec<Part<u64>> {
+        let group_of = |index: usize| self.tabs.get(index).and_then(|tab| tab.group);
+        self.groups
+            .iter()
+            .enumerate()
+            .filter_map(|(at, group)| {
+                let tabs: Vec<u64> = built
+                    .iter()
+                    .filter(|&&(index, _)| group_of(index) == Some(at))
+                    .map(|&(_, id)| id)
+                    .collect();
+                if tabs.is_empty() {
+                    return None;
+                }
+                Some(Part {
+                    name: group.name.clone(),
+                    collapsed: group.collapsed,
+                    resident: group.resident.and_then(|tab| {
+                        built
+                            .iter()
+                            .find(|&&(index, _)| index == tab)
+                            .map(|&(_, id)| id)
+                    }),
+                    tabs,
+                })
+            })
+            .collect()
+    }
+
+    /// The groups once only the tabs `kept` (their indices here, in order) remain: a group none of
+    /// them is in is gone, the others count again, and a group's resident that did not stay is
+    /// forgotten. The second list is the new group of each kept tab.
+    fn keeping(&self, kept: &[usize]) -> (Vec<SavedGroup>, Vec<Option<usize>>) {
+        let mut groups = Vec::new();
+        let mut moved = Vec::new();
+        for (at, group) in self.groups.iter().enumerate() {
+            if kept.iter().any(|&old| self.tabs[old].group == Some(at)) {
+                moved.push(Some(groups.len()));
+                groups.push(SavedGroup {
+                    name: group.name.clone(),
+                    collapsed: group.collapsed,
+                    resident: group
+                        .resident
+                        .and_then(|tab| kept.iter().position(|&old| old == tab)),
+                });
+            } else {
+                moved.push(None);
+            }
+        }
+        let grouped = kept
+            .iter()
+            .map(|&old| {
+                self.tabs[old]
+                    .group
+                    .and_then(|group| moved.get(group).copied().flatten())
+            })
+            .collect();
+        (groups, grouped)
+    }
+
+    /// The window's strip and groups as the models the rule lives in, tabs named by their index;
+    /// `None` when the groups are no grouping of the strip.
+    fn grouping(&self) -> Option<(Tabs<usize>, Groups<usize>)> {
+        let count = self.tabs.len();
+        if count == 0
+            || self
+                .tabs
+                .iter()
+                .any(|tab| tab.group.is_some_and(|group| group >= self.groups.len()))
+        {
+            return None;
+        }
+        let mut tabs = Tabs::new(0);
+        for index in 1..count {
+            tabs.append(index);
+        }
+        tabs.select(self.selected);
+        let parts = self
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(at, group)| Part {
+                name: group.name.clone(),
+                collapsed: group.collapsed,
+                resident: group.resident,
+                tabs: (0..count)
+                    .filter(|&index| self.tabs[index].group == Some(at))
+                    .collect(),
+            })
+            .collect();
+        let groups = Groups::from_parts(&tabs, parts)?;
+        Some((tabs, groups))
     }
 }
 
@@ -469,8 +635,11 @@ impl Saved {
             .iter()
             .flat_map(|window| &window.tabs)
             .any(|tab| tab.name.is_some());
-        let version = if sided {
+        let grouped = self.windows.iter().any(|window| !window.groups.is_empty());
+        let version = if grouped {
             VERSION
+        } else if sided {
+            SIDED
         } else if named {
             NAMED
         } else {
@@ -489,13 +658,23 @@ impl Saved {
                 window.selected,
                 u8::from(window.key)
             ));
-            if version >= VERSION {
+            if version >= SIDED {
                 match window.side_width {
                     Some(side) => out.push_str(&format!(" {side}")),
                     None => out.push_str(" -"),
                 }
             }
             out.push('\n');
+            if version >= VERSION {
+                for group in &window.groups {
+                    out.push_str(&format!(
+                        "G {} {} {}\n",
+                        escape(&group.name),
+                        u8::from(group.collapsed),
+                        group.resident.map_or("-".to_owned(), |tab| tab.to_string()),
+                    ));
+                }
+            }
             for tab in &window.tabs {
                 let zoomed = tab.zoomed.map_or("-".to_owned(), |z| z.to_string());
                 out.push_str(&format!("T {} {zoomed}", tab.focused));
@@ -504,6 +683,11 @@ impl Saved {
                 if version >= NAMED {
                     out.push(' ');
                     out.push_str(&render_optional(tab.name.as_deref()));
+                }
+                // The group sits after the name for the same reason.
+                if version >= VERSION {
+                    out.push(' ');
+                    out.push_str(&tab.group.map_or("-".to_owned(), |group| group.to_string()));
                 }
                 tab.shape.render(&mut out);
                 out.push('\n');
@@ -531,7 +715,7 @@ impl Saved {
             return None;
         }
         let version = header.next()?.parse::<u32>().ok()?;
-        if ![UNNAMED, NAMED, VERSION].contains(&version) || header.next().is_some() {
+        if ![UNNAMED, NAMED, SIDED, VERSION].contains(&version) || header.next().is_some() {
             return None;
         }
         let mut windows: Vec<SavedWindow> = Vec::new();
@@ -548,6 +732,14 @@ impl Saved {
             let mut tokens = line.split(' ');
             match tokens.next()? {
                 "W" => windows.push(parse_window(&mut tokens, version)?),
+                // The groups come before the window's first tab, the tabs name them by index.
+                "G" => {
+                    let window = windows.last_mut()?;
+                    if version < VERSION || !window.tabs.is_empty() {
+                        return None;
+                    }
+                    window.groups.push(parse_group(&mut tokens)?);
+                }
                 "T" => windows
                     .last_mut()?
                     .tabs
@@ -576,7 +768,9 @@ impl Saved {
 
 impl SavedWindow {
     fn is_consistent(&self) -> bool {
-        self.selected < self.tabs.len() && self.tabs.iter().all(SavedTab::is_consistent)
+        self.selected < self.tabs.len()
+            && self.tabs.iter().all(SavedTab::is_consistent)
+            && self.grouping().is_some()
     }
 }
 
@@ -609,7 +803,7 @@ fn parse_window<'a>(
     let selected = tokens.next()?.parse().ok()?;
     let key = parse_bit(tokens.next()?)?;
     // Versions before 3 have no width: the column is the default.
-    let side_width = if version >= VERSION {
+    let side_width = if version >= SIDED {
         match tokens.next()? {
             "-" => None,
             side => {
@@ -629,6 +823,24 @@ fn parse_window<'a>(
         selected,
         key,
         side_width,
+        groups: Vec::new(),
+    })
+}
+
+/// A `G` line's fields after the letter: the name (escaped), whether the group is closed, and the
+/// index of the tab it was last on (`-` for none).
+fn parse_group<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Option<SavedGroup> {
+    let name = unescape(tokens.next()?)?;
+    if name.trim().is_empty() {
+        return None;
+    }
+    Some(SavedGroup {
+        name,
+        collapsed: parse_bit(tokens.next()?)?,
+        resident: match tokens.next()? {
+            "-" => None,
+            index => Some(index.parse().ok()?),
+        },
     })
 }
 
@@ -644,6 +856,15 @@ fn parse_tab<'a>(tokens: &mut impl Iterator<Item = &'a str>, version: u32) -> Op
     } else {
         None
     };
+    // Versions before 4 have no groups: every tab is ungrouped.
+    let group = if version >= VERSION {
+        match tokens.next()? {
+            "-" => None,
+            index => Some(index.parse().ok()?),
+        }
+    } else {
+        None
+    };
     let shape = Shape::parse(tokens, 0)?;
     Some(SavedTab {
         shape,
@@ -651,6 +872,7 @@ fn parse_tab<'a>(tokens: &mut impl Iterator<Item = &'a str>, version: u32) -> Op
         focused,
         zoomed,
         name,
+        group,
     })
 }
 
@@ -942,6 +1164,7 @@ mod tests {
             focused: 0,
             zoomed: None,
             name: None,
+            group: None,
         }
     }
 
@@ -957,6 +1180,7 @@ mod tests {
             selected: 0,
             key: false,
             side_width: None,
+            groups: Vec::new(),
         }
     }
 
@@ -1000,6 +1224,7 @@ mod tests {
             focused: 1,
             zoomed: Some(2),
             name: None,
+            group: None,
         };
         let mut first = window(vec![single(B), split]);
         first.selected = 1;
@@ -1022,6 +1247,32 @@ mod tests {
     fn rich_sided() -> Saved {
         let mut saved = rich();
         saved.windows[0].side_width = Some(260.5);
+        saved
+    }
+
+    /// [`rich_sided`] with the first window's tabs gathered: `api server` (the split tab and a
+    /// single one, last on the single) and a closed `ünï` (one tab), the first tab ungrouped; the
+    /// second window stays a plain list. The model of [`V4_FIXTURE`].
+    fn rich_grouped() -> Saved {
+        let mut saved = rich_sided();
+        let first = &mut saved.windows[0];
+        first.tabs.push(single(C));
+        first.tabs.push(single(A));
+        first.tabs[1].group = Some(0);
+        first.tabs[2].group = Some(0);
+        first.tabs[3].group = Some(1);
+        first.groups = vec![
+            SavedGroup {
+                name: "api server".to_owned(),
+                collapsed: false,
+                resident: Some(2),
+            },
+            SavedGroup {
+                name: "ünï".to_owned(),
+                collapsed: true,
+                resident: None,
+            },
+        ];
         saved
     }
 
@@ -1082,26 +1333,53 @@ mod tests {
         "P AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE 0 0 - -\n",
     );
 
+    /// Version 4 for [`rich_grouped`], frozen the same way: the `G` lines follow their window's
+    /// `W` line, and every `T` line carries its group's index after the name, `-` where it has
+    /// none (a window without groups too).
+    const V4_FIXTURE: &str = concat!(
+        "bateri-session 4\n",
+        "W 120.5 -30 800 600.25 1 1 260.5\n",
+        "G api\\sserver 0 2\n",
+        "G ünï 1 -\n",
+        "T 0 - - - L 0\n",
+        "P 11111111-2222-3333-4444-555555555555 0 0 - -\n",
+        "T 1 2 - 0 S h 0.3333333333333333 L 2 S v 0.71 L 0 L 1\n",
+        r"P 0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0 3 1 +/Users/ömer/My\sDrive/çalışma\\dosya -",
+        "\n",
+        r"P 11111111-2222-3333-4444-555555555555 -2 0 +/tmp/tab\there\nnew\sline\rcr\s- +ssh\s-p\s2222\sprod",
+        "\n",
+        "P AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE 0 1 + +\n",
+        "T 0 - - 0 L 0\n",
+        "P AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE 0 0 - -\n",
+        "T 0 - - 1 L 0\n",
+        "P 0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0 0 0 - -\n",
+        "W 120.5 -30 800 600.25 0 0 -\n",
+        "T 0 - - - L 0\n",
+        "P AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE 0 0 - -\n",
+    );
+
     #[test]
     fn the_previous_version_is_read_byte_for_byte() {
         assert_eq!(Saved::parse(V1_FIXTURE), Some(rich()));
         assert_eq!(Saved::parse(V2_FIXTURE), Some(rich_named()));
+        assert_eq!(Saved::parse(V3_FIXTURE), Some(rich_sided()));
     }
 
     #[test]
     fn the_current_version_is_read_byte_for_byte() {
-        assert_eq!(Saved::parse(V3_FIXTURE), Some(rich_sided()));
+        assert_eq!(Saved::parse(V4_FIXTURE), Some(rich_grouped()));
     }
 
     /// The writer says the oldest version that holds the session — the one before names while no
-    /// tab is named and no column was resized, the one before widths while only names are — so
-    /// the bateri that only knew that version still reads it; the current one as soon as a width
-    /// is there.
+    /// tab is named, no column was resized and no group exists, the one before widths while only
+    /// names are, the one before groups while a width is too — so the bateri that only knew that
+    /// version still reads it; the current one as soon as a window has a group.
     #[test]
     fn an_unnamed_session_is_written_as_the_previous_version() {
         assert_eq!(rich().render(), V1_FIXTURE);
         assert_eq!(rich_named().render(), V2_FIXTURE);
         assert_eq!(rich_sided().render(), V3_FIXTURE);
+        assert_eq!(rich_grouped().render(), V4_FIXTURE);
     }
 
     /// A width is a positive number of points or `-`; anything else is a layout not understood.
@@ -1109,6 +1387,10 @@ mod tests {
     fn a_side_width_that_is_no_width_drops_the_layout() {
         for side in ["0", "-4", "inf", "NaN", "wide", "+"] {
             let text = V3_FIXTURE.replace("1 1 260.5\n", &format!("1 1 {side}\n"));
+            assert_eq!(Saved::parse(&text), None, "{side}");
+        }
+        for side in ["0", "-4", "inf", "NaN", "wide", "+"] {
+            let text = V4_FIXTURE.replace("1 1 260.5\n", &format!("1 1 {side}\n"));
             assert_eq!(Saved::parse(&text), None, "{side}");
         }
         // Version 2's window line has no width field; one there is a stray token.
@@ -1125,6 +1407,7 @@ mod tests {
             (rich_named(), "bateri-session 2\n"),
             (rich_sided(), "bateri-session 3\n"),
             (both, "bateri-session 3\n"),
+            (rich_grouped(), "bateri-session 4\n"),
         ] {
             let text = saved.render();
             assert!(text.starts_with(header), "{text}");
@@ -1173,6 +1456,221 @@ mod tests {
             .retain(&[true, false, true])
             .expect("two panes are left");
         assert_eq!(kept.name.as_deref(), Some("release notes"));
+    }
+
+    /// Retaining some panes of a tab keeps the tab's group with it.
+    #[test]
+    fn retaining_panes_keeps_the_group() {
+        let tab = rich_grouped().windows[0].tabs[1].clone();
+        let kept = tab
+            .retain(&[true, false, true])
+            .expect("two panes are left");
+        assert_eq!(kept.group, Some(0));
+    }
+
+    /// A group's name is what the user typed, escaped like a path, and stays on its line.
+    #[test]
+    fn a_group_name_round_trips_whatever_it_holds() {
+        for name in [
+            "-",
+            "+",
+            "a b",
+            "\\s",
+            "ğüşiöç",
+            "x\\",
+            "\t\n\r \\",
+            " lead and trail ",
+        ] {
+            let mut saved = rich_grouped();
+            saved.windows[0].groups[0].name = name.to_owned();
+            let text = saved.render();
+            assert_eq!(
+                text.lines().count(),
+                rich_grouped().render().lines().count(),
+                "{name:?}"
+            );
+            assert_eq!(Saved::parse(&text), Some(saved), "{name:?}");
+        }
+    }
+
+    /// The reader asks the groups' own rule whether what is saved is a grouping of the strip, and
+    /// a layout that is not is not read — a half-understood grouping would put tabs in the wrong
+    /// group.
+    #[test]
+    fn groups_that_are_no_grouping_of_the_strip_drop_the_layout() {
+        let read = |from: &str, to: &str| {
+            assert!(V4_FIXTURE.contains(from), "{from:?}");
+            Saved::parse(&V4_FIXTURE.replacen(from, to, 1))
+        };
+        // The sanity of the helper: a replacement that changes nothing reads.
+        assert_eq!(read("G ünï 1 -", "G ünï 1 -"), Some(rich_grouped()));
+        // A listed group no tab is in, a tab in a group that is not listed.
+        assert_eq!(read("T 0 - - 1 L 0", "T 0 - - 0 L 0"), None);
+        assert_eq!(read("T 0 - - 1 L 0", "T 0 - - 2 L 0"), None);
+        assert_eq!(read("T 0 - - 1 L 0", "T 0 - - x L 0"), None);
+        // An ungrouped tab behind a group's tabs, or a group's behind the next group's.
+        assert_eq!(read("T 0 - - - L 0\nP 1", "T 0 - - 1 L 0\nP 1"), None);
+        assert_eq!(read("T 1 2 - 0 S", "T 1 2 - 1 S"), None);
+        // A resident that is another group's, or no tab, or no number; a closed flag that is no flag.
+        assert_eq!(read("G api\\sserver 0 2", "G api\\sserver 0 3"), None);
+        assert_eq!(read("G api\\sserver 0 2", "G api\\sserver 0 9"), None);
+        assert_eq!(read("G api\\sserver 0 2", "G api\\sserver 0 x"), None);
+        assert_eq!(read("G api\\sserver 0 2", "G api\\sserver 2 2"), None);
+        // A resident that is an ungrouped tab.
+        assert_eq!(read("G api\\sserver 0 2", "G api\\sserver 0 0"), None);
+        // A blank name, a missing name, a group line with a field too many or too few.
+        assert_eq!(read("G api\\sserver 0 2", "G \\s 0 2"), None);
+        assert_eq!(read("G api\\sserver 0 2", "G  0 2"), None);
+        assert_eq!(read("G api\\sserver 0 2", "G api 0 2 -"), None);
+        assert_eq!(read("G api\\sserver 0 2", "G api 0"), None);
+        // A group line after the window's first tab, or in a version that has no groups.
+        assert_eq!(
+            read("T 0 - - - L 0\nP 1", "T 0 - - - L 0\nG late 0 -\nP 1"),
+            None
+        );
+        let before = V4_FIXTURE.replacen("bateri-session 4", "bateri-session 3", 1);
+        assert_eq!(Saved::parse(&before), None);
+        // A window of a grouped file with no group of its own is fine: its tabs say `-`.
+        assert!(rich_grouped().windows[1].groups.is_empty());
+    }
+
+    /// Tabs another layout placed already leave this one; a group keeps the tabs that stay, counts
+    /// again, forgets a resident that left, and goes with its last tab.
+    #[test]
+    fn placing_after_another_layout_regroups_what_stays() {
+        let uuid = |n: u32| format!("00000000-0000-0000-0000-{n:012}");
+        let mut tabs: Vec<SavedTab> = (1..=5).map(|n| single(&uuid(n))).collect();
+        for (tab, group) in tabs
+            .iter_mut()
+            .zip([None, Some(0), Some(0), Some(1), Some(1)])
+        {
+            tab.group = group;
+        }
+        let mut grouped = window(tabs);
+        grouped.selected = 1;
+        grouped.groups = vec![
+            SavedGroup {
+                name: "a".to_owned(),
+                collapsed: false,
+                resident: Some(2),
+            },
+            SavedGroup {
+                name: "b".to_owned(),
+                collapsed: true,
+                resident: Some(3),
+            },
+        ];
+        let saved = Saved {
+            windows: vec![grouped],
+        };
+        assert_eq!(Saved::parse(&saved.render()), Some(saved.clone()));
+        let id = |n: u32| id(&uuid(n));
+        // The second tab and the fourth are taken: `a` keeps its resident, `b` loses its own.
+        let placed = saved.place_after(&mut vec![id(2), id(4)]);
+        let window = &placed.windows[0];
+        assert_eq!(window.tabs.len(), 3);
+        assert_eq!(
+            window.tabs.iter().map(|tab| tab.group).collect::<Vec<_>>(),
+            [None, Some(0), Some(1)]
+        );
+        assert_eq!(window.selected, 0, "the selected tab went: the first stays");
+        assert_eq!(
+            window
+                .groups
+                .iter()
+                .map(|group| (group.name.as_str(), group.collapsed, group.resident))
+                .collect::<Vec<_>>(),
+            [("a", false, Some(1)), ("b", true, None)]
+        );
+        assert_eq!(Saved::parse(&placed.render()), Some(placed.clone()));
+        // Both of `b`'s tabs: the group goes, and with no group left the layout is a plain list.
+        let placed = saved.place_after(&mut vec![id(4), id(5)]);
+        assert_eq!(placed.windows[0].groups.len(), 1);
+        assert_eq!(placed.windows[0].groups[0].name, "a");
+        assert_eq!(Saved::parse(&placed.render()), Some(placed));
+        let placed = saved.place_after(&mut vec![id(2), id(3), id(4), id(5)]);
+        assert!(placed.windows[0].groups.is_empty());
+        assert!(placed.render().starts_with("bateri-session 1\n"));
+    }
+
+    /// The groups a live window saves are the ones over the tabs that are saved: a tab that is
+    /// left out keeps its group's others, a group it emptied is not written, and a resident that
+    /// is not saved is forgotten.
+    #[test]
+    fn a_live_windows_groups_are_saved_over_the_tabs_that_are_saved() {
+        use crate::groups::Target;
+        let mut tabs = Tabs::new(1u64);
+        for tab in 2..=8 {
+            tabs.append(tab);
+        }
+        let mut groups = Groups::new();
+        groups.place(&mut tabs, &[1, 2, 3], Target::New("api".to_owned()));
+        groups.place(&mut tabs, &[4, 5], Target::New("web".to_owned()));
+        groups.select(&mut tabs, 2);
+        // The strip reads `6 7 8 | 1 2 3 | 4 5`, `api` last left on 2.
+        let (saved, of) = saved_groups(&groups, tabs.ids());
+        let group = |name: &str, resident| SavedGroup {
+            name: name.to_owned(),
+            collapsed: false,
+            resident,
+        };
+        assert_eq!(saved, [group("api", Some(4)), group("web", None)]);
+        assert_eq!(
+            of,
+            [
+                None,
+                None,
+                None,
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(1),
+                Some(1)
+            ]
+        );
+        // Tab 2 and `web`'s tabs are not saved.
+        let (saved, of) = saved_groups(&groups, &[6, 7, 8, 1, 3]);
+        assert_eq!(saved, [group("api", None)]);
+        assert_eq!(of, [None, None, None, Some(0), Some(0)]);
+        // No group: no saved group, whatever the strip.
+        let (saved, of) = saved_groups(&Groups::<u64>::new(), &[1, 2]);
+        assert!(saved.is_empty());
+        assert_eq!(of, [None, None]);
+    }
+
+    /// What a restoring window builds its groups from: the saved ones over the tabs that were
+    /// built again, which can be fewer.
+    #[test]
+    fn the_groups_of_the_tabs_that_came_back_are_the_saved_ones_over_those() {
+        let saved = rich_grouped().windows[0].clone();
+        let everything: Vec<(usize, u64)> =
+            (0..4).map(|index| (index, 10 + index as u64)).collect();
+        let parts = saved.parts(&everything);
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| (
+                    part.name.as_str(),
+                    part.collapsed,
+                    part.resident,
+                    part.tabs.clone()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("api server", false, Some(12), vec![11, 12]),
+                ("ünï", true, None, vec![13])
+            ]
+        );
+        // The last two tabs did not come back: `api server` keeps its first, loses its resident,
+        // and `ünï` is gone. What is left is a grouping of the strip it came from.
+        let parts = saved.parts(&[(0, 10), (1, 11)]);
+        assert_eq!(parts.len(), 1);
+        assert_eq!((parts[0].tabs.clone(), parts[0].resident), (vec![11], None));
+        let mut tabs = Tabs::new(10u64);
+        tabs.append(11);
+        assert!(Groups::from_parts(&tabs, parts).is_some());
+        // A window with no group has no part.
+        assert!(rich().windows[0].parts(&[(0, 10)]).is_empty());
     }
 
     #[test]
@@ -1349,6 +1847,7 @@ mod tests {
                 focused: 0,
                 zoomed: None,
                 name: None,
+                group: None,
             }
         };
         let saved = Saved {

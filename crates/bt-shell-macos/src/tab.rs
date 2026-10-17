@@ -1445,6 +1445,8 @@ impl TerminalTab {
             focused: position(self.focused_pane().id()).unwrap_or(0),
             zoomed: self.ivars().container.zoomed().and_then(position),
             name: self.name(),
+            // The window knows the groups: it says which one the tab is in.
+            group: None,
         };
         Some((tab, histories))
     }

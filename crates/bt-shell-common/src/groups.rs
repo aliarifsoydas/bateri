@@ -151,6 +151,18 @@ pub struct Picked<K> {
     pub open: Option<K>,
 }
 
+/// A group as a saved layout holds it, with the tabs it gathers ([`Groups::from_parts`],
+/// [`Groups::parts`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Part<K> {
+    pub name: String,
+    pub collapsed: bool,
+    /// The tab the user was last on in the group; one of [`Self::tabs`].
+    pub resident: Option<K>,
+    /// The group's tabs, in the order of the strip.
+    pub tabs: Vec<K>,
+}
+
 /// The name a group starts with from its first tab's title: the folder it stands in (`~/code/api`
 /// → `api`), `home` for the home directory (`~`), the host for a remote tab (`⇄ db-1` → `db-1`),
 /// and [`UNTITLED`] when there is nothing to take.
@@ -385,6 +397,79 @@ impl<K: Copy + Eq> Groups<K> {
         );
         self.select(tabs, tab);
         group
+    }
+
+    /// A tab let go on the strip at place `gap` (before the tab that stands there; the strip's
+    /// length is the end) joins **the cluster of the tab it goes before** — of the last tab at the
+    /// end — and is selected: where a tab dragged along or onto a strip lands when the strip is
+    /// all the pointer named. A tab that is here moves instead of being added twice. In a window
+    /// without groups it is [`Tabs::insert_at`].
+    pub fn insert_at(&mut self, tabs: &mut Tabs<K>, tab: K, gap: usize) {
+        self.put_at(tabs, tab, gap);
+        self.select(tabs, tab);
+    }
+
+    /// A new tab at place `gap` ([`Self::insert_at`]'s cluster rule) with the selection left where
+    /// it was — a pane that became a tab of its own. `false` if the tab is here already. In a
+    /// window without groups it is [`Tabs::place_new`].
+    pub fn place_new(&mut self, tabs: &mut Tabs<K>, tab: K, gap: usize) -> bool {
+        if tabs.index_of(tab).is_some() {
+            return false;
+        }
+        self.put_at(tabs, tab, gap);
+        true
+    }
+
+    /// A tab that joins from another window at the end (Merge All Windows), the selection staying
+    /// where it was: **among the ungrouped tabs**, after the last of them — a groupless tab at the
+    /// far end would stand behind the groups and break the order. `false` if it is here already.
+    /// In a window without groups it is [`Tabs::append`].
+    pub fn append(&mut self, tabs: &mut Tabs<K>, tab: K) -> bool {
+        if tabs.index_of(tab).is_some() {
+            return false;
+        }
+        tabs.append(tab);
+        self.place(tabs, &[tab], Target::Loose { before: None });
+        true
+    }
+
+    /// A tab takes place `index` in the strip (clamped to the last place) and goes into the
+    /// cluster of the tab it then stands before, or of the last tab; the selection stays on its
+    /// tab. `true` if the order or the tab's group changed. In a window without groups it is
+    /// [`Tabs::move_to`].
+    pub fn move_to(&mut self, tabs: &mut Tabs<K>, tab: K, index: usize) -> bool {
+        if tabs.index_of(tab).is_none() {
+            return false;
+        }
+        let before = tabs.ids().to_vec();
+        let group = self.group_of(tab);
+        let rest: Vec<K> = before
+            .iter()
+            .copied()
+            .filter(|&other| other != tab)
+            .collect();
+        let target = self.landing(&rest, index.min(rest.len()));
+        self.place(tabs, &[tab], target);
+        tabs.ids() != before || self.group_of(tab) != group
+    }
+
+    /// The tab `source`, whose last pane went into tab `target`, is gone and the screen follows
+    /// the pane if it was on `source` ([`Tabs::pane_to_tab`]'s rule, with the group left empty
+    /// going too). `true` if `source` was removed.
+    pub fn pane_to_tab(&mut self, tabs: &mut Tabs<K>, source: K, emptied: bool, target: K) -> bool {
+        if !emptied
+            || source == target
+            || tabs.index_of(source).is_none()
+            || tabs.index_of(target).is_none()
+        {
+            return false;
+        }
+        let selected = tabs.selected() == Some(source);
+        self.close(tabs, &[source]);
+        if selected {
+            self.select(tabs, target);
+        }
+        true
     }
 
     /// Takes tabs out of the window; how many were there. When the selected one goes,
@@ -674,6 +759,50 @@ impl<K: Copy + Eq> Groups<K> {
         }
     }
 
+    // ─── Saving and restoring ────────────────────────────────────────────
+
+    /// The groups with the tabs they gather, in the order they are listed — what a saved layout
+    /// keeps. The ungrouped tabs are what no part names; the cluster of ungrouped tabs remembers
+    /// no resident on disk (the first one is entered again).
+    pub fn parts(&self, tabs: &Tabs<K>) -> Vec<Part<K>> {
+        self.groups
+            .iter()
+            .map(|group| Part {
+                name: group.name.clone(),
+                collapsed: group.collapsed,
+                resident: group.resident,
+                tabs: self.cluster(tabs, Some(group.id)),
+            })
+            .collect()
+    }
+
+    /// The groups a saved layout names over `tabs`, which are already in strip order: each part's
+    /// tabs are its members, names kept as saved (not made unique: they were when they were
+    /// made). `None` when what is saved is not a consistent grouping of `tabs` ([`Self::check`]):
+    /// a tab in two parts or none of this strip, a group with no tab, a blank name, the groups
+    /// not standing in the order the strip has, a resident outside its group.
+    pub fn from_parts(tabs: &Tabs<K>, parts: Vec<Part<K>>) -> Option<Self> {
+        let mut groups = Self::new();
+        for part in parts {
+            if part.name.trim().is_empty() {
+                return None;
+            }
+            let id = GroupId(groups.next);
+            groups.next += 1;
+            groups.groups.push(Group {
+                id,
+                name: part.name,
+                collapsed: part.collapsed,
+                resident: part.resident,
+            });
+            groups
+                .members
+                .extend(part.tabs.into_iter().map(|tab| (tab, id)));
+        }
+        groups.check(tabs).ok()?;
+        Some(groups)
+    }
+
     // ─── The invariant ───────────────────────────────────────────────────
 
     /// Whether the groups and the order agree: the strip is the ungrouped tabs, then each group's
@@ -735,6 +864,46 @@ impl<K: Copy + Eq> Groups<K> {
             resident: None,
         });
         id
+    }
+
+    /// The target of a tab let go at place `at` of `list` (the strip without the tab, when it is a
+    /// tab that moves): the cluster of the tab at `at`, before it; at the end, the last tab's
+    /// cluster, after its last tab; an empty list is the ungrouped tabs.
+    fn landing(&self, list: &[K], at: usize) -> Target<K> {
+        match list.get(at) {
+            Some(&before) => match self.group_of(before) {
+                Some(group) => Target::Group {
+                    group,
+                    before: Some(before),
+                },
+                None => Target::Loose {
+                    before: Some(before),
+                },
+            },
+            None => match list.last().and_then(|&last| self.group_of(last)) {
+                Some(group) => Target::Group {
+                    group,
+                    before: None,
+                },
+                None => Target::Loose { before: None },
+            },
+        }
+    }
+
+    /// Puts a tab at place `gap` of the strip, in the cluster [`Self::landing`] names; the
+    /// selection stays on its tab.
+    fn put_at(&mut self, tabs: &mut Tabs<K>, tab: K, gap: usize) {
+        let rest: Vec<K> = tabs
+            .ids()
+            .iter()
+            .copied()
+            .filter(|&other| other != tab)
+            .collect();
+        let target = self.landing(&rest, gap.min(rest.len()));
+        if tabs.index_of(tab).is_none() {
+            tabs.place_new(tab, tabs.len());
+        }
+        self.place(tabs, &[tab], target);
     }
 
     /// The strip's length up to and including a cluster: where a tab put at its end goes.
@@ -1111,6 +1280,226 @@ mod tests {
             );
             assert_eq!(groups.numbered(&tabs, View::Top), plain.ids());
         }
+    }
+
+    #[test]
+    fn a_window_without_groups_places_tabs_as_the_plain_list_does() {
+        let mut rng = Rng(11);
+        let mut plain = Tabs::new(0u32);
+        let mut tabs = Tabs::new(0u32);
+        let mut groups = Groups::new();
+        let mut next = 1;
+        for step in 0..600 {
+            let ids = plain.ids().to_vec();
+            let gap = rng.below(ids.len() + 2);
+            match rng.below(6) {
+                0 => {
+                    plain.insert_at(next, gap);
+                    groups.insert_at(&mut tabs, next, gap);
+                    next += 1;
+                }
+                1 => {
+                    assert_eq!(
+                        plain.place_new(next, gap),
+                        groups.place_new(&mut tabs, next, gap)
+                    );
+                    next += 1;
+                }
+                2 => {
+                    assert_eq!(plain.append(next), groups.append(&mut tabs, next));
+                    next += 1;
+                }
+                3 => {
+                    let tab = ids[rng.below(ids.len())];
+                    assert_eq!(
+                        plain.move_to(tab, gap),
+                        groups.move_to(&mut tabs, tab, gap),
+                        "step {step}"
+                    );
+                }
+                4 if ids.len() > 2 => {
+                    let source = ids[rng.below(ids.len())];
+                    let target = ids[rng.below(ids.len())];
+                    assert_eq!(
+                        plain.pane_to_tab(source, true, target),
+                        groups.pane_to_tab(&mut tabs, source, true, target),
+                        "step {step}"
+                    );
+                }
+                _ => {
+                    plain.insert(next);
+                    groups.open(&mut tabs, next);
+                    next += 1;
+                }
+            }
+            assert_eq!(
+                (tabs.ids(), tabs.selected()),
+                (plain.ids(), plain.selected()),
+                "step {step}"
+            );
+        }
+    }
+
+    /// A strip place names no cluster, so the tab joins the one of the tab it goes before — the
+    /// start of a group is that group's, not the end of the ungrouped tabs.
+    #[test]
+    fn a_tab_let_go_on_the_strip_joins_the_cluster_it_goes_before() {
+        // The strip reads `6 7 8 | 1 2 3 | 4 5`.
+        for (gap, cluster, expect) in [
+            (0, "ungrouped", vec![9, 6, 7, 8]),
+            (2, "ungrouped", vec![6, 7, 9, 8]),
+            (3, "api", vec![9, 1, 2, 3]),
+            (4, "api", vec![1, 9, 2, 3]),
+            (8, "web", vec![4, 5, 9]),
+            (99, "web", vec![4, 5, 9]),
+        ] {
+            let (mut tabs, mut groups, api, web) = scene();
+            groups.insert_at(&mut tabs, 9, gap);
+            ok(&groups, &tabs);
+            let of = match cluster {
+                "api" => Some(api),
+                "web" => Some(web),
+                _ => None,
+            };
+            assert_eq!(groups.cluster(&tabs, of), expect, "gap {gap}");
+            assert_eq!(
+                tabs.selected(),
+                Some(9),
+                "gap {gap}: it is the tab looked at"
+            );
+        }
+        // A tab that is made for a place (a pane that became a tab) leaves the screen alone.
+        let (mut tabs, mut groups, api, _) = scene();
+        assert!(groups.place_new(&mut tabs, 9, 4));
+        assert!(!groups.place_new(&mut tabs, 9, 4));
+        assert_eq!(groups.cluster(&tabs, Some(api)), [1, 9, 2, 3]);
+        assert_eq!(tabs.selected(), Some(1));
+        ok(&groups, &tabs);
+    }
+
+    #[test]
+    fn a_tab_joining_at_the_end_stands_among_the_ungrouped_ones() {
+        let (mut tabs, mut groups, _, _) = scene();
+        assert!(groups.append(&mut tabs, 9));
+        assert!(!groups.append(&mut tabs, 9));
+        assert_eq!(tabs.ids(), [6, 7, 8, 9, 1, 2, 3, 4, 5]);
+        assert_eq!(tabs.selected(), Some(1), "the window shows what it showed");
+        ok(&groups, &tabs);
+    }
+
+    #[test]
+    fn a_tab_dragged_along_the_strip_changes_cluster_where_it_lands() {
+        // `6 7 8 | 1 2 3 | 4 5`; 1 is selected.
+        let (mut tabs, mut groups, api, web) = scene();
+        assert!(groups.move_to(&mut tabs, 6, 4));
+        assert_eq!(groups.cluster(&tabs, Some(api)), [1, 2, 6, 3]);
+        ok(&groups, &tabs);
+        assert!(groups.move_to(&mut tabs, 1, 0));
+        assert_eq!(groups.group_of(1), None);
+        assert_eq!(tabs.ids(), [1, 7, 8, 2, 6, 3, 4, 5]);
+        assert_eq!(groups.cluster(&tabs, None), [1, 7, 8]);
+        assert_eq!(tabs.selected(), Some(1), "the selection stays on its tab");
+        ok(&groups, &tabs);
+        // To the very end: the last tab's group, after its last tab.
+        assert!(groups.move_to(&mut tabs, 4, 99));
+        assert_eq!(groups.cluster(&tabs, Some(web)), [5, 4]);
+        // Where it already is: nothing changed.
+        let before = (tabs.clone(), groups.clone());
+        assert!(!groups.move_to(&mut tabs, 7, 1));
+        assert_eq!((tabs.clone(), groups.clone()), before);
+        assert!(
+            !groups.move_to(&mut Tabs::new(1), 2, 0),
+            "a tab that is not here"
+        );
+    }
+
+    #[test]
+    fn a_tab_folded_into_another_takes_its_group_with_it_when_it_was_the_last() {
+        let (mut tabs, mut groups, api, _) = scene();
+        // The selected tab folds: the screen goes to the tab its pane went to.
+        assert!(groups.pane_to_tab(&mut tabs, 1, true, 4));
+        assert_eq!(tabs.selected(), Some(4));
+        assert_eq!(groups.cluster(&tabs, Some(api)), [2, 3]);
+        ok(&groups, &tabs);
+        // Not emptied, itself, or not here: nothing.
+        assert!(!groups.pane_to_tab(&mut tabs, 2, false, 3));
+        assert!(!groups.pane_to_tab(&mut tabs, 2, true, 2));
+        assert!(!groups.pane_to_tab(&mut tabs, 2, true, 99));
+        // The last tab of a group folding away ends the group.
+        assert!(groups.pane_to_tab(&mut tabs, 2, true, 3));
+        assert!(groups.pane_to_tab(&mut tabs, 3, true, 4));
+        assert_eq!(groups.len(), 1, "api is gone");
+        ok(&groups, &tabs);
+    }
+
+    #[test]
+    fn the_parts_of_a_grouping_build_it_again() {
+        let (tabs, mut groups, _, web) = scene();
+        groups.set_collapsed(web, true);
+        groups.rename(web, "api");
+        let parts = groups.parts(&tabs);
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| (
+                    part.name.as_str(),
+                    part.collapsed,
+                    part.resident,
+                    part.tabs.clone()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("api", false, Some(1), vec![1, 2, 3]),
+                ("api", true, None, vec![4, 5])
+            ],
+            "names are kept as they are, even two alike"
+        );
+        assert_eq!(Groups::from_parts(&tabs, parts), Some(groups));
+        assert_eq!(
+            Groups::from_parts(&tabs, Vec::new()),
+            Some(Groups::new()),
+            "no group is a plain list"
+        );
+    }
+
+    #[test]
+    fn parts_that_are_no_grouping_of_the_strip_build_nothing() {
+        let (tabs, groups, _, _) = scene();
+        let good = groups.parts(&tabs);
+        let rejected = |mutate: &dyn Fn(&mut Vec<Part<u32>>)| {
+            let mut parts = good.clone();
+            mutate(&mut parts);
+            Groups::from_parts(&tabs, parts)
+        };
+        assert!(rejected(&|_| {}).is_some());
+        assert!(
+            rejected(&|parts| parts[0].name = " \t".into()).is_none(),
+            "a blank name"
+        );
+        assert!(
+            rejected(&|parts| parts[0].tabs.push(99)).is_none(),
+            "a tab not in the strip"
+        );
+        assert!(
+            rejected(&|parts| parts[1].tabs.push(1)).is_none(),
+            "a tab in two groups"
+        );
+        assert!(
+            rejected(&|parts| parts[1].tabs.clear()).is_none(),
+            "a group with no tab"
+        );
+        assert!(
+            rejected(&|parts| parts.swap(0, 1)).is_none(),
+            "groups against the strip's order"
+        );
+        assert!(
+            rejected(&|parts| parts[0].resident = Some(4)).is_none(),
+            "a resident of another"
+        );
+        assert!(
+            rejected(&|parts| parts[0].resident = Some(7)).is_none(),
+            "a resident ungrouped"
+        );
     }
 
     #[test]
@@ -1518,7 +1907,7 @@ mod tests {
                     count => groups.groups()[rng.below(count)].id,
                 }
             };
-            let what = rng.below(14);
+            let what = rng.below(19);
             if ids.is_empty() {
                 groups.open(&mut tabs, next);
                 next += 1;
@@ -1580,6 +1969,28 @@ mod tests {
                         let closed = rng.below(2) == 0;
                         groups.set_collapsed(group, closed);
                         groups.rename(group, "renamed");
+                    }
+                    14 => {
+                        let gap = rng.below(ids.len() + 2);
+                        groups.insert_at(&mut tabs, next, gap);
+                        next += 1;
+                    }
+                    15 => {
+                        let gap = rng.below(ids.len() + 2);
+                        groups.place_new(&mut tabs, next, gap);
+                        next += 1;
+                    }
+                    16 => {
+                        groups.append(&mut tabs, next);
+                        next += 1;
+                    }
+                    17 => {
+                        let tab = some(&mut rng);
+                        groups.move_to(&mut tabs, tab, rng.below(ids.len() + 1));
+                    }
+                    18 => {
+                        let (source, target) = (some(&mut rng), some(&mut rng));
+                        groups.pane_to_tab(&mut tabs, source, true, target);
                     }
                     _ => {
                         if let Reach::Tab { tab, expand } = groups.reach(&tabs, rng.below(10) as u8)

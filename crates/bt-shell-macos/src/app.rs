@@ -3633,9 +3633,29 @@ impl AppDelegate {
                 }
                 true
             }
-            Step::PutStrip { window, order } => {
+            Step::PutStrip {
+                window,
+                order,
+                groups,
+            } => {
                 if let Some(window) = self.window(window) {
-                    window.put_strip(order);
+                    window.put_strip(order, groups);
+                }
+                true
+            }
+            Step::Regroup {
+                window,
+                tabs,
+                target,
+            } => {
+                if let Some(window) = self.window(window) {
+                    window.regroup(&tabs, target);
+                }
+                true
+            }
+            Step::MoveGroup { window, group, to } => {
+                if let Some(window) = self.window(window) {
+                    window.move_group(group, to);
                 }
                 true
             }
@@ -4322,6 +4342,9 @@ impl AppDelegate {
                 .find(|(index, _)| *index == window.selected)
                 .or_else(|| tabs.first())
                 .map(|(_, tab)| *tab);
+            // The groups before the selection, so the tab the window comes up on is also the
+            // one its group was last left on.
+            built.restore_groups(window.parts(&tabs));
             if let Some(selected) = selected {
                 built.select_tab(selected);
             }
@@ -4556,6 +4579,7 @@ impl AppDelegate {
                 continue;
             };
             let mut tabs = Vec::new();
+            let mut saved_ids = Vec::new();
             let mut selected_index = 0;
             for live in window.tabs() {
                 let Some((tab, tab_histories)) = live.saved_tab(with_history) else {
@@ -4566,9 +4590,16 @@ impl AppDelegate {
                 }
                 histories.extend(tab_histories);
                 tabs.push(tab);
+                saved_ids.push(live.id());
             }
             if tabs.is_empty() {
                 continue;
+            }
+            // The groups over the tabs that are saved: a tab left out leaves the rest as
+            // they were, and a group it emptied is not written.
+            let (groups, grouped) = restore::saved_groups(&window.groups(), &saved_ids);
+            for (tab, group) in tabs.iter_mut().zip(grouped) {
+                tab.group = group;
             }
             let rect = window.ns_window().frame();
             windows.push(SavedWindow {
@@ -4584,6 +4615,7 @@ impl AppDelegate {
                 // A column at the default is written as none: the layout then stays in the
                 // version before widths.
                 side_width: Some(window.side_width()).filter(|&side| side != tabs::SIDE_WIDTH),
+                groups,
             });
         }
         (Saved { windows }, histories)

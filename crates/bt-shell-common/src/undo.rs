@@ -5,8 +5,8 @@
 //! panes) to another tab, makes a tab of it, swaps two panes or reorders a lone pane's tab
 //! writes down what it is about to change — for each window that takes part, the strip as it
 //! stood ([`Scene::order`]: order and selection) and each tab it touches as it stood
-//! ([`Shape`]: name, split tree with its ratios, the focused pane) — and putting that picture
-//! back is planned like any move (`moves::Move::Undo`), through the same steps the moves use. A
+//! ([`Shape`]: name, split tree with its ratios, the focused pane; the strip's tab groups go with
+//! the strip) — and putting that picture back is planned like any move (`moves::Move::Undo`), through the same steps the moves use. A
 //! picture covers every move the same
 //! way (a tab that the move closed is born again from its shape; a tab the move made is taken
 //! apart), where one inverse per move would be five code paths that drift apart.
@@ -22,6 +22,7 @@
 //! Panes and tabs are named by the in-process identities, which mean nothing in another
 //! process; a record never reaches the disk.
 
+use crate::groups::Groups;
 use crate::split::Tree;
 use crate::tabs::Tabs;
 
@@ -43,6 +44,9 @@ pub struct Scene {
     pub window: u64,
     /// The strip before the move: the tabs in order and the selected one.
     pub order: Tabs<u64>,
+    /// The groups before the move: which tabs were gathered under which name, which were closed
+    /// and which tab each was last on. Putting the strip back puts them back with it.
+    pub groups: Groups<u64>,
     /// The touched tabs, each as it stood. Every one is in [`Self::order`].
     pub shapes: Vec<Shape>,
 }
@@ -188,6 +192,7 @@ mod tests {
             scenes: vec![Scene {
                 window: 1,
                 order: strip(&[1, 2, 3]),
+                groups: Groups::new(),
                 shapes: vec![shape(1, Tree::Leaf(10)), shape(2, pair(20, 21))],
             }],
             born: Vec::new(),
@@ -237,6 +242,7 @@ mod tests {
             scenes: vec![Scene {
                 window: 1,
                 order: strip(&[1, 2]),
+                groups: Groups::new(),
                 shapes: vec![shape(1, pair(10, 11))],
             }],
             born: Vec::new(),
@@ -253,6 +259,7 @@ mod tests {
             scenes: vec![Scene {
                 window: 1,
                 order: strip(&[1, 2, 3]),
+                groups: Groups::new(),
                 shapes: Vec::new(),
             }],
             born: Vec::new(),
@@ -267,6 +274,7 @@ mod tests {
             scenes: vec![Scene {
                 window: 1,
                 order: strip(&[1]),
+                groups: Groups::new(),
                 shapes: vec![shape(1, pair(10, 11))],
             }],
             born: vec![5],

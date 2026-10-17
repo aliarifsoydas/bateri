@@ -149,6 +149,8 @@ fn step_words(step: &Step) -> String {
         Step::Select { .. } => step::SELECT,
         Step::Focus { .. } => step::FOCUS,
         Step::Pulse { .. } => step::PULSE,
+        // Groups are not part of the C surface; no plan from a picture without them holds these.
+        Step::Regroup { .. } | Step::MoveGroup { .. } => 0,
     };
     format!(
         "{} w{} t{} p{} i{} f{} g{} x{} s{} at{:?}{extra}",

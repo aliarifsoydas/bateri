@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char};
 use std::ptr::{null, null_mut};
 
+use bt_shell_common::groups::Groups;
 use bt_shell_common::moves::{self, Host, Joins, Move, Plan, Refusal, Slot, Step, Window};
 use bt_shell_common::split::{
     Axis, Direction, Layout, Rect, Room, Size, Spacing, Tree, Verdict, Zone,
@@ -621,6 +622,8 @@ pub unsafe extern "C" fn bt_world_add_window(
             world.windows.push(Window {
                 id: window,
                 order: Tabs::empty(),
+                // A host's windows keep no tab groups: no move the C surface can ask for makes one.
+                groups: Groups::new(),
                 tabs: Vec::new(),
                 asking,
                 stays_empty,
@@ -1355,6 +1358,10 @@ pub unsafe extern "C" fn bt_plan_step_kind(plan: *const BtPlan, part: u32, index
             Step::Select { .. } => step::SELECT,
             Step::Focus { .. } => step::FOCUS,
             Step::Pulse { .. } => step::PULSE,
+            // Tab groups are not part of the C surface: a host's pictures have none and no
+            // `BtMove` regroups, so no plan holds these. A kind that is 0 reads as unknown, and
+            // an unknown main step makes a host refuse the whole plan.
+            Step::Regroup { .. } | Step::MoveGroup { .. } => 0,
         })
     }
 }
@@ -1441,6 +1448,8 @@ fn fields(step: &Step) -> Fields {
             ..none
         },
         Step::PutStrip { window, .. }
+        | Step::Regroup { window, .. }
+        | Step::MoveGroup { window, .. }
         | Step::Undone { window }
         | Step::CloseIfEmptied { window }
         | Step::Raise { window } => Fields { window, ..none },

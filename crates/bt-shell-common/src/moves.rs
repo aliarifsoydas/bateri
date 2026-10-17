@@ -31,11 +31,20 @@
 //! every step is done ([`Plan::undo`]); a move that closes a window leaves none, since a window
 //! is not a picture Undo Move can paint again.
 //!
+//! **Groups go with the strip.** A window's tabs may be gathered in named groups
+//! ([`crate::groups`]): the picture carries them beside the strip ([`Window::groups`]), a plan
+//! that moves a tab lets them follow the rules there (a group left empty is gone, a tab joining a
+//! strip lands in the cluster of the place it was let go at), Undo Move's record puts them back
+//! with the strip, and the moves of tabs *between* groups and of groups themselves
+//! ([`Move::RegroupTabs`], [`Move::MoveGroup`], [`Move::GroupToWindow`],
+//! [`Move::GroupToNewWindow`], [`Move::TabsToNewWindow`]) are planned here like any other.
+//!
 //! **Whether an emptied window closes is the window's.** bateri's windows close when a move
 //! takes their last tab; a host whose windows are places of their own (a workspace that stays
 //! when its last terminal moves out) says so in the picture ([`Window::stays_empty`]), and the
 //! same moves leave such a window open — and undoable.
 
+use crate::groups::{GroupId, Groups, Target};
 use crate::split::{Direction, Tree};
 use crate::tabs::{NewTab, Tabs, gap_to_index};
 use crate::undo::{Now, Record, Scene, Shape};
@@ -46,6 +55,9 @@ pub struct Window {
     pub id: u64,
     /// The strip: the tabs in order and the selected one.
     pub order: Tabs<u64>,
+    /// The strip's tab groups: who is gathered under which name. Empty for a plain list of tabs
+    /// — and for a host that keeps no groups, whose pictures are all like that.
+    pub groups: Groups<u64>,
     /// Every tab of the strip as it stands: name, split tree with its ratios, focused pane.
     pub tabs: Vec<Shape>,
     /// The window holds a question of its own (the close question, the application's report),
@@ -83,6 +95,7 @@ impl Window {
         Scene {
             window: self.id,
             order: self.order.clone(),
+            groups: self.groups.clone(),
             shapes: touched
                 .iter()
                 .filter_map(|&tab| self.tab(tab).cloned())
@@ -164,8 +177,51 @@ pub enum Move {
     /// selected.
     TabToStrip { tab: u64, window: u64, index: usize },
     /// Every other window's tabs join window `into`'s at its end, in strip order, the
-    /// selection staying where it was; the windows they leave close.
+    /// selection staying where it was; the windows they leave close. They join as ungrouped
+    /// tabs: a group belongs to its window.
     MergeAllWindows { into: u64 },
+    /// Tabs `tabs` of window `window` go where `target` says ([`Groups::place`]): into a group
+    /// (before one of its tabs, or last), into a group made for them with a name, or out of any
+    /// group among the ungrouped ones — Move to Group, Move to New Group, Remove from Group,
+    /// Ungroup, a row let go between two rows. What is on screen stays. A question the window
+    /// holds does not hold it back: nothing is shown or hidden.
+    RegroupTabs {
+        window: u64,
+        tabs: Vec<u64>,
+        target: Target<u64>,
+    },
+    /// Group `group` of window `window` takes place `to` among the groups (past the end is the
+    /// end), its tabs with it; the ungrouped tabs stay first.
+    MoveGroup {
+        window: u64,
+        group: GroupId,
+        to: usize,
+    },
+    /// Group `group` of window `window` joins window `into` as a group of its own, with its name
+    /// (made unique there) and at place `to` among that window's groups; its tabs leave their
+    /// window whole and the window comes forward on the tab the user was on in the group. The
+    /// window they leave closes if they were all it had. In its own window it is
+    /// [`Move::MoveGroup`].
+    GroupToWindow {
+        window: u64,
+        group: GroupId,
+        into: u64,
+        to: usize,
+    },
+    /// Group `group` of window `window` becomes a window of its own with the group's name, as
+    /// [`Move::TabToNewWindow`] says for `at`. A window that is only that group stays.
+    GroupToNewWindow {
+        window: u64,
+        group: GroupId,
+        at: Option<(f64, f64)>,
+    },
+    /// Tabs `tabs` of window `window` become a window of their own, ungrouped, in the order they
+    /// had; `at` as in [`Move::TabToNewWindow`]. A window that is only these tabs stays.
+    TabsToNewWindow {
+        window: u64,
+        tabs: Vec<u64>,
+        at: Option<(f64, f64)>,
+    },
     /// Undo Move: the picture `record` keeps goes back, as one step — what the move made comes
     /// apart (a window it made closes, no program with it), then each tab and strip is put as
     /// it was, the selection and the focus with them. There is no redo.
@@ -225,9 +281,27 @@ pub enum Step {
         tree: Tree,
         name: Option<String>,
     },
-    /// Window `window`'s strip is `order` again, its selection with it; what was on screen
-    /// leaves it first.
-    PutStrip { window: u64, order: Tabs<u64> },
+    /// Window `window`'s strip is `order` again, its selection and its `groups` with it; what was
+    /// on screen leaves it first.
+    PutStrip {
+        window: u64,
+        order: Tabs<u64>,
+        groups: Groups<u64>,
+    },
+    /// Tabs `tabs` of window `window` go where `target` says ([`Groups::place`]); a group made
+    /// for them is given its identity by the window's own count, which the plan reads from the
+    /// picture. What is on screen does not change.
+    Regroup {
+        window: u64,
+        tabs: Vec<u64>,
+        target: Target<u64>,
+    },
+    /// Group `group` of window `window` takes place `to` among the groups, its tabs with it.
+    MoveGroup {
+        window: u64,
+        group: GroupId,
+        to: usize,
+    },
     /// Tab `tab` of window `window`, if its panes no longer fit their smallest on this screen,
     /// is evened out.
     Fit { window: u64, tab: u64 },
@@ -296,6 +370,24 @@ pub fn plan(world: &[Window], wanted: Move, host: &dyn Host) -> Result<Plan, Ref
         Move::PaneToNewWindow { pane, at } => pane_to_new_window(world, pane, at, host),
         Move::TabToStrip { tab, window, index } => tab_to_strip(world, tab, window, index),
         Move::MergeAllWindows { into } => merge_all_windows(world, into),
+        Move::RegroupTabs {
+            window,
+            tabs,
+            target,
+        } => regroup_tabs(world, window, &tabs, target),
+        Move::MoveGroup { window, group, to } => move_group(world, window, group, to),
+        Move::GroupToWindow {
+            window,
+            group,
+            into,
+            to,
+        } => group_to_window(world, window, group, into, to),
+        Move::GroupToNewWindow { window, group, at } => {
+            group_to_new_window(world, window, group, at, host)
+        }
+        Move::TabsToNewWindow { window, tabs, at } => {
+            tabs_to_new_window(world, window, &tabs, at, host)
+        }
         Move::Undo { record } => undo(world, &record),
     }
 }
@@ -505,8 +597,8 @@ fn pane_to_new_tab(
             // dragged along it does — nothing is shown or hidden, so a question up does not hold
             // it back.
             let at = from.order.index_of(source.tab).ok_or(Refusal::Quiet)?;
-            let mut order = from.order.clone();
-            if order.pane_to_new_tab(source.tab, panes, source.tab, gap) != NewTab::Reordered {
+            let (mut order, mut groups) = (from.order.clone(), from.groups.clone());
+            if !groups.move_to(&mut order, source.tab, gap_to_index(at, gap)) {
                 return Err(Refusal::Quiet);
             }
             return Ok(Plan {
@@ -696,7 +788,8 @@ fn tab_to_strip(world: &[Window], tab: u64, window: u64, index: usize) -> Result
     if from.id == onto.id {
         // Along its own strip nothing is shown or hidden, so a question up does not hold it back;
         // nothing to undo either: the strip is all it changed.
-        if !from.order.clone().move_to(tab, index) {
+        let (mut order, mut groups) = (from.order.clone(), from.groups.clone());
+        if !groups.move_to(&mut order, tab, index) {
             return Err(Refusal::Quiet);
         }
         return Ok(Plan {
@@ -773,6 +866,250 @@ fn merge_all_windows(world: &[Window], into: u64) -> Result<Plan, Refusal> {
         steps,
         after: vec![Step::Raise { window: into }],
         undo: None,
+    })
+}
+
+/// The window `id`.
+fn window_named(world: &[Window], id: u64) -> Result<&Window, Refusal> {
+    world
+        .iter()
+        .find(|window| window.id == id)
+        .ok_or(Refusal::Quiet)
+}
+
+/// What a strip and its groups say, short of the tabs each group last remembers: the order, who is
+/// in which group, how many groups there are. A move that leaves it as it was moved nothing.
+fn arrangement(order: &Tabs<u64>, groups: &Groups<u64>) -> (Vec<u64>, Vec<Option<GroupId>>, usize) {
+    (
+        order.ids().to_vec(),
+        order
+            .ids()
+            .iter()
+            .map(|&tab| groups.group_of(tab))
+            .collect(),
+        groups.len(),
+    )
+}
+
+/// The tabs of `from` that `tabs` names, in the order of the strip.
+fn in_strip(from: &Window, tabs: &[u64]) -> Vec<u64> {
+    from.order
+        .ids()
+        .iter()
+        .copied()
+        .filter(|tab| tabs.contains(tab))
+        .collect()
+}
+
+/// The tab on screen once tabs `tabs` of `from` have gone to another place: the one the user was
+/// on if it is among them, else the one `prefer` names (the group's own) if it is, else the first.
+fn shown_among(from: &Window, tabs: &[u64], prefer: Option<u64>) -> u64 {
+    from.order
+        .selected()
+        .filter(|tab| tabs.contains(tab))
+        .or_else(|| prefer.filter(|tab| tabs.contains(tab)))
+        .unwrap_or(tabs[0])
+}
+
+/// The steps that take `tabs` out of `from`, the one on screen last (it is the one that leaves the
+/// screen, and the window it leaves may be closing anyway).
+fn releases(from: &Window, tabs: &[u64]) -> Vec<Step> {
+    let selected = from.order.selected();
+    tabs.iter()
+        .filter(|&&tab| Some(tab) != selected)
+        .chain(tabs.iter().filter(|&&tab| Some(tab) == selected))
+        .map(|&tab| Step::ReleaseTab {
+            window: from.id,
+            tab,
+        })
+        .collect()
+}
+
+fn regroup_tabs(
+    world: &[Window],
+    window: u64,
+    tabs: &[u64],
+    target: Target<u64>,
+) -> Result<Plan, Refusal> {
+    let from = window_named(world, window)?;
+    let tabs = in_strip(from, tabs);
+    let (mut order, mut groups) = (from.order.clone(), from.groups.clone());
+    groups
+        .place(&mut order, &tabs, target.clone())
+        .ok_or(Refusal::Quiet)?;
+    if arrangement(&order, &groups) == arrangement(&from.order, &from.groups) {
+        return Err(Refusal::Quiet);
+    }
+    Ok(Plan {
+        steps: vec![Step::Regroup {
+            window,
+            tabs,
+            target,
+        }],
+        after: Vec::new(),
+        undo: Some(Record {
+            scenes: vec![from.scene(&[])],
+            born: Vec::new(),
+        }),
+    })
+}
+
+fn move_group(world: &[Window], window: u64, group: GroupId, to: usize) -> Result<Plan, Refusal> {
+    let from = window_named(world, window)?;
+    let (mut order, mut groups) = (from.order.clone(), from.groups.clone());
+    if !groups.move_group(&mut order, group, to) {
+        return Err(Refusal::Quiet);
+    }
+    Ok(Plan {
+        steps: vec![Step::MoveGroup { window, group, to }],
+        after: Vec::new(),
+        undo: Some(Record {
+            scenes: vec![from.scene(&[])],
+            born: Vec::new(),
+        }),
+    })
+}
+
+fn group_to_window(
+    world: &[Window],
+    window: u64,
+    group: GroupId,
+    into: u64,
+    to: usize,
+) -> Result<Plan, Refusal> {
+    let from = window_named(world, window)?;
+    let onto = window_named(world, into)?;
+    if from.id == onto.id {
+        return move_group(world, window, group, to);
+    }
+    let name = from.groups.group(group).ok_or(Refusal::Quiet)?.name.clone();
+    let tabs = from.groups.cluster(&from.order, Some(group));
+    if from.asking || onto.asking {
+        return Err(Refusal::Beep);
+    }
+    // What the window it joins makes of the tabs, played on a copy: the group's identity, which the
+    // step that places it and the one that moves it name, is the window's own count.
+    let (mut order, mut groups) = (onto.order.clone(), onto.groups.clone());
+    for &tab in &tabs {
+        groups.append(&mut order, tab);
+    }
+    let made = groups
+        .place(&mut order, &tabs, Target::New(name.clone()))
+        .flatten()
+        .ok_or(Refusal::Quiet)?;
+    let at = groups.position(made);
+    let mut steps = releases(from, &tabs);
+    steps.extend(tabs.iter().map(|&tab| Step::AdoptTab {
+        window: onto.id,
+        tab,
+        slot: Slot::End,
+    }));
+    steps.push(Step::Regroup {
+        window: onto.id,
+        tabs: tabs.clone(),
+        target: Target::New(name),
+    });
+    if at.is_some_and(|at| at != to.min(groups.len() - 1)) {
+        steps.push(Step::MoveGroup {
+            window: onto.id,
+            group: made,
+            to,
+        });
+    }
+    steps.extend(from.close_if_emptied());
+    // The window it leaves closes if the group was all it had, and then there is nothing to undo.
+    let closes = from.closes_without(tabs.len());
+    let resident = from.groups.resident(Some(group));
+    Ok(Plan {
+        steps,
+        after: vec![
+            Step::Raise { window: onto.id },
+            Step::Select {
+                window: onto.id,
+                tab: shown_among(from, &tabs, resident),
+            },
+        ],
+        undo: (!closes).then(|| Record {
+            scenes: vec![from.scene(&tabs), onto.scene(&[])],
+            born: Vec::new(),
+        }),
+    })
+}
+
+fn group_to_new_window(
+    world: &[Window],
+    window: u64,
+    group: GroupId,
+    at: Option<(f64, f64)>,
+    host: &dyn Host,
+) -> Result<Plan, Refusal> {
+    let from = window_named(world, window)?;
+    let name = from.groups.group(group).ok_or(Refusal::Quiet)?.name.clone();
+    let tabs = from.groups.cluster(&from.order, Some(group));
+    let resident = from.groups.resident(Some(group));
+    new_window_of(from, tabs, Some(name), resident, at, host)
+}
+
+fn tabs_to_new_window(
+    world: &[Window],
+    window: u64,
+    tabs: &[u64],
+    at: Option<(f64, f64)>,
+    host: &dyn Host,
+) -> Result<Plan, Refusal> {
+    let from = window_named(world, window)?;
+    new_window_of(from, in_strip(from, tabs), None, None, at, host)
+}
+
+/// A window made of `tabs` of `from`, grouped under `group` if a name is given, ungrouped if not.
+/// Like a lone tab's, it takes the old window's size and place (or goes under `at`); a window that
+/// is only these tabs stays where it is, and one that outlives its tabs lets them go. Undo Move
+/// takes the tabs back and closes the window.
+fn new_window_of(
+    from: &Window,
+    tabs: Vec<u64>,
+    group: Option<String>,
+    resident: Option<u64>,
+    at: Option<(f64, f64)>,
+    host: &dyn Host,
+) -> Result<Plan, Refusal> {
+    if tabs.is_empty() {
+        return Err(Refusal::Quiet);
+    }
+    if from.closes_without(tabs.len()) || from.asking {
+        return Err(Refusal::Beep);
+    }
+    let window = host.fresh_id();
+    let shown = shown_among(from, &tabs, resident);
+    let mut steps = releases(from, &tabs);
+    steps.push(Step::OpenWindow {
+        window,
+        from: from.id,
+        tab: tabs[0],
+        at,
+    });
+    steps.extend(tabs[1..].iter().map(|&tab| Step::AdoptTab {
+        window,
+        tab,
+        slot: Slot::End,
+    }));
+    if let Some(name) = group {
+        steps.push(Step::Regroup {
+            window,
+            tabs: tabs.clone(),
+            target: Target::New(name),
+        });
+    }
+    Ok(Plan {
+        steps,
+        after: (shown != tabs[0])
+            .then_some(Step::Select { window, tab: shown })
+            .into_iter()
+            .collect(),
+        undo: Some(Record {
+            scenes: vec![from.scene(&tabs)],
+            born: vec![window],
+        }),
     })
 }
 
@@ -862,6 +1199,7 @@ fn undo(world: &[Window], record: &Record) -> Result<Plan, Refusal> {
         steps.push(Step::PutStrip {
             window,
             order: scene.order.clone(),
+            groups: scene.groups.clone(),
         });
         for shape in &scene.shapes {
             steps.push(Step::Focus {
@@ -965,6 +1303,7 @@ mod tests {
         Window {
             id,
             order,
+            groups: Groups::new(),
             tabs,
             asking: false,
             stays_empty: false,
@@ -1784,6 +2123,7 @@ mod tests {
                 Step::PutStrip {
                     window: window.id,
                     order: window.order.clone(),
+                    groups: window.groups.clone(),
                 },
                 Step::Focus {
                     window: window.id,
@@ -1841,7 +2181,8 @@ mod tests {
             plan.steps[2],
             Step::PutStrip {
                 window: 1,
-                order: before[0].order.clone()
+                order: before[0].order.clone(),
+                groups: Groups::new()
             }
         );
 
@@ -1966,6 +2307,7 @@ mod tests {
         assert!(undo.steps.contains(&Step::PutStrip {
             window: 1,
             order: world[0].order.clone(),
+            groups: Groups::new(),
         }));
     }
 
@@ -2016,5 +2358,793 @@ mod tests {
                 "{wanted:?}"
             );
         }
+    }
+
+    // ─── Groups ──────────────────────────────────────────────────────────
+
+    /// [`world`] with window 1 grouped. Its strip reads `10 | 11 12 | 13` — tab 10 ungrouped,
+    /// `api` holding 11 and 12, `web` holding 13 — with 10 on screen; tabs 12 and 13 are one pane
+    /// each (120, 130). Window 2 is as it was.
+    fn grouped() -> Vec<Window> {
+        let mut world = world();
+        let one = &mut world[0];
+        for (tab, pane) in [(12, 120), (13, 130)] {
+            one.tabs.push(shape(tab, Tree::Leaf(pane), pane));
+            one.order.append(tab);
+        }
+        one.groups
+            .place(&mut one.order, &[11, 12], Target::New("api".to_owned()));
+        one.groups
+            .place(&mut one.order, &[13], Target::New("web".to_owned()));
+        world
+    }
+
+    fn gid(window: &Window, name: &str) -> GroupId {
+        window
+            .groups
+            .groups()
+            .iter()
+            .find(|group| group.name == name)
+            .expect("the group is there")
+            .id
+    }
+
+    /// A group identity no window of [`grouped`] has.
+    fn stray() -> GroupId {
+        let mut tabs = Tabs::new(1u64);
+        tabs.append(2);
+        tabs.append(3);
+        let mut groups = Groups::new();
+        for tab in 1..=3 {
+            groups.place(&mut tabs, &[tab], Target::New(format!("g{tab}")));
+        }
+        groups.groups()[2].id
+    }
+
+    /// Window 3: its one tab, 30, is all of group `solo`.
+    fn solo() -> Window {
+        let mut window = window(3, vec![shape(30, Tree::Leaf(300), 300)], 30);
+        window
+            .groups
+            .place(&mut window.order, &[30], Target::New("solo".to_owned()));
+        window
+    }
+
+    #[test]
+    fn tabs_regroup_in_their_window_and_the_picture_comes_back_with_undo() {
+        let before = grouped();
+        let api = gid(&before[0], "api");
+        let record = |wanted| {
+            plan(&before, wanted, &Cramped)
+                .map(|plan| (plan.steps, plan.after, plan.undo))
+                .unwrap()
+        };
+        // Into a group, before one of its tabs.
+        let (steps, after, undo) = record(Move::RegroupTabs {
+            window: 1,
+            tabs: vec![10],
+            target: Target::Group {
+                group: api,
+                before: Some(12),
+            },
+        });
+        assert_eq!(
+            steps,
+            [Step::Regroup {
+                window: 1,
+                tabs: vec![10],
+                target: Target::Group {
+                    group: api,
+                    before: Some(12)
+                }
+            }]
+        );
+        assert_eq!(after, []);
+        let undo = undo.expect("a regrouping can be taken back");
+        assert_eq!(undo.scenes, [before[0].scene(&[])]);
+        assert_eq!(undo.scenes[0].groups, before[0].groups);
+
+        // Played on the picture, then taken back: the strip and the groups as they were, named.
+        let mut now = before.clone();
+        let one = &mut now[0];
+        one.groups.place(
+            &mut one.order,
+            &[10],
+            Target::Group {
+                group: api,
+                before: Some(12),
+            },
+        );
+        assert_eq!(
+            now[0].groups.cluster(&now[0].order, Some(api)),
+            [11, 10, 12]
+        );
+        assert!(standing(&now, &undo));
+        let taken_back = undoing(&now, undo).unwrap();
+        assert!(taken_back.steps.contains(&Step::PutStrip {
+            window: 1,
+            order: before[0].order.clone(),
+            groups: before[0].groups.clone(),
+        }));
+        assert_eq!(
+            taken_back.steps.last(),
+            Some(&Step::Undone { window: 1 }),
+            "and the window says so"
+        );
+        assert_eq!(taken_back.undo, None, "there is no redo");
+    }
+
+    #[test]
+    fn tabs_move_to_a_new_group_with_the_name_asked_and_out_of_a_group() {
+        let before = grouped();
+        let made = plan(
+            &before,
+            Move::RegroupTabs {
+                window: 1,
+                tabs: vec![13, 10],
+                target: Target::New("db".to_owned()),
+            },
+            &Cramped,
+        )
+        .unwrap();
+        // The tabs go in the strip's order, whatever order they were named in.
+        assert_eq!(
+            made.steps,
+            [Step::Regroup {
+                window: 1,
+                tabs: vec![10, 13],
+                target: Target::New("db".to_owned())
+            }]
+        );
+        // `web` was only tab 13: the group it leaves empty is gone, the strip is as the planner
+        // played it.
+        let mut now = before.clone();
+        let one = &mut now[0];
+        one.groups
+            .place(&mut one.order, &[10, 13], Target::New("db".to_owned()));
+        assert_eq!(one.groups.len(), 2);
+        assert!(standing(&now, made.undo.as_ref().unwrap()));
+        let back = undoing(&now, made.undo.unwrap()).unwrap();
+        assert!(back.steps.contains(&Step::PutStrip {
+            window: 1,
+            order: before[0].order.clone(),
+            groups: before[0].groups.clone(),
+        }));
+
+        // Remove from Group: ungrouped, after the last ungrouped tab.
+        let out = plan(
+            &before,
+            Move::RegroupTabs {
+                window: 1,
+                tabs: vec![12],
+                target: Target::Loose { before: None },
+            },
+            &Cramped,
+        )
+        .unwrap();
+        assert_eq!(out.steps.len(), 1);
+    }
+
+    #[test]
+    fn a_regrouping_that_changes_nothing_or_names_nothing_ends_quietly() {
+        let world = grouped();
+        let api = gid(&world[0], "api");
+        let regroup = |window, tabs: Vec<u64>, target| {
+            plan(
+                &world,
+                Move::RegroupTabs {
+                    window,
+                    tabs,
+                    target,
+                },
+                &Cramped,
+            )
+        };
+        for (tabs, target) in [
+            // Already there, last in `api`.
+            (
+                vec![12],
+                Target::Group {
+                    group: api,
+                    before: None,
+                },
+            ),
+            // Already ungrouped, and last of the ungrouped.
+            (vec![10], Target::Loose { before: None }),
+            // A group that is not there; tabs that are not there; no tab.
+            (
+                vec![10],
+                Target::Group {
+                    group: stray(),
+                    before: None,
+                },
+            ),
+            (vec![99], Target::New("x".to_owned())),
+            (vec![], Target::New("x".to_owned())),
+        ] {
+            assert_eq!(
+                regroup(1, tabs.clone(), target.clone()),
+                Err(Refusal::Quiet),
+                "{tabs:?} {target:?}"
+            );
+        }
+        assert_eq!(
+            regroup(9, vec![10], Target::New("x".to_owned())),
+            Err(Refusal::Quiet),
+            "a window that is not there"
+        );
+        // A tab named to go before one that is not in the group goes last in it.
+        assert!(
+            regroup(
+                1,
+                vec![10],
+                Target::Group {
+                    group: api,
+                    before: Some(99)
+                }
+            )
+            .is_ok()
+        );
+        // A question the window holds does not hold it back: nothing is shown or hidden.
+        let mut asking = grouped();
+        asking[0].asking = true;
+        assert!(
+            plan(
+                &asking,
+                Move::RegroupTabs {
+                    window: 1,
+                    tabs: vec![10],
+                    target: Target::New("x".to_owned()),
+                },
+                &Cramped
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_group_moves_among_the_groups_and_undo_puts_them_back() {
+        let before = grouped();
+        let web = gid(&before[0], "web");
+        let moved = plan(
+            &before,
+            Move::MoveGroup {
+                window: 1,
+                group: web,
+                to: 0,
+            },
+            &Cramped,
+        )
+        .unwrap();
+        assert_eq!(
+            moved.steps,
+            [Step::MoveGroup {
+                window: 1,
+                group: web,
+                to: 0
+            }]
+        );
+        let mut now = before.clone();
+        let one = &mut now[0];
+        one.groups.move_group(&mut one.order, web, 0);
+        assert_eq!(now[0].order.ids(), [10, 13, 11, 12]);
+        assert!(standing(&now, moved.undo.as_ref().unwrap()));
+        let back = undoing(&now, moved.undo.unwrap()).unwrap();
+        assert!(back.steps.contains(&Step::PutStrip {
+            window: 1,
+            order: before[0].order.clone(),
+            groups: before[0].groups.clone(),
+        }));
+        // Where it already is, or a group that is not there: nothing.
+        for (group, to) in [(web, 1), (web, 9), (stray(), 0)] {
+            assert_eq!(
+                plan(
+                    &before,
+                    Move::MoveGroup {
+                        window: 1,
+                        group,
+                        to
+                    },
+                    &Cramped
+                ),
+                Err(Refusal::Quiet),
+                "{to}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_crossing_windows_comes_up_there_under_its_name_and_undo_takes_it_back() {
+        let before = grouped();
+        let api = gid(&before[0], "api");
+        let moved = plan(
+            &before,
+            Move::GroupToWindow {
+                window: 1,
+                group: api,
+                into: 2,
+                to: 0,
+            },
+            &Cramped,
+        )
+        .unwrap();
+        let adopt = |tab| Step::AdoptTab {
+            window: 2,
+            tab,
+            slot: Slot::End,
+        };
+        assert_eq!(
+            moved.steps,
+            [
+                Step::ReleaseTab { window: 1, tab: 11 },
+                Step::ReleaseTab { window: 1, tab: 12 },
+                adopt(11),
+                adopt(12),
+                Step::Regroup {
+                    window: 2,
+                    tabs: vec![11, 12],
+                    target: Target::New("api".to_owned())
+                },
+                // The window closes only if the steps before left it without a tab.
+                Step::CloseIfEmptied { window: 1 },
+            ],
+            "it is the window's only group, so it is at place 0 already"
+        );
+        assert_eq!(
+            moved.after,
+            [
+                Step::Raise { window: 2 },
+                Step::Select { window: 2, tab: 11 }
+            ],
+            "the window comes forward on the group's first tab"
+        );
+        let undo = moved.undo.expect("window 1 stays");
+        assert_eq!(undo.scenes.len(), 2);
+        assert_eq!(undo.scenes[0].shapes.len(), 2, "the tabs that crossed");
+
+        // Played: window 1 without them, window 2 with them in a group of its own.
+        let mut now = before.clone();
+        {
+            let one = &mut now[0];
+            one.groups.close(&mut one.order, &[11, 12]);
+            one.tabs.retain(|shape| shape.tab != 11 && shape.tab != 12);
+            let two = &mut now[1];
+            for tab in [11, 12] {
+                two.groups.append(&mut two.order, tab);
+            }
+            two.groups
+                .place(&mut two.order, &[11, 12], Target::New("api".to_owned()));
+            two.tabs.push(shape(11, Tree::Leaf(110), 110));
+            two.tabs.push(shape(12, Tree::Leaf(120), 120));
+        }
+        assert!(standing(&now, &undo));
+        let back = undoing(&now, undo).unwrap();
+        for tab in [11, 12] {
+            assert!(back.steps.contains(&Step::Dissolve { window: 2, tab }));
+        }
+        assert!(back.steps.contains(&Step::PutStrip {
+            window: 1,
+            order: before[0].order.clone(),
+            groups: before[0].groups.clone(),
+        }));
+        assert!(back.steps.contains(&Step::PutStrip {
+            window: 2,
+            order: before[1].order.clone(),
+            groups: Groups::new(),
+        }));
+    }
+
+    #[test]
+    fn a_group_let_go_among_another_windows_groups_stands_where_it_was_let_go() {
+        let mut world = grouped();
+        let two = &mut world[1];
+        two.groups
+            .place(&mut two.order, &[21], Target::New("x".to_owned()));
+        let api = gid(&world[0], "api");
+        let steps = plan(
+            &world,
+            Move::GroupToWindow {
+                window: 1,
+                group: api,
+                into: 2,
+                to: 0,
+            },
+            &Cramped,
+        )
+        .unwrap()
+        .steps;
+        // Made after `x`, it is then moved before it: the group it names is the window's next.
+        let moved = steps
+            .iter()
+            .find(|step| matches!(step, Step::MoveGroup { .. }))
+            .expect("a step that moves it");
+        assert!(
+            matches!(moved, Step::MoveGroup { window: 2, to: 0, group } if *group != gid(&world[1], "x")),
+            "{moved:?}"
+        );
+        // Past the end is the end: no move at all.
+        let steps = plan(
+            &world,
+            Move::GroupToWindow {
+                window: 1,
+                group: api,
+                into: 2,
+                to: 9,
+            },
+            &Cramped,
+        )
+        .unwrap()
+        .steps;
+        assert!(
+            !steps
+                .iter()
+                .any(|step| matches!(step, Step::MoveGroup { .. }))
+        );
+        // In its own window it is a move among its groups.
+        assert_eq!(
+            plan(
+                &world,
+                Move::GroupToWindow {
+                    window: 1,
+                    group: api,
+                    into: 1,
+                    to: 1
+                },
+                &Cramped
+            ),
+            plan(
+                &world,
+                Move::MoveGroup {
+                    window: 1,
+                    group: api,
+                    to: 1
+                },
+                &Cramped
+            )
+        );
+    }
+
+    #[test]
+    fn a_group_that_is_all_a_window_has_closes_it_when_it_crosses_and_cannot_be_undone() {
+        let mut world = grouped();
+        world.push(solo());
+        let moved = plan(
+            &world,
+            Move::GroupToWindow {
+                window: 3,
+                group: gid(&world[2], "solo"),
+                into: 1,
+                to: 9,
+            },
+            &Cramped,
+        )
+        .unwrap();
+        assert_eq!(
+            moved.steps.last(),
+            Some(&Step::CloseIfEmptied { window: 3 })
+        );
+        assert_eq!(moved.undo, None);
+        // A window that outlives its tabs stays, and can be taken back.
+        world[2].stays_empty = true;
+        let moved = plan(
+            &world,
+            Move::GroupToWindow {
+                window: 3,
+                group: gid(&world[2], "solo"),
+                into: 1,
+                to: 9,
+            },
+            &Cramped,
+        )
+        .unwrap();
+        assert!(!moved.steps.contains(&Step::CloseIfEmptied { window: 3 }));
+        assert!(moved.undo.is_some());
+    }
+
+    #[test]
+    fn a_group_becomes_a_window_that_keeps_its_name_and_undo_closes_it() {
+        let before = grouped();
+        let api = gid(&before[0], "api");
+        let moved = plan(
+            &before,
+            Move::GroupToNewWindow {
+                window: 1,
+                group: api,
+                at: Some((10.0, 20.0)),
+            },
+            &roomy(&before),
+        )
+        .unwrap();
+        assert_eq!(
+            moved.steps,
+            [
+                Step::ReleaseTab { window: 1, tab: 11 },
+                Step::ReleaseTab { window: 1, tab: 12 },
+                Step::OpenWindow {
+                    window: NEW,
+                    from: 1,
+                    tab: 11,
+                    at: Some((10.0, 20.0))
+                },
+                Step::AdoptTab {
+                    window: NEW,
+                    tab: 12,
+                    slot: Slot::End
+                },
+                Step::Regroup {
+                    window: NEW,
+                    tabs: vec![11, 12],
+                    target: Target::New("api".to_owned())
+                },
+            ]
+        );
+        assert_eq!(moved.after, []);
+        let undo = moved.undo.expect("the window it made is closed by undo");
+        assert_eq!(undo.born, [NEW]);
+
+        // Played: window 1 without the group, the window it made holding it.
+        let mut now = before.clone();
+        {
+            let one = &mut now[0];
+            one.groups.close(&mut one.order, &[11, 12]);
+            one.tabs.retain(|shape| shape.tab != 11 && shape.tab != 12);
+        }
+        let mut born = window(
+            NEW,
+            vec![
+                shape(11, Tree::Leaf(110), 110),
+                shape(12, Tree::Leaf(120), 120),
+            ],
+            11,
+        );
+        born.groups
+            .place(&mut born.order, &[11, 12], Target::New("api".to_owned()));
+        now.push(born);
+        assert!(standing(&now, &undo));
+        let back = undoing(&now, undo).unwrap();
+        for tab in [11, 12] {
+            assert!(back.steps.contains(&Step::Unpack { window: NEW, tab }));
+        }
+        assert!(back.steps.contains(&Step::CloseIfEmptied { window: NEW }));
+        assert!(back.steps.contains(&Step::PutStrip {
+            window: 1,
+            order: before[0].order.clone(),
+            groups: before[0].groups.clone(),
+        }));
+        assert_eq!(back.after, [Step::Raise { window: 1 }]);
+    }
+
+    #[test]
+    fn the_tab_on_screen_in_the_group_is_the_one_the_new_window_shows() {
+        let mut world = grouped();
+        world[0].order.select(12);
+        let moved = plan(
+            &world,
+            Move::GroupToNewWindow {
+                window: 1,
+                group: gid(&world[0], "api"),
+                at: None,
+            },
+            &roomy(&world),
+        )
+        .unwrap();
+        // It leaves last, and comes up on screen in the window that takes it.
+        assert_eq!(
+            &moved.steps[..2],
+            [
+                Step::ReleaseTab { window: 1, tab: 11 },
+                Step::ReleaseTab { window: 1, tab: 12 }
+            ]
+        );
+        assert_eq!(
+            moved.after,
+            [Step::Select {
+                window: NEW,
+                tab: 12
+            }]
+        );
+    }
+
+    #[test]
+    fn tabs_become_an_ungrouped_window_in_the_order_they_had() {
+        let before = grouped();
+        let moved = plan(
+            &before,
+            Move::TabsToNewWindow {
+                window: 1,
+                tabs: vec![13, 11],
+                at: None,
+            },
+            &roomy(&before),
+        )
+        .unwrap();
+        assert_eq!(
+            moved.steps,
+            [
+                Step::ReleaseTab { window: 1, tab: 11 },
+                Step::ReleaseTab { window: 1, tab: 13 },
+                Step::OpenWindow {
+                    window: NEW,
+                    from: 1,
+                    tab: 11,
+                    at: None
+                },
+                Step::AdoptTab {
+                    window: NEW,
+                    tab: 13,
+                    slot: Slot::End
+                },
+            ],
+            "no group in the window they make"
+        );
+        assert_eq!(moved.undo.unwrap().born, [NEW]);
+        // All of a window's tabs: it stays. Nothing named: quietly nothing. A window asking: a beep.
+        let all = [10, 11, 12, 13].to_vec();
+        for (tabs, answer) in [
+            (all, Refusal::Beep),
+            (vec![99], Refusal::Quiet),
+            (vec![], Refusal::Quiet),
+        ] {
+            assert_eq!(
+                plan(
+                    &before,
+                    Move::TabsToNewWindow {
+                        window: 1,
+                        tabs,
+                        at: None
+                    },
+                    &roomy(&before)
+                )
+                .map(|plan| plan.steps),
+                Err(answer)
+            );
+        }
+        let mut asking = grouped();
+        asking[0].asking = true;
+        assert_eq!(
+            plan(
+                &asking,
+                Move::TabsToNewWindow {
+                    window: 1,
+                    tabs: vec![10],
+                    at: None
+                },
+                &roomy(&asking)
+            )
+            .map(|plan| plan.steps),
+            Err(Refusal::Beep)
+        );
+    }
+
+    /// A record of a regrouping or of a group that crossed is a picture like any: a tab that
+    /// closed since, or a pane that was born in one the move carried, makes it false.
+    #[test]
+    fn a_group_record_that_the_windows_have_outgrown_is_stale() {
+        let before = grouped();
+        let api = gid(&before[0], "api");
+        let regrouped = plan(
+            &before,
+            Move::RegroupTabs {
+                window: 1,
+                tabs: vec![10],
+                target: Target::Group {
+                    group: api,
+                    before: None,
+                },
+            },
+            &Cramped,
+        )
+        .unwrap()
+        .undo
+        .unwrap();
+        let mut now = before.clone();
+        assert!(standing(&now, &regrouped));
+        // Tab 13 closed since.
+        let one = &mut now[0];
+        one.groups.close(&mut one.order, &[13]);
+        one.tabs.retain(|shape| shape.tab != 13);
+        assert!(!standing(&now, &regrouped));
+        assert_eq!(undoing(&now, regrouped), Err(Refusal::Stale));
+
+        let crossed = plan(
+            &before,
+            Move::GroupToWindow {
+                window: 1,
+                group: api,
+                into: 2,
+                to: 0,
+            },
+            &Cramped,
+        )
+        .unwrap()
+        .undo
+        .unwrap();
+        // The tabs are in window 2 as the move left them, but one of them has split since.
+        let mut now = before.clone();
+        {
+            let one = &mut now[0];
+            one.groups.close(&mut one.order, &[11, 12]);
+            one.tabs.retain(|shape| shape.tab != 11 && shape.tab != 12);
+            let two = &mut now[1];
+            for tab in [11, 12] {
+                two.groups.append(&mut two.order, tab);
+            }
+            two.tabs.push(shape(11, Tree::Leaf(110), 110));
+            two.tabs
+                .push(shape(12, split(Tree::Leaf(120), Tree::Leaf(121)), 120));
+        }
+        assert!(!standing(&now, &crossed));
+        assert_eq!(undoing(&now, crossed), Err(Refusal::Stale));
+    }
+
+    #[test]
+    fn the_moves_that_were_there_before_groups_keep_the_groups_in_their_record() {
+        let before = grouped();
+        // A tab folded into another of its window; its group goes with its last tab.
+        let folded = plan(
+            &before,
+            Move::TabToTab {
+                tab: 13,
+                into: 12,
+                place: beside(),
+            },
+            &roomy(&before),
+        )
+        .unwrap();
+        assert_eq!(
+            folded.undo.as_ref().unwrap().scenes[0].groups,
+            before[0].groups
+        );
+        // A tab dragged along the strip lands in the cluster of the place it was let go at.
+        let strip = |index| {
+            plan(
+                &before,
+                Move::TabToStrip {
+                    tab: 10,
+                    window: 1,
+                    index,
+                },
+                &Cramped,
+            )
+        };
+        assert_eq!(
+            strip(1).unwrap().steps,
+            [Step::MoveTab {
+                window: 1,
+                tab: 10,
+                index: 1
+            }]
+        );
+        // `11` let go before `12` is where it is.
+        assert_eq!(
+            plan(
+                &before,
+                Move::TabToStrip {
+                    tab: 11,
+                    window: 1,
+                    index: 1
+                },
+                &Cramped
+            ),
+            Err(Refusal::Quiet)
+        );
+        // A tab that crosses to a window with groups takes its place by the same rule.
+        let mut world = grouped();
+        world.swap(0, 1);
+        let crossed = plan(
+            &world,
+            Move::TabToStrip {
+                tab: 20,
+                window: 1,
+                index: 2,
+            },
+            &Cramped,
+        )
+        .unwrap();
+        assert!(crossed.steps.contains(&Step::AdoptTab {
+            window: 1,
+            tab: 20,
+            slot: Slot::At(2)
+        }));
     }
 }
