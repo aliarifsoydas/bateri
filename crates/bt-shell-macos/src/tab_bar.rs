@@ -193,6 +193,9 @@ mod tab_group;
 // The group button of the title row and the list of groups under it.
 #[path = "tab_switch.rs"]
 mod tab_switch;
+// A title that does not fit: faded at its end, slid under the pointer.
+#[path = "tab_title.rs"]
+mod tab_title;
 
 /// Space between the zoom button's right edge and the strip — the design's
 /// strip starts at 84 pt beside lights ending at 72 pt. In full screen the
@@ -3101,7 +3104,7 @@ pub(crate) struct ChipIvars {
     lines: Retained<ChipLines>,
     /// The indicator, left of the title.
     glyph: Retained<Glyph>,
-    label: Retained<NSTextField>,
+    title: tab_title::Title,
     /// The ⌘ key that reaches the tab, right of the title while ⌘ is held.
     hint: Retained<NSTextField>,
     close: Retained<CloseButton>,
@@ -3251,7 +3254,7 @@ impl Chip {
         let lines = ChipLines::new(mtm);
         let fill_view = ChipFill::new(mtm);
         let glyph = Glyph::new(mtm);
-        let text = label(mtm);
+        let title = tab_title::Title::new(mtm, NSTextAlignment::Center);
         let hint = label(mtm);
         let close = CloseButton::new(mtm);
         let this = Self::alloc(mtm).set_ivars(ChipIvars {
@@ -3272,7 +3275,7 @@ impl Chip {
             glowing: Cell::new(false),
             lines: lines.clone(),
             glyph: glyph.clone(),
-            label: text.clone(),
+            title,
             hint: hint.clone(),
             close: close.clone(),
             dwell: RefCell::new(None),
@@ -3302,7 +3305,7 @@ impl Chip {
         this.addSubview(&fill_view);
         this.addSubview(&lines);
         this.addSubview(&glyph);
-        this.addSubview(&text);
+        this.addSubview(this.ivars().title.view());
         this.addSubview(&hint);
         this.addSubview(&close);
         hint.setHidden(true);
@@ -3315,7 +3318,7 @@ impl Chip {
         }
         // The label is read through the chip; its own element would say the
         // title twice.
-        text.setAccessibilityElement(false);
+        this.ivars().title.field().setAccessibilityElement(false);
         track_hover(&this);
         this
     }
@@ -3550,7 +3553,7 @@ impl Chip {
         } else {
             iv.fill.follow(size, *fill, palette, selected, *reduce);
         }
-        let text = &iv.label;
+        let text = iv.title.field();
         let (size_pt, weight, color, pad) = if single {
             // SAFETY: AppKit's constant font weight.
             (
@@ -3610,13 +3613,23 @@ impl Chip {
             None => tabs::title_row(inner, natural.width, lead),
         };
         let pad = if row.is_some() { 0.0 } else { pad };
-        text.setFrame(NSRect::new(
-            NSPoint::new(
-                pad + text_x,
-                ((size.height - natural.height) / 2.0).max(0.0),
+        iv.title.place(
+            NSRect::new(
+                NSPoint::new(
+                    pad + text_x,
+                    ((size.height - natural.height) / 2.0).max(0.0),
+                ),
+                NSSize::new(text_width, natural.height),
             ),
-            NSSize::new(text_width, natural.height),
-        ));
+            natural.width,
+            hovered,
+            *reduce,
+        );
+        // With Reduce Motion nothing slides to show what the fade hides: the tooltip says it.
+        let tip = (iv.title.overflows() && *reduce).then(|| title.to_string());
+        if self.toolTip().map(|now| now.to_string()) != tip {
+            self.setToolTip(tip.as_deref().map(NSString::from_str).as_deref());
+        }
         if let (Some(x), Some(lead)) = (glyph_x, lead) {
             let high = tabs::ICON_SIDE + 2.0 * GLYPH_OVERHANG;
             iv.glyph.setFrame(NSRect::new(
@@ -5916,13 +5929,13 @@ impl TabBar {
                 weight,
             )));
             let height = field.intrinsicContentSize().height;
-            let x = frame.origin.x + tab_switch::NAME_X - 2.0;
+            let (x, width) = tab_switch::name_span(frame.size.width);
             field.setFrame(NSRect::new(
-                NSPoint::new(x, top + ((CHIP_HEIGHT - height) / 2.0).max(0.0)),
-                NSSize::new(
-                    (frame.origin.x + frame.size.width - tab_switch::NAME_END / 2.0 - x).max(0.0),
-                    height,
+                NSPoint::new(
+                    frame.origin.x + x,
+                    top + ((CHIP_HEIGHT - height) / 2.0).max(0.0),
                 ),
+                NSSize::new(width, height),
             ));
         }
     }

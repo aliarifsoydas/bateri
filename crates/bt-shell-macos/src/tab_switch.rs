@@ -40,6 +40,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
+use super::tab_title::Title;
 use super::{
     CARD_RADIUS, Palette, SwitchRow, TabBar, Tint, contains, label, rounded, stroke, track_hover,
 };
@@ -104,7 +105,7 @@ pub(super) struct ButtonIvars {
     /// The pointer is over it.
     hot: Cell<bool>,
     pressed: Cell<bool>,
-    name: Retained<NSTextField>,
+    name: Title,
     /// A label outside every view that texts are measured on, and the last measure: the bar asks
     /// for the button's width at every layout, and what is shown is not touched by it.
     gauge: Retained<NSTextField>,
@@ -193,13 +194,17 @@ define_class!(
 
         #[unsafe(method(mouseEntered:))]
         fn mouse_entered(&self, _event: &NSEvent) {
-            self.ivars().hot.set(true);
+            let iv = self.ivars();
+            iv.hot.set(true);
+            iv.name.hover(true, self.reduce_motion());
             self.setNeedsDisplay(true);
         }
 
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, _event: &NSEvent) {
-            self.ivars().hot.set(false);
+            let iv = self.ivars();
+            iv.hot.set(false);
+            iv.name.hover(false, self.reduce_motion());
             self.setNeedsDisplay(true);
         }
 
@@ -224,22 +229,20 @@ define_class!(
 
 impl GroupButton {
     pub(super) fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let name = label(mtm);
         let this = Self::alloc(mtm).set_ivars(ButtonIvars {
             palette: Cell::new(None),
             look: RefCell::new(None),
             hot: Cell::new(false),
             pressed: Cell::new(false),
-            name: name.clone(),
+            name: Title::new(mtm, NSTextAlignment::Left),
             gauge: label(mtm),
             measured: RefCell::new(None),
         });
         // SAFETY: `initWithFrame:` is NSView's designated initializer and the ivars are set.
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
-        name.setFont(Some(&name_font()));
-        name.setAlignment(NSTextAlignment::Left);
+        this.ivars().name.field().setFont(Some(&name_font()));
         this.ivars().gauge.setFont(Some(&name_font()));
-        this.addSubview(&name);
+        this.addSubview(this.ivars().name.view());
         this.setAccessibilityElement(true);
         // SAFETY: AppKit's constant role string, alive for the process.
         this.setAccessibilityRole(Some(unsafe { NSAccessibilityButtonRole }));
@@ -251,6 +254,11 @@ impl GroupButton {
     fn bar(&self) -> Option<Retained<TabBar>> {
         // SAFETY: reading the superview; we are on the main thread.
         unsafe { self.superview() }?.downcast::<TabBar>().ok()
+    }
+
+    /// Reduce Motion, as the bar the button is in has it.
+    fn reduce_motion(&self) -> bool {
+        self.bar().is_some_and(|bar| bar.reduce_motion())
     }
 
     /// A double click: the group's name opens under the field.
@@ -296,15 +304,23 @@ impl GroupButton {
         }
         iv.look.replace(Some(look.clone()));
         let name = look.name.as_deref().unwrap_or("");
-        iv.name.setStringValue(&NSString::from_str(name));
-        iv.name
-            .setTextColor(Some(&Tint::of(palette.title, 1.0).color()));
-        iv.name.setHidden(look.name.is_none() || look.naming);
-        let height = iv.name.intrinsicContentSize().height;
-        iv.name.setFrame(NSRect::new(
-            NSPoint::new(NAME_X, (frame.size.height - height) / 2.0),
-            NSSize::new((frame.size.width - NAME_X - NAME_END).max(0.0), height),
-        ));
+        let field = iv.name.field();
+        field.setStringValue(&NSString::from_str(name));
+        field.setTextColor(Some(&Tint::of(palette.title, 1.0).color()));
+        iv.name.view().setHidden(look.name.is_none() || look.naming);
+        // The label's frame is the drawing one, the fitting size, 4 points wider than the type's
+        // own width the button is sized by.
+        let natural = field.fittingSize();
+        let (x, width) = name_span(frame.size.width);
+        iv.name.place(
+            NSRect::new(
+                NSPoint::new(x, ((frame.size.height - natural.height) / 2.0).max(0.0)),
+                NSSize::new(width, natural.height),
+            ),
+            natural.width,
+            iv.hot.get(),
+            self.reduce_motion(),
+        );
         let words = match &look.name {
             Some(name) => format!("Tab group {name}, show the window\u{2019}s groups"),
             None => "Ungrouped tabs, show the window\u{2019}s groups".to_owned(),
@@ -368,6 +384,15 @@ impl GroupButton {
             }
         }
     }
+}
+
+/// Where the name stands in a button `width` wide: `(x, width)` from its left edge. The one
+/// place for the label and for the rename field that opens over it ([`TabBar::place_switch`]):
+/// two points left of the name's own x, which is the label's inset, and as far right as the field
+/// goes.
+pub(super) fn name_span(width: f64) -> (f64, f64) {
+    let x = NAME_X - 2.0;
+    (x, (width - NAME_END / 2.0 - x).max(0.0))
 }
 
 fn name_font() -> Retained<NSFont> {

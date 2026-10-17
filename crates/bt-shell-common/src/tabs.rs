@@ -507,6 +507,45 @@ pub fn title_row(inner: f64, text: f64, lead: Option<f64>) -> (Option<f64>, f64,
     (Some(start), start + lead + ICON_GAP, width)
 }
 
+/// How far the end of a title fades out where it does not fit its room: the last stretch of the
+/// room, the whole of it when the room is narrower.
+pub const TITLE_FADE: f64 = 22.0;
+
+/// How long the pointer rests on a title that does not fit before it starts to slide, how fast it
+/// slides (points a second) and how long it takes to come back when the pointer leaves.
+pub const TITLE_DWELL: f64 = 0.35;
+pub const TITLE_SPEED: f64 = 40.0;
+pub const TITLE_RETURN: f64 = 0.25;
+
+/// The stretch of a title's room that fades out at its right end when the title does not fit.
+pub fn title_fade(room: f64) -> f64 {
+    TITLE_FADE.min(room.max(0.0))
+}
+
+/// The slide of a title that does not fit its room: how far it goes left and how long that takes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Slide {
+    pub distance: f64,
+    pub secs: f64,
+}
+
+/// What a title `text` wide (as the type sets it) does in a `room` wide place: `None` when it
+/// fits and stands as it is, otherwise the slide that shows the rest. It ends with the title's
+/// end clear of the fade at the right, so the last word is read whole and not through the fade
+/// that hid it at rest. The one rule for the chips, the side rows and the group button; the fade
+/// and the slide are drawn by the shell, the arithmetic is here.
+pub fn title_slide(text: f64, room: f64) -> Option<Slide> {
+    let over = text.ceil() - room;
+    if room < 1.0 || over <= 0.0 {
+        return None;
+    }
+    let distance = over + title_fade(room);
+    Some(Slide {
+        distance,
+        secs: distance / TITLE_SPEED,
+    })
+}
+
 /// What a title may take of the `inner` width after the leading element (`lead` wide, with its
 /// [`ICON_GAP`]) — the one rule for the strip's centred title and the side column's left-aligned
 /// one.
@@ -2664,6 +2703,38 @@ mod tests {
             "to the edge"
         );
         assert_eq!(fit_title("", 0.0, counted), "");
+    }
+
+    #[test]
+    fn a_title_that_fits_its_room_neither_fades_nor_slides() {
+        assert_eq!(title_slide(100.0, 100.0), None, "to the edge");
+        assert_eq!(title_slide(99.2, 100.0), None);
+        assert_eq!(title_slide(0.0, 0.0), None, "no room, nothing to show");
+        assert_eq!(
+            title_slide(40.0, 0.5),
+            None,
+            "a room under a point is no room"
+        );
+    }
+
+    #[test]
+    fn a_title_that_does_not_fit_slides_until_its_end_clears_the_fade() {
+        let slide = title_slide(160.0, 140.0).expect("20 pt too long");
+        // The 20 pt that are over, and the fade the end must come out of.
+        assert_eq!(slide.distance, 20.0 + TITLE_FADE);
+        assert_eq!(slide.secs, slide.distance / TITLE_SPEED);
+        // The type's width is whole points to the frame that holds it.
+        let slide = title_slide(140.2, 140.0).expect("a point over once it is rounded up");
+        assert_eq!(slide.distance, 1.0 + TITLE_FADE);
+    }
+
+    #[test]
+    fn the_fade_never_takes_more_than_the_room() {
+        assert_eq!(title_fade(140.0), TITLE_FADE);
+        assert_eq!(title_fade(10.0), 10.0);
+        assert_eq!(title_fade(-4.0), 0.0);
+        let slide = title_slide(50.0, 10.0).expect("over");
+        assert_eq!(slide.distance, 40.0 + 10.0);
     }
 
     #[test]

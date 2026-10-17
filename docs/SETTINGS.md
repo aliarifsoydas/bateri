@@ -569,6 +569,14 @@ shows one group at a time instead (see **In the title row** below).
   Undo Move takes any of them back (not when a window that held only what was
   carried closed with it). A window with no group slides the rows of its column
   as it always did.
+- **Long names.** A tab's name in the title row or the column and a group
+  button's name do not end in "…" where they do not fit: the last 22 pt fade
+  out, and with the pointer resting on the name for a third of a second it
+  slides along (about 40 pt a second) to show the rest, stays at its end and
+  goes back in a quarter of a second when the pointer leaves. With Reduce Motion
+  (`reduce_motion`, or the system's) nothing slides: the fade stays and
+  hovering a tab shows its whole name as a tooltip (the button always does).
+  Group headers, the group list and Show All Tabs keep their "…".
 - **Elsewhere.** Show All Tabs lists every tab, a closed group's too. The
   groups are saved with the windows and come back with them
   (`restore_windows`); Merge All Windows brings every group with its tabs

@@ -1365,8 +1365,9 @@ pub unsafe extern "C" fn bt_plan_step_kind(plan: *const BtPlan, part: u32, index
             Step::Focus { .. } => step::FOCUS,
             Step::Pulse { .. } => step::PULSE,
             // Tab groups are not part of the C surface: a host's pictures have none and no
-            // `BtMove` regroups, so no plan holds these. A kind that is 0 reads as unknown, and
-            // an unknown main step makes a host refuse the whole plan.
+            // `BtMove` regroups, so no plan holds these — a host that walks the steps by
+            // `bt_plan_step_count` never reads one. They have no kind of their own until groups
+            // reach the C surface; the 0 is what a kind past the end reads as.
             Step::Regroup { .. } | Step::MoveGroup { .. } => 0,
         })
     }

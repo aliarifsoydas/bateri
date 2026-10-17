@@ -200,9 +200,10 @@ pub(crate) fn close_title(panes: usize) -> &'static str {
 }
 
 /// Title of the Shell ▸ Close Tab item while tabs are picked together in the side column: ⌘W
-/// closes all of them ([`TerminalWindow::close_picked`]).
+/// closes all of them ([`TerminalWindow::close_picked`]) and always asks first, so the title
+/// ends in the "…" of a command that asks — as the picked rows' own menu says it.
 pub(crate) fn close_picked_title(count: usize) -> String {
-    counted("Close", count, "")
+    counted("Close", count, "\u{2026}")
 }
 
 /// What is being closed — chooses the question's title and confirm button.
