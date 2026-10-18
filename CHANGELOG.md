@@ -22,11 +22,11 @@ of every installed copy. A version without a section is not released.
   programs still running. Over the tab it is itself the panes say so and
   nothing happens. Out of the window it still becomes a window of its own, back
   over the column it still reorders or changes group, and Esc takes it back.
-  Or slide a row along the column and hold it still on the middle of another
-  row: after a moment that row lights, and letting go there adds the tab to it
-  as a split on the right and shows it. Move on before it lights and the row
-  slides into place as it always did. Rows of the same group and of other
-  groups both work; a group's header is not a tab to split into. The tab's row
+  Or drop a row on another row, as in a browser's sidebar: over the middle of a
+  row that row lights at once, and letting go there adds the dragged tab to it
+  as a split on the right and shows it. Over a row's top or bottom edge, or
+  between rows, the rows make room and the row goes to that place as before.
+  Rows of the same group and of other groups both work; a group's header is not a tab to split into. The tab's row
   leaves the column, the tab it joined shows the deck of a split tab, and Undo
   Move takes either back. The tabs in the title row are as they were: pulled
   down onto the panes without Option-Command, a tab opens in a window of its

@@ -18,8 +18,8 @@
 //! comes to — a place in its own strip, a place in another window's, or a window of its own.
 //! Two rules turn a dragged tab into splits: [`Pull`] says what a tab pulled out of its list
 //! comes to over a window's panes (with ⌥⌘, or a side column's row over its own window's, a block
-//! of panes; otherwise a window), and [`RowDwell`] when a row slid along the side column rests on
-//! another row long enough to be split into it.
+//! of panes; otherwise a window), and [`Column::split_target`] when a row slid along the side
+//! column is over another row's middle, to be split into it, rather than over a place of the list.
 //!
 //! **A carried pane** is read here too: [`Strip::pane_over`] says whether a point over the strip
 //! means "into this tab" or "a new tab at this place", and the pane operations of [`Tabs`]
@@ -1087,68 +1087,35 @@ impl Strip {
     }
 }
 
-/// How long a row dragged along the side column rests on the middle of another row before that
-/// row is lit as the one it would split into ([`RowDwell`]). Longer than [`SPRING_DELAY`]: a row
-/// slid one place along and held there before it is let go rests with the pointer over the middle
-/// of the row that made room for it — where the rows stood before the drag — so a pause at the
-/// end of a reorder must not become a merge. Waiting this long is asking, not stumbling into it.
-/// A design constant.
-pub const ROW_SPLIT_DELAY: Duration = Duration::from_millis(800);
+/// How much of a row's height, at each of its two edges, is a place of the list when another row
+/// is dragged along the side column over it ([`split_band`]): over the top edge the held row goes
+/// before it, over the bottom edge after it. Between the two edges is the row's middle, which
+/// means "into this tab" — the held tab joins it as a split. A quarter at each end leaves the
+/// middle half of a row: 14 pt of the 28 pt row, the same aim the title row's 64% middle asks of
+/// a chip twice as wide, and the edges 7 pt, wider than the 2 pt gap they border. A design
+/// constant.
+pub const SPLIT_EDGE: f64 = 0.25;
 
-/// A row dragged along the side column, resting on the middle of row `row` (an identity of the
-/// shell's choosing: the row's place in the list, or its tab) since the pointer stood at `from`
-/// along the column. After [`ROW_SPLIT_DELAY`] it is `armed`: the row is lit, the others stand
-/// where they stood before the drag, and letting go splits the held tab into that row's tab
-/// (Split Right) instead of putting it in a place of the list.
-///
-/// **What a row's middle is** is read on the column as it stood before the drag
-/// ([`Column::split_over`]): the held row's neighbours slide out of its way as it goes, so the row
-/// a pointer moves onto is never under it in the column as drawn — the place it would take is.
-/// The wait is for the pointer to rest: it starts again when the pointer moves on by more than
-/// [`DRAG_SLOP`], so a row slid past others is not lit on the way. Once lit, the row stays lit for
-/// as long as the pointer is over its middle; off it, the slide goes on as if nothing waited.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RowDwell<K> {
-    pub row: K,
-    /// Where along the column the wait began.
-    pub from: f64,
-    pub armed: bool,
-}
+/// The most an edge of [`SPLIT_EDGE`] may take, in points: a row taller than 48 pt (a card with
+/// lines under its title) keeps 12 pt edges and gives the rest to its middle, so a tall row is not
+/// mostly edge and a short one is not mostly middle — the edge is what a hand finds between two
+/// rows, whatever their height. A design constant.
+pub const SPLIT_EDGE_MAX: f64 = 12.0;
 
-impl<K: Copy + PartialEq> RowDwell<K> {
-    /// The wait after the pointer moved to `at` along the column, over the middle of `over`
-    /// (`None`: no row's middle, or the held row's own). The same row's wait goes on — lit, it
-    /// stays lit; not yet, it goes on while the pointer rests within [`DRAG_SLOP`] of where it
-    /// began, and begins again further on. Another row begins its own; no row ends it.
-    pub fn follow(now: Option<Self>, over: Option<K>, at: f64) -> Option<Self> {
-        let row = over?;
-        match now {
-            Some(dwell)
-                if dwell.row == row && (dwell.armed || (at - dwell.from).abs() <= DRAG_SLOP) =>
-            {
-                Some(dwell)
-            }
-            _ => Some(Self {
-                row,
-                from: at,
-                armed: false,
-            }),
-        }
-    }
+/// How far past its middle the pointer may stray, in points, before a row lit as the one a held
+/// row would split into goes out ([`Column::split_target`]): a lit row stays lit over the first
+/// [`SPLIT_HOLD`] of each edge, a row not lit lights only over its middle. A pointer resting on the
+/// line between middle and edge, a hand's tremor or a trackpad's last fraction of a point, does
+/// not make the row light and go out by turns. Less than the shortest edge (7 pt), so the edge
+/// is still there to reorder. A design constant.
+pub const SPLIT_HOLD: f64 = 3.0;
 
-    /// The wait is over: the row is lit.
-    pub fn arm(self) -> Self {
-        Self {
-            armed: true,
-            ..self
-        }
-    }
-
-    /// Whether a wait that began as `began` is the same one still: the timer that ends it counts
-    /// only then (the pointer has not moved on, nor to another row, since it was set).
-    pub fn same_wait(now: Option<Self>, began: Self) -> bool {
-        now.is_some_and(|now| now.row == began.row && now.from == began.from && !now.armed)
-    }
+/// The middle of `row` along y — the part that means "split into this tab" for a row dragged over
+/// it, between two edges of [`SPLIT_EDGE`] of its own height, each at most [`SPLIT_EDGE_MAX`].
+/// Read from the row's own rectangle, so a row of any height has its own.
+pub fn split_band(row: Rect) -> (f64, f64) {
+    let edge = (row.height * SPLIT_EDGE).clamp(0.0, SPLIT_EDGE_MAX);
+    (row.y + edge, row.y + row.height - edge)
 }
 
 /// What is under a tab carried out of its list, read where the pointer is ([`Pull::comes_to`]).
@@ -1587,17 +1554,42 @@ impl Column {
         self.run().pane_over(y)
     }
 
-    /// The row a row held at place `held` and dragged along the column would split into at `y`:
-    /// the row whose middle ([`TAB_CORE_FROM`] to [`TAB_CORE_TO`] of its height, both ends in) is
-    /// under the pointer — read on this column as it stood before the drag, the same reading as a
-    /// carried pane's ([`Column::pane_over`]) — and not the held row itself. `None` between rows,
-    /// over a row's edge, and over a header: a group's header, open or closed, is no tab to split
-    /// into ([`RowDwell`]).
-    pub fn split_over(&self, y: f64, held: usize) -> Option<usize> {
-        match self.pane_over(y) {
-            PaneOver::OnTab { index } if index != held => Some(index),
-            _ => None,
+    /// The row a row held at place `held` and dragged along the column would split into, with the
+    /// pointer at `y` and row `lit` lit now (`None`: none is). Read on this column as it stood
+    /// before the drag — the rows the held one passes slide out of its way, and a decision read
+    /// on where they slid to would move them back under the pointer and flip at once — so the
+    /// answer is a function of the pointer alone, and the rows' sliding cannot feed it.
+    ///
+    /// A row lights over its middle ([`split_band`]) and, lit, stays lit [`SPLIT_HOLD`] beyond it
+    /// on either side, so the line between middle and edge does not flicker. Never the held row
+    /// itself, never a header (a group's, open or closed, is no tab), and never between rows:
+    /// `None` there, and the row is slid to the place [`Column::reorder_slot`] says.
+    pub fn split_target(&self, y: f64, held: usize, lit: Option<usize>) -> Option<usize> {
+        let within = |index: usize, slack: f64| {
+            index != held
+                && self.rows.get(index).is_some_and(|row| {
+                    let (from, to) = split_band(*row);
+                    y >= from - slack && y <= to + slack
+                })
+        };
+        if let Some(lit) = lit.filter(|lit| within(*lit, SPLIT_HOLD)) {
+            return Some(lit);
         }
+        (0..self.rows.len()).find(|index| within(*index, 0.0))
+    }
+
+    /// The place of the list a row held at place `held` would take with the pointer at `y`, among
+    /// the others: past every other row whose centre is above the pointer. Read on this column as
+    /// it stood before the drag, as [`Column::split_target`] is, so the two answers share one
+    /// geometry: over a row's top edge the held row goes before it, over its middle into it, over
+    /// its bottom edge after it — going down a row, the rows move once, in order, and never back.
+    /// The place counts the list without the held row, as [`reordered`] takes it.
+    pub fn reorder_slot(&self, y: f64, held: usize) -> usize {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(index, row)| *index != held && row.y + row.height / 2.0 < y)
+            .count()
     }
 
     /// Where the line that marks "a new tab here" runs (the window's space): in the [`GAP`] above
@@ -5534,80 +5526,153 @@ mod tests {
     }
 
     #[test]
-    fn a_held_row_splits_into_the_row_whose_middle_it_rests_on() {
+    fn a_rows_middle_is_its_half_and_a_tall_row_keeps_twelve_point_edges() {
+        // The 28 pt row: 7 pt edges, a 14 pt middle.
+        assert_eq!(split_band(Rect::new(8.0, 76.0, 184.0, 28.0)), (83.0, 97.0));
+        // A 48 pt row is the last whose edges are a quarter: 12 pt.
+        assert_eq!(split_band(Rect::new(8.0, 0.0, 184.0, 48.0)), (12.0, 36.0));
+        // A 90 pt card keeps 12 pt edges and a 66 pt middle.
+        assert_eq!(
+            split_band(Rect::new(8.0, 100.0, 184.0, 90.0)),
+            (112.0, 178.0)
+        );
+        // Each row its own: a short row's middle is no taller than its half.
+        assert_eq!(split_band(Rect::new(8.0, 10.0, 184.0, 20.0)), (15.0, 25.0));
+    }
+
+    #[test]
+    fn a_held_row_splits_into_the_row_whose_middle_it_is_over() {
         let column = side(600.0, 4).layout();
-        // Row 1 spans 76..104: the middle 64% is 81.04..98.96, as for a carried pane.
-        assert_eq!(column.split_over(90.0, 0), Some(1));
-        assert_eq!(column.split_over(81.2, 3), Some(1));
-        assert_eq!(column.split_over(81.0, 0), None, "the row's edge reorders");
-        assert_eq!(column.split_over(99.1, 0), None);
-        assert_eq!(column.split_over(75.0, 0), None, "the gap");
-        assert_eq!(column.split_over(90.0, 1), None, "the held row's own place");
-        assert_eq!(column.split_over(590.0, 0), None, "under the last row");
+        // Row 1 spans 76..104: its middle is 83..97, its edges 76..83 and 97..104.
+        assert_eq!(column.split_target(90.0, 0, None), Some(1));
+        assert_eq!(column.split_target(83.0, 3, None), Some(1), "both ends in");
+        assert_eq!(column.split_target(97.0, 3, None), Some(1));
+        assert_eq!(
+            column.split_target(82.9, 0, None),
+            None,
+            "the top edge reorders"
+        );
+        assert_eq!(
+            column.split_target(97.1, 0, None),
+            None,
+            "the bottom edge too"
+        );
+        assert_eq!(column.split_target(75.0, 0, None), None, "the gap");
+        assert_eq!(
+            column.split_target(90.0, 1, None),
+            None,
+            "the held row's own place"
+        );
+        assert_eq!(
+            column.split_target(590.0, 0, None),
+            None,
+            "under the last row"
+        );
+        assert_eq!(column.split_target(20.0, 1, None), None, "above the first");
 
         // In a column with groups a header is no row: neither its upper half nor its lower.
         let headed = headed();
-        assert_eq!(headed.split_over(120.0, 0), None, "a header's upper half");
-        assert_eq!(headed.split_over(136.0, 0), None, "a header's lower half");
         assert_eq!(
-            headed.split_over(156.0, 0),
+            headed.split_target(120.0, 0, None),
+            None,
+            "a header's upper half"
+        );
+        assert_eq!(
+            headed.split_target(136.0, 0, None),
+            None,
+            "a header's lower half"
+        );
+        assert_eq!(
+            headed.split_target(156.0, 0, None),
             Some(2),
             "a row of another group"
         );
-        assert_eq!(headed.split_over(252.0, 2), Some(4), "and of the last one");
-        assert_eq!(headed.split_over(60.0, 1), Some(0), "or of the same");
+        assert_eq!(
+            headed.split_target(252.0, 2, None),
+            Some(4),
+            "and of the last one"
+        );
+        assert_eq!(
+            headed.split_target(60.0, 1, None),
+            Some(0),
+            "or of the same"
+        );
     }
 
     #[test]
-    fn a_row_is_lit_for_a_split_only_where_the_pointer_rests() {
-        let begun = RowDwell::follow(None, Some(1), 90.0).unwrap();
+    fn a_lit_row_stays_lit_a_little_past_its_middle_and_no_further() {
+        let column = side(600.0, 4).layout();
+        // Row 1's middle is 83..97. Not lit, it lights only inside it.
+        assert_eq!(column.split_target(81.0, 0, None), None);
+        assert_eq!(column.split_target(99.0, 0, None), None);
+        // Lit, it holds SPLIT_HOLD (3 pt) past either end.
+        assert_eq!(column.split_target(81.0, 0, Some(1)), Some(1));
+        assert_eq!(column.split_target(80.0, 0, Some(1)), Some(1));
+        assert_eq!(column.split_target(100.0, 0, Some(1)), Some(1));
         assert_eq!(
-            begun,
-            RowDwell {
-                row: 1,
-                from: 90.0,
-                armed: false
+            column.split_target(79.9, 0, Some(1)),
+            None,
+            "then the edge is the edge"
+        );
+        assert_eq!(column.split_target(100.1, 0, Some(1)), None);
+        // The hold never reaches the next row's middle, nor makes a row lit that is held.
+        assert_eq!(
+            column.split_target(77.0, 0, Some(1)),
+            None,
+            "a row's top edge outlasts the hold"
+        );
+        assert_eq!(column.split_target(90.0, 1, Some(1)), None);
+        // A lit row the pointer has left for another's middle gives way to it.
+        assert_eq!(column.split_target(120.0, 0, Some(1)), Some(2));
+
+        // Wobbling across the line between middle and edge, it does not go out and back: the
+        // answer read with what it was, step by step, is one answer.
+        let mut lit = None;
+        let mut changes = 0;
+        for y in [82.0, 83.5, 82.5, 83.2, 81.5, 82.8, 81.0, 83.0] {
+            let now = column.split_target(y, 0, lit);
+            changes += usize::from(now != lit);
+            lit = now;
+        }
+        assert_eq!(lit, Some(1));
+        assert_eq!(changes, 1, "lit once, at 83.5, and kept");
+    }
+
+    #[test]
+    fn a_held_row_goes_before_a_row_over_its_top_and_after_it_over_its_bottom() {
+        let column = side(600.0, 4).layout();
+        // Rows at 46, 76, 106, 136, 28 high: centres 60, 90, 120, 150. Row 0 held.
+        assert_eq!(column.reorder_slot(50.0, 0), 0, "its own place");
+        assert_eq!(
+            column.reorder_slot(78.0, 0),
+            0,
+            "over row 1's top edge: before it"
+        );
+        assert_eq!(
+            column.reorder_slot(100.0, 0),
+            1,
+            "over its bottom edge: after it"
+        );
+        assert_eq!(column.reorder_slot(105.0, 0), 1, "the gap");
+        assert_eq!(column.reorder_slot(590.0, 0), 3, "under the last: the end");
+        // Row 3 held, carried up: over row 1's bottom edge it goes after it, over its top before.
+        assert_eq!(column.reorder_slot(100.0, 3), 2);
+        assert_eq!(column.reorder_slot(78.0, 3), 1);
+        assert_eq!(column.reorder_slot(20.0, 3), 0);
+        // Down one row, the place moves once and the middle between: before, into, after.
+        let read: Vec<(usize, Option<usize>)> = (76..=104)
+            .map(|y| {
+                let y = f64::from(y);
+                (column.reorder_slot(y, 0), column.split_target(y, 0, None))
+            })
+            .collect();
+        let mut seen: Vec<(usize, Option<usize>)> = Vec::new();
+        for step in read {
+            if seen.last() != Some(&step) {
+                seen.push(step);
             }
-        );
-        assert_eq!(RowDwell::<usize>::follow(None, None, 90.0), None);
-        // Resting within the slop, the same wait goes on.
-        assert_eq!(
-            RowDwell::follow(Some(begun), Some(1), 90.0 + DRAG_SLOP),
-            Some(begun)
-        );
-        assert!(RowDwell::same_wait(Some(begun), begun));
-        // Moving on over the same row begins it again, from there.
-        let again = RowDwell::follow(Some(begun), Some(1), 95.0).unwrap();
-        assert_eq!(again.from, 95.0);
-        assert!(
-            !RowDwell::same_wait(Some(again), begun),
-            "the old timer does not count"
-        );
-        // Another row, or none, ends it.
-        assert_eq!(
-            RowDwell::follow(Some(begun), Some(2), 120.0).unwrap().row,
-            2
-        );
-        assert_eq!(RowDwell::follow(Some(begun), None, 100.0), None);
-        assert!(!RowDwell::same_wait(None, begun));
-
-        // Lit, the row stays lit wherever the pointer goes over its middle, and off it goes out.
-        let lit = begun.arm();
-        assert!(lit.armed);
-        assert_eq!(RowDwell::follow(Some(lit), Some(1), 98.0), Some(lit));
-        assert_eq!(RowDwell::follow(Some(lit), None, 100.0), None);
-        assert!(!RowDwell::follow(Some(lit), Some(2), 120.0).unwrap().armed);
-        assert!(
-            !RowDwell::same_wait(Some(lit), begun),
-            "a lit row is not lit twice"
-        );
-    }
-
-    #[test]
-    fn a_split_is_waited_for_longer_than_a_tab_opens_under_a_pane() {
-        // A reorder's pause rests on the row that made room: it must not become a merge.
-        assert!(ROW_SPLIT_DELAY > SPRING_DELAY);
-        assert_eq!(ROW_SPLIT_DELAY, Duration::from_millis(800));
+        }
+        assert_eq!(seen, [(0, None), (0, Some(1)), (1, Some(1)), (1, None)]);
     }
 
     #[test]

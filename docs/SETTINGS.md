@@ -562,8 +562,8 @@ shows one group at a time instead (see **In the title row** below).
   rows land in the group they are let go on; over nothing but the desktop or
   another window's panes they become a window of their own, ungrouped, in the
   order they had. One row pulled onto its own window's panes is split into the
-  tab on screen instead (see `tab_position`), and one row held still on the
-  middle of another row until that row lights is split into it. Pull
+  tab on screen instead (see `tab_position`), and one row let go on the middle
+  of another row is split into it. Pull
   a header and the group goes: between two groups to put them in order (the
   ungrouped tabs stay first), out of the window for a window of its own under
   the group's name, or onto another window, ` 2` after a name it has already. In
@@ -1137,11 +1137,14 @@ tab_position = "top"
   would take is painted with its name (Left, Right, Above, Below), as with ⌥⌘,
   and letting go puts its panes there, still running; over the tab it is
   itself the panes say "This tab is already on screen" and nothing happens, and
-  Esc takes the drag back. Held still on the middle of another row for a
-  moment (0.8 s) while you slide it, a row lights that row; let go, its tab
-  joins the lit one as a split on the right (Split Right) and the lit tab comes
-  on screen. Move off the row's middle first and the slide goes on. Undo Move
-  takes either back. In the title row (`"top"`) a tab pulled down onto the
+  Esc takes the drag back. Slid onto another row, a row splits too, as in a
+  browser's sidebar: over the middle half of a row (its top and bottom quarter,
+  at most 12 pt each, are its edges) that row lights at once and the rows stop
+  making room; let go, the dragged tab joins the lit one as a split on the
+  right (Split Right) and the lit tab comes on screen. Over a row's top edge
+  the dragged row goes before it, over its bottom edge after it, and between
+  rows or groups the rows make room as before; a group's header is never
+  lit. Undo Move takes either back. In the title row (`"top"`) a tab pulled down onto the
   panes still opens a window of its own unless ⌥⌘ is held. A pane carried with
   ⌥⌘ and dropped on a row joins that tab; dropped between two rows it opens a
   new tab. One place for every window; it applies

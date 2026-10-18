@@ -5322,10 +5322,9 @@ struct Dragging {
     /// list — the gap opens over a group's header or under it, and a drop puts the row in the
     /// group that was shown ([`TabBar::release`]).
     grouped: bool,
-    /// A row of the side column resting on the middle of another row's tab, or lit there: let go
-    /// lit, the held tab joins that tab as a split instead of taking a place
-    /// ([`TabBar::rest_on_row`]).
-    split: Option<tabs::RowDwell<u64>>,
+    /// In the side column, the tab of the row whose middle the held row is over, lit: let go
+    /// there, the held tab joins it as a split instead of taking a place ([`TabBar::aim_row`]).
+    split: Option<u64>,
 }
 
 pub(crate) struct BarIvars {
@@ -6080,7 +6079,7 @@ impl TabBar {
         // column of a window with groups, with each header over the row it would stand over.
         // A row lit for a split leaves the others where they stood: the held row hovers over the
         // lit one, not in a place of the list.
-        let lit = drag.is_some_and(|drag| drag.split.is_some_and(|split| split.armed));
+        let lit = drag.is_some_and(|drag| drag.split.is_some());
         if let Some(Dragging {
             tab,
             at: Some((_, to)),
@@ -7125,9 +7124,15 @@ impl TabBar {
             Drag::Press => iv.drag.set(Some(drag)),
             Drag::Reorder { left, to } => {
                 let first = drag.at.is_none();
-                // A row lit for a split, or no longer lit, changes the whole column: the others
-                // stand where they stood before the drag while it is lit ([`Self::rest_on_row`]).
-                let relit = upright && !drag.multi && self.rest_on_row(&mut drag, point.y);
+                // In the column the row is over another row's middle — lit, to split into — or
+                // a place of the list, read where the rows stood before the drag; a row lit or no
+                // longer lit changes the whole column ([`Self::aim_row`]).
+                let (relit, slot) = if upright {
+                    self.aim_row(&mut drag, point.y)
+                } else {
+                    (false, None)
+                };
+                let to = if drag.grouped { to } else { slot.unwrap_or(to) };
                 let same_place = drag.at.is_some_and(|(_, place)| place == to) && !relit;
                 drag.at = Some((left, to));
                 iv.drag.set(Some(drag));
@@ -7152,7 +7157,7 @@ impl TabBar {
                 if self.tear_off(tab, drag.multi, event) {
                     drag.at = None;
                     drag.torn = true;
-                    if drag.split.take().is_some_and(|split| split.armed) {
+                    if drag.split.take().is_some() {
                         iv.target.set(None);
                     }
                     iv.drag.set(Some(drag));
@@ -7267,14 +7272,14 @@ impl TabBar {
             return;
         }
         iv.drag.set(None);
-        if let Some(split) = drag.split.filter(|split| split.armed) {
+        if let Some(into) = drag.split {
             // Let go on a lit row: the held tab joins that row's tab as a split on its right, a
             // turn later (this chip goes with its tab); until then it glides back to its place.
             iv.target.set(None);
             iv.glide.set(true);
             self.lay_out();
             if let Some(window) = self.terminal_window() {
-                window.split_tab_into(tab, split.row);
+                window.split_tab_into(tab, into);
             }
             return;
         }
