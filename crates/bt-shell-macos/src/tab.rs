@@ -108,13 +108,19 @@ impl TabHost {
 }
 
 impl PaneHost for TabHost {
-    fn title_changed(&self, _pane: u64) {
+    fn title_changed(&self, pane: u64) {
         // The title is from the focused pane; a background pane's news does
         // the same read and rewrites the unchanged title — cheap and branchless.
         if let Some(tab) = self.tab() {
             tab.refresh_title();
-            // The news also says a directory moved: a layout edge.
+            // The news also says a directory moved: a layout edge, and a place for the
+            // palette's folders and servers to remember.
             tab.layout_changed();
+            if let Some(app) = app::delegate(Self::mtm())
+                && let Some(pane) = tab.panes().into_iter().find(|p| p.id() == pane)
+            {
+                app.note_places_of(&pane);
+            }
         }
     }
 
@@ -756,7 +762,7 @@ impl TerminalTab {
         };
         let from = self.focused_pane();
         if let Some(this) = app.tab(self.id()) {
-            app.open_split(&this, &from, axis);
+            app.open_split(&this, &from, axis, None);
         }
     }
 

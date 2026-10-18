@@ -18,6 +18,8 @@
 //!   opens, the menu of a row (→) and what choosing does.
 //! - [`synonyms`] — the words a menu command is also found by, keyed by its selector.
 //! - [`PathQuery`] — a path typed in the field.
+//! - [`Targets`], [`go`] and [`path_list`] — the folders, servers and ports ⌘O lists, a typed
+//!   path's entries, and what choosing each does ([`Go`]).
 //!
 //! The palette's commands are the **menu's own** (the shell reads the menu, so a command exists
 //! in the palette exactly when it exists in the menu); the rows of the menu are built by the
@@ -36,6 +38,7 @@ mod row;
 mod state;
 mod switch;
 mod synonyms;
+mod targets;
 mod themes;
 mod visits;
 
@@ -47,8 +50,8 @@ pub use list::{
 };
 pub use matching::{Match, score};
 pub use menu::{
-    GO_TO_TABS_ACTION, MenuNode, MenuRow, MenuRows, Modifiers, PALETTE_ACTION, rows as menu_rows,
-    shortcut,
+    GO_TO_FOLDERS_ACTION, GO_TO_TABS_ACTION, MenuNode, MenuRow, MenuRows, Modifiers,
+    PALETTE_ACTION, rows as menu_rows, shortcut,
 };
 pub use pages::{Chosen, Sources, chosen, page_rows, root_rows};
 pub use path::PathQuery;
@@ -65,6 +68,11 @@ pub use switch::{
     listing_order, status as tab_status, tab_id, tab_keys, tab_list, tab_row, tab_rows,
 };
 pub use synonyms::for_selector as command_words;
+pub use targets::{
+    Beside, ENTRY_LIMIT, FOLDER_LIMIT, FolderFacts, Go, HOST_LIMIT, HostFacts, OpenFolder,
+    PortFacts, Seen, Targets, beside, cd_line, expand as expand_home, folder_facts, folder_row, go,
+    host_facts, host_row, list_dirs, mark_status, path_list, port_row, ssh_line, tilde,
+};
 pub use themes::{Group as ThemeGroup, ThemeEntry, entries as theme_entries};
 pub use visits::Visits;
 

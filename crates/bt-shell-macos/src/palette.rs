@@ -23,6 +23,15 @@
 //! a turn after the palette is down ([`AppDelegate::palette_act`](crate::app)). A tab's icon is
 //! the one the bar draws ([`palette_icon`]).
 //!
+//! **Folders, servers and ports** ([`bt_shell_common::palette::Targets`], read when the palette
+//! opens): ⌘O ([`go_to_folder`]) opens the palette on the folders — the directories panes
+//! reported this run, newest first — and a field that holds a path (`~/Pro`, `/usr/lo`) lists the
+//! folders inside the one it points into, read off the main thread ([`Open::listing`]); ⇥ goes
+//! inside. ⏎ on a folder opens a new tab in it and ⌥⏎ pastes `cd '…'` on the line of the pane on
+//! screen; ⏎ on a server opens a new local tab with `ssh host` left on the line; **no byte that
+//! runs is sent anywhere** ([`AppDelegate::palette_go`](crate::app)). A port opens in the browser,
+//! ⌘⏎ copies its address. `~/.ssh/config` is read in the background every time the palette opens.
+//!
 //! **Running a row** is the menu's own act: the palette closes, the keyboard goes back to the tab
 //! on screen, and only then is the item's action sent — to the item's target, or down the
 //! responder chain from that pane — with the item as the sender, so a tagged item (a direction,
@@ -53,16 +62,18 @@ mod menu;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::Path;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use block2::RcBlock;
 use bt_core::{Settings, Theme};
 use bt_shell_common::palette::{
-    self as rules, Chosen, Effect, Fallbacks, Key, Kind, List, Modifier, Palette, Places, Row,
-    Scope, Sources, Swatch, ThemeEntry,
+    self as rules, Chosen, Effect, Fallbacks, Key, Kind, List, Modifier, Palette, PathQuery,
+    Places, Row, Scope, Sources, Swatch, Targets, ThemeEntry,
 };
-use dispatch2::{DispatchQueue, DispatchTime};
+use dispatch2::{DispatchQueue, DispatchRetained, DispatchTime};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{
@@ -236,6 +247,12 @@ fn hints(
             "Open"
         } else if matches!(row.kind, Kind::Tab | Kind::Group) {
             "Go to"
+        } else if row.kind == Kind::Folder {
+            "New Tab Here"
+        } else if row.kind == Kind::Host {
+            "ssh in New Tab"
+        } else if row.kind == Kind::Port {
+            "Open"
         } else if row.kind == Kind::Search {
             "Find"
         } else if matches!(row.kind, Kind::Theme | Kind::Choice) {
@@ -256,18 +273,34 @@ fn hints(
         {
             hints.push(("⌥↵", format!("Use for {appearance}")));
         }
+        // What the other keys do to a folder and to a port.
+        match row.kind {
+            Kind::Folder => {
+                hints.push(("⌥↵", "Type cd".to_owned()));
+                hints.push(("⌘↵", "Show in Finder".to_owned()));
+                hints.push(("⇥", "Go inside".to_owned()));
+            }
+            Kind::Port => hints.push(("⌘↵", "Copy URL".to_owned())),
+            _ => {}
+        }
     }
     hints.push(("↑↓", "Move".to_owned()));
     hints.push(("esc", if depth > 0 { "Back" } else { "Close" }.to_owned()));
     hints
 }
 
-/// What the list says when it has no rows.
-fn empty_message(depth: usize, query: &str) -> &'static str {
-    if !query.trim().is_empty() || depth > 0 {
-        "No matches"
-    } else {
-        "Type a command, or press ↓ ↵ to run a recent one"
+/// What the list says when it has no rows. `looking`: a folder's names are being read.
+fn empty_message(scope: Option<&Scope>, depth: usize, query: &str, looking: bool) -> &'static str {
+    if looking {
+        return "Reading the folder…";
+    }
+    let typed = !query.trim().is_empty();
+    match scope {
+        Some(Scope::Folders) if !typed => "No folders yet: type a path such as ~/",
+        Some(Scope::Hosts) if !typed => "No servers yet: add Host lines to ~/.ssh/config",
+        Some(Scope::Ports) if !typed => "Nothing in your tabs is listening",
+        _ if typed || depth > 0 => "No matches",
+        _ => "Type a command, or press ↓ ↵ to run a recent one",
     }
 }
 
@@ -821,9 +854,35 @@ struct Open {
     places: Places,
     /// The tabs' icons, by row id ([`tab_icons`]).
     icons: Icons,
+    /// The folders, servers and ports ([`AppDelegate::palette_targets`](crate::app)), as they
+    /// were when the palette opened and when `~/.ssh/config` was last read.
+    targets: Targets,
+    /// The names inside the folder a typed path points into, read off the main thread.
+    listing: Option<Listing>,
     list: List,
     rows: Vec<Row>,
     look: Look,
+}
+
+/// The path `query` is on the page `scope` (`None`: the root): only the root and the folders page
+/// read a query that begins with `~` or `/` as one.
+fn path_in(scope: Option<&Scope>, query: &str) -> Option<PathQuery> {
+    matches!(scope, None | Some(Scope::Folders))
+        .then(|| PathQuery::parse(query))
+        .flatten()
+}
+
+/// A directory a typed path is listing: the base as typed (`~/Projects`) and, once the background
+/// read is back, the directories inside it.
+struct Listing {
+    base: String,
+    names: Option<Vec<String>>,
+}
+
+/// The serial queue directories are listed on.
+fn listing_queue() -> &'static DispatchRetained<DispatchQueue> {
+    static QUEUE: OnceLock<DispatchRetained<DispatchQueue>> = OnceLock::new();
+    QUEUE.get_or_init(|| DispatchQueue::new("dev.bateri.palette", None))
 }
 
 impl Open {
@@ -833,7 +892,23 @@ impl Open {
             settings: &self.settings,
             themes: &self.themes,
             places: &self.places,
+            targets: &self.targets,
         }
+    }
+
+    /// The path the field holds when it is read as a folder: on the root and on the folders page
+    /// a query that begins with `~` or `/` is a path ([`PathQuery`]).
+    fn typed_path(&self) -> Option<PathQuery> {
+        path_in(self.machine.scope(), self.machine.query())
+    }
+
+    /// Whether the folder the field points into is being read.
+    fn looking(&self) -> bool {
+        self.typed_path().is_some_and(|path| {
+            self.listing
+                .as_ref()
+                .is_some_and(|listing| listing.base == path.base && listing.names.is_none())
+        })
     }
 
     /// The root's rows afresh, after the settings they show changed.
@@ -844,6 +919,17 @@ impl Open {
     /// The list the machine's field and page ask for.
     fn derive(&self) -> List {
         let query = self.machine.query();
+        // A path typed on the root or on the folders page lists the folders inside the one it
+        // points into; until they are read it lists none.
+        if let Some(path) = self.typed_path() {
+            return match &self.listing {
+                Some(Listing {
+                    base,
+                    names: Some(names),
+                }) if *base == path.base => rules::path_list(&path, names, &self.targets.home),
+                _ => List::default(),
+            };
+        }
         let Some(scope) = self.machine.scope() else {
             return rules::root_list(
                 &self.root,
@@ -1133,6 +1219,7 @@ impl PaletteCard {
     /// [`PaletteCard::refresh`], with the highlighted row scrolled into sight or not.
     fn refresh_scrolling(&self, scroll: bool) {
         let iv = self.ivars();
+        self.want_listing();
         let (list, highlight, empty, look, query, warning, icons) = {
             let mut open = iv.open.borrow_mut();
             let list = open.derive();
@@ -1144,7 +1231,12 @@ impl PaletteCard {
             (
                 list,
                 highlight,
-                empty_message(open.machine.depth(), open.machine.query()),
+                empty_message(
+                    open.machine.scope(),
+                    open.machine.depth(),
+                    open.machine.query(),
+                    open.looking(),
+                ),
                 open.look,
                 open.machine.query().to_owned(),
                 open.warning(),
@@ -1234,24 +1326,93 @@ impl PaletteCard {
         }
     }
 
-    /// ⌘P with the palette up: on the tabs the highlight goes one tab on (the keys' ↓, which
-    /// wraps); anywhere else the tabs come, fresh, as when ⌘P opens the palette.
-    fn go_to_tabs(&self) {
+    /// ⌘P or ⌘O with the palette up: on that page (the tabs, the folders) the highlight goes one
+    /// row on (the keys' ↓, which wraps); anywhere else the page comes, fresh, as when the
+    /// shortcut opens the palette.
+    fn go_to_page(&self, page: Scope) {
         let _keep = self.retain();
-        let on_tabs = matches!(
-            self.ivars().open.borrow().machine.scope(),
-            Some(Scope::Tabs)
-        );
-        if on_tabs {
+        let on_page = self.ivars().open.borrow().machine.scope() == Some(&page);
+        if on_page {
             self.press(Key::Down);
             return;
         }
         let effect = {
             let mut open = self.ivars().open.borrow_mut();
             open.notice = None;
-            open.machine.start_on(Scope::Tabs)
+            open.machine.start_on(page)
         };
         self.settle(effect);
+    }
+
+    /// Reads the folder the field points into, off the main thread, unless it is the one already
+    /// read or being read ([`Open::listing`]).
+    fn want_listing(&self) {
+        let wanted = {
+            let mut open = self.ivars().open.borrow_mut();
+            match open.typed_path() {
+                Some(path)
+                    if open
+                        .listing
+                        .as_ref()
+                        .is_none_or(|listing| listing.base != path.base) =>
+                {
+                    open.listing = Some(Listing {
+                        base: path.base.clone(),
+                        names: None,
+                    });
+                    Some((path.base, open.targets.home.clone()))
+                }
+                _ => None,
+            }
+        };
+        let Some((base, home)) = wanted else {
+            return;
+        };
+        let window = self.ivars().window;
+        listing_queue().exec_async(move || {
+            let dir = rules::expand_home(&base, &home);
+            let names = rules::list_dirs(Path::new(&dir));
+            DispatchQueue::main().exec_async(move || {
+                // audit: a block running on the main queue is on the main thread by definition.
+                let mtm = MainThreadMarker::new().expect("the main queue is the main thread");
+                if let Some(app) = app::delegate(mtm)
+                    && let Some(window) = app.window(window)
+                    && let Some(scrim) = window.root().palette()
+                {
+                    scrim.ivars().card.listed(&base, names);
+                }
+            });
+        });
+    }
+
+    /// The names inside `base` are read. Late news about a folder the field has left is dropped.
+    fn listed(&self, base: &str, names: Vec<String>) {
+        if self.ivars().closing.get() {
+            return;
+        }
+        {
+            let mut open = self.ivars().open.borrow_mut();
+            match &mut open.listing {
+                Some(listing) if listing.base == base => listing.names = Some(names),
+                _ => return,
+            }
+        }
+        // The list changes under a pointer at rest: the highlight stays where the keys left it.
+        self.refresh_scrolling(false);
+    }
+
+    /// The folders, servers and ports changed while the palette is open (`~/.ssh/config` was
+    /// read): the rows are made afresh.
+    fn retarget(&self, targets: Targets) {
+        if self.ivars().closing.get() {
+            return;
+        }
+        {
+            let mut open = self.ivars().open.borrow_mut();
+            open.targets = targets;
+            open.rebuild_root();
+        }
+        self.refresh_scrolling(false);
     }
 
     /// A key to the machine, and what it asks for done.
@@ -1404,6 +1565,11 @@ impl PaletteCard {
             });
             return;
         }
+        // A folder, a server or a port.
+        if let Some(go) = rules::go(id, modifier) {
+            self.go(go);
+            return;
+        }
         if let Some(chosen) = rules::chosen(id, scope.as_ref(), modifier, &settings, dark) {
             self.write(id, &chosen);
             return;
@@ -1438,6 +1604,53 @@ impl PaletteCard {
                 target.as_deref(),
                 Some(sender),
             );
+        }
+    }
+
+    /// A folder, a server or a port was chosen. A port is opened or copied at once, from the
+    /// address its row holds; the others are done a turn after the palette is down — they open a
+    /// tab or write to a line, over a window that has its keyboard back.
+    fn go(&self, go: rules::Go) {
+        use rules::Go;
+        let port = |key: &str| {
+            self.ivars()
+                .open
+                .borrow()
+                .targets
+                .ports
+                .iter()
+                .find(|port| port.key == key)
+                .map(|port| port.url.clone())
+        };
+        match go {
+            Go::OpenPort(key) => {
+                let url = port(&key);
+                self.dismiss();
+                if let Some(url) = url {
+                    crate::footer::open_url(&url);
+                }
+            }
+            Go::CopyPort(key) => {
+                let url = port(&key);
+                self.dismiss();
+                if let Some(url) = url {
+                    crate::clipboard::copy(
+                        &objc2_app_kit::NSPasteboard::generalPasteboard(),
+                        Some(url),
+                    );
+                }
+            }
+            later => {
+                let window = self.ivars().window;
+                self.dismiss();
+                DispatchQueue::main().exec_async(move || {
+                    // audit: a block running on the main queue is on the main thread by definition.
+                    let mtm = MainThreadMarker::new().expect("the main queue is the main thread");
+                    if let Some(app) = app::delegate(mtm) {
+                        app.palette_go(window, later);
+                    }
+                });
+            }
         }
     }
 
@@ -1644,12 +1857,29 @@ pub(crate) fn toggle(window: &TerminalWindow) {
 }
 
 /// ⌘P: opens the palette on the tabs, or — open — takes its highlight one tab on
-/// ([`PaletteCard::go_to_tabs`]).
+/// ([`PaletteCard::go_to_page`]).
 pub(crate) fn go_to_tab(window: &TerminalWindow) {
+    go_to(window, Scope::Tabs);
+}
+
+/// ⌘O: opens the palette on the folders, or — open — takes its highlight one folder on.
+pub(crate) fn go_to_folder(window: &TerminalWindow) {
+    go_to(window, Scope::Folders);
+}
+
+fn go_to(window: &TerminalWindow, page: Scope) {
     if let Some(scrim) = window.root().palette() {
-        scrim.ivars().card.go_to_tabs();
+        scrim.ivars().card.go_to_page(page);
     } else if ready(window) {
-        open(window, Some(Scope::Tabs));
+        open(window, Some(page));
+    }
+}
+
+/// The folders, servers and ports changed (`~/.ssh/config` was read): an open palette of `window`
+/// lists them afresh.
+pub(crate) fn retarget(window: &TerminalWindow, targets: Targets) {
+    if let Some(scrim) = window.root().palette() {
+        scrim.ivars().card.retarget(targets);
     }
 }
 
@@ -1674,7 +1904,7 @@ fn tab_icons(mtm: MainThreadMarker, places: &Places, theme: &Theme) -> Icons {
 }
 
 /// Opens the palette over `window`'s content; `start`: on that page, which esc closes from
-/// (⌘P on the tabs) rather than going back to the root.
+/// (⌘P on the tabs, ⌘O on the folders) rather than going back to the root.
 fn open(window: &TerminalWindow, start: Option<Scope>) {
     let mtm = window.mtm();
     let Some(app) = app::delegate(mtm) else {
@@ -1691,6 +1921,9 @@ fn open(window: &TerminalWindow, start: Option<Scope>) {
     let animate = !app.reduce_motion();
     let places = app.palette_places();
     let icons = tab_icons(mtm, &places, &theme);
+    let targets = app.palette_targets();
+    // The file is read as the palette opens; the answer, if it differs, reaches the open card.
+    app.refresh_ssh_hosts();
     let mut state = Open {
         machine: Palette::new(),
         root: Vec::new(),
@@ -1703,6 +1936,8 @@ fn open(window: &TerminalWindow, start: Option<Scope>) {
         recent,
         places,
         icons,
+        targets,
+        listing: None,
         list: List::default(),
         rows: Vec::new(),
         look,
@@ -1926,6 +2161,53 @@ mod tests {
     }
 
     #[test]
+    fn a_path_is_read_as_one_on_the_root_and_the_folders_page_only() {
+        assert_eq!(
+            path_in(None, "~/Pro").map(|p| p.stem),
+            Some("Pro".to_owned())
+        );
+        assert!(path_in(Some(&Scope::Folders), "/usr/lo").is_some());
+        // Elsewhere the same text is a search, as on any other page.
+        assert!(path_in(Some(&Scope::Tabs), "~/").is_none());
+        assert!(path_in(Some(&Scope::Settings), "/x").is_none());
+        // And a query that is not a path never is.
+        assert!(path_in(None, "api").is_none());
+        assert!(path_in(Some(&Scope::Folders), "api").is_none());
+    }
+
+    #[test]
+    fn a_folder_names_the_keys_it_answers_and_a_server_and_a_port_theirs() {
+        let folder = Row::new(Kind::Folder, "/Users/a/api", "api");
+        assert_eq!(
+            hints(Some(&folder), 0, None),
+            pairs(&[
+                ("↵", "New Tab Here"),
+                ("⌥↵", "Type cd"),
+                ("⌘↵", "Show in Finder"),
+                ("⇥", "Go inside"),
+                ("↑↓", "Move"),
+                ("esc", "Close")
+            ])
+        );
+        let host = Row::new(Kind::Host, "db-1", "db-1");
+        assert_eq!(
+            hints(Some(&host), 0, None)[0],
+            ("↵", "ssh in New Tab".to_owned())
+        );
+        assert_eq!(hints(Some(&host), 0, None).len(), 3);
+        let port = Row::new(Kind::Port, "3000", "localhost:3000");
+        assert_eq!(
+            hints(Some(&port), 0, None),
+            pairs(&[
+                ("↵", "Open"),
+                ("⌘↵", "Copy URL"),
+                ("↑↓", "Move"),
+                ("esc", "Close")
+            ])
+        );
+    }
+
+    #[test]
     fn a_theme_names_its_third_use_for_the_appearance_the_system_has() {
         let theme = Row::new(Kind::Theme, "nord", "Nord");
         assert_eq!(
@@ -1950,8 +2232,17 @@ mod tests {
 
     #[test]
     fn an_empty_list_says_why() {
-        assert_eq!(empty_message(0, "zzz"), "No matches");
-        assert_eq!(empty_message(1, ""), "No matches");
-        assert!(empty_message(0, "").starts_with("Type"));
+        assert_eq!(empty_message(None, 0, "zzz", false), "No matches");
+        assert_eq!(empty_message(None, 1, "", false), "No matches");
+        assert!(empty_message(None, 0, "", false).starts_with("Type"));
+        // The pages of folders, servers and ports say what would fill them.
+        assert!(empty_message(Some(&Scope::Folders), 0, "", false).contains("path"));
+        assert!(empty_message(Some(&Scope::Hosts), 0, "", false).contains(".ssh/config"));
+        assert!(empty_message(Some(&Scope::Ports), 0, "", false).contains("listening"));
+        assert_eq!(
+            empty_message(Some(&Scope::Hosts), 0, "zz", false),
+            "No matches"
+        );
+        assert!(empty_message(Some(&Scope::Folders), 0, "~/Pro", true).contains("Reading"));
     }
 }

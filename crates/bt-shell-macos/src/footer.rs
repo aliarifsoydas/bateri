@@ -450,17 +450,71 @@ impl PortsModel {
     }
 }
 
-/// An item's title: `localhost:3000 — next-server (v16.0.10) · all interfaces`.
-pub(crate) fn port_title(listener: &Listener) -> String {
-    let reach = match listener.bound {
+/// Who can reach a listener, in words: "all interfaces", "this Mac only", "one address".
+pub(crate) fn reach(bound: Bound) -> &'static str {
+    match bound {
         Bound::Any => "all interfaces",
         Bound::Loopback => "this Mac only",
         Bound::Address => "one address",
-    };
+    }
+}
+
+/// An item's title: `localhost:3000 — next-server (v16.0.10) · all interfaces`.
+pub(crate) fn port_title(listener: &Listener) -> String {
     format!(
-        "localhost:{} \u{2014} {} \u{b7} {reach}",
-        listener.port, listener.name
+        "localhost:{} \u{2014} {} \u{b7} {}",
+        listener.port,
+        listener.name,
+        reach(listener.bound)
     )
+}
+
+/// The ports of a pane as the command palette's rows: what listens on this Mac, and the server's
+/// ports that open as they are (direct, or already forwarded) — one that has to be forwarded first
+/// stays in Shell ▸ Open Port ▸. `tab` is the title of the tab they belong to.
+pub(crate) fn port_facts(
+    model: &PortsModel,
+    tab: Option<&str>,
+) -> Vec<bt_shell_common::palette::PortFacts> {
+    use crate::remote_ports::RemoteState;
+    let note = |parts: Vec<String>| {
+        parts
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" \u{b7} ")
+    };
+    let tab = tab.unwrap_or_default().to_owned();
+    let mut facts: Vec<_> = model
+        .local
+        .iter()
+        .map(|listener| bt_shell_common::palette::PortFacts {
+            key: listener.port.to_string(),
+            title: format!("localhost:{}", listener.port),
+            subtitle: note(vec![
+                listener.name.clone(),
+                reach(listener.bound).to_owned(),
+                tab.clone(),
+            ]),
+            url: listener.url(),
+        })
+        .collect();
+    for item in &model.remote {
+        let Some(url) = &item.url else {
+            continue;
+        };
+        let how = match item.state {
+            RemoteState::Forwarded(local) => format!("forwarded to localhost:{local}"),
+            _ => "opens directly".to_owned(),
+        };
+        facts.push(bt_shell_common::palette::PortFacts {
+            key: format!("{}:{}", model.host, item.port),
+            title: format!("{}:{}", model.host, item.port),
+            subtitle: note(vec![item.name.clone(), how, tab.clone()]),
+            url: url.clone(),
+        });
+    }
+    facts
 }
 
 /// Fills `menu` with an item per port — `openPort:` (the tab's own) or

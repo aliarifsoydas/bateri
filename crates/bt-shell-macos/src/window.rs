@@ -2642,6 +2642,12 @@ impl TerminalWindow {
         palette::go_to_tab(self);
     }
 
+    /// Shell ▸ Go to Folder… (⌘O): the palette on the folders, or its highlight one folder on
+    /// ([`palette::go_to_folder`]).
+    pub(crate) fn go_to_folder(&self) {
+        palette::go_to_folder(self);
+    }
+
     /// Whether the palette may open now: not while a question is up on the window or on the
     /// tab on screen — it would sit over a sheet it cannot answer — and not on a window with no
     /// tab to give the keyboard back to.

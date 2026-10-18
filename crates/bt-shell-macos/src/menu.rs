@@ -1,7 +1,8 @@
 //! Main menu: the app menu (About, Check for Updates…, Settings…, Open settings.toml, Hide, Quit
 //! and — ⌥ held, under `keep_running = "quit"` only — Quit and End Programs), Shell (New
 //! Window, New Tab, New Local Tab, Mark Host as ▸, Shell Integration on Host,
-//! Forget Password, Cancel Upload, Open Port ▸, Split
+//! Forget Password, Cancel Upload, Open Port ▸, Go to Folder…, Copy Folder Path, Show Folder in
+//! Finder, Split
 //! Right, Split Down, Close Tab/Close, Close Window), Edit (Undo Move, Cut, Copy, Paste, Paste
 //! Escaped Text, Select All, Clear to Start, Clear Scrollback, Find ▸
 //! Find…/Find Next/Find Previous/Use Selection for Find), View (Theme ▸, Tabs ▸,
@@ -39,8 +40,9 @@
 //! `toggleHostIntegration:`
 //! (its title, checkmark and grey state in the app delegate's
 //! `validateMenuItem:`, from [`integration_menu`]) and
-//! `toggleCommandPalette:` and `goToTab:` (View ▸ Command Palette… ⇧⌘P, Window ▸ Go to Tab… ⌘P: the
-//! key window's palette; grey while a question is up on it) and
+//! `toggleCommandPalette:`, `goToTab:` and `goToFolder:` (View ▸ Command Palette… ⇧⌘P, Window ▸ Go
+//! to Tab… ⌘P, Shell ▸ Go to Folder… ⌘O: the key window's palette; grey while a question is up on
+//! it) and
 //! `newWindow:`/`newTab:`/`newLocalTab:`/`quitAndEndPrograms:` to the app delegate
 //! (the same path as the settings record's `settingsDidChange:` — they spread to all
 //! windows or must work even when there is no window);
@@ -588,6 +590,13 @@ pub(crate) fn install(
                 ports.setTag(PORTS_HOLDER_TAG);
                 ports
             },
+            NSMenuItem::separatorItem(mtm),
+            // The palette's folders page (⌘O), handled by the app delegate like Go to Tab…. The
+            // two beside it act on the focused pane's folder (`TerminalPane`): a remote tab
+            // copies `host:folder` and has no Finder folder to show.
+            item(mtm, "Go to Folder\u{2026}", sel!(goToFolder:), "o"),
+            item(mtm, "Copy Folder Path", sel!(copyFolderPath:), ""),
+            item(mtm, "Show Folder in Finder", sel!(showFolderInFinder:), ""),
             NSMenuItem::separatorItem(mtm),
             // Splits (Ghostty/iTerm2 precedent): the handler is
             // `TerminalWindow` (splits the focused pane); grey at the smallest pane

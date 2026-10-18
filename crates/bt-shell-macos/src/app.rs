@@ -389,6 +389,37 @@ fn initial_line(opening: Opening, remote_line: Option<String>) -> Option<String>
     }
 }
 
+/// Where a new pane starts and what waits on its line when the palette chose rather than the pane
+/// it grows from: a folder to be born in, a line left ready (`cd '…'`'s sibling `ssh host`). A pane
+/// with a `Start` is **local**: it inherits nothing of the source's remote session, whatever the
+/// source is ([`first_input`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Start {
+    /// The folder the shell starts in; `None`: the source's, as without a `Start`.
+    pub(crate) directory: Option<PathBuf>,
+    /// The line left on the input line, **not run**; the user's ⏎ runs it.
+    pub(crate) line: Option<String>,
+}
+
+/// The new pane's first input and the remote line it inherits (the `ssh` start folder is asked
+/// about the second only, never about a line the palette wrote — the folder is the source's
+/// server's and the line may name another). A `Start` makes the pane local: nothing inherited,
+/// its line waits ([`InitialInput::ready`]); without one ⌘T's rule ([`initial_line`]) runs the
+/// source's remote line.
+fn first_input(
+    opening: Opening,
+    remote_line: Option<String>,
+    start: Option<&Start>,
+) -> (Option<InitialInput>, Option<String>) {
+    match start {
+        Some(start) => (start.line.clone().map(InitialInput::ready), None),
+        None => {
+            let inherited = initial_line(opening, remote_line);
+            (inherited.clone().map(InitialInput::run), inherited)
+        }
+    }
+}
+
 /// The remote folder the new shell's first `ssh` starts in, as the
 /// environment pair the wrapper's `ssh` takes once (`BATERI_SSH_CWD` →
 /// `bateri ssh-argv --cwd`): only beside ⌘T's first input ([`initial_line`])
@@ -1081,6 +1112,14 @@ pub(crate) struct Ivars {
     /// ([`AppDelegate::note_visit`], [`AppDelegate::forget_visit`]). In memory only — after a
     /// restart the tabs are listed in the strip's order until they are looked at.
     visits: RefCell<bt_shell_common::palette::Visits<u64>>,
+    /// The directories panes reported in this run, the latest first, and the servers they were
+    /// connected to ([`AppDelegate::note_places_of`]): what ⌘O lists beside what is open now.
+    /// In memory only.
+    folders_seen: RefCell<bt_shell_common::palette::Seen>,
+    hosts_seen: RefCell<bt_shell_common::palette::Seen>,
+    /// The host names `~/.ssh/config` holds, as the last background read found them
+    /// ([`AppDelegate::refresh_ssh_hosts`]).
+    ssh_hosts: RefCell<Vec<String>>,
     /// What the update's holders gave at launch
     /// ([`arrive`] — taken before this delegate was born); consumed by the
     /// first windows ([`AppDelegate::restore_or_open`]).
@@ -1634,9 +1673,11 @@ define_class!(
                 self.key_window().is_some()
             } else if item.action() == Some(sel!(toggleCommandPalette:))
                 || item.action() == Some(sel!(goToTab:))
+                || item.action() == Some(sel!(goToFolder:))
             {
                 // Grey without a terminal window to open it over, and while a question is up
-                // on it; open, the same item takes it down (⇧⌘P) or moves it one tab on (⌘P).
+                // on it; open, the same item takes it down (⇧⌘P) or moves it one row on (⌘P,
+                // ⌘O).
                 self.key_window().is_some_and(|window| {
                     window.root().palette().is_some() || window.palette_may_open()
                 })
@@ -1669,6 +1710,15 @@ define_class!(
         fn go_to_tab(&self, _sender: Option<&AnyObject>) {
             if let Some(window) = self.key_window() {
                 window.go_to_tab();
+            }
+        }
+
+        /// Shell ▸ Go to Folder… (⌘O): the key window's palette opens on the folders; open on
+        /// them already, the highlight goes one on; open elsewhere, it comes to the folders.
+        #[unsafe(method(goToFolder:))]
+        fn go_to_folder(&self, _sender: Option<&AnyObject>) {
+            if let Some(window) = self.key_window() {
+                window.go_to_folder();
             }
         }
 
@@ -2587,6 +2637,13 @@ impl AppDelegate {
             restore_lock: RefCell::new(None),
             palette_recent: RefCell::new(None),
             visits: RefCell::new(bt_shell_common::palette::Visits::new()),
+            folders_seen: RefCell::new(bt_shell_common::palette::Seen::new(
+                bt_shell_common::palette::FOLDER_LIMIT,
+            )),
+            hosts_seen: RefCell::new(bt_shell_common::palette::Seen::new(
+                bt_shell_common::palette::HOST_LIMIT,
+            )),
+            ssh_hosts: RefCell::new(Vec::new()),
             arrival: RefCell::new(arrival),
             holder: RefCell::new(None),
             keeper,
@@ -3477,7 +3534,7 @@ impl AppDelegate {
         let tab = self.next_id();
         // Inheritance comes from the active window's selected tab's **focused pane**.
         let source = from.map(|from| from.selected_tab().focused_pane());
-        let (launch, theme) = self.pane_launch(tab, source.as_deref(), opening);
+        let (launch, theme) = self.pane_launch(tab, source.as_deref(), opening, None);
         let window = TerminalWindow::new(mtm, id, tab, launch).map_err(|e| e.to_string())?;
         // The side column is as wide as the one the window opens from: a width the user chose
         // is the user's, not one window's accident.
@@ -3522,6 +3579,7 @@ impl AppDelegate {
         window: &TerminalWindow,
         opening: Opening,
         seat: &Seat,
+        start: Option<&Start>,
     ) -> Result<(), String> {
         if !window.selection_free() {
             crate::preview::beep();
@@ -3530,7 +3588,7 @@ impl AppDelegate {
         let mtm = self.mtm();
         let tab_id = self.next_id();
         let source = window.selected_tab().focused_pane();
-        let (launch, theme) = self.pane_launch(tab_id, Some(&source), opening);
+        let (launch, theme) = self.pane_launch(tab_id, Some(&source), opening, start);
         let pane =
             embed::open(mtm, crate::window::initial_rect(), launch).map_err(|e| e.to_string())?;
         let tab = TerminalTab::new(mtm, tab_id, window.id(), &pane);
@@ -4221,10 +4279,17 @@ impl AppDelegate {
     /// the one on screen, a remote host included) with the place named: the `+` of a group's
     /// header, Shell ▸ New Ungrouped Tab, ⌃⌘0 with no ungrouped tab, Shell ▸ New Group.
     pub(crate) fn new_tab_seated(&self, window: u64, seat: Seat) {
+        self.new_tab_started(window, seat, None);
+    }
+
+    /// [`Self::new_tab_seated`] with where the shell starts and what waits on its line chosen
+    /// ([`Start`]; the palette's folders and servers): a local tab, beside the one on screen
+    /// when `seat` says so.
+    pub(crate) fn new_tab_started(&self, window: u64, seat: Seat, start: Option<&Start>) {
         let Some(window) = self.window(window) else {
             return;
         };
-        if let Err(e) = self.open_tab(&window, Opening::Tab, &seat) {
+        if let Err(e) = self.open_tab(&window, Opening::Tab, &seat, start) {
             eprintln!("bateri: {e}");
         }
     }
@@ -4236,25 +4301,32 @@ impl AppDelegate {
     ///
     /// `from` is the source of inheritance (the focused pane): the OSC 7 directory (home
     /// if none), the point-size delta, the theme and the remote line ([`initial_line`]);
-    /// without `from` the theme is resolved from settings. The integration is asked **once**
+    /// without `from` the theme is resolved from settings. `start` names a folder and a line the
+    /// palette chose instead ([`Start`]). The integration is asked **once**
     /// and gives both answers at once (environment + dock share).
     fn pane_launch(
         &self,
         tab: u64,
         from: Option<&TerminalPane>,
         opening: Opening,
+        start: Option<&Start>,
     ) -> (embed::Config, Theme) {
         let session = from.and_then(|from| from.session());
         let theme = session.map_or_else(|| self.resolve_theme(), |session| session.theme());
-        let dir = session
-            .and_then(|session| session.working_directory())
+        let dir = start
+            .and_then(|start| start.directory.clone())
+            .or_else(|| session.and_then(|session| session.working_directory()))
             .or_else(child::working_directory);
-        let initial = initial_line(opening, session.and_then(|session| session.remote_line()));
+        let (initial, inherited) = first_input(
+            opening,
+            session.and_then(|session| session.remote_line()),
+            start,
+        );
         let integration = self.shell_integration();
         let env = session
             .and_then(|session| {
                 ssh_start_dir(
-                    initial.as_deref(),
+                    inherited.as_deref(),
                     session.remote_target().map(|(_, target, _)| target.kind),
                     session.remote_link_directory(),
                     &integration.env,
@@ -4269,7 +4341,7 @@ impl AppDelegate {
             settings: self.settings().clone(),
             theme,
             working_directory: dir,
-            initial_input: initial.map(InitialInput::run),
+            initial_input: initial,
             uuid: None,
             replay: None,
             zoom: from.map_or_else(Zoom::default, TerminalPane::zoom),
@@ -4297,8 +4369,14 @@ impl AppDelegate {
     /// `from`'s inheritance ([`Opening::Split`]). The error goes to
     /// stderr; the tab stays open — the other panes' shells must not die because a new one
     /// could not be born.
-    pub(crate) fn open_split(&self, tab: &TerminalTab, from: &TerminalPane, axis: Axis) {
-        let (launch, _) = self.pane_launch(tab.id(), Some(from), Opening::Split);
+    pub(crate) fn open_split(
+        &self,
+        tab: &TerminalTab,
+        from: &TerminalPane,
+        axis: Axis,
+        start: Option<&Start>,
+    ) {
+        let (launch, _) = self.pane_launch(tab.id(), Some(from), Opening::Split, start);
         if let Err(e) = tab.add_pane(self.mtm(), launch, from.id(), axis) {
             eprintln!("bateri: {e}");
         }
@@ -4320,7 +4398,7 @@ impl AppDelegate {
     fn open_window_or_report(&self, from: Option<&TerminalWindow>, opening: Opening) {
         let result = match from {
             Some(from) if opening != Opening::Window || prefers_tabs(self.mtm(), from) => {
-                self.open_tab(from, opening, &Seat::Beside)
+                self.open_tab(from, opening, &Seat::Beside, None)
             }
             _ => self.open_window(from, opening).map(drop),
         };
@@ -4714,7 +4792,7 @@ impl AppDelegate {
                 }
             }
         };
-        let (launch, theme) = self.pane_launch(tab, None, Opening::Restore);
+        let (launch, theme) = self.pane_launch(tab, None, Opening::Restore, None);
         let mut launch = launch.with_launch(restored_launch(pane, replay));
         launch.adopt = adopt;
         launch.zoom = Zoom::from_steps(pane.zoom_steps, &launch.settings.font);
@@ -5047,6 +5125,174 @@ impl AppDelegate {
             .filter_map(|tab| by_tab.remove(&tab))
             .collect();
         places
+    }
+
+    /// A pane's news said where it is: the local directory its shell reported, or the server it
+    /// is connected to. The palette's folders and servers list what was seen, newest first
+    /// ([`Self::palette_targets`]). Called from the pane's title news ([`crate::tab::TabHost`]),
+    /// which also says a directory moved.
+    pub(crate) fn note_places_of(&self, pane: &TerminalPane) {
+        let Some(session) = pane.session() else {
+            return;
+        };
+        if let Some((host, _)) = session.remote_mark() {
+            if bt_shell_common::ssh_hosts::is_typeable(&host) {
+                self.ivars().hosts_seen.borrow_mut().note(&host);
+            }
+        } else if let Some(dir) = session.working_directory() {
+            self.ivars()
+                .folders_seen
+                .borrow_mut()
+                .note(&dir.to_string_lossy());
+        }
+    }
+
+    /// The folders, servers and ports as the palette lists them, from every window's panes, what
+    /// was seen this run and `~/.ssh/config` as the last background read found it
+    /// ([`Self::refresh_ssh_hosts`]). Folders and servers of a **remote** pane are not folders of
+    /// this Mac: its directory is the one it left, so it counts as open nowhere.
+    pub(crate) fn palette_targets(&self) -> bt_shell_common::palette::Targets {
+        use bt_shell_common::palette as rules;
+        let home = child::home()
+            .map(|home| home.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut open_folders = Vec::new();
+        let mut open_hosts = Vec::new();
+        let mut ports: Vec<rules::PortFacts> = Vec::new();
+        for tab in self.tabs() {
+            let title = tab.session_title();
+            if let Some(session) = tab.focused_pane().session()
+                && session.remote_mark().is_none()
+                && let Some(dir) = session.working_directory()
+            {
+                open_folders.push(rules::OpenFolder {
+                    path: dir.to_string_lossy().into_owned(),
+                    branch: session.branch(),
+                });
+            }
+            for pane in tab.panes() {
+                if let Some((host, _)) = pane.session().and_then(|session| session.remote_mark()) {
+                    open_hosts.push(host);
+                }
+                for fact in crate::footer::port_facts(&pane.ports_model(), title.as_deref()) {
+                    if !ports.iter().any(|known| known.key == fact.key) {
+                        ports.push(fact);
+                    }
+                }
+            }
+        }
+        {
+            let mut seen = self.ivars().folders_seen.borrow_mut();
+            for folder in &open_folders {
+                seen.note_unseen(&folder.path);
+            }
+        }
+        let folders = rules::folder_facts(&self.ivars().folders_seen.borrow(), &open_folders);
+        let settings = self.settings();
+        let hosts = rules::host_facts(
+            &self.ivars().hosts_seen.borrow(),
+            &open_hosts,
+            &self.ivars().ssh_hosts.borrow(),
+            |name| bt_core::host_mark(&settings.remote_hosts, name),
+        );
+        rules::Targets {
+            home,
+            folders,
+            hosts,
+            ports,
+        }
+    }
+
+    /// Reads `~/.ssh/config` (and what it includes) off the main thread; when the answer differs
+    /// from the last one it is kept and any open palette lists the servers afresh. Asked each time
+    /// the palette opens, so the file's edits show without a restart; a timed run reads no file of
+    /// the user's.
+    pub(crate) fn refresh_ssh_hosts(&self) {
+        if matches!(self.inputs(), Inputs::Hermetic) {
+            return;
+        }
+        static QUEUE: std::sync::OnceLock<dispatch2::DispatchRetained<DispatchQueue>> =
+            std::sync::OnceLock::new();
+        let queue = QUEUE.get_or_init(|| DispatchQueue::new("dev.bateri.ssh-hosts", None));
+        queue.exec_async(|| {
+            let Some(home) = child::home() else {
+                return;
+            };
+            let hosts = bt_shell_common::ssh_hosts::read_hosts(&home);
+            DispatchQueue::main().exec_async(move || {
+                // audit: a block running on the main queue is on the main thread by definition.
+                let mtm = MainThreadMarker::new().expect("the main queue is the main thread");
+                if let Some(app) = delegate(mtm) {
+                    app.ssh_hosts_read(hosts);
+                }
+            });
+        });
+    }
+
+    fn ssh_hosts_read(&self, hosts: Vec<String>) {
+        if *self.ivars().ssh_hosts.borrow() == hosts {
+            return;
+        }
+        *self.ivars().ssh_hosts.borrow_mut() = hosts;
+        for window in self.windows() {
+            crate::palette::retarget(&window, self.palette_targets());
+        }
+    }
+
+    /// What choosing a folder or a server row, or ⌥⏎ or ⌘⏎ on a folder, comes to
+    /// ([`bt_shell_common::palette::go`]) in window `window`, the palette's; the palette is down
+    /// and the keyboard back with the tab on screen. **No byte is sent to a shell that runs**: a folder opens a tab *in* it, a server
+    /// a local tab with `ssh host` left on its line, and ⌥⏎ pastes `cd '…'` — Enter is the user's.
+    pub(crate) fn palette_go(&self, window: u64, go: bt_shell_common::palette::Go) {
+        use bt_shell_common::palette::{self as rules, Go};
+        // The palette's own window: it was the key window when a row was chosen.
+        let Some(window) = self.window(window) else {
+            return;
+        };
+        match go {
+            Go::OpenFolder(path) => {
+                let start = Start {
+                    directory: Some(PathBuf::from(path)),
+                    line: None,
+                };
+                self.new_tab_started(window.id(), Seat::Beside, Some(&start));
+            }
+            Go::OpenHost(name) => {
+                let Some(line) = rules::ssh_line(&name) else {
+                    crate::preview::beep();
+                    return;
+                };
+                let start = Start {
+                    directory: None,
+                    line: Some(line),
+                };
+                self.new_tab_started(window.id(), Seat::Beside, Some(&start));
+            }
+            Go::TypeCd(path) => {
+                let pane = window.try_selected_tab().map(|tab| tab.focused_pane());
+                let free = pane
+                    .as_ref()
+                    .and_then(|pane| pane.session())
+                    .is_some_and(|session| {
+                        session.remote_mark().is_none()
+                            && session.running_command().is_none()
+                            && !session.alt_screen()
+                    });
+                match (
+                    pane.as_ref().and_then(|pane| pane.session()),
+                    free,
+                    rules::cd_line(&path),
+                ) {
+                    (Some(session), true, Some(line)) => session.paste(line.into_bytes()),
+                    // A program or a server holds the line: `cd` there would go to it. The folder
+                    // opens in a tab of its own instead.
+                    _ => self.palette_go(window.id(), Go::OpenFolder(path)),
+                }
+            }
+            Go::ShowFolder(path) => crate::hyperlink::show_folder(std::path::Path::new(&path)),
+            // A port runs where the palette's card chose it (it holds the address).
+            Go::OpenPort(_) | Go::CopyPort(_) => {}
+        }
     }
 
     /// What choosing a tab's or a group's row, or an action of its menu, comes to
@@ -8019,6 +8265,55 @@ mod tests {
         ] {
             assert_eq!(initial_line(opening, None), None, "{opening:?}");
         }
+    }
+
+    #[test]
+    fn a_panes_news_is_where_the_palettes_folders_and_servers_are_learned() {
+        // The title news is the one edge that also says a directory moved or a session began;
+        // without this call ⌘O would list only what is open when it opens.
+        let source = include_str!("tab.rs");
+        let from = source
+            .find("fn title_changed(&self, pane: u64)")
+            .expect("the host's title news");
+        let body = &source[from..];
+        let body = &body[..body.find("\n    fn shell_exited").expect("the next method")];
+        assert!(body.contains("note_places_of("));
+    }
+
+    #[test]
+    fn a_pane_the_palette_started_is_local_and_its_line_waits() {
+        let remote = || Some("ssh -p 2222 prod".to_owned());
+        // Without a start ⌘T's rule: the remote line runs, and it is what the ssh start folder
+        // is asked about.
+        let (input, inherited) = first_input(Opening::Tab, remote(), None);
+        assert_eq!(input, Some(InitialInput::run("ssh -p 2222 prod")));
+        assert_eq!(inherited.as_deref(), Some("ssh -p 2222 prod"));
+        // A start from a remote tab: local, nothing inherited — not the remote line, and not a
+        // start folder of the source's server for the line the palette wrote.
+        let folder = Start {
+            directory: Some(PathBuf::from("/Users/a/api")),
+            line: None,
+        };
+        assert_eq!(
+            first_input(Opening::Tab, remote(), Some(&folder)),
+            (None, None)
+        );
+        let server = Start {
+            directory: None,
+            line: Some("ssh db-1".to_owned()),
+        };
+        let (input, inherited) = first_input(Opening::Tab, remote(), Some(&server));
+        assert_eq!(input, Some(InitialInput::ready("ssh db-1")));
+        assert!(
+            !input.is_some_and(|input| input.run),
+            "the user's ⏎ runs it"
+        );
+        assert_eq!(inherited, None);
+        // A split started the same way.
+        assert_eq!(
+            first_input(Opening::Split, remote(), Some(&folder)),
+            (None, None)
+        );
     }
 
     #[test]

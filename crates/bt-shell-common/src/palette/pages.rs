@@ -16,6 +16,7 @@ use super::menu::MenuRows;
 use super::row::{Kind, Row, Scope, Slot};
 use super::state::Modifier;
 use super::switch::{self, Places};
+use super::targets::{self, Targets};
 use super::themes::{self, ThemeEntry};
 
 /// The key of the View ▸ Theme ▸ page in the menu rows: the themes are the palette's own rows
@@ -30,6 +31,8 @@ pub struct Sources<'a> {
     pub themes: &'a [ThemeEntry],
     /// The tabs and the groups of every window.
     pub places: &'a Places,
+    /// The folders, the servers and the ports.
+    pub targets: &'a Targets,
 }
 
 /// The pages the root offers beside what a query finds.
@@ -69,11 +72,16 @@ pub fn root_rows(src: &Sources<'_>) -> Vec<Row> {
     rows.extend(themes::rows(Slot::Active, src.themes, src.settings));
     rows.extend(switch::tab_rows(src.places));
     rows.extend(switch::group_rows(src.places));
+    rows.extend(targets::folder_rows(src.targets));
+    rows.extend(targets::host_rows(src.targets));
+    rows.extend(targets::port_rows(src.targets));
     rows.extend(go_to());
+    rows.extend(targets::go_to(src.targets));
     rows
 }
 
-/// The rows of the page `scope` names. A page that lists something later phases bring is empty.
+/// The rows of the page `scope` names. A page that lists something later phases bring is empty
+/// (the command history).
 /// (The tabs page lists them in the order of [`switch::tab_list`]'s empty field; its headings
 /// and its clusters are that function's.)
 pub fn page_rows(scope: &Scope, src: &Sources<'_>) -> Vec<Row> {
@@ -93,6 +101,9 @@ pub fn page_rows(scope: &Scope, src: &Sources<'_>) -> Vec<Row> {
             .chain(switch::group_rows(src.places))
             .collect(),
         Scope::TabActions(_) | Scope::GroupActions(_) => switch::actions(scope, src.places),
+        Scope::Folders => targets::folder_rows(src.targets),
+        Scope::Hosts => targets::host_rows(src.targets),
+        Scope::Ports => targets::port_rows(src.targets),
         _ => Vec::new(),
     }
 }
@@ -206,6 +217,7 @@ mod tests {
             settings: &settings,
             themes: &themes,
             places: &Places::default(),
+            targets: &Targets::default(),
         });
         let ids = ids(&rows);
         assert!(ids.contains(&"cmd.makeFontBigger"));
@@ -232,6 +244,7 @@ mod tests {
             settings: &settings,
             themes: &themes,
             places: &places,
+            targets: &Targets::default(),
         };
         assert_eq!(page_rows(&Scope::Settings, &src).len(), 34);
         let themed = page_rows(&Scope::Theme(Slot::Active), &src);
@@ -241,6 +254,54 @@ mod tests {
         assert!(shapes.iter().any(|row| row.checked));
         assert!(page_rows(&Scope::Choices("no.such".to_owned()), &src).is_empty());
         assert!(page_rows(&Scope::Tabs, &src).is_empty());
+        assert!(page_rows(&Scope::Folders, &src).is_empty());
+    }
+
+    #[test]
+    fn the_folders_hosts_and_ports_are_rows_at_the_root_and_on_their_pages() {
+        use super::super::targets::{FolderFacts, HostFacts, PortFacts};
+        let (menu, settings, themes) = (menu(), Settings::default(), entries());
+        let targets = Targets {
+            home: "/Users/a".to_owned(),
+            folders: vec![FolderFacts {
+                path: "/Users/a/api".to_owned(),
+                tabs: 1,
+                branch: None,
+            }],
+            hosts: vec![HostFacts {
+                name: "db-1".to_owned(),
+                mark: bt_core::HostMark::None,
+                configured: true,
+                tabs: 0,
+            }],
+            ports: vec![PortFacts {
+                key: "3000".to_owned(),
+                title: "localhost:3000".to_owned(),
+                subtitle: "node".to_owned(),
+                url: "http://localhost:3000".to_owned(),
+            }],
+        };
+        let src = Sources {
+            menu: &menu,
+            settings: &settings,
+            themes: &themes,
+            places: &Places::default(),
+            targets: &targets,
+        };
+        let root = root_rows(&src);
+        let root = ids(&root);
+        for id in [
+            "dir./Users/a/api",
+            "host.db-1",
+            "port.3000",
+            "scope.hosts",
+            "scope.ports",
+        ] {
+            assert!(root.contains(&id), "{id}");
+        }
+        assert_eq!(ids(&page_rows(&Scope::Folders, &src)), ["dir./Users/a/api"]);
+        assert_eq!(ids(&page_rows(&Scope::Hosts, &src)), ["host.db-1"]);
+        assert_eq!(ids(&page_rows(&Scope::Ports, &src)), ["port.3000"]);
     }
 
     #[test]

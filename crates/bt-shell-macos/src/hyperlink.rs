@@ -449,6 +449,16 @@ fn file_url(path: &Path) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
 }
 
+/// Opens the folder `path` in a Finder window (Shell ▸ Show Folder in Finder, the palette's ⌘⏎
+/// on a folder); a path that is not a folder beeps.
+pub(crate) fn show_folder(path: &Path) {
+    if path.is_dir() {
+        NSWorkspace::sharedWorkspace().openURL(&file_url(path));
+    } else {
+        crate::preview::beep();
+    }
+}
+
 /// Hands a URL string to its default application; a string `NSURL` rejects does nothing.
 fn open_url(url: &str) {
     if let Some(url) = NSURL::URLWithString(&NSString::from_str(url)) {

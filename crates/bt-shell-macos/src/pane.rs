@@ -2398,6 +2398,11 @@ define_class!(
             } else if action == Some(sel!(forgetPassword:)) {
                 // A remote tab with a saved password.
                 self.can_forget_password()
+            } else if action == Some(sel!(copyFolderPath:)) {
+                self.folder_text().is_some()
+            } else if action == Some(sel!(showFolderInFinder:)) {
+                // A folder of this Mac: a remote tab's is the server's.
+                self.local_folder().is_some_and(|folder| folder.is_dir())
             } else {
                 true
             }
@@ -2420,6 +2425,23 @@ define_class!(
         #[unsafe(method(forgetPassword:))]
         fn forget_password_sent(&self, _sender: Option<&AnyObject>) {
             self.forget_password();
+        }
+
+        /// Shell ▸ Copy Folder Path: this pane's folder on the pasteboard — the path, or
+        /// `host:path` in a remote session ([`TerminalPane::folder_text`]).
+        #[unsafe(method(copyFolderPath:))]
+        fn copy_folder_path_sent(&self, _sender: Option<&AnyObject>) {
+            if let Some(text) = self.folder_text() {
+                clipboard::copy(&NSPasteboard::generalPasteboard(), Some(text));
+            }
+        }
+
+        /// Shell ▸ Show Folder in Finder (grey in a remote session).
+        #[unsafe(method(showFolderInFinder:))]
+        fn show_folder_in_finder_sent(&self, _sender: Option<&AnyObject>) {
+            if let Some(folder) = self.local_folder() {
+                crate::hyperlink::show_folder(&folder);
+            }
         }
 
         /// A listening port's item (the dock's ports menu, Shell ▸ Open
@@ -5480,6 +5502,35 @@ impl TerminalPane {
             clipboard::copy(&NSPasteboard::pasteboardWithName(name), Some(plain));
         }
         self.open_search(true);
+    }
+
+    /// The folder of this Mac the pane's shell is in; `None` in a remote session (its
+    /// directory is the one the shell left) and before the shell says.
+    fn local_folder(&self) -> Option<std::path::PathBuf> {
+        let session = self.session()?;
+        if session.remote_mark().is_some() {
+            return None;
+        }
+        session.working_directory()
+    }
+
+    /// The folder as Copy Folder Path writes it: the path, or `host:path` in a remote session
+    /// (the host alone when the server says no folder), the way the tab's place line says it.
+    fn folder_text(&self) -> Option<String> {
+        let session = self.session()?;
+        match session.remote_mark() {
+            Some((host, _)) => {
+                let folder = session.remote_link_directory();
+                Some(if folder.is_empty() {
+                    host
+                } else {
+                    format!("{host}:{folder}")
+                })
+            }
+            None => session
+                .working_directory()
+                .map(|folder| folder.to_string_lossy().into_owned()),
+        }
     }
 
     /// Gate of Find Next/Previous: whether the pane has a query or the find

@@ -14,7 +14,8 @@
 //! rules of previewing and downloading a remote file (`remote_files`), its
 //! helper ssh session (`remote_helper`), the preview cache on disk
 //! (`preview_cache`), the remote host's load sampling (`remote_stats`), which
-//! ssh connection a remote job rides on and the askpass wire (`ssh_route`), whether
+//! ssh connection a remote job rides on and the askpass wire (`ssh_route`), the host names of
+//! `~/.ssh/config` (`ssh_hosts`), whether
 //! the user's `ssh` gets the remote shell integration (`ssh_wrap`), what an
 //! outside process may ask about one pane's focus (`focus`), the update's
 //! live handover and its holder process (`handover`), a pane's journal in
@@ -66,6 +67,7 @@ pub mod remote_stats;
 pub mod restore;
 pub mod settings;
 pub mod split;
+pub mod ssh_hosts;
 pub mod ssh_route;
 pub mod ssh_wrap;
 pub mod tabs;

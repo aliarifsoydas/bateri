@@ -9586,6 +9586,17 @@ impl Session {
         (!log.context.cwd.is_empty()).then(|| PathBuf::from(&log.context.cwd))
     }
 
+    /// The git branch of the shell's directory as the context line shows it (the short SHA on a
+    /// detached HEAD); `None` outside a repository or while the shell has not said. The same
+    /// shape as [`Session::working_directory`]: copies under the leaf lock, `Term` is not touched.
+    /// Its reader is the command palette's folder rows.
+    ///
+    /// **Journal-neutral:** reads only.
+    pub fn branch(&self) -> Option<String> {
+        let log = lock(&self.shell);
+        (!log.context.branch.is_empty()).then(|| log.context.branch.clone())
+    }
+
     /// The link under a point: its cells, raw target, kind and stamp;
     /// `None` if there is none. Pure — no file I/O: a [`LinkKind::Path`] is a
     /// candidate the shell layer still has to resolve.
