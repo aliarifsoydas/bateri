@@ -766,6 +766,32 @@ impl TerminalTab {
         }
     }
 
+    /// The palette's ⌥⏎ on a command: Split Right with `start`'s line left on the new pane's
+    /// prompt — beside the focused pane, below it when beside does not fit
+    /// ([`bt_shell_common::palette::beside`]). `false` when neither fits: the caller opens a tab
+    /// instead.
+    pub(crate) fn split_with_line(&self, start: &app::Start) -> bool {
+        use bt_shell_common::palette::{Beside, beside};
+        self.set_zoom(None);
+        let axis = match beside(
+            self.can_split(Axis::Horizontal),
+            self.can_split(Axis::Vertical),
+        ) {
+            Beside::Right => Axis::Horizontal,
+            Beside::Down => Axis::Vertical,
+            Beside::NewTab => return false,
+        };
+        let Some(app) = app::delegate(self.mtm()) else {
+            return false;
+        };
+        let from = self.focused_pane();
+        let Some(this) = app.tab(self.id()) else {
+            return false;
+        };
+        app.open_split(&this, &from, axis, Some(start));
+        true
+    }
+
     /// Puts the new pane in `target`'s second half on `axis`, opens its
     /// session and gives it the keyboard. The order is required: the pane's
     /// `start` reads the scale from the window, so it is first attached to

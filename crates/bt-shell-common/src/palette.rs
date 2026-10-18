@@ -18,6 +18,9 @@
 //!   opens, the menu of a row (→) and what choosing does.
 //! - [`synonyms`] — the words a menu command is also found by, keyed by its selector.
 //! - [`PathQuery`] — a path typed in the field.
+//! - [`Commands`], [`history_list`] and [`history_run`] — the commands the open panes ran, the
+//!   page Command History and Jump to Command… list, and what a key does with one ([`Use`]);
+//!   [`suggested`] — what the empty root suggests.
 //! - [`Targets`], [`go`] and [`path_list`] — the folders, servers and ports ⌘O lists, a typed
 //!   path's entries, and what choosing each does ([`Go`]).
 //!
@@ -27,6 +30,7 @@
 
 mod catalog;
 mod fold;
+mod history;
 mod list;
 mod matching;
 mod menu;
@@ -45,15 +49,21 @@ mod visits;
 pub use catalog::{
     Choice, Control, Section, Setting, all as settings, find as setting, rows as setting_rows,
 };
+pub use history::{
+    CommandFacts, Commands, FullScreen, OTHER_TABS_HEADING, Run, SUGGESTED_HEADING,
+    SUGGESTED_LIMIT, THIS_TAB_HEADING, Use, Uses, actions as history_actions,
+    actions_heading as history_actions_heading, ago, command_row, command_rows, history_id,
+    history_list, program_of, run as history_run, suggested, uses as history_uses, write_line,
+};
 pub use list::{
     Fallbacks, GO_TO_HEADING, List, RECENT_HEADING, page as page_list, root as root_list,
 };
 pub use matching::{Match, score};
 pub use menu::{
-    GO_TO_FOLDERS_ACTION, GO_TO_TABS_ACTION, MenuNode, MenuRow, MenuRows, Modifiers,
-    PALETTE_ACTION, rows as menu_rows, shortcut,
+    GO_TO_FOLDERS_ACTION, GO_TO_TABS_ACTION, JUMP_TO_COMMAND_ACTION, MenuNode, MenuRow, MenuRows,
+    Modifiers, PALETTE_ACTION, rows as menu_rows, shortcut,
 };
-pub use pages::{Chosen, Sources, chosen, page_rows, root_rows};
+pub use pages::{Chosen, Sources, chosen, page_rows, root_rows, suggested_rows};
 pub use path::PathQuery;
 pub use rank::{
     CLUSTER_LIMIT, Cluster, Hit, Nearness, RECENT_BONUS, THEME_LIMIT, VISIT_BONUS, VISIT_STEP,

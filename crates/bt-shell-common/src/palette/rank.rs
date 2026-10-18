@@ -13,7 +13,7 @@
 //! in the pane, look it up in the command history.
 
 use super::matching::{Match, score};
-use super::row::{Kind, Row};
+use super::row::{Kind, Row, Scope};
 
 /// Added to the score of a row in Recent, at the root.
 pub const RECENT_BONUS: f64 = 12.0;
@@ -153,6 +153,13 @@ pub fn fallbacks(query: &str) -> Cluster {
         Kind::Search,
         "history",
         format!("Search Command History for “{query}”"),
+    )
+    .opens(
+        Scope::History {
+            jump: false,
+            query: Some(query.to_owned()),
+        },
+        true,
     );
     Cluster {
         title: Kind::Search.cluster().to_owned(),

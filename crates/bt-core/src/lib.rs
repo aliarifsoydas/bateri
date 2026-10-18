@@ -57,6 +57,7 @@ mod dock;
 mod graphics;
 mod grid_input;
 mod handler;
+mod history;
 mod identity;
 mod input;
 mod journal;
@@ -83,6 +84,7 @@ pub use dock::{
     footer_span, footer_spans, footer_trailing,
 };
 pub use graphics::{Picture, PictureLayer, Pictures};
+pub use history::{CommandRecord, MEMORY_LIMIT as COMMAND_MEMORY_LIMIT, RecordState};
 pub use identity::{LC_TERMINAL, PaneUuid, TERM_PROGRAM, TERM_PROGRAM_VERSION, pane_env};
 pub use input::{Arrow, MouseButton, MouseModifiers};
 pub use journal::{
@@ -123,7 +125,7 @@ pub use shell::{
     ProgramTone, Reconnect, RemoteKind, RemoteSetupFault, RemoteStats, RemoteTarget, STATS_HISTORY,
     ShellEnvironment, ShellPhase, ShellState, SignIn, StatsForm, Transfer, TransferAction,
     TransferControls, TransferTone, TtyModes, counter_period, counter_tier_end, decode_percent,
-    next_tick, running_counter,
+    finished_counter, next_tick, running_counter,
 };
 pub use wake::Wake;
 

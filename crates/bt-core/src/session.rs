@@ -84,11 +84,12 @@ use polling::{Event as PollingEvent, PollMode, Poller};
 use crate::block_index::{self, BlockPass, Observation};
 use crate::cluster::{ClusterId, Clusters};
 use crate::color::{self, LinearRgba, Theme};
-use crate::commands::{CommandId, CommandState, command_state};
+use crate::commands::{CommandId, CommandPhase, CommandState, command_state};
 use crate::dock::{self, Dock, DockBudget, DockCols, DockEdit, DockPoint};
 use crate::graphics::{self, Hub, Pictures};
 use crate::grid_input;
 use crate::handler::ClusterHandler;
+use crate::history::{self, CommandMemory, CommandRecord, RecordState, Remembered};
 use crate::identity::{LC_TERMINAL, PaneUuid, TERM_PROGRAM, TERM_PROGRAM_VERSION};
 // The journal's side record comes in under an alias: `Side` is alacritty's
 // selection side in this module.
@@ -109,7 +110,7 @@ use crate::search::{
 };
 use crate::settings::{CaretShape, CursorBlink, HostMark, HostRule, MarkSubject};
 use crate::shell::{
-    BlockKey, COUNTER_FLOOR, CaretHome, Carried, Counter, DockContext, DockPrediction,
+    BlockKey, COUNTER_FLOOR, CaretHome, Carried, Counter, Cursors, DockContext, DockPrediction,
     DockSelection, DockState, DockStatus, HistoryCut, Outcome, Precision, RemoteStats,
     RemoteTarget, ScanEvent, Scanner, ShellLog, ShellState, Stripe, Transfer, TtyModes,
 };
@@ -2017,6 +2018,10 @@ struct AdapterInner {
     /// reader writes it when the scanner sees the `C`, before the read's bytes
     /// reach `Term`.
     title_at_command: AtomicU64,
+    /// The newest block's text, read just before a program took the alternate screen, for the
+    /// command memory's turn ([`crate::history`]): at most a few, a **leaf lock** the parser's
+    /// wrapper writes under `Term` and the main queue takes out of with none held.
+    captured: Mutex<Vec<(BlockKey, String)>>,
     /// [`AdapterInner::title_epoch`] when the remote state was last set: a title written since
     /// is the remote shell's — the login signal ([`Session::remote_login`]). Read under the
     /// `Term` lock ([`Session::set_remote`]), so a local title still being parsed in the
@@ -2087,6 +2092,7 @@ impl Adapter {
             title: Mutex::new(None),
             title_epoch: AtomicU64::new(0),
             title_at_command: AtomicU64::new(0),
+            captured: Mutex::new(Vec::new()),
             title_at_remote: AtomicU64::new(0),
             ledger: AtomicU64::new(0),
             wipes: AtomicU64::new(0),
@@ -2150,6 +2156,18 @@ impl graphics::Sink for Adapter {
 
     fn pointer(&self) -> &PointerShapes {
         &self.0.pointer
+    }
+
+    fn leaving_primary_screen(&self, newest: Option<(BlockKey, String)>) {
+        let Some(newest) = newest else {
+            return;
+        };
+        let mut captured = lock(&self.0.captured);
+        captured.retain(|(key, _)| *key != newest.0);
+        captured.push(newest);
+        if captured.len() > CAPTURES_KEPT {
+            captured.remove(0);
+        }
     }
 
     fn pointer_changed(&self) {
@@ -3370,11 +3388,34 @@ fn block_start_near<T>(term: &Term<T>, line: i64, key: BlockKey, boundary: usize
         })
 }
 
+/// Row `line`'s text, every cell as its character (a hidden one as a space, the spacers of a wide
+/// character skipped), and whether the row runs on into the next (a soft wrap). The trailing
+/// blanks are the caller's to trim.
+pub(crate) fn row_text<T>(term: &Term<T>, line: i32) -> (String, bool) {
+    let mut piece = String::new();
+    let mut wrapped = false;
+    for cell in &term.grid()[Line(line)] {
+        wrapped = cell.flags.contains(Flags::WRAPLINE);
+        if cell.flags.intersects(SPACERS) {
+            continue;
+        }
+        piece.push(if cell.flags.contains(Flags::HIDDEN) {
+            ' '
+        } else {
+            cell.c
+        });
+        if let Some(marks) = cell.zerowidth() {
+            piece.extend(marks);
+        }
+    }
+    (piece, wrapped)
+}
+
 /// The command's text from its start row: the rows carrying `key`, a
 /// wrapped row run on into the next, the others joined with a space, trimmed
 /// — one line for the tip. Bounded: a pasted script carries the anchor on
 /// every row and the tip shows only its beginning anyway.
-fn block_text<T>(term: &Term<T>, start: i32, key: BlockKey) -> String {
+pub(crate) fn block_text<T>(term: &Term<T>, start: i32, key: BlockKey) -> String {
     const MOST_ROWS: i32 = 8;
     const MOST_CHARS: usize = 512;
     let bottom = term.bottommost_line().0;
@@ -3383,23 +3424,7 @@ fn block_text<T>(term: &Term<T>, start: i32, key: BlockKey) -> String {
     while line <= bottom.min(start.saturating_add(MOST_ROWS - 1))
         && row_block(term, Line(line)) == Some(key)
     {
-        let row = &term.grid()[Line(line)];
-        let mut piece = String::new();
-        let mut wrapped = false;
-        for cell in row {
-            wrapped = cell.flags.contains(Flags::WRAPLINE);
-            if cell.flags.intersects(SPACERS) {
-                continue;
-            }
-            piece.push(if cell.flags.contains(Flags::HIDDEN) {
-                ' '
-            } else {
-                cell.c
-            });
-            if let Some(marks) = cell.zerowidth() {
-                piece.extend(marks);
-            }
-        }
+        let (piece, wrapped) = row_text(term, line);
         if wrapped {
             text.push_str(&piece);
         } else {
@@ -4297,6 +4322,9 @@ pub(crate) fn underline_link(cell: &mut Cell, style: Option<UnderlineStyle>) {
     }
 }
 
+/// How many captured command texts the adapter keeps for the memory ([`AdapterInner::captured`]).
+const CAPTURES_KEPT: usize = 4;
+
 /// The two wide-char spacer flags: cells that carry no char of their own.
 const SPACERS: Flags = Flags::WIDE_CHAR_SPACER.union(Flags::LEADING_WIDE_CHAR_SPACER);
 
@@ -4831,6 +4859,9 @@ pub struct Session {
     /// marks ([`crate::block_index`]); a **leaf lock**, the borrowing rule
     /// is [`block_index::BlockSlot`]'s.
     block_index: Mutex<block_index::BlockSlot>,
+    /// What the commands' lines said when they started ([`crate::history`]) — a **leaf
+    /// lock**, never held across a `Term` lock either way.
+    memory: Mutex<CommandMemory>,
     /// Whether the block marks are wanted ([`Session::set_block_marks`]) —
     /// the gate of the index's steps, of its news and of the frame's block
     /// lane.
@@ -5455,6 +5486,7 @@ impl Session {
             search: Mutex::new(SearchSlot::default()),
             // Nothing wanted at opening: the shell asks when a bar is wide.
             block_index: Mutex::new(block_index::BlockSlot::default()),
+            memory: Mutex::new(CommandMemory::default()),
             blocks_wanted: AtomicBool::new(false),
             block_news: AtomicBool::new(false),
             unseen: Mutex::new(Unseen::default()),
@@ -9497,6 +9529,221 @@ impl Session {
         self.ledger_info(key, command, depth)
     }
 
+    /// Reads the text of the commands that started since the last look and keeps it
+    /// ([`crate::history`]): the palette's command history is made of it. The main queue asks
+    /// after a command starts ([`Wake::command_started`], [`Wake::remote_command_edge`]) and
+    /// the listing asks again, so a late turn loses nothing.
+    ///
+    /// A command whose rows cannot be read for the alternate screen waits for the next look
+    /// (or the text the wrapper captured as the screen was taken); one whose rows are gone is
+    /// left out. **Journal-neutral:** reads `Term`, writes the memory only — no side record
+    /// ([`crate::journal`]).
+    pub fn remember_commands(&self) {
+        let cursors = lock(&self.memory).cursors();
+        let fresh = lock(&self.shell).fresh_commands(cursors);
+        let mut captured = std::mem::take(&mut *lock(&self.adapter.0.captured));
+        let mut take = |key: BlockKey| -> Taken {
+            if let Some(at) = captured.iter().position(|(known, _)| *known == key) {
+                return Taken::Text(captured.swap_remove(at).1);
+            }
+            match self.find_block(key) {
+                Some((text, _)) => Taken::Text(text),
+                None if self.term.lock().mode().contains(TermMode::ALT_SCREEN) => Taken::Later,
+                None => Taken::Gone,
+            }
+        };
+        let mut found: Vec<Remembered> = Vec::new();
+        let mut local_next = fresh.local.end;
+        for (n, id) in fresh.local.ids.iter().enumerate() {
+            let key = BlockKey::Local(*id);
+            match take(key) {
+                Taken::Text(text) if !text.is_empty() => found.push(Remembered {
+                    key,
+                    text,
+                    // The directory is the newest command's: the shell reports it once per start.
+                    directory: (n + 1 == fresh.local.ids.len() && !fresh.cwd.is_empty())
+                        .then(|| PathBuf::from(&fresh.cwd)),
+                }),
+                Taken::Text(_) | Taken::Gone => {}
+                Taken::Later => {
+                    local_next = *id;
+                    break;
+                }
+            }
+        }
+        let mut remote_cursor = cursors.remote;
+        if let Some((shell, walk)) = &fresh.remote {
+            let mut next = walk.end;
+            for id in &walk.ids {
+                let key = BlockKey::Remote {
+                    shell: *shell,
+                    id: *id,
+                };
+                match take(key) {
+                    Taken::Text(text) if !text.is_empty() => found.push(Remembered {
+                        key,
+                        text,
+                        directory: None,
+                    }),
+                    Taken::Text(_) | Taken::Gone => {}
+                    Taken::Later => {
+                        next = *id;
+                        break;
+                    }
+                }
+            }
+            remote_cursor = Some((*shell, next));
+        }
+        // What was captured for a command not yet read waits for the next look.
+        captured.retain(|(key, _)| matches!(key, BlockKey::Local(id) if *id >= local_next));
+        if !captured.is_empty() {
+            let mut slot = lock(&self.adapter.0.captured);
+            slot.extend(captured);
+            let excess = slot.len().saturating_sub(CAPTURES_KEPT);
+            slot.drain(..excess);
+        }
+        let mut memory = lock(&self.memory);
+        if fresh.local.reset {
+            memory.forget_local();
+        }
+        for entry in found {
+            memory.push(entry);
+        }
+        memory.set_cursors(Cursors {
+            local: Some(local_next),
+            remote: remote_cursor,
+        });
+    }
+
+    /// The commands this pane remembers, newest first, each with what the ledger says of it now
+    /// ([`CommandRecord`]). The screen's own blocks that a restored session came back with are
+    /// taken the first time. One `Term` round for the rows, none held with the memory's lock.
+    ///
+    /// **Journal-neutral:** reads `Term`, writes the memory only — no side record
+    /// ([`crate::journal`]).
+    pub fn command_records(&self) -> Vec<CommandRecord> {
+        self.remember_commands();
+        if !lock(&self.memory).restored() {
+            let found = {
+                let term = self.term.lock();
+                (!term.mode().contains(TermMode::ALT_SCREEN)).then(|| history::saved_blocks(&term))
+            };
+            if let Some(found) = found {
+                lock(&self.memory).adopt_restored(found);
+            }
+        }
+        let entries: Vec<Remembered> = lock(&self.memory).entries().iter().cloned().collect();
+        let keys: Vec<BlockKey> = entries.iter().map(|entry| entry.key).collect();
+        let depths = {
+            let term = self.term.lock();
+            if term.mode().contains(TermMode::ALT_SCREEN) {
+                vec![None; keys.len()]
+            } else {
+                history::depths(&term, &keys, self.clear_boundary.load(Ordering::Relaxed))
+            }
+        };
+        let log = lock(&self.shell);
+        entries
+            .into_iter()
+            .zip(depths)
+            .rev()
+            .map(|(entry, depth)| {
+                let (state, remote, started) = match entry.key {
+                    BlockKey::Saved { stripe, .. } => (
+                        RecordState::Restored {
+                            failed: stripe == Stripe::Error,
+                        },
+                        false,
+                        None,
+                    ),
+                    key => match command_state(&log, key) {
+                        Some(known) => (
+                            match known.phase {
+                                CommandPhase::Running => RecordState::Running(log.running_for()),
+                                _ => RecordState::Finished {
+                                    exit: known.exit,
+                                    elapsed: known.elapsed,
+                                },
+                            },
+                            known.remote,
+                            known.started,
+                        ),
+                        None => (
+                            RecordState::Finished {
+                                exit: None,
+                                elapsed: None,
+                            },
+                            matches!(key, BlockKey::Remote { .. }),
+                            None,
+                        ),
+                    },
+                };
+                CommandRecord {
+                    id: CommandId(entry.key),
+                    text: entry.text,
+                    directory: entry.directory,
+                    remote,
+                    state,
+                    started,
+                    depth,
+                }
+            })
+            .collect()
+    }
+
+    /// The newest command this pane remembers and its line: Edit ▸ Copy Last Command.
+    ///
+    /// **Journal-neutral:** see [`Self::remember_commands`].
+    pub fn last_remembered(&self) -> Option<(CommandId, String)> {
+        self.remember_commands();
+        lock(&self.memory)
+            .newest()
+            .map(|entry| (CommandId(entry.key), entry.text.clone()))
+    }
+
+    /// The output of command `id` as text — the rows after its own, up to the next prompt or
+    /// the bottom, at most [`history::OUTPUT_LIMIT`] characters of the end. `None` once its row
+    /// has left the history and on the alternate screen, where the rows are out of reach.
+    ///
+    /// **Journal-neutral:** reads `Term` only — no side record ([`crate::journal`]).
+    pub fn command_output(&self, id: CommandId) -> Option<String> {
+        let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        history::output_of(&term, id.0, self.clear_boundary.load(Ordering::Relaxed))
+    }
+
+    /// Where command `id`'s row is, rows from the history's top — [`BlockInfo::depth`]'s space,
+    /// what [`Self::scroll_to`] takes; `None` as [`Self::command_output`].
+    ///
+    /// **Journal-neutral:** see [`Self::command_output`].
+    pub fn command_depth(&self, id: CommandId) -> Option<u32> {
+        self.find_block(id.0).map(|(_, depth)| depth)
+    }
+
+    /// Whether anything has run in this pane that the memory holds or has yet to read — the
+    /// gate of Edit ▸ Copy Last Command, asked at every menu validation, so cheap: two leaf
+    /// locks, no `Term`.
+    pub fn has_commands(&self) -> bool {
+        let (empty, cursors) = {
+            let memory = lock(&self.memory);
+            (memory.entries().is_empty(), memory.cursors())
+        };
+        if !empty {
+            return true;
+        }
+        let fresh = lock(&self.shell).fresh_commands(cursors);
+        !fresh.local.ids.is_empty() || fresh.remote.is_some_and(|(_, walk)| !walk.ids.is_empty())
+    }
+
+    /// Whether a program holds the alternate screen **now**, read from `Term` itself rather than
+    /// from what the last frame published ([`Self::alt_screen`]): a tab that is not on screen
+    /// draws no frames, and the palette lists the commands of all of them.
+    pub fn on_alternate_screen(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::ALT_SCREEN)
+    }
+
     /// Block `key`'s command row as text and its depth (rows from the history's top), found
     /// walking up from the bottom — the newest block's start is the last one there. `None` on
     /// the alternate screen (the row is in the primary screen, out of reach) and when the row is
@@ -12679,6 +12926,15 @@ fn window_size(grid: GridSize, cell_px: (u16, u16)) -> WindowSize {
 /// Producing a second panic on the shutdown path benefits nobody.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What reading a command's text came to ([`Session::remember_commands`]).
+enum Taken {
+    Text(String),
+    /// Its row has left the history: it is not remembered.
+    Gone,
+    /// The pane is on the alternate screen and nothing was captured: the next look tries again.
+    Later,
 }
 
 #[cfg(test)]
@@ -24599,6 +24855,132 @@ e\\314\\201.'; sleep 5";
             ("$ make", false, Some(2))
         );
         assert_eq!(session.activity().finished, 1, "block 1");
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_commands_a_pane_ran_are_remembered_with_their_lines_and_what_became_of_them() {
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_session(
+            "stty -echo; printf '\\033]7;file://localhost/tmp\\007\\033]133;A;bt_block=1\\007\\033]8;;bateri://block/1\\007$ true\
+             \\033]8;;\\007\\033]133;C\\007\\r\\n\\033]133;D;0;bt_block=1\\007\
+             \\033]133;A;bt_block=2\\007\\033]8;;bateri://block/2\\007$ make\
+             \\033]8;;\\007\\033]133;C\\007\\r\\none\\r\\ntwo\\r\\n'; read _; \
+             printf '\\033]133;D;2;bt_block=2\\007\\033]133;A;bt_block=3\\007\\033]8;;bateri://block/3\\007$ '; sleep 5",
+            Arc::clone(&wake),
+        );
+        wait_until("block 2 did not start", Duration::from_secs(5), || {
+            session
+                .last_block_info()
+                .is_some_and(|info| info.command == "$ make")
+        });
+        let records = session.command_records();
+        let texts: Vec<&str> = records.iter().map(|record| record.text.as_str()).collect();
+        assert_eq!(texts, ["$ make", "$ true"], "newest first");
+        assert!(matches!(records[0].state, RecordState::Running(_)));
+        assert!(matches!(
+            records[1].state,
+            RecordState::Finished { exit: Some(0), .. }
+        ));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.depth.is_some() && !record.remote)
+        );
+        assert_eq!(
+            records[0].directory,
+            Some(PathBuf::from("/tmp")),
+            "where the shell said it was when the newest command started"
+        );
+        assert_eq!(
+            session.command_output(records[0].id).as_deref(),
+            Some("one\ntwo")
+        );
+        assert_eq!(
+            session.last_remembered().map(|(_, text)| text).as_deref(),
+            Some("$ make")
+        );
+        session.write(b"\n");
+        wait_until("block 2 did not end", Duration::from_secs(5), || {
+            session.activity().failed == 1
+        });
+        let records = session.command_records();
+        assert_eq!(
+            records.len(),
+            2,
+            "the prompt being typed at is not a command"
+        );
+        assert!(matches!(
+            records[0].state,
+            RecordState::Finished { exit: Some(2), .. }
+        ));
+        assert_eq!(
+            session.command_output(records[0].id).as_deref(),
+            Some("one\ntwo"),
+            "the next prompt ends the output"
+        );
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_command_whose_rows_scrolled_away_is_still_in_the_memory_without_an_output() {
+        // The scrollback of these sessions is a hundred rows: three hundred lines push the
+        // command's own row out of the history.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_session(
+            "stty -echo; printf '\\033]133;A;bt_block=1\\007\\033]8;;bateri://block/1\\007$ yes\
+             \\033]8;;\\007\\033]133;C\\007\\r\\n'; read _; i=0; \
+             while [ $i -lt 300 ]; do echo line$i; i=$((i+1)); done; sleep 5",
+            Arc::clone(&wake),
+        );
+        wait_until("block 1 did not start", Duration::from_secs(5), || {
+            session.last_block_info().is_some()
+        });
+        // The main queue's turn after the start: the line is read while its rows are on the grid.
+        session.remember_commands();
+        session.write(b"\n");
+        wait_until(
+            "the command's row did not scroll away",
+            Duration::from_secs(5),
+            || {
+                session
+                    .command_records()
+                    .first()
+                    .is_some_and(|r| r.depth.is_none())
+            },
+        );
+        let records = session.command_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "$ yes", "its text outlived its rows");
+        assert_eq!(session.command_output(records[0].id), None);
+        assert_eq!(session.command_depth(records[0].id), None);
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_command_that_takes_the_alternate_screen_with_its_start_is_remembered_all_the_same() {
+        // `vim file`: the `C` mark and `ESC [ ? 1049 h` arrive in one read, so by the time the
+        // main queue looks the rows of the command are on the screen the program took.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_session(
+            "stty -echo; printf '\\033]133;A;bt_block=1\\007\\033]8;;bateri://block/1\\007$ vim file\
+             \\033]8;;\\007\\033]133;C\\007\\033[?1049hfull screen'; sleep 5",
+            Arc::clone(&wake),
+        );
+        wait_until(
+            "the program did not take the screen",
+            Duration::from_secs(5),
+            || session.term.lock().mode().contains(TermMode::ALT_SCREEN),
+        );
+        let records = session.command_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "$ vim file");
+        assert_eq!(
+            records[0].depth, None,
+            "its row is out of reach under the program"
+        );
+        assert!(matches!(records[0].state, RecordState::Running(_)));
+        assert_eq!(session.command_output(records[0].id), None);
         session.shutdown();
     }
 

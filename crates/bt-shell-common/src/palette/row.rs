@@ -194,6 +194,10 @@ pub struct Row {
     pub preview: Option<Preview>,
     /// A theme's colours, for the row to show beside its title.
     pub swatch: Option<Swatch>,
+    /// The keys the bottom band names for this row, with what each does, in place of the ones its
+    /// kind implies (a command's ⏎, ⌥⏎ and ⌘⏎ depend on where it ran and whether its output is
+    /// still there). Empty: the kind's own.
+    pub hints: Vec<(&'static str, String)>,
 }
 
 impl Row {
@@ -215,6 +219,7 @@ impl Row {
             completion: None,
             preview: None,
             swatch: None,
+            hints: Vec::new(),
         }
     }
 
@@ -278,6 +283,12 @@ impl Row {
 
     pub fn swatch(mut self, swatch: Swatch) -> Row {
         self.swatch = Some(swatch);
+        self
+    }
+
+    /// The bottom band names `key` as doing `verb` while this row is highlighted.
+    pub fn hint(mut self, key: &'static str, verb: impl Into<String>) -> Row {
+        self.hints.push((key, verb.into()));
         self
     }
 

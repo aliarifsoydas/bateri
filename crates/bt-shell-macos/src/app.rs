@@ -401,6 +401,23 @@ pub(crate) struct Start {
     pub(crate) line: Option<String>,
 }
 
+/// Where a command the palette lists ran, in the same order as the list the palette was handed
+/// ([`bt_shell_common::palette::Commands::items`]): what a choice needs to find its pane and its
+/// output, none of which the rules see.
+#[derive(Clone, Debug)]
+pub(crate) struct Origin {
+    pub(crate) tab: u64,
+    pub(crate) pane: u64,
+    pub(crate) id: bt_core::CommandId,
+    /// The line, as the rules wrote it ([`bt_shell_common::palette::write_line`]); `None` when
+    /// it cannot be left on a prompt.
+    pub(crate) line: Option<String>,
+    /// The command's own text, for the pasteboard.
+    pub(crate) text: String,
+    pub(crate) directory: Option<PathBuf>,
+    pub(crate) remote: bool,
+}
+
 /// The new pane's first input and the remote line it inherits (the `ssh` start folder is asked
 /// about the second only, never about a line the palette wrote — the folder is the source's
 /// server's and the line may name another). A `Start` makes the pane local: nothing inherited,
@@ -1120,6 +1137,9 @@ pub(crate) struct Ivars {
     /// The host names `~/.ssh/config` holds, as the last background read found them
     /// ([`AppDelegate::refresh_ssh_hosts`]).
     ssh_hosts: RefCell<Vec<String>>,
+    /// The keys of the ports that were listening when the palette was last opened: what the
+    /// root suggests is a port that was not ([`AppDelegate::palette_fresh_ports`]). In memory.
+    ports_seen: RefCell<std::collections::HashSet<String>>,
     /// What the update's holders gave at launch
     /// ([`arrive`] — taken before this delegate was born); consumed by the
     /// first windows ([`AppDelegate::restore_or_open`]).
@@ -1674,6 +1694,7 @@ define_class!(
             } else if item.action() == Some(sel!(toggleCommandPalette:))
                 || item.action() == Some(sel!(goToTab:))
                 || item.action() == Some(sel!(goToFolder:))
+                || item.action() == Some(sel!(jumpToCommand:))
             {
                 // Grey without a terminal window to open it over, and while a question is up
                 // on it; open, the same item takes it down (⇧⌘P) or moves it one row on (⌘P,
@@ -1710,6 +1731,15 @@ define_class!(
         fn go_to_tab(&self, _sender: Option<&AnyObject>) {
             if let Some(window) = self.key_window() {
                 window.go_to_tab();
+            }
+        }
+
+        /// Window ▸ Jump to Command…: the key window's palette opens on the command history, ⏎
+        /// going to a command's output; open on it already, the highlight goes one on.
+        #[unsafe(method(jumpToCommand:))]
+        fn jump_to_command(&self, _sender: Option<&AnyObject>) {
+            if let Some(window) = self.key_window() {
+                window.jump_to_command();
             }
         }
 
@@ -2644,6 +2674,7 @@ impl AppDelegate {
                 bt_shell_common::palette::HOST_LIMIT,
             )),
             ssh_hosts: RefCell::new(Vec::new()),
+            ports_seen: RefCell::new(std::collections::HashSet::new()),
             arrival: RefCell::new(arrival),
             holder: RefCell::new(None),
             keeper,
@@ -5270,14 +5301,7 @@ impl AppDelegate {
             }
             Go::TypeCd(path) => {
                 let pane = window.try_selected_tab().map(|tab| tab.focused_pane());
-                let free = pane
-                    .as_ref()
-                    .and_then(|pane| pane.session())
-                    .is_some_and(|session| {
-                        session.remote_mark().is_none()
-                            && session.running_command().is_none()
-                            && !session.alt_screen()
-                    });
+                let free = pane.as_ref().is_some_and(|pane| Self::takes_a_line(pane));
                 match (
                     pane.as_ref().and_then(|pane| pane.session()),
                     free,
@@ -5399,6 +5423,215 @@ impl AppDelegate {
                 {
                     target.raise();
                     target.close_group(group);
+                }
+            }
+        }
+    }
+
+    /// The commands the open panes ran, as the palette lists them, with where each ran
+    /// ([`Origin`]): every window's tabs and every pane of them, the key window's first. Whether
+    /// the pane on screen is idle ([`Commands::free`](bt_shell_common::palette::Commands)) is read
+    /// here and again when a choice is made.
+    pub(crate) fn palette_commands(&self) -> (bt_shell_common::palette::Commands, Vec<Origin>) {
+        use bt_core::RecordState;
+        use bt_shell_common::palette as rules;
+        let key = self.key_window().map(|window| window.id());
+        let mut walk: Vec<(usize, Retained<TerminalWindow>)> = self
+            .windows()
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(at, window)| (at + 1, window))
+            .collect();
+        walk.sort_by_key(|(_, window)| Some(window.id()) != key);
+        let here = walk
+            .iter()
+            .find(|(_, window)| Some(window.id()) == key)
+            .and_then(|(_, window)| window.try_selected_tab());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let mut commands = rules::Commands {
+            now,
+            free: here
+                .as_ref()
+                .is_some_and(|tab| Self::takes_a_line(&tab.focused_pane())),
+            ..rules::Commands::default()
+        };
+        let mut origins = Vec::new();
+        for (number, window) in &walk {
+            let is_key = Some(window.id()) == key;
+            for tab in window.tabs() {
+                let title = tab.session_title().unwrap_or_else(|| "bateri".to_owned());
+                let on_screen = is_key && here.as_ref().is_some_and(|here| here.id() == tab.id());
+                for pane in tab.panes() {
+                    let Some(session) = pane.session() else {
+                        continue;
+                    };
+                    let records = session.command_records();
+                    if session.on_alternate_screen() {
+                        let program = records
+                            .iter()
+                            .find(|record| matches!(record.state, RecordState::Running(_)))
+                            .and_then(|record| rules::program_of(&record.text));
+                        commands.full_screen.push(rules::FullScreen {
+                            tab: tab.id(),
+                            program,
+                        });
+                    }
+                    for record in records {
+                        commands.items.push(rules::CommandFacts {
+                            tab: tab.id(),
+                            text: record.text.clone(),
+                            remote: record.remote,
+                            standing: record.state,
+                            started: record.started.map(u64::from),
+                            can_show: record.depth.is_some(),
+                            tab_title: title.clone(),
+                            other_window: (!is_key).then_some(*number),
+                            here: on_screen,
+                        });
+                        origins.push(Origin {
+                            tab: tab.id(),
+                            pane: pane.id(),
+                            id: record.id,
+                            line: rules::write_line(&record.text),
+                            text: record.text,
+                            directory: record.directory,
+                            remote: record.remote,
+                        });
+                    }
+                }
+            }
+        }
+        (commands, origins)
+    }
+
+    /// Whether `pane` can take a line written to its prompt: a local shell with nothing running
+    /// and no program on the whole screen. The same test ⌥⏎ on a folder makes.
+    fn takes_a_line(pane: &TerminalPane) -> bool {
+        pane.session().is_some_and(|session| {
+            session.remote_mark().is_none()
+                && session.running_command().is_none()
+                && !session.on_alternate_screen()
+        })
+    }
+
+    /// The ports of `ports` that were not listening when the palette was last opened, which is
+    /// now: the baseline moves to what listens now.
+    pub(crate) fn palette_fresh_ports(
+        &self,
+        ports: &[bt_shell_common::palette::PortFacts],
+    ) -> Vec<String> {
+        let mut seen = self.ivars().ports_seen.borrow_mut();
+        let fresh = ports
+            .iter()
+            .filter(|port| !seen.contains(&port.key))
+            .map(|port| port.key.clone())
+            .collect();
+        *seen = ports.iter().map(|port| port.key.clone()).collect();
+        fresh
+    }
+
+    /// What choosing a command, or an action of its menu, comes to
+    /// ([`bt_shell_common::palette::history_run`]) in window `window`, the palette's; the palette
+    /// is down and the keyboard back with the tab on screen. **The line is left on a prompt, never
+    /// run**: written to the idle pane on screen, to a new local tab's, or to a split's — and
+    /// the idle test is made again here, because the pane may have started something since the
+    /// palette was drawn.
+    pub(crate) fn palette_history(
+        &self,
+        window: u64,
+        how: bt_shell_common::palette::Use,
+        origin: &Origin,
+    ) {
+        use bt_shell_common::palette::Use;
+        let Some(window) = self.window(window) else {
+            return;
+        };
+        let pasteboard = || objc2_app_kit::NSPasteboard::generalPasteboard();
+        let on_screen = window.try_selected_tab();
+        // A line that cannot be left on a prompt (it has a control character in it) is copied.
+        let how =
+            if origin.line.is_none() && matches!(how, Use::Write | Use::NewTab | Use::SplitRight) {
+                Use::CopyCommand
+            } else {
+                how
+            };
+        // What a write comes to when the pane on screen does not take it.
+        let how = match how {
+            Use::Write
+                if on_screen
+                    .as_ref()
+                    .is_some_and(|tab| Self::takes_a_line(&tab.focused_pane())) =>
+            {
+                Use::Write
+            }
+            Use::Write if origin.remote => Use::CopyCommand,
+            Use::Write => Use::NewTab,
+            other => other,
+        };
+        let start = || {
+            origin.line.clone().map(|line| Start {
+                directory: origin.directory.clone().filter(|dir| dir.is_dir()),
+                line: Some(line),
+            })
+        };
+        match how {
+            Use::Write => {
+                if let (Some(tab), Some(line)) = (on_screen, origin.line.clone()) {
+                    if let Some(session) = tab.focused_pane().session() {
+                        session.paste(line.into_bytes());
+                    }
+                } else {
+                    crate::preview::beep();
+                }
+            }
+            Use::NewTab => match start() {
+                Some(start) => self.new_tab_started(window.id(), Seat::Beside, Some(&start)),
+                None => crate::preview::beep(),
+            },
+            Use::SplitRight => {
+                let (Some(tab), Some(start)) = (on_screen, start()) else {
+                    crate::preview::beep();
+                    return;
+                };
+                if !tab.split_with_line(&start) {
+                    self.new_tab_started(window.id(), Seat::Beside, Some(&start));
+                }
+            }
+            Use::ShowOutput => {
+                let found = self.tab(origin.tab).and_then(|tab| {
+                    let pane = tab
+                        .panes()
+                        .into_iter()
+                        .find(|pane| pane.id() == origin.pane)?;
+                    let window = tab.window()?;
+                    Some((tab, pane, window))
+                });
+                match found {
+                    Some((tab, pane, window)) => {
+                        window.bring_to_front(&tab, &pane);
+                        if !pane.show_command(origin.id) {
+                            crate::preview::beep();
+                        }
+                    }
+                    None => crate::preview::beep(),
+                }
+            }
+            Use::CopyCommand => {
+                crate::clipboard::copy(&pasteboard(), Some(origin.text.clone()));
+            }
+            Use::CopyOutput => {
+                let output = self
+                    .tab(origin.tab)
+                    .and_then(|tab| tab.panes().into_iter().find(|p| p.id() == origin.pane))
+                    .and_then(|pane| pane.session()?.command_output(origin.id));
+                match output {
+                    Some(text) if !text.is_empty() => {
+                        crate::clipboard::copy(&pasteboard(), Some(text));
+                    }
+                    _ => crate::preview::beep(),
                 }
             }
         }

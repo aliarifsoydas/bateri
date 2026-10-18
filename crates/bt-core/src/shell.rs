@@ -1668,6 +1668,34 @@ fn next_revision() -> u64 {
     REVISIONS.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// What one walk of a ledger found for the command memory ([`BlockLog::ran_since`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Walk {
+    /// The identities that ran, oldest first.
+    pub(crate) ids: Vec<u32>,
+    /// Where the next walk starts once all of `ids` are taken.
+    pub(crate) end: u32,
+    /// The counter had restarted: what the memory holds of this ledger is another shell's.
+    pub(crate) reset: bool,
+}
+
+/// Where the command memory's walks ended ([`ShellLog::fresh_commands`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Cursors {
+    pub(crate) local: Option<u32>,
+    pub(crate) remote: Option<(RemoteShell, u32)>,
+}
+
+/// The commands the ledgers hold that the memory has not read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Fresh {
+    pub(crate) local: Walk,
+    /// Our remote shell's ledger, when one is on.
+    pub(crate) remote: Option<(RemoteShell, Walk)>,
+    /// Where the newest local command was started.
+    pub(crate) cwd: String,
+}
+
 impl BlockLog {
     pub(crate) fn new(scrollback: usize) -> Self {
         Self {
@@ -1799,6 +1827,52 @@ impl BlockLog {
     fn last(&self) -> Option<(u32, Outcome)> {
         let at = self.entries.len().checked_sub(1)?;
         Some((self.first.wrapping_add(at as u32), self.entries[at]))
+    }
+
+    /// The blocks that **ran** from `from` on, oldest first — the command memory's walk
+    /// ([`Walk`]). `from` is where the last walk ended; `None`, an identity the ring has
+    /// dropped or one past its end (the counter restarted: `reset`) start from the oldest.
+    ///
+    /// A block that ran is one whose start was stamped or whose duration was seen: a prompt
+    /// answered with nothing is not a command. The **newest** block that did not run is the
+    /// prompt the user is typing at — it may become a command, so the walk ends before it.
+    fn ran_since(&self, from: Option<u32>) -> Walk {
+        let len = self.entries.len();
+        let Some((last, _)) = self.last() else {
+            return Walk {
+                ids: Vec::new(),
+                end: from.unwrap_or(0),
+                reset: false,
+            };
+        };
+        let (mut at, reset) = match from {
+            None => (0, false),
+            Some(from) => match from.checked_sub(self.first) {
+                None => (0, false),
+                Some(behind) if behind as usize <= len => (behind as usize, false),
+                Some(_) => (0, true),
+            },
+        };
+        let mut ids = Vec::new();
+        let mut end = last.wrapping_add(1);
+        while at < len {
+            let id = self.first.wrapping_add(at as u32);
+            let ran = match self.entries[at] {
+                Outcome::Pending { started } => started != 0,
+                Outcome::Finished {
+                    started,
+                    elapsed_ms,
+                    ..
+                } => started != 0 || elapsed_ms > 0,
+            };
+            if ran {
+                ids.push(id);
+            } else if at + 1 == len {
+                end = id;
+            }
+            at += 1;
+        }
+        Walk { ids, end, reset }
     }
 
     /// The identity's place in the ring; an identity outside the range is `None`.
@@ -2378,6 +2452,10 @@ pub(crate) struct ShellLog {
     /// `Prompt` — while the command is still running the generation looks like
     /// `None`, the probe is dropped and the indicator would never appear.
     command_open: bool,
+    /// The directory the shell reported when the newest command started (`C`): where the command
+    /// was run, for the palette's command history. The title's directory moves at the **next**
+    /// prompt, so a fast `cd` has changed it by the time anything reads it from `context`.
+    command_cwd: String,
     /// The **raw** answer of the handover, as last observed.
     ///
     /// The stamp is kept in [`Self::apply_scan`] — the single entry point and under the
@@ -2699,6 +2777,7 @@ impl ShellLog {
             typed: None,
             ours: false,
             command_open: false,
+            command_cwd: String::new(),
             // At startup the caret is the dock's (`caret_home_raw(None, Idle)`), so the first
             // handover is always in the Dock→Grid direction and the hold can apply to it.
             caret_raw: CaretHome::Dock,
@@ -2839,6 +2918,7 @@ impl ShellLog {
                     self.command += 1;
                     self.command_open = true;
                     self.paste_since_remote = false;
+                    self.command_cwd.clone_from(&self.context.cwd);
                     outcome.started = true;
                     outcome.title = self.context.clear_remote();
                     // The offer's lifetime is until the next command.
@@ -3461,6 +3541,24 @@ impl ShellLog {
         running.then(|| clock.map_or(Duration::ZERO, |clock| clock.elapsed()))
     }
 
+    /// What the ledgers hold that the command memory has not read since `cursors`
+    /// ([`crate::Session::remember_commands`]): the blocks that ran, local and — with our remote
+    /// shell on — remote. Under the leaf lock alone, no `Term`.
+    pub(crate) fn fresh_commands(&self, cursors: Cursors) -> Fresh {
+        let remote = self.remote_shell.map(|shell| {
+            let from = cursors
+                .remote
+                .filter(|(seen, _)| *seen == shell)
+                .map(|(_, next)| next);
+            (shell, self.remote.blocks.ran_since(from))
+        });
+        Fresh {
+            local: self.local.blocks.ran_since(cursors.local),
+            remote,
+            cwd: self.command_cwd.clone(),
+        }
+    }
+
     /// The newest block the tab's summary card tells of
     /// ([`crate::Session::last_block_info`]): our remote shell's last one
     /// while the remote session runs under its `ssh` block, else the local
@@ -3960,6 +4058,14 @@ pub fn counter_tier_end(elapsed: Duration) -> Option<Duration> {
 /// block's row shows; an allocation per call, so not for the frame path.
 pub fn running_counter(elapsed: Duration) -> Option<String> {
     (elapsed >= COUNTER_FLOOR).then(|| Counter::new(elapsed, Precision::Whole).as_str().to_owned())
+}
+
+/// A finished command's duration text for `elapsed` — tenths under a minute
+/// ([`Precision::Tenths`]), the form the block's row and the summary card give — or `None` below
+/// [`COUNTER_FLOOR`], where a duration is noise next to every `ls`. The command history says
+/// how long a command took with it; an allocation per call, so not for the frame path.
+pub fn finished_counter(elapsed: Duration) -> Option<String> {
+    (elapsed >= COUNTER_FLOOR).then(|| Counter::new(elapsed, Precision::Tenths).as_str().to_owned())
 }
 
 /// The counter's text — **on the stack**, no per-frame allocation.
@@ -6322,6 +6428,51 @@ fn parse_carried_highlight(fields: &[&str]) -> Option<Highlight> {
 mod tests {
     use super::*;
     use crate::session::CellHalf;
+
+    #[test]
+    fn the_command_memorys_walk_takes_the_blocks_that_ran_and_leaves_the_prompt_being_typed_at() {
+        let mut blocks = BlockLog::new(100);
+        // 1 ran and ended, 2 is a prompt answered with nothing, 3 runs, 4 is the prompt typed at.
+        blocks.start(1);
+        blocks.stamp(1000);
+        blocks.finish(1, Some(0), 20);
+        blocks.start(2);
+        blocks.finish(2, Some(0), 0);
+        blocks.start(3);
+        blocks.stamp(1001);
+        blocks.start(4);
+        let walk = blocks.ran_since(None);
+        assert_eq!(walk.ids, [1, 3]);
+        assert_eq!(
+            (walk.end, walk.reset),
+            (4, false),
+            "the prompt may yet become a command"
+        );
+        // The next walk starts at the prompt: nothing new until it runs.
+        assert!(blocks.ran_since(Some(walk.end)).ids.is_empty());
+        blocks.stamp(1002);
+        assert_eq!(blocks.ran_since(Some(walk.end)).ids, [4]);
+        // Everything read: the walk ends past the last block.
+        assert_eq!(blocks.ran_since(Some(5)).end, 5);
+    }
+
+    #[test]
+    fn the_command_memorys_walk_notices_a_counter_that_started_over() {
+        let mut blocks = BlockLog::new(100);
+        for id in 1..=3 {
+            blocks.start(id);
+            blocks.stamp(1000);
+            blocks.finish(id, Some(0), 5);
+        }
+        blocks.start(4);
+        // A new shell numbers from one: the ledger restarts below where the walk had got to.
+        let mut fresh = BlockLog::new(100);
+        fresh.start(1);
+        fresh.stamp(2000);
+        let walk = fresh.ran_since(Some(5));
+        assert!(walk.reset);
+        assert_eq!(walk.ids, [1]);
+    }
 
     /// Feeds the sequence in the given chunks; the scanner has to carry its state
     /// between chunks.

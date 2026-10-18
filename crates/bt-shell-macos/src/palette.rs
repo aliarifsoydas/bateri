@@ -70,8 +70,8 @@ use std::sync::OnceLock;
 use block2::RcBlock;
 use bt_core::{Settings, Theme};
 use bt_shell_common::palette::{
-    self as rules, Chosen, Effect, Fallbacks, Key, Kind, List, Modifier, Palette, PathQuery,
-    Places, Row, Scope, Sources, Swatch, Targets, ThemeEntry,
+    self as rules, Chosen, Commands, Effect, Fallbacks, Key, Kind, List, Modifier, Palette,
+    PathQuery, Places, Row, Scope, Sources, Swatch, Targets, ThemeEntry,
 };
 use dispatch2::{DispatchQueue, DispatchRetained, DispatchTime};
 use objc2::rc::Retained;
@@ -94,7 +94,7 @@ use objc2_foundation::{
 use objc2_quartz_core::{CAMediaTimingFunction, kCAMediaTimingFunctionEaseOut};
 
 use self::menu::Snapshot;
-use crate::app;
+use crate::app::{self, Origin};
 use crate::tab_bar::{PALETTE_ICON_SIDE, Tint, inner_line, palette_icon, rounded};
 use crate::window::{RootView, TerminalWindow};
 
@@ -243,7 +243,12 @@ fn hints(
 ) -> Vec<(&'static str, String)> {
     let mut hints = Vec::new();
     if let Some(row) = row {
-        let verb = if row.opens.is_some() && row.enters {
+        // A command says its own keys: where it ran and whether its output is still there decide
+        // what each does.
+        hints.extend(row.hints.iter().cloned());
+        let verb = if !row.hints.is_empty() {
+            ""
+        } else if row.opens.is_some() && row.enters {
             "Open"
         } else if matches!(row.kind, Kind::Tab | Kind::Group) {
             "Go to"
@@ -262,7 +267,9 @@ fn hints(
         } else {
             "Run"
         };
-        hints.push(("↵", verb.to_owned()));
+        if !verb.is_empty() {
+            hints.push(("↵", verb.to_owned()));
+        }
         // A row that does something by ⏎ and keeps a menu of its own behind →.
         if row.opens.is_some() && !row.enters {
             hints.push(("→", "Actions".to_owned()));
@@ -299,6 +306,8 @@ fn empty_message(scope: Option<&Scope>, depth: usize, query: &str, looking: bool
         Some(Scope::Folders) if !typed => "No folders yet: type a path such as ~/",
         Some(Scope::Hosts) if !typed => "No servers yet: add Host lines to ~/.ssh/config",
         Some(Scope::Ports) if !typed => "Nothing in your tabs is listening",
+        Some(Scope::History { jump: true, .. }) if !typed => "No command output to jump to",
+        Some(Scope::History { .. }) if !typed => "Nothing has run in your tabs yet",
         _ if typed || depth > 0 => "No matches",
         _ => "Type a command, or press ↓ ↵ to run a recent one",
     }
@@ -857,6 +866,12 @@ struct Open {
     /// The folders, servers and ports ([`AppDelegate::palette_targets`](crate::app)), as they
     /// were when the palette opened and when `~/.ssh/config` was last read.
     targets: Targets,
+    /// The commands the open panes ran, as they were when the palette opened, and where each ran
+    /// (same order: [`AppDelegate::palette_commands`](crate::app)).
+    commands: Commands,
+    origins: Vec<Origin>,
+    /// The ports that started listening since the palette was last opened.
+    fresh_ports: Vec<String>,
     /// The names inside the folder a typed path points into, read off the main thread.
     listing: Option<Listing>,
     list: List,
@@ -893,6 +908,8 @@ impl Open {
             themes: &self.themes,
             places: &self.places,
             targets: &self.targets,
+            commands: &self.commands,
+            fresh_ports: &self.fresh_ports,
         }
     }
 
@@ -935,21 +952,24 @@ impl Open {
                 &self.root,
                 query,
                 &self.recent,
-                // The history does not exist yet: its fallback is not offered.
-                Fallbacks {
-                    find: true,
-                    history: false,
-                },
+                &rules::suggested_rows(&self.sources()),
+                Fallbacks::ALL,
             );
         };
-        // The tabs page has its own order and headings; the others list their rows.
+        // The tabs and the command history pages have their own order and headings; the others
+        // list their rows.
         if matches!(scope, Scope::Tabs) {
             return rules::tab_list(&self.places, query);
         }
+        if let Scope::History { jump, .. } = scope {
+            return rules::history_list(&self.commands, query, *jump);
+        }
         let rows = rules::page_rows(scope, &self.sources());
         let mut list = rules::page_list(&rows, query);
-        // A tab's or a group's menu says whose it is.
-        if let Some(whose) = rules::actions_heading(scope, &self.places) {
+        // A tab's, a group's or a command's menu says whose it is.
+        if let Some(whose) = rules::actions_heading(scope, &self.places)
+            .or_else(|| rules::history_actions_heading(scope, &self.commands))
+        {
             list.headings.insert(0, (0, whose));
         }
         // A page that writes says over its rows why it cannot.
@@ -1570,6 +1590,36 @@ impl PaletteCard {
             self.go(go);
             return;
         }
+        // A command a pane ran, or an action of its menu: the line is left on a prompt a turn
+        // after the palette is down (never run), the output gone to or copied.
+        let run = {
+            let open = self.ivars().open.borrow();
+            rules::history_run(id, scope.as_ref(), modifier, &open.commands).and_then(|run| {
+                open.origins
+                    .get(run.index)
+                    .cloned()
+                    .map(|origin| (run, origin))
+            })
+        };
+        if let Some((run, origin)) = run {
+            let window = self.ivars().window;
+            self.dismiss();
+            DispatchQueue::main().exec_async(move || {
+                // audit: a block running on the main queue is on the main thread by definition.
+                let mtm = MainThreadMarker::new().expect("the main queue is the main thread");
+                if let Some(app) = app::delegate(mtm) {
+                    app.palette_history(window, run.how, &origin);
+                }
+            });
+            return;
+        }
+        if id.starts_with(Kind::History.prefix()) {
+            // A command without the use this key stands for (no output to go to): the key does
+            // nothing, and the palette stays.
+            crate::preview::beep();
+            self.refresh();
+            return;
+        }
         if let Some(chosen) = rules::chosen(id, scope.as_ref(), modifier, &settings, dark) {
             self.write(id, &chosen);
             return;
@@ -1867,6 +1917,18 @@ pub(crate) fn go_to_folder(window: &TerminalWindow) {
     go_to(window, Scope::Folders);
 }
 
+/// Window ▸ Jump to Command…: opens the palette on the command history with ⏎ going to the
+/// output, or — open — takes its highlight one command on.
+pub(crate) fn jump_to_command(window: &TerminalWindow) {
+    go_to(
+        window,
+        Scope::History {
+            jump: true,
+            query: None,
+        },
+    );
+}
+
 fn go_to(window: &TerminalWindow, page: Scope) {
     if let Some(scrim) = window.root().palette() {
         scrim.ivars().card.go_to_page(page);
@@ -1922,6 +1984,8 @@ fn open(window: &TerminalWindow, start: Option<Scope>) {
     let places = app.palette_places();
     let icons = tab_icons(mtm, &places, &theme);
     let targets = app.palette_targets();
+    let fresh_ports = app.palette_fresh_ports(&targets.ports);
+    let (commands, origins) = app.palette_commands();
     // The file is read as the palette opens; the answer, if it differs, reaches the open card.
     app.refresh_ssh_hosts();
     let mut state = Open {
@@ -1937,6 +2001,9 @@ fn open(window: &TerminalWindow, start: Option<Scope>) {
         places,
         icons,
         targets,
+        commands,
+        origins,
+        fresh_ports,
         listing: None,
         list: List::default(),
         rows: Vec::new(),
@@ -2228,6 +2295,52 @@ mod tests {
         assert_eq!(hints(Some(&switch), 0, None)[0], ("↵", "Switch".to_owned()));
         let choice = Row::new(Kind::Choice, "beam", "Beam");
         assert_eq!(hints(Some(&choice), 1, None)[0], ("↵", "Use".to_owned()));
+    }
+
+    #[test]
+    fn a_command_names_its_own_keys_and_the_menu_behind_it() {
+        // Where it ran and whether its output is still there decide what each key does: the row
+        // says, the band names exactly that, then the menu and the movement keys.
+        let command = Row::new(Kind::History, "0", "make")
+            .opens(Scope::HistoryActions("hist.0".to_owned()), false)
+            .hint("↵", "Write to the Line")
+            .hint("⌥↵", "Split Right")
+            .hint("⌘↵", "Show Output");
+        assert_eq!(
+            hints(Some(&command), 0, None),
+            pairs(&[
+                ("↵", "Write to the Line"),
+                ("⌥↵", "Split Right"),
+                ("⌘↵", "Show Output"),
+                ("→", "Actions"),
+                ("↑↓", "Move"),
+                ("esc", "Close")
+            ])
+        );
+        // A server's command whose pane is busy can only be copied; no key is named twice.
+        let remote = Row::new(Kind::History, "1", "systemctl status")
+            .opens(Scope::HistoryActions("hist.1".to_owned()), false)
+            .hint("↵", "Copy Command");
+        let keys: Vec<&str> = hints(Some(&remote), 0, None)
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
+        assert_eq!(keys, ["↵", "→", "↑↓", "esc"]);
+    }
+
+    #[test]
+    fn the_history_pages_say_what_an_empty_list_means() {
+        let history = Scope::History {
+            jump: false,
+            query: None,
+        };
+        let jump = Scope::History {
+            jump: true,
+            query: None,
+        };
+        assert!(empty_message(Some(&history), 0, "", false).contains("run"));
+        assert!(empty_message(Some(&jump), 0, "", false).contains("jump"));
+        assert_eq!(empty_message(Some(&history), 0, "zz", false), "No matches");
     }
 
     #[test]

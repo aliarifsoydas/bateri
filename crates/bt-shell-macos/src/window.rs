@@ -2648,6 +2648,12 @@ impl TerminalWindow {
         palette::go_to_folder(self);
     }
 
+    /// Window ▸ Jump to Command…: the palette on the command history, ⏎ going to the output, or
+    /// its highlight one command on ([`palette::jump_to_command`]).
+    pub(crate) fn jump_to_command(&self) {
+        palette::jump_to_command(self);
+    }
+
     /// Whether the palette may open now: not while a question is up on the window or on the
     /// tab on screen — it would sit over a sheet it cannot answer — and not on a window with no
     /// tab to give the keyboard back to.

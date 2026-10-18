@@ -73,8 +73,8 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{
     Attr, CharsetIndex, ClearMode, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
-    KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, PrivateMode, Rgb,
-    ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
+    KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedPrivateMode,
+    PrivateMode, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
 };
 // vte does not re-export this type; the reason for the edge is in the root
 // `Cargo.toml`.
@@ -443,6 +443,14 @@ impl<U: EventListener> Handler for ClusterHandler<'_, U> {
     fn set_private_mode(&mut self, mode: PrivateMode) {
         if mode == PrivateMode::Unknown(PIXEL_MOUSE_MODE) {
             return self.pixel_mouse_mode(true);
+        }
+        // The command that took the screen is on the screen being left until this very call:
+        // its text is read now, or it is out of reach for as long as the program runs.
+        if mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor)
+            && !self.on_alternate_screen()
+            && let Some(graphics) = self.graphics
+        {
+            graphics.leaving_primary_screen(crate::history::newest_block(&*self.term));
         }
         self.switching_screens(|term| term.set_private_mode(mode));
     }

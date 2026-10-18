@@ -5,6 +5,7 @@
 //! page of one thing — and handed back. A list is rows in order and the headings that stand
 //! before some of them; the highlight indexes the rows, never a heading.
 
+use super::history::SUGGESTED_HEADING;
 use super::rank::{Hit, Nearness, recent_rows, root as clustered, search};
 use super::row::{Kind, Row};
 
@@ -59,10 +60,16 @@ impl List {
     }
 }
 
-/// The root: while the field is empty Recent and then the pages that are not a menu's (Themes…,
-/// All Settings…); with a query, the clusters of what it finds with the fallbacks `offer` closing
-/// them.
-pub fn root(rows: &[Row], query: &str, recent: &[String], offer: Fallbacks) -> List {
+/// The root: while the field is empty Recent, what is `suggested` and then the pages that are not
+/// a menu's (Themes…, All Settings…); with a query, the clusters of what it finds with the
+/// fallbacks `offer` closing them.
+pub fn root(
+    rows: &[Row],
+    query: &str,
+    recent: &[String],
+    suggested: &[Row],
+    offer: Fallbacks,
+) -> List {
     let mut list = List::default();
     if query.trim().is_empty() {
         let recent = recent_rows(recent, rows);
@@ -79,6 +86,11 @@ pub fn root(rows: &[Row], query: &str, recent: &[String], offer: Fallbacks) -> L
             .cloned()
             .collect();
         list.hits = recent.into_iter().map(unscored).collect();
+        if !suggested.is_empty() {
+            list.headings
+                .push((list.hits.len(), SUGGESTED_HEADING.to_owned()));
+            list.hits.extend(suggested.iter().cloned().map(unscored));
+        }
         if !pages.is_empty() {
             list.headings
                 .push((list.hits.len(), GO_TO_HEADING.to_owned()));
@@ -144,12 +156,12 @@ mod tests {
     #[test]
     fn an_empty_field_lists_recent_under_its_heading() {
         let recent = vec!["cmd.splitDown".to_owned(), "cmd.gone".to_owned()];
-        let list = root(&rows(), "  ", &recent, Fallbacks::ALL);
+        let list = root(&rows(), "  ", &recent, &[], Fallbacks::ALL);
         assert_eq!(list.len(), 1);
         assert_eq!(list.hits[0].row.id, "cmd.splitDown");
         assert_eq!(list.heading_before(0), Some(RECENT_HEADING));
         assert_eq!(list.heading_before(1), None);
-        assert!(root(&rows(), "", &[], Fallbacks::ALL).is_empty());
+        assert!(root(&rows(), "", &[], &[], Fallbacks::ALL).is_empty());
     }
 
     #[test]
@@ -158,13 +170,13 @@ mod tests {
         pool.push(Row::new(Kind::Scope, "themes", "Themes…"));
         pool.push(Row::new(Kind::Scope, "settings", "All Settings…"));
         pool.push(Row::new(Kind::Scope, "menu.Edit", "Edit"));
-        let list = root(&pool, "", &[], Fallbacks::ALL);
+        let list = root(&pool, "", &[], &[], Fallbacks::ALL);
         let ids: Vec<_> = list.hits.iter().map(|hit| hit.row.id.as_str()).collect();
         assert_eq!(ids, ["scope.themes", "scope.settings"]);
         assert_eq!(list.heading_before(0), Some(GO_TO_HEADING));
         // A page Recent already shows is not listed twice.
         let recent = vec!["scope.themes".to_owned()];
-        let list = root(&pool, "", &recent, Fallbacks::ALL);
+        let list = root(&pool, "", &recent, &[], Fallbacks::ALL);
         let ids: Vec<_> = list.hits.iter().map(|hit| hit.row.id.as_str()).collect();
         assert_eq!(ids, ["scope.themes", "scope.settings"]);
         assert_eq!(list.heading_before(0), Some(RECENT_HEADING));
@@ -172,8 +184,24 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_field_lists_what_is_suggested_between_recent_and_the_pages() {
+        let mut pool = rows();
+        pool.push(Row::new(Kind::Scope, "themes", "Themes…"));
+        let suggested = vec![Row::new(Kind::Tab, "7", "api")];
+        let recent = vec!["cmd.splitDown".to_owned()];
+        let list = root(&pool, "", &recent, &suggested, Fallbacks::ALL);
+        let ids: Vec<_> = list.hits.iter().map(|hit| hit.row.id.as_str()).collect();
+        assert_eq!(ids, ["cmd.splitDown", "tab.7", "scope.themes"]);
+        assert_eq!(list.heading_before(1), Some(SUGGESTED_HEADING));
+        assert_eq!(list.heading_before(2), Some(GO_TO_HEADING));
+        // A query lists none of it.
+        let found = root(&pool, "split", &recent, &suggested, Fallbacks::ALL);
+        assert!(found.hits.iter().all(|hit| hit.row.id != "tab.7"));
+    }
+
+    #[test]
     fn a_query_lists_clusters_and_closes_with_the_fallbacks_that_exist() {
-        let list = root(&rows(), "spr", &[], Fallbacks::ALL);
+        let list = root(&rows(), "spr", &[], &[], Fallbacks::ALL);
         assert_eq!(list.hits[0].row.id, "cmd.splitRight");
         assert_eq!(list.heading_before(0), Some("Commands"));
         let ids: Vec<_> = list.hits.iter().map(|hit| hit.row.id.as_str()).collect();
@@ -182,6 +210,7 @@ mod tests {
         let find_only = root(
             &rows(),
             "spr",
+            &[],
             &[],
             Fallbacks {
                 find: true,
@@ -199,7 +228,7 @@ mod tests {
 
     #[test]
     fn a_query_that_finds_nothing_still_offers_the_fallbacks() {
-        let list = root(&rows(), "zzzz", &[], Fallbacks::ALL);
+        let list = root(&rows(), "zzzz", &[], &[], Fallbacks::ALL);
         assert_eq!(list.len(), 2);
         assert_eq!(list.heading_before(0), Some("Search"));
     }

@@ -12,6 +12,7 @@
 use bt_core::{Settings, SettingsEdit};
 
 use super::catalog::{self, Control};
+use super::history::{self, Commands};
 use super::menu::MenuRows;
 use super::row::{Kind, Row, Scope, Slot};
 use super::state::Modifier;
@@ -33,11 +34,24 @@ pub struct Sources<'a> {
     pub places: &'a Places,
     /// The folders, the servers and the ports.
     pub targets: &'a Targets,
+    /// The commands the open panes ran.
+    pub commands: &'a Commands,
+    /// The keys of the ports that started listening since the palette was last opened.
+    pub fresh_ports: &'a [String],
 }
 
 /// The pages the root offers beside what a query finds.
-fn go_to() -> [Row; 2] {
+fn go_to() -> [Row; 3] {
     [
+        Row::new(Kind::Scope, "history", "Command History…")
+            .keywords("commands ran previous terminal shell output")
+            .opens(
+                Scope::History {
+                    jump: false,
+                    query: None,
+                },
+                true,
+            ),
         Row::new(Kind::Scope, "themes", "Themes…")
             .keywords("theme colors color scheme appearance dark light")
             .opens(Scope::Theme(Slot::Active), true),
@@ -75,13 +89,23 @@ pub fn root_rows(src: &Sources<'_>) -> Vec<Row> {
     rows.extend(targets::folder_rows(src.targets));
     rows.extend(targets::host_rows(src.targets));
     rows.extend(targets::port_rows(src.targets));
+    rows.extend(history::command_rows(src.commands, false));
     rows.extend(go_to());
     rows.extend(targets::go_to(src.targets));
     rows
 }
 
-/// The rows of the page `scope` names. A page that lists something later phases bring is empty
-/// (the command history).
+/// What the root suggests when the field is empty ([`history::suggested`]).
+pub fn suggested_rows(src: &Sources<'_>) -> Vec<Row> {
+    history::suggested(
+        src.places,
+        src.commands,
+        &src.targets.ports,
+        src.fresh_ports,
+    )
+}
+
+/// The rows of the page `scope` names.
 /// (The tabs page lists them in the order of [`switch::tab_list`]'s empty field; its headings
 /// and its clusters are that function's.)
 pub fn page_rows(scope: &Scope, src: &Sources<'_>) -> Vec<Row> {
@@ -104,6 +128,8 @@ pub fn page_rows(scope: &Scope, src: &Sources<'_>) -> Vec<Row> {
         Scope::Folders => targets::folder_rows(src.targets),
         Scope::Hosts => targets::host_rows(src.targets),
         Scope::Ports => targets::port_rows(src.targets),
+        Scope::History { jump, .. } => history::command_rows(src.commands, *jump),
+        Scope::HistoryActions(_) => history::actions(scope, src.commands),
         _ => Vec::new(),
     }
 }
@@ -218,6 +244,8 @@ mod tests {
             themes: &themes,
             places: &Places::default(),
             targets: &Targets::default(),
+            commands: &Commands::default(),
+            fresh_ports: &[],
         });
         let ids = ids(&rows);
         assert!(ids.contains(&"cmd.makeFontBigger"));
@@ -245,6 +273,8 @@ mod tests {
             themes: &themes,
             places: &places,
             targets: &Targets::default(),
+            commands: &Commands::default(),
+            fresh_ports: &[],
         };
         assert_eq!(page_rows(&Scope::Settings, &src).len(), 34);
         let themed = page_rows(&Scope::Theme(Slot::Active), &src);
@@ -287,6 +317,8 @@ mod tests {
             themes: &themes,
             places: &Places::default(),
             targets: &targets,
+            commands: &Commands::default(),
+            fresh_ports: &[],
         };
         let root = root_rows(&src);
         let root = ids(&root);

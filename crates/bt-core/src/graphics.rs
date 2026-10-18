@@ -72,6 +72,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::Term;
 
 use crate::pointer::PointerShapes;
+use crate::shell::BlockKey;
 
 pub(crate) use apc::Collector;
 pub(crate) use place::Motion;
@@ -805,6 +806,12 @@ pub(crate) trait Sink: Send + Sync {
     /// ([`crate::Session::pointer_shape`]). No frame — the pointer is not
     /// drawn by the renderer.
     fn pointer_changed(&self);
+
+    /// A program is about to take the alternate screen: the newest block on the screen it
+    /// leaves, with its command's text (`None` when nothing anchored is there). The command
+    /// memory ([`crate::history`]) keeps it, because once the screen is taken the rows are out of
+    /// reach. A stream with no memory to keep it in lets it go.
+    fn leaving_primary_screen(&self, _newest: Option<(BlockKey, String)>) {}
 }
 
 #[cfg(test)]

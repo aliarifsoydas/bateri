@@ -932,6 +932,9 @@ struct ShellWake {
     /// Whether the search count's scrollback news is waiting on the main
     /// queue — `title_pending`'s twin.
     search_pending: Arc<AtomicBool>,
+    /// Whether the command memory's turn is waiting on the main queue
+    /// ([`TerminalPane::remember_commands`]) — `search_pending`'s twin: at most one job.
+    memory_pending: Arc<AtomicBool>,
     /// The remote-session probe's arm and pending job; `Arc`, because
     /// the main queue's job holds it.
     remote_probe: Arc<RemoteProbe>,
@@ -1319,6 +1322,26 @@ impl ShellWake {
     /// A shell edge: the pane's state goes to the holder on the next
     /// main-queue turn — `state_blob` takes the ledger's lock and must not
     /// run here (reader thread, possibly under the `Term` lock).
+    /// A command started: the main queue's next turn reads its line into the pane's command
+    /// memory ([`bt_core::Session::remember_commands`]) while the rows that carry it are still
+    /// on the grid. At most one job waits; a second start folds into it (the memory reads
+    /// every command since its last look). Reader thread, the `Term` lock may be held.
+    fn remember_soon(&self) {
+        if self.memory_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let pending = Arc::clone(&self.memory_pending);
+        let (id, lookup) = (self.id, self.lookup);
+        DispatchQueue::main().exec_async(move || {
+            pending.store(false, Ordering::Release);
+            // audit: a block running on the main queue is on the main thread by definition.
+            let mtm = MainThreadMarker::new().expect("the main queue is the main thread");
+            if let Some(pane) = lookup(mtm, id) {
+                pane.remember_commands();
+            }
+        });
+    }
+
     fn push_state_soon(&self) {
         if !self.kept() || self.state_pending.swap(true, Ordering::AcqRel) {
             return;
@@ -1510,6 +1533,7 @@ impl Wake for ShellWake {
             return;
         }
         self.push_state_soon();
+        self.remember_soon();
         if self.remote_probe.command_started() {
             self.dispatch_remote_probe();
         }
@@ -1538,6 +1562,9 @@ impl Wake for ShellWake {
         // or ended — the tab's indicator alone hears it, and its icon: the command's line is
         // all there is to know the program by on this side.
         self.announce_activity();
+        if !self.timed {
+            self.remember_soon();
+        }
         if !self.timed && self.identity_probe.command_started() {
             self.dispatch_identity_probe(None);
         }
@@ -2398,6 +2425,10 @@ define_class!(
             } else if action == Some(sel!(forgetPassword:)) {
                 // A remote tab with a saved password.
                 self.can_forget_password()
+            } else if action == Some(sel!(copyLastCommand:)) || action == Some(sel!(copyLastOutput:))
+            {
+                // Something has run in this pane.
+                self.session().is_some_and(|session| session.has_commands())
             } else if action == Some(sel!(copyFolderPath:)) {
                 self.folder_text().is_some()
             } else if action == Some(sel!(showFolderInFinder:)) {
@@ -2425,6 +2456,34 @@ define_class!(
         #[unsafe(method(forgetPassword:))]
         fn forget_password_sent(&self, _sender: Option<&AnyObject>) {
             self.forget_password();
+        }
+
+        /// Edit ▸ Copy Last Command: the line of the newest command this pane ran, on the
+        /// pasteboard.
+        #[unsafe(method(copyLastCommand:))]
+        fn copy_last_command_sent(&self, _sender: Option<&AnyObject>) {
+            match self.session().and_then(|session| session.last_remembered()) {
+                Some((_, text)) => {
+                    clipboard::copy(&NSPasteboard::generalPasteboard(), Some(text));
+                }
+                None => crate::preview::beep(),
+            }
+        }
+
+        /// Edit ▸ Copy Last Output: the newest command's output, on the pasteboard — nothing
+        /// (a beep) once its rows have left the history or while a program holds the screen.
+        #[unsafe(method(copyLastOutput:))]
+        fn copy_last_output_sent(&self, _sender: Option<&AnyObject>) {
+            let output = self.session().and_then(|session| {
+                let (id, _) = session.last_remembered()?;
+                session.command_output(id)
+            });
+            match output {
+                Some(text) if !text.is_empty() => {
+                    clipboard::copy(&NSPasteboard::generalPasteboard(), Some(text));
+                }
+                _ => crate::preview::beep(),
+            }
         }
 
         /// Shell ▸ Copy Folder Path: this pane's folder on the pasteboard — the path, or
@@ -2598,6 +2657,7 @@ impl TerminalPane {
                 pending_copy: Arc::default(),
                 title_pending: Arc::default(),
                 search_pending: Arc::default(),
+                memory_pending: Arc::default(),
                 remote_probe: Arc::default(),
                 login_probe: Arc::default(),
                 program_probe: Arc::default(),
@@ -3209,6 +3269,32 @@ impl TerminalPane {
         };
         let top = info.depth.saturating_sub(2) as f32;
         session.scroll_to(top, self.ivars().smooth_scroll.get());
+        self.poke_scrollbar();
+        true
+    }
+
+    /// Reads the lines of the commands that started into the pane's command memory
+    /// ([`bt_core::Session::remember_commands`]); the main queue's turn after a start.
+    pub(crate) fn remember_commands(&self) {
+        if let Some(session) = self.session() {
+            session.remember_commands();
+        }
+    }
+
+    /// The window goes to command `id`'s row: it goes two rows below the window's top, as a click
+    /// on its block mark does ([`Self::go_to_block`]). `false` once its row has left the history
+    /// or while a program holds the screen.
+    pub(crate) fn show_command(&self, id: CommandId) -> bool {
+        let Some(session) = self.session() else {
+            return false;
+        };
+        let Some(depth) = session.command_depth(id) else {
+            return false;
+        };
+        session.scroll_to(
+            depth.saturating_sub(2) as f32,
+            self.ivars().smooth_scroll.get(),
+        );
         self.poke_scrollbar();
         true
     }
@@ -5792,6 +5878,23 @@ fn new_pane_uuid() -> PaneUuid {
 
 #[cfg(test)]
 mod tests {
+    /// The command memory is filled on the start of a command, while its rows are on the grid: a
+    /// start edge that does not ask for the memory's turn loses the command from the palette's
+    /// history without anything failing. A source scan: the edges are the reader thread's.
+    #[test]
+    fn both_start_edges_ask_for_the_command_memorys_turn() {
+        let source = include_str!("pane.rs");
+        let code = &source[..source.find("#[cfg(test)]").expect("the tests follow")];
+        let body = |signature: &str| {
+            let start = code.find(signature).expect("the method is in this file");
+            let rest = &code[start + signature.len()..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        assert!(body("    fn command_started(&self) {").contains("self.remember_soon()"));
+        assert!(body("    fn remote_command_edge(&self) {").contains("self.remember_soon()"));
+        assert!(body("    fn remember_soon(&self) {").contains("pane.remember_commands()"));
+    }
+
     #[test]
     fn pane_uuids_are_canonical_and_distinct() {
         let (a, b) = (super::new_pane_uuid(), super::new_pane_uuid());

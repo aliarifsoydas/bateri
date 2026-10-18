@@ -4,11 +4,11 @@
 //! Forget Password, Cancel Upload, Open Port ▸, Go to Folder…, Copy Folder Path, Show Folder in
 //! Finder, Split
 //! Right, Split Down, Close Tab/Close, Close Window), Edit (Undo Move, Cut, Copy, Paste, Paste
-//! Escaped Text, Select All, Clear to Start, Clear Scrollback, Find ▸
+//! Escaped Text, Select All, Copy Last Command, Copy Last Output, Clear to Start, Clear Scrollback, Find ▸
 //! Find…/Find Next/Find Previous/Use Selection for Find), View (Theme ▸, Tabs ▸,
 //! Bigger, Smaller, Actual Size, Scroll to Top, Scroll to Bottom, Page Up,
 //! Page Down) and Window (Minimize,
-//! Zoom, Show Previous/Next Tab, Go to Tab…, Select Tab ▸, Show All Tabs, Rename Tab…, splits — Select Previous/Next
+//! Zoom, Show Previous/Next Tab, Go to Tab…, Jump to Command…, Select Tab ▸, Show All Tabs, Rename Tab…, splits — Select Previous/Next
 //! Split, Select Split ▸, Resize Split ▸, Equalize Splits, Zoom Split —, Move
 //! Tab to New Window, Merge All Windows, Bring All to Front). Settings… (⌘,) opens the settings window
 //! (`settings_window`; it used to open the file in the editor, that job is now
@@ -19,7 +19,7 @@
 //! `selectAll:` to the first responder `BateriView` (Cut's enablement is in its
 //! `validateMenuItem:` — only while there is a dock selection and the editing gate
 //! is open; Paste Escaped Text's while the pasteboard has text); the font-size
-//! actions, Find ▸'s four actions, the two clearing actions, the four
+//! actions, Find ▸'s four actions, `copyLastCommand:`/`copyLastOutput:`, the two clearing actions, the four
 //! scrolling actions (grey on the alternate screen) and `cancelUpload:`
 //! to the focused pane (`pane::TerminalPane`, `BateriView`'s parent view);
 //! `closeTab:`, `closeWindow:`, `selectTab:`, `showNextTab:`,
@@ -40,9 +40,9 @@
 //! `toggleHostIntegration:`
 //! (its title, checkmark and grey state in the app delegate's
 //! `validateMenuItem:`, from [`integration_menu`]) and
-//! `toggleCommandPalette:`, `goToTab:` and `goToFolder:` (View ▸ Command Palette… ⇧⌘P, Window ▸ Go
-//! to Tab… ⌘P, Shell ▸ Go to Folder… ⌘O: the key window's palette; grey while a question is up on
-//! it) and
+//! `toggleCommandPalette:`, `goToTab:`, `goToFolder:` and `jumpToCommand:` (View ▸ Command
+//! Palette… ⇧⌘P, Window ▸ Go to Tab… ⌘P, Shell ▸ Go to Folder… ⌘O, Window ▸ Jump to Command…: the
+//! key window's palette; grey while a question is up on it) and
 //! `newWindow:`/`newTab:`/`newLocalTab:`/`quitAndEndPrograms:` to the app delegate
 //! (the same path as the settings record's `settingsDidChange:` — they spread to all
 //! windows or must work even when there is no window);
@@ -478,6 +478,10 @@ pub(crate) fn install(
             NSMenuItem::separatorItem(mtm),
             item(mtm, "Select All", sel!(selectAll:), "a"),
             NSMenuItem::separatorItem(mtm),
+            // The command memory's two (`TerminalPane`): the newest command's line and output.
+            item(mtm, "Copy Last Command", sel!(copyLastCommand:), ""),
+            item(mtm, "Copy Last Output", sel!(copyLastOutput:), ""),
+            NSMenuItem::separatorItem(mtm),
             // Terminal.app's place and shortcuts; the selectors are
             // our own names, the handler is `TerminalPane`.
             item(mtm, "Clear to Start", sel!(clearToStart:), "k"),
@@ -709,6 +713,9 @@ pub(crate) fn install(
             // The palette's tabs page (⌘P): handled by the app delegate, like the palette's own
             // item. Open, the same key takes the highlight one tab further.
             item(mtm, "Go to Tab\u{2026}", sel!(goToTab:), "p"),
+            // The command history with ⏎ going to a command's output: the app delegate's, no
+            // key (the palette's Command History… is the same list with ⏎ writing the line).
+            item(mtm, "Jump to Command\u{2026}", sel!(jumpToCommand:), ""),
             hidden_shortcut(with_modifiers(
                 item(mtm, "Show Previous Tab", sel!(showPreviousTab:), "\t"),
                 NSEventModifierFlags::Control | NSEventModifierFlags::Shift,

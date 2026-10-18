@@ -54,6 +54,11 @@ pub const GO_TO_TABS_ACTION: &str = "goToTab:";
 /// (`scope.folders`) with the menu item's own shortcut.
 pub const GO_TO_FOLDERS_ACTION: &str = "goToFolder:";
 
+/// The action of Window ▸ Jump to Command…: the **page** of the command history that goes to a
+/// command's output on ⏎ (`scope.jump`), not a command that would close the palette to open it
+/// again.
+pub const JUMP_TO_COMMAND_ACTION: &str = "jumpToCommand:";
+
 /// The actions of the items Select Tab ▸ and Select Group ▸ hold (⌘1…⌘9, ⌃⌘0…⌃⌘9): the tabs
 /// page lists the tabs and the groups themselves, with these very keys, so listing the items
 /// too would say each twice.
@@ -300,6 +305,17 @@ fn walk(
             level.push(page);
             continue;
         }
+        if selector == JUMP_TO_COMMAND_ACTION {
+            let page = MenuRow {
+                row: jump_page(node, path),
+                token: None,
+            };
+            if !under_paged && !out.flat.iter().any(|listed| listed.row.id == page.row.id) {
+                out.flat.push(page.clone());
+            }
+            level.push(page);
+            continue;
+        }
         let base = command_key(node, selector);
         let mut row = command(node, selector, path, &base);
         if ambiguous.contains(&base) {
@@ -344,6 +360,25 @@ fn folders_page(node: &MenuNode, path: &[String]) -> Row {
         .keywords(for_selector(GO_TO_FOLDERS_ACTION))
         .subtitle(path.join(" › "))
         .opens(Scope::Folders, true);
+    if let Some(glyphs) = shortcut(&node.key, node.modifiers) {
+        row = row.shortcut(glyphs);
+    }
+    row
+}
+
+/// The page row of Jump to Command…: the item's title, opening the command history with ⏎ going
+/// to the output.
+fn jump_page(node: &MenuNode, path: &[String]) -> Row {
+    let mut row = Row::new(Kind::Scope, "jump", node.title.clone())
+        .keywords(for_selector(JUMP_TO_COMMAND_ACTION))
+        .subtitle(path.join(" › "))
+        .opens(
+            Scope::History {
+                jump: true,
+                query: None,
+            },
+            true,
+        );
     if let Some(glyphs) = shortcut(&node.key, node.modifiers) {
         row = row.shortcut(glyphs);
     }
@@ -757,6 +792,30 @@ mod tests {
         assert_eq!(page.row.opens, Some(Scope::Folders));
         assert!(page.row.enters);
         assert_eq!(page.row.shortcut.as_deref(), Some("⌘O"));
+        assert_eq!(page.token, None, "a page runs no menu item");
+    }
+
+    #[test]
+    fn jump_to_command_is_the_history_page_that_goes_to_the_output() {
+        let bar = vec![MenuNode::holder(
+            0,
+            "Window",
+            vec![
+                MenuNode::item(1, "Jump to Command…", JUMP_TO_COMMAND_ACTION),
+                MenuNode::item(2, "Minimize", "performMiniaturize:"),
+            ],
+        )];
+        let menu = rows(&bar);
+        let page = &menu.flat[0];
+        assert_eq!(page.row.id, "scope.jump");
+        assert_eq!(
+            page.row.opens,
+            Some(Scope::History {
+                jump: true,
+                query: None
+            })
+        );
+        assert!(page.row.enters);
         assert_eq!(page.token, None, "a page runs no menu item");
     }
 

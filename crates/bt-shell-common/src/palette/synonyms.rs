@@ -30,6 +30,18 @@ const WORDS: &[(&str, &str)] = &[
     ("goToTab", "switch jump recent previous window"),
     ("goToFolder", "directory cd path open project change"),
     ("copyFolderPath", "directory pwd clipboard cwd"),
+    (
+        "jumpToCommand",
+        "scroll output history previous block result go",
+    ),
+    (
+        "copyLastCommand",
+        "previous history clipboard pasteboard line",
+    ),
+    (
+        "copyLastOutput",
+        "previous result clipboard pasteboard text",
+    ),
     ("showFolderInFinder", "reveal directory open"),
     ("moveGroupToNewWindow", "window pop out detach folder"),
     ("showNextTab", "switch"),
