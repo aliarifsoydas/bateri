@@ -1125,11 +1125,16 @@ tab_position = "top"
   the column, with the ⚠ of a settings problem beside it; a list longer than
   the window scrolls and fades at its ends, and Show All Tabs (⇧⌘\) opens its
   menu at the head of the list (the column has no button for it). The window
-  moves by the column's empty space and beside the traffic lights, and a press
-  on a pane's top line selects text as anywhere else. Rows are dragged as the
-  tabs of the bar are: drag one to reorder, out of the column to tear it off
-  into a window of its own, onto another window's column or bar to move it
-  there. A pane carried with ⌥⌘ and dropped on a row joins that tab; dropped
+  moves by the column's empty space and beside the traffic lights, and by the
+  blank strip along the top of the panes at the window's top edge — the margin
+  above their first line, within the title row's height — where a double click
+  zooms or minimizes as the system's title bar setting says; a press on a
+  pane's top line selects text as anywhere else. Under `content_edge = "fade"`
+  that strip is the fade; under `"cut"` and `"line"` it is only what is left
+  above the first line while no history stands there. Not in full screen.
+  Rows are dragged as the tabs of the bar are: drag one to reorder, out of the
+  column to tear it off into a window of its own, onto another window's column
+  or bar to move it there. A pane carried with ⌥⌘ and dropped on a row joins that tab; dropped
   between two rows it opens a new tab. One place for every window; it applies
   at once, and `"top"` brings the bar back as it was. A tab with one pane is
   set off from the column by a thin line in the divider's color; under

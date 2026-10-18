@@ -19,6 +19,14 @@ of every installed copy. A version without a section is not released.
   tab's from the moment it starts to go, so what you type or click right after
   ⏎ or esc is not lost. With Reduce Motion it still goes at once.
 
+### Fixed
+
+- **With the tabs at the side, the window moves by the top of its panes too.**
+  A press on the blank strip above the first line of a pane along the window's
+  top, within the height of a title bar, drags the window, and a double click
+  there zooms or minimizes as System Settings says, as on the tab column's
+  empty space; a press on the top line's text still selects it.
+
 ## [0.19.0] - 2026-10-18
 
 ### Added
