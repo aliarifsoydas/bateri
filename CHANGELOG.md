@@ -21,11 +21,13 @@ of every installed copy. A version without a section is not released.
 
 ### Fixed
 
-- **With the tabs at the side, the window moves by the top of its panes too.**
-  A press on the blank strip above the first line of a pane along the window's
-  top, within the height of a title bar, drags the window, and a double click
-  there zooms or minimizes as System Settings says, as on the tab column's
-  empty space; a press on the top line's text still selects it.
+- **With the tabs at the side, the window moves by an empty spot of the panes
+  along its top**, as Arc moves its window by an empty part of the page. A
+  press within a title bar's height of the window's top, on no text — the
+  margin above the first line or a blank cell — drags the window, and a double
+  click there zooms or minimizes as System Settings says, as on the tab
+  column's empty space; a press on text there selects it. A program that asked
+  for the mouse (vim, htop, tmux) keeps every press on its screen.
 
 ## [0.19.0] - 2026-10-18
 

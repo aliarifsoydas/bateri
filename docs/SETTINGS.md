@@ -1125,17 +1125,21 @@ tab_position = "top"
   the column, with the ⚠ of a settings problem beside it; a list longer than
   the window scrolls and fades at its ends, and Show All Tabs (⇧⌘\) opens its
   menu at the head of the list (the column has no button for it). The window
-  moves by the column's empty space and beside the traffic lights, and by the
-  blank strip along the top of the panes at the window's top edge — the margin
-  above their first line, within the title row's height — where a double click
-  zooms or minimizes as the system's title bar setting says; a press on a
-  pane's top line selects text as anywhere else. Under `content_edge = "fade"`
-  that strip is the fade; under `"cut"` and `"line"` it is only what is left
-  above the first line while no history stands there. Not in full screen.
-  Rows are dragged as the tabs of the bar are: drag one to reorder, out of the
-  column to tear it off into a window of its own, onto another window's column
-  or bar to move it there. A pane carried with ⌥⌘ and dropped on a row joins that tab; dropped
-  between two rows it opens a new tab. One place for every window; it applies
+  moves by the column's empty space and beside the traffic lights, and, as in
+  Arc, by an empty spot of the panes along the window's top: a press within a
+  title bar's height of the top, on no text — the margin above the first line,
+  or a blank cell (no letter, no colour of its own, no link, not selected) —
+  drags the window, and a double click there zooms or minimizes as the
+  system's title bar setting says. A press on text there selects it as
+  anywhere else; a drag that starts on a blank cell in that band moves the
+  window instead of selecting, so start a selection there on a letter (or
+  hold Shift to extend one). While a program has asked for the mouse (vim,
+  htop, tmux with `mouse on`) every press on its screen is the program's, as
+  today. Not in full screen, and not in a pane lower in a split tab. Rows are
+  dragged as the tabs of the bar are: drag one to reorder, out of the column
+  to tear it off into a window of its own, onto another window's column or bar
+  to move it there. A pane carried with ⌥⌘ and dropped on a row joins that
+  tab; dropped between two rows it opens a new tab. One place for every window; it applies
   at once, and `"top"` brings the bar back as it was. A tab with one pane is
   set off from the column by a thin line in the divider's color; under
   `split_style = "cards"` a split tab's cards and the column stand on the

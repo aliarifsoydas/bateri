@@ -4121,6 +4121,24 @@ fn visible_range<T>(selection: Option<&Selection>, term: &Term<T>) -> Option<Sel
     (range.end.line >= top && range.start.line <= bottom).then_some(range)
 }
 
+/// Whether a grid cell draws nothing a press could be aimed at: a space (or a cell never
+/// written), with no mark that a blank still carries — no glyph joined to it, no wide glyph's
+/// half, no underline or strike, not inverse, no background of its own (a program's status bar
+/// or a coloured prompt segment is drawn, even where it has no letter) and no OSC 8 link. Pure;
+/// [`Session::blank_at`]'s cell half.
+fn blank_cell(cell: &TermCell) -> bool {
+    let marked = Flags::INVERSE
+        | Flags::WIDE_CHAR
+        | Flags::WIDE_CHAR_SPACER
+        | Flags::ALL_UNDERLINES
+        | Flags::STRIKEOUT;
+    matches!(cell.c, ' ' | '\0')
+        && !cell.flags.intersects(marked)
+        && cell.bg == ansi::Color::Named(ansi::NamedColor::Background)
+        && cell.zerowidth().is_none()
+        && cell.hyperlink().is_none()
+}
+
 /// The point the link hit test asks about ([`Session::link_at`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkPoint {
@@ -8197,6 +8215,34 @@ impl Session {
         let report = mouse_report_at(encoding, byte, at, offset, pressed, self.adapter.cell_px());
         drop(term);
         self.send_report(report)
+    }
+
+    /// Whether a press at `at` (a cell of the visible window, as the mouse gives it) would land
+    /// on nothing: the press would be the terminal's — no mouse reporting claims it, the
+    /// arbitration of [`Session::mouse_button`] without Shift — and the cell draws nothing
+    /// ([`blank_cell`]) and is not in the selection on screen. `bt-shell` moves the window from
+    /// such a spot of the panes' top band, as from a title bar, with the tabs in the side
+    /// column; a press on anything else there stays the terminal's or the program's.
+    ///
+    /// The mode stays unaskable from outside ([`Session::mouse_button`]'s reason): the answer
+    /// folds it into "the press is nobody's", so a program that asked for the mouse (vim,
+    /// htop, tmux with `mouse on`) keeps every press on its screen, blank or not.
+    ///
+    /// **Journal-neutral:** reads only; one `Term` lock.
+    pub fn blank_at(&self, at: SelectionPoint) -> bool {
+        let term = self.term.lock();
+        if !matches!(
+            input::button_route(*term.mode(), false),
+            ButtonRoute::Select
+        ) {
+            return false;
+        }
+        let offset = term.grid().display_offset() as i32;
+        let point = viewport_point((at.col, at.row), offset);
+        if !in_grid(&term, point) || !blank_cell(&term.grid()[point]) {
+            return false;
+        }
+        !visible_range(term.selection.as_ref(), &term).is_some_and(|range| range.contains(point))
     }
 
     /// Sends the report; an empty report is [`Click::Ignored`]. The lock must be
@@ -24086,6 +24132,81 @@ mod tests {
             cell: at(col, row, CellHalf::Left),
             px: Some((col * 9 + dx, row * 18 + dy)),
         }
+    }
+
+    /// A cell is blank only while it draws nothing: a space or an unwritten cell, bold or
+    /// not; a glyph, an inverse or underlined space, a wide glyph's half, a background of its
+    /// own, a joined mark or an OSC 8 link is something to aim at.
+    #[test]
+    fn a_blank_cell_draws_nothing_at_all() {
+        let with = |change: &dyn Fn(&mut TermCell)| {
+            let mut cell = TermCell::default();
+            change(&mut cell);
+            blank_cell(&cell)
+        };
+        assert!(with(&|_| {}), "a cell never written");
+        assert!(with(&|cell| cell.c = '\0'));
+        assert!(
+            with(&|cell| cell.flags.insert(Flags::BOLD)),
+            "bold draws nothing on a space"
+        );
+        assert!(!with(&|cell| cell.c = 'a'), "a glyph");
+        assert!(!with(&|cell| cell.flags.insert(Flags::INVERSE)), "a block");
+        assert!(!with(&|cell| cell.flags.insert(Flags::UNDERLINE)), "a line");
+        assert!(!with(&|cell| cell.flags.insert(Flags::STRIKEOUT)), "a line");
+        assert!(
+            !with(&|cell| cell.flags.insert(Flags::WIDE_CHAR_SPACER)),
+            "a wide glyph's right half"
+        );
+        assert!(
+            !with(&|cell| cell.bg = ansi::Color::Indexed(4)),
+            "a status bar's ground"
+        );
+        assert!(
+            !with(&|cell| cell.push_zerowidth('\u{301}')),
+            "a joined mark"
+        );
+        assert!(!with(&|cell| {
+            cell.set_hyperlink(Some(Hyperlink::new(None::<String>, "https://x.io".into())));
+        }));
+    }
+
+    /// The spot a press may move the window from: a blank cell, not in the selection, while no
+    /// program has asked for the mouse — then every press is the program's, blank or not.
+    #[test]
+    fn a_blank_spot_is_nobodys_until_a_program_takes_the_mouse() {
+        let (session, _wake) = dump_session(40, "printf 'ab  cd\\033[?2004h'", |mode| {
+            mode.contains(TermMode::BRACKETED_PASTE)
+        });
+        assert!(!session.blank_at(at(0, 0, CellHalf::Left)), "a glyph");
+        assert!(
+            session.blank_at(at(2, 0, CellHalf::Left)),
+            "the space between words"
+        );
+        assert!(
+            session.blank_at(at(30, 0, CellHalf::Right)),
+            "past the line's end"
+        );
+        assert!(!session.blank_at(at(40, 0, CellHalf::Left)), "off the grid");
+        session.set_selection(
+            SelectKind::Simple,
+            at(1, 0, CellHalf::Left),
+            at(4, 0, CellHalf::Right),
+        );
+        assert!(
+            !session.blank_at(at(2, 0, CellHalf::Left)),
+            "the selection is drawn there"
+        );
+        assert!(session.blank_at(at(10, 0, CellHalf::Left)));
+
+        let (mouse, _wake) = dump_session(40, "printf 'ab  cd\\033[?1000h'", |mode| {
+            mode.contains(TermMode::MOUSE_REPORT_CLICK)
+        });
+        assert!(
+            !mouse.blank_at(at(2, 0, CellHalf::Left)),
+            "the program's press"
+        );
+        assert!(!mouse.blank_at(at(30, 0, CellHalf::Left)));
     }
 
     #[test]

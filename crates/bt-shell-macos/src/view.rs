@@ -306,7 +306,8 @@ fn cell_at(
 /// [`OutOfGrid::Clamp`] calls it the edge: in the fade, where a row only thins away, or anywhere
 /// above the origin while no fill band is drawn there. The band's rows below the fade are the
 /// scrollback's text, seen if not selectable, and a press on them stays the pane's; so does a
-/// grid row a tall dock band lifted into the fade, which is not above the origin.
+/// grid row a tall dock band lifted into the fade, which is not above the origin. The grid's own
+/// rows answer for themselves, cell by cell ([`Session::blank_at`]).
 pub(crate) fn blank_above_grid(
     window_y_px: f64,
     origin_px: f64,
@@ -2370,11 +2371,13 @@ impl BateriView {
         if button == MouseButton::Left && self.context_control(event) {
             return;
         }
-        // **The pane's blank top under the title row moves the window** with the tabs in the
-        // side column, as the title bar it stands in for would ([`Self::grabs_window`]): above
-        // the first row, so the press would have started nothing here.
+        // **An empty spot of the pane's top under the title row moves the window** with the
+        // tabs in the side column, as the title bar it stands in for would
+        // ([`Self::grabs_window`]): the margin above the first row, or a blank cell of the rows
+        // in the band that no program's mouse claims. Before the ledger: the press begins no
+        // gesture of the pane's.
         if button == MouseButton::Left
-            && let Some(window) = self.grabs_window(event)
+            && let Some(window) = self.grabs_window(event, session)
         {
             crate::tab_bar::title_press(&window, event);
             return;
@@ -2649,19 +2652,39 @@ impl BateriView {
         )
     }
 
-    /// The window a press on this pane moves, with the tabs in the side column: the press is in
-    /// the title row's band at the window's top and over the pane's blank top — its margin or
-    /// fade above the first row, no text ([`blank_above_grid`]) — and the window is not in full
-    /// screen (`tabs::side_grab`). `None` for every other press, which stays the pane's: with the
-    /// tabs in the title row, on the top line's text, in a pane lower in a split tab, and in a
-    /// pane embedded in another application (no window of ours to ask the row of).
+    /// The window a press on this pane moves, with the tabs in the side column — Arc's way: an
+    /// empty spot near the window's top is the window's to drag. The press is plain (no
+    /// modifier: Shift extends a selection, ⌘ opens a link, ⌥⌘ carries the pane), in the title
+    /// row's band at the window's top, the window not in full screen (`tabs::side_grab`), and
+    /// over no text:
+    ///
+    /// - the margin or the fade above the grid's first row ([`blank_above_grid`]), or
+    /// - a cell of the grid that draws nothing, is not in the selection and is not a program's
+    ///   to report — [`Session::blank_at`], where the mouse mode stays; a program that asked
+    ///   for the mouse (vim, htop, tmux) keeps every press on its screen.
+    ///
+    /// Not the dock's input line, which has its own presses. `None` for every other press,
+    /// which stays the pane's: with the tabs in the title row, on the top line's text (a
+    /// selection starts there as anywhere), below the band, in a pane lower in a split tab, and
+    /// in a pane embedded in another application (no window of ours to ask the row of). The
+    /// trade is Arc's and kept to the band: a drag that starts on a blank cell there moves the
+    /// window instead of selecting; started on a letter, it selects.
     ///
     /// The window server leaves this band to the panes ([`crate::tab_bar::RowClaim`] claims it,
     /// so a press on the top line selects instead of moving the window); the move is this
     /// press's own, `performWindowDragWithEvent:` as from the column's empty part.
-    fn grabs_window(&self, event: &NSEvent) -> Option<Retained<NSWindow>> {
+    fn grabs_window(&self, event: &NSEvent, session: &Session) -> Option<Retained<NSWindow>> {
         let mtm = self.mtm();
         if !crate::window::tabs_at_side(mtm) {
+            return None;
+        }
+        let plain = !event.modifierFlags().intersects(
+            NSEventModifierFlags::Shift
+                | NSEventModifierFlags::Command
+                | NSEventModifierFlags::Option
+                | NSEventModifierFlags::Control,
+        );
+        if !plain {
             return None;
         }
         let window = self.window()?;
@@ -2673,13 +2696,21 @@ impl BateriView {
         // (a full-size content view), so its height is where the window's top is.
         let at = event.locationInWindow();
         let from_top = window.contentView()?.frame().size.height - at.y;
+        // The band first: a press below it asks nothing of the grid.
+        if !crate::tabs::side_grab(from_top, row, full_screen, true)
+            || self.window_point_dock(at, OutOfGrid::Reject).is_some()
+        {
+            return None;
+        }
         let origin = self.origin();
         let blank = blank_above_grid(
             self.convertPoint_fromView(at, None).y * window.backingScaleFactor(),
             origin.map_or(0.0, |origin| f64::from(origin.px())),
             origin.map_or(0.0, |origin| f64::from(origin.edge_px())),
             origin.map_or(0, Origin::fill_rows),
-        );
+        ) || self
+            .window_point_pointer(at, OutOfGrid::Reject)
+            .is_some_and(|pointer| session.blank_at(pointer.cell));
         crate::tabs::side_grab(from_top, row, full_screen, blank).then_some(window)
     }
 

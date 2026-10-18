@@ -1185,13 +1185,14 @@ pub fn side_width(wanted: f64, window: f64) -> f64 {
 
 /// Whether a press on a pane moves the window, with the tabs in the side column. There is no
 /// title row over the content then — the panes start at the window's top — so the window is
-/// moved, besides by the column's empty part, by the panes' blank top: a press `from_top` points
-/// below the window's top, within the title row's height (`row`), on a part of a pane that draws
-/// no text to aim at (`blank`: the pane's margin above its first row, or the fade the rows thin
-/// away in — the pane's to say). A press on text there is the pane's, so a selection starts on
-/// the top line as anywhere else; below the band a pane's blank part stays the pane's, so only
-/// the panes along the window's top edge move it, and a pane lower in a split tab never does. In
-/// full screen nothing moves the window.
+/// moved, besides by the column's empty part, by an empty spot of the panes near the top, the
+/// way Arc moves its window by an empty part of the page: a press `from_top` points below the
+/// window's top, within the title row's height (`row`), on a part of a pane that draws no text
+/// to aim at (`blank`, the pane's to say: its margin above the first row, the fade the rows
+/// thin away in, or a blank cell no program's mouse claims). A press on text there is the
+/// pane's, so a selection starts on the top line as anywhere else; below the band every part of
+/// a pane stays the pane's, so only the panes along the window's top edge move it, and a pane
+/// lower in a split tab never does. In full screen nothing moves the window.
 pub fn side_grab(from_top: f64, row: f64, full_screen: bool, blank: bool) -> bool {
     blank && !full_screen && (0.0..row).contains(&from_top)
 }

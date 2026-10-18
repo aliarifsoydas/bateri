@@ -358,7 +358,7 @@ pub(crate) fn title_double_click(action: Option<&str>, legacy_minimize: bool) ->
 }
 
 /// A press that stands for one on the title bar — on the bar's or the column's empty part
-/// ([`TabBar`]'s `mouseDown:`), or on a pane's blank top margin under the title row with the tabs
+/// ([`TabBar`]'s `mouseDown:`), or on an empty spot of a pane under the title row with the tabs
 /// in the side column (`BateriView`'s press): one click moves `window`
 /// (`performWindowDragWithEvent:`), a double click does what the system's setting says
 /// ([`title_double_click`]). One body, so every place that moves the window answers the double
