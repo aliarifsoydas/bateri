@@ -12,6 +12,8 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-18
+
 ### Added
 
 - **A command palette.** ⇧⌘P (View ▸ Command Palette…) opens one search field
