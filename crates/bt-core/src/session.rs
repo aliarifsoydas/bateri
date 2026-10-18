@@ -60,7 +60,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener, OnResize, VoidListener, WindowSize};
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::sync::FairMutex;
@@ -3341,9 +3341,9 @@ fn last_ink_in_row<T>(term: &Term<T>, row: u16, offset: i32) -> Option<char> {
 /// (`-history..rows`); the row cannot be cell-less but an iterator is used
 /// instead of indexing, because panic is banned in `bt-core` (the precedent is
 /// the fill loop's `zip`).
-pub(crate) fn row_identity<T>(term: &Term<T>, line: Line) -> usize {
-    let line = line.grid_clamp(term, Boundary::Grid);
-    (&term.grid()[line])
+pub(crate) fn row_identity<R: Rows>(rows: &R, line: Line) -> usize {
+    let line = line.grid_clamp(rows, Boundary::Grid);
+    (&rows.cells()[line])
         .into_iter()
         .next()
         .map_or(0, |cell| std::ptr::from_ref(cell) as usize)
@@ -3391,10 +3391,10 @@ fn block_start_near<T>(term: &Term<T>, line: i64, key: BlockKey, boundary: usize
 /// Row `line`'s text, every cell as its character (a hidden one as a space, the spacers of a wide
 /// character skipped), and whether the row runs on into the next (a soft wrap). The trailing
 /// blanks are the caller's to trim.
-pub(crate) fn row_text<T>(term: &Term<T>, line: i32) -> (String, bool) {
+pub(crate) fn row_text<R: Rows>(rows: &R, line: i32) -> (String, bool) {
     let mut piece = String::new();
     let mut wrapped = false;
-    for cell in &term.grid()[Line(line)] {
+    for cell in &rows.cells()[Line(line)] {
         wrapped = cell.flags.contains(Flags::WRAPLINE);
         if cell.flags.intersects(SPACERS) {
             continue;
@@ -3411,20 +3411,34 @@ pub(crate) fn row_text<T>(term: &Term<T>, line: i32) -> (String, bool) {
     (piece, wrapped)
 }
 
+/// Block `key`'s command text and its start row's depth in `rows` (rows from the top of the
+/// history), found walking up from the bottom. `None` when the row is not there or is past
+/// `boundary` ([`Session::clear_boundary`]).
+fn block_start<R: Rows>(rows: &R, key: BlockKey, boundary: usize) -> Option<(String, u32)> {
+    let (top, bottom) = (rows.topmost_line().0, rows.bottommost_line().0);
+    let line = (top..=bottom).rev().find(|&probe| {
+        row_block(rows, Line(probe)) == Some(key)
+            && !block_row_continues(rows, Line(probe - 1), key, boundary)
+    })?;
+    let history = i64::try_from(rows.history_size()).ok()?;
+    let depth = u32::try_from(i64::from(line) + history).ok()?;
+    Some((block_text(rows, line, key), depth))
+}
+
 /// The command's text from its start row: the rows carrying `key`, a
 /// wrapped row run on into the next, the others joined with a space, trimmed
 /// — one line for the tip. Bounded: a pasted script carries the anchor on
 /// every row and the tip shows only its beginning anyway.
-pub(crate) fn block_text<T>(term: &Term<T>, start: i32, key: BlockKey) -> String {
+pub(crate) fn block_text<R: Rows>(rows: &R, start: i32, key: BlockKey) -> String {
     const MOST_ROWS: i32 = 8;
     const MOST_CHARS: usize = 512;
-    let bottom = term.bottommost_line().0;
+    let bottom = rows.bottommost_line().0;
     let mut text = String::new();
     let mut line = start;
     while line <= bottom.min(start.saturating_add(MOST_ROWS - 1))
-        && row_block(term, Line(line)) == Some(key)
+        && row_block(rows, Line(line)) == Some(key)
     {
-        let (piece, wrapped) = row_text(term, line);
+        let (piece, wrapped) = row_text(rows, line);
         if wrapped {
             text.push_str(&piece);
         } else {
@@ -3531,13 +3545,35 @@ enum ClearKind {
     Scrollback,
 }
 
+/// Rows the command readers can read: a `Term`'s screen, or a bare grid — the primary screen's,
+/// while a full screen program covers it ([`Term::hidden_primary_grid`]). The readers
+/// ([`row_block`], [`row_text`], [`block_text`], [`block_row_continues`], [`row_identity`] and
+/// the command history's) ask nothing of the rows but the cells and the extent, so one body
+/// serves both and a block's rows are found the same way on either screen.
+pub(crate) trait Rows: Dimensions {
+    /// The grid the rows are read from.
+    fn cells(&self) -> &Grid<TermCell>;
+}
+
+impl<T> Rows for Term<T> {
+    fn cells(&self) -> &Grid<TermCell> {
+        self.grid()
+    }
+}
+
+impl Rows for Grid<TermCell> {
+    fn cells(&self) -> &Grid<TermCell> {
+        self
+    }
+}
+
 /// The block key carried by screen row `line` — the row form of
 /// [`block_key`], the reading idiom of [`block_row_continues`]. The first
 /// found wins: two blocks' anchors cannot be on one row (the link closes at
 /// `preexec`). Both namespaces: inside ssh the remote prompt's anchor is what
 /// tells ⌘K which rows are the input's.
-pub(crate) fn row_block<T>(term: &Term<T>, line: Line) -> Option<BlockKey> {
-    term.grid()[line]
+pub(crate) fn row_block<R: Rows>(rows: &R, line: Line) -> Option<BlockKey> {
+    rows.cells()[line]
         .into_iter()
         .find_map(|cell| cell.hyperlink().and_then(|link| block_key(link.uri())))
 }
@@ -4531,24 +4567,24 @@ fn link_spans<T>(term: &Term<T>, first: Point, last: Point, offset: i32) -> Vec<
 /// [`Session::clear_boundary`]) is `false` too: the prompt Ctrl-L reprints
 /// carries the same id and must not lose its marker. The scan stops at the
 /// first match, once per row.
-pub(crate) fn block_row_continues<T>(
-    term: &Term<T>,
+pub(crate) fn block_row_continues<R: Rows>(
+    rows: &R,
     line: Line,
     id: BlockKey,
     boundary: usize,
 ) -> bool {
-    if line < term.topmost_line() || line > term.bottommost_line() {
+    if line < rows.topmost_line() || line > rows.bottommost_line() {
         return false;
     }
-    if boundary != 0 && row_identity(term, line) == boundary {
+    if boundary != 0 && row_identity(rows, line) == boundary {
         return false;
     }
     // `grid_clamp` is only the call site's safety belt: the range was asked
     // above (the panic ban).
     let line = Point::new(line, Column(0))
-        .grid_clamp(term, Boundary::Grid)
+        .grid_clamp(rows, Boundary::Grid)
         .line;
-    term.grid()[line]
+    rows.cells()[line]
         .into_iter()
         .any(|cell| cell.hyperlink().and_then(|link| block_key(link.uri())) == Some(id))
 }
@@ -6227,7 +6263,7 @@ impl Session {
             && self.screen_clear_history.load(Ordering::Relaxed) == Self::UNSTAMPED;
         if !alt_screen && (pending || unstamped) {
             let boundary = if term.history_size() > 0 {
-                row_identity(&term, Line(-1))
+                row_identity(&*term, Line(-1))
             } else {
                 0
             };
@@ -6432,7 +6468,7 @@ impl Session {
                     && continued != Some((row, id))
                 {
                     let above = Line(i32::from(row) - offset - 1);
-                    if block_row_continues(&term, above, id, clear_boundary) {
+                    if block_row_continues(&*term, above, id, clear_boundary) {
                         continued = Some((row, id));
                     } else {
                         // The last-ink column starts from zero: on a command row
@@ -6815,7 +6851,7 @@ impl Session {
                     && fill_continued != Some((fill_row, id))
                 {
                     let above = Line(i32::from(fill_row) - i32::from(channel) - offset - 1);
-                    if block_row_continues(&term, above, id, clear_boundary) {
+                    if block_row_continues(&*term, above, id, clear_boundary) {
                         fill_continued = Some((fill_row, id));
                     } else {
                         blocks.fill_anchors.push((id, fill_row));
@@ -9534,10 +9570,10 @@ impl Session {
     /// after a command starts ([`Wake::command_started`], [`Wake::remote_command_edge`]) and
     /// the listing asks again, so a late turn loses nothing.
     ///
-    /// A command whose rows cannot be read for the alternate screen waits for the next look
-    /// (or the text the wrapper captured as the screen was taken); one whose rows are gone is
-    /// left out. **Journal-neutral:** reads `Term`, writes the memory only — no side record
-    /// ([`crate::journal`]).
+    /// A program on the whole screen does not hide a command's rows: they are read from the
+    /// primary screen behind it, in the same `Term` round (or are the text the wrapper captured
+    /// as the screen was taken); one whose rows are gone is left out. **Journal-neutral:** reads
+    /// `Term`, writes the memory only — no side record ([`crate::journal`]).
     pub fn remember_commands(&self) {
         let cursors = lock(&self.memory).cursors();
         let fresh = lock(&self.shell).fresh_commands(cursors);
@@ -9546,14 +9582,13 @@ impl Session {
             if let Some(at) = captured.iter().position(|(known, _)| *known == key) {
                 return Taken::Text(captured.swap_remove(at).1);
             }
-            match self.find_block(key) {
-                Some((text, _)) => Taken::Text(text),
-                None if self.term.lock().mode().contains(TermMode::ALT_SCREEN) => Taken::Later,
+            match self.find_block_text(key) {
+                Some(text) => Taken::Text(text),
                 None => Taken::Gone,
             }
         };
         let mut found: Vec<Remembered> = Vec::new();
-        let mut local_next = fresh.local.end;
+        let local_next = fresh.local.end;
         for (n, id) in fresh.local.ids.iter().enumerate() {
             let key = BlockKey::Local(*id);
             match take(key) {
@@ -9565,15 +9600,11 @@ impl Session {
                         .then(|| PathBuf::from(&fresh.cwd)),
                 }),
                 Taken::Text(_) | Taken::Gone => {}
-                Taken::Later => {
-                    local_next = *id;
-                    break;
-                }
             }
         }
         let mut remote_cursor = cursors.remote;
         if let Some((shell, walk)) = &fresh.remote {
-            let mut next = walk.end;
+            let next = walk.end;
             for id in &walk.ids {
                 let key = BlockKey::Remote {
                     shell: *shell,
@@ -9586,10 +9617,6 @@ impl Session {
                         directory: None,
                     }),
                     Taken::Text(_) | Taken::Gone => {}
-                    Taken::Later => {
-                        next = *id;
-                        break;
-                    }
                 }
             }
             remote_cursor = Some((*shell, next));
@@ -9626,28 +9653,33 @@ impl Session {
         if !lock(&self.memory).restored() {
             let found = {
                 let term = self.term.lock();
-                (!term.mode().contains(TermMode::ALT_SCREEN)).then(|| history::saved_blocks(&term))
+                match term.hidden_primary_grid() {
+                    Some(primary) => history::saved_blocks(primary),
+                    None => history::saved_blocks(&*term),
+                }
             };
-            if let Some(found) = found {
-                lock(&self.memory).adopt_restored(found);
-            }
+            lock(&self.memory).adopt_restored(found);
         }
         let entries: Vec<Remembered> = lock(&self.memory).entries().iter().cloned().collect();
         let keys: Vec<BlockKey> = entries.iter().map(|entry| entry.key).collect();
-        let depths = {
+        let (rows, covered) = {
             let term = self.term.lock();
-            if term.mode().contains(TermMode::ALT_SCREEN) {
-                vec![None; keys.len()]
-            } else {
-                history::depths(&term, &keys, self.clear_boundary.load(Ordering::Relaxed))
+            let boundary = self.clear_boundary.load(Ordering::Relaxed);
+            // The primary screen's rows: the grid in use, or the one behind a full screen
+            // program, where the commands that ran before it are still.
+            match term.hidden_primary_grid() {
+                Some(primary) => (history::depths(primary, &keys, boundary), true),
+                None => (history::depths(&*term, &keys, boundary), false),
             }
         };
         let log = lock(&self.shell);
         entries
             .into_iter()
-            .zip(depths)
+            .zip(rows)
             .rev()
-            .map(|(entry, depth)| {
+            .map(|(entry, row)| {
+                // A program on the whole screen can be read behind but not scrolled to.
+                let depth = row.filter(|_| !covered);
                 let (state, remote, started) = match entry.key {
                     BlockKey::Saved { stripe, .. } => (
                         RecordState::Restored {
@@ -9678,6 +9710,9 @@ impl Session {
                         ),
                     },
                 };
+                // What a command still running under a program on the whole screen prints is that
+                // program's own screen: there is nothing of it to read behind it.
+                let running_under = covered && matches!(state, RecordState::Running(_));
                 CommandRecord {
                     id: CommandId(entry.key),
                     text: entry.text,
@@ -9686,6 +9721,7 @@ impl Session {
                     state,
                     started,
                     depth,
+                    readable: row.is_some() && !running_under,
                 }
             })
             .collect()
@@ -9703,19 +9739,22 @@ impl Session {
 
     /// The output of command `id` as text — the rows after its own, up to the next prompt or
     /// the bottom, at most [`history::OUTPUT_LIMIT`] characters of the end. `None` once its row
-    /// has left the history and on the alternate screen, where the rows are out of reach.
+    /// has left the history. Under a program on the whole screen it is read from the primary
+    /// screen behind it, which is where the shell left it.
     ///
     /// **Journal-neutral:** reads `Term` only — no side record ([`crate::journal`]).
     pub fn command_output(&self, id: CommandId) -> Option<String> {
         let term = self.term.lock();
-        if term.mode().contains(TermMode::ALT_SCREEN) {
-            return None;
+        let boundary = self.clear_boundary.load(Ordering::Relaxed);
+        match term.hidden_primary_grid() {
+            Some(primary) => history::output_of(primary, id.0, boundary),
+            None => history::output_of(&*term, id.0, boundary),
         }
-        history::output_of(&term, id.0, self.clear_boundary.load(Ordering::Relaxed))
     }
 
     /// Where command `id`'s row is, rows from the history's top — [`BlockInfo::depth`]'s space,
-    /// what [`Self::scroll_to`] takes; `None` as [`Self::command_output`].
+    /// what [`Self::scroll_to`] takes; `None` once its row has left the history and on the
+    /// alternate screen, where the window cannot be taken to it.
     ///
     /// **Journal-neutral:** see [`Self::command_output`].
     pub fn command_depth(&self, id: CommandId) -> Option<u32> {
@@ -9746,22 +9785,28 @@ impl Session {
 
     /// Block `key`'s command row as text and its depth (rows from the history's top), found
     /// walking up from the bottom — the newest block's start is the last one there. `None` on
-    /// the alternate screen (the row is in the primary screen, out of reach) and when the row is
-    /// no longer in the history or past a terminal-side clear. One `Term` round.
+    /// the alternate screen (the row is in the primary screen behind the program: its text can
+    /// be read, see [`Self::find_block_text`], but the window cannot be taken to it) and when the
+    /// row is no longer in the history or past a terminal-side clear. One `Term` round.
     fn find_block(&self, key: BlockKey) -> Option<(String, u32)> {
         let term = self.term.lock();
         if term.mode().contains(TermMode::ALT_SCREEN) {
             return None;
         }
+        block_start(&*term, key, self.clear_boundary.load(Ordering::Relaxed))
+    }
+
+    /// Block `key`'s command text wherever the primary screen is: the grid in use, or the one
+    /// behind a program on the whole screen. One `Term` round — the screen cannot change between
+    /// asking which it is and reading it.
+    fn find_block_text(&self, key: BlockKey) -> Option<String> {
+        let term = self.term.lock();
         let boundary = self.clear_boundary.load(Ordering::Relaxed);
-        let (top, bottom) = (term.topmost_line().0, term.bottommost_line().0);
-        let line = (top..=bottom).rev().find(|&probe| {
-            row_block(&term, Line(probe)) == Some(key)
-                && !block_row_continues(&term, Line(probe - 1), key, boundary)
-        })?;
-        let history = i64::try_from(term.history_size()).ok()?;
-        let depth = u32::try_from(i64::from(line) + history).ok()?;
-        Some((block_text(&term, line, key), depth))
+        match term.hidden_primary_grid() {
+            Some(primary) => block_start(primary, key, boundary),
+            None => block_start(&*term, key, boundary),
+        }
+        .map(|(text, _)| text)
     }
 
     /// The notifications programs asked for since the last call (`OSC 9 ; text`, `OSC 777 ;
@@ -11188,7 +11233,7 @@ impl Session {
             let boundary = self.clear_boundary.load(Ordering::Relaxed);
             let line = block_start_near(&term, near, key, boundary)?;
             let depth = u32::try_from(i64::from(line) + history).ok()?;
-            (block_text(&term, line, key), depth)
+            (block_text(&*term, line, key), depth)
         };
         self.ledger_info(key, command, depth)
     }
@@ -12933,8 +12978,6 @@ enum Taken {
     Text(String),
     /// Its row has left the history: it is not remembered.
     Gone,
-    /// The pane is on the alternate screen and nothing was captured: the next look tries again.
-    Later,
 }
 
 #[cfg(test)]
@@ -24980,6 +25023,94 @@ e\\314\\201.'; sleep 5";
             "its row is out of reach under the program"
         );
         assert!(matches!(records[0].state, RecordState::Running(_)));
+        assert!(
+            !records[0].readable,
+            "what the program draws is its own screen, not rows to read behind it"
+        );
+        session.shutdown();
+    }
+
+    #[test]
+    fn the_output_of_the_commands_before_a_full_screen_program_is_read_from_the_screen_behind_it() {
+        // `make`, then `vim`: the program holds the alternate screen, the shell's rows are in the
+        // primary grid behind it. Their output is read from there; the window cannot be taken
+        // to them until the program gives the screen back.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_session(
+            "stty -echo; printf '\\033]133;A;bt_block=1\\007\\033]8;;bateri://block/1\\007$ make\
+             \\033]8;;\\007\\033]133;C\\007\\r\\none\\r\\ntwo\\r\\n\\033]133;D;0;bt_block=1\\007\
+             \\033]133;A;bt_block=2\\007\\033]8;;bateri://block/2\\007$ vim file\
+             \\033]8;;\\007\\033]133;C\\007\\033[?1049hfull screen'; read _; \
+             printf '\\033[?1049l'; sleep 5",
+            Arc::clone(&wake),
+        );
+        wait_until(
+            "the program did not take the screen",
+            Duration::from_secs(5),
+            || session.on_alternate_screen(),
+        );
+        let records = session.command_records();
+        let texts: Vec<&str> = records.iter().map(|record| record.text.as_str()).collect();
+        assert_eq!(texts, ["$ vim file", "$ make"], "newest first");
+        let make = records[1].id;
+        assert!(
+            records[1].readable,
+            "the rows before the program are behind it"
+        );
+        assert!(
+            !records[0].readable,
+            "the program's own command has no output to read behind it"
+        );
+        assert!(
+            records.iter().all(|record| record.depth.is_none()),
+            "the window cannot be taken to a row under a program"
+        );
+        assert_eq!(session.command_output(make).as_deref(), Some("one\ntwo"));
+        assert_eq!(session.command_depth(make), None);
+
+        // The program gives the screen back: the same rows are the screen again.
+        session.write(b"\n");
+        wait_until(
+            "the program did not give the screen back",
+            Duration::from_secs(5),
+            || !session.on_alternate_screen(),
+        );
+        let records = session.command_records();
+        assert!(
+            records
+                .iter()
+                .all(|record| record.depth.is_some() && record.readable)
+        );
+        assert_eq!(session.command_output(make).as_deref(), Some("one\ntwo"));
+        session.shutdown();
+    }
+
+    #[test]
+    fn a_command_whose_rows_were_gone_before_the_program_took_the_screen_stays_unreadable() {
+        // The behind-the-program read is the primary grid's: what had already left its
+        // history (a hundred rows in these sessions) is not there to be read.
+        let wake = Arc::new(TestWake::default());
+        let session = spawn_session(
+            "stty -echo; printf '\\033]133;A;bt_block=1\\007\\033]8;;bateri://block/1\\007$ yes\
+             \\033]8;;\\007\\033]133;C\\007\\r\\n'; read _; i=0; \
+             while [ $i -lt 300 ]; do echo line$i; i=$((i+1)); done; \
+             printf '\\033[?1049hfull screen'; sleep 5",
+            Arc::clone(&wake),
+        );
+        wait_until("block 1 did not start", Duration::from_secs(5), || {
+            session.last_block_info().is_some()
+        });
+        session.remember_commands();
+        session.write(b"\n");
+        wait_until(
+            "the program did not take the screen",
+            Duration::from_secs(5),
+            || session.on_alternate_screen(),
+        );
+        let records = session.command_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "$ yes", "its text outlived its rows");
+        assert!(!records[0].readable && records[0].depth.is_none());
         assert_eq!(session.command_output(records[0].id), None);
         session.shutdown();
     }

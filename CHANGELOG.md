@@ -12,6 +12,52 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **A command palette.** ⇧⌘P (View ▸ Command Palette…) opens one search field
+  over the terminal and finds, by a few letters of each word — “spr” is Split
+  Right, “side” is Tab Position — every command of the menus (with the
+  shortcut, and greyed as the menu would be), every setting and theme, the tabs
+  and groups of all windows, folders, servers, ports and the commands your open
+  panes ran. ⏎ does it, → opens the row's menu or page, esc steps back and
+  closes, and what you chose last comes first. Nothing it offers runs a command
+  on its own: a command from the history or an `ssh` host is written on a
+  prompt and waits for your own ⏎.
+  - **Themes and settings try themselves out.** A theme, and the font family
+    and size, the line spacing, the cursor shape, the split style, the veil over
+    a window that lost focus, where the tabs sit and the tab icons and colours,
+    show on every window as the highlight reaches them, without touching
+    `settings.toml`; ⏎ writes the choice there (the rest of the file stays as it
+    was) and esc puts everything back. The settings you type a number for stay
+    in the settings window; the palette offers a list of values.
+  - **⌘P goes to a tab.** The list is in the order you looked at the tabs, with
+    the one you just left highlighted, so ⌘P ⏎ goes back and forth between two
+    tabs and another ⌘P goes one further. Groups are listed with their ⌃⌘
+    numbers (⏎ goes to the tab you were last on in the group), a tab of another
+    window comes to the front, and → opens the menu its chip or its group header
+    has.
+  - **⌘O goes to a folder.** The folders your tabs have been in, newest first;
+    type a path (`~/Pro`) and it lists what is inside, ⇥ steps in. ⏎ opens a
+    new tab there. Servers come from the `Host` lines of `~/.ssh/config` and
+    the ones you reached: ⏎ opens a new tab with `ssh host` waiting on its
+    line. Ports listed by the panes open in the browser. Shell ▸ Copy Folder
+    Path and Show Folder in Finder are menu commands now.
+  - **Command History** lists what the open panes ran, where and how each
+    ended. ⏎ writes the command on the prompt of the tab in front when it is
+    idle, and otherwise in a new tab in the command's folder; ⌥⏎ does it in a
+    new split beside the tab; ⌘⏎ takes you to its output (Window ▸ Jump to
+    Command… lists only those) and a row's menu copies the command or its
+    output. A command that ran on a server is never opened in a new local tab
+    (it would run on this Mac): it is copied. Edit ▸ Copy Last Command and Copy Last Output copy from the tab in
+    front. When a program holds the whole screen (vim, a pager) the commands
+    before it are still listed under a note that says so; their output can be
+    copied from behind the program, and shows again when it closes. The
+    palette reads only what your open panes ran — not the shell's own history
+    file.
+  - The menu has Go to Tab… (⌘P), Go to Folder… (⌘O), Jump to Command…, Copy
+    Last Command, Copy Last Output, Copy Folder Path, Show Folder in Finder and
+    Open settings.toml.
+
 ## [0.18.0] - 2026-10-17
 
 ### Added

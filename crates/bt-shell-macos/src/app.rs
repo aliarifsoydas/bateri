@@ -5487,6 +5487,7 @@ impl AppDelegate {
                             standing: record.state,
                             started: record.started.map(u64::from),
                             can_show: record.depth.is_some(),
+                            can_copy: record.readable,
                             tab_title: title.clone(),
                             other_window: (!is_key).then_some(*number),
                             here: on_screen,
@@ -6332,9 +6333,14 @@ impl AppDelegate {
             return Err(format!("{} is not available", settings::FILE_NAME));
         };
         let before = self.file_settings();
-        for edit in edits {
+        for (written, edit) in edits.iter().enumerate() {
             if let Err(message) = settings::write_edit(&root, edit) {
                 self.post_notices(Source::Write, vec![message.clone()]);
+                if written > 0 {
+                    // The keys before this one are in the file now: read it as the watcher
+                    // would, so what the preview is taken back to is the file as it stands.
+                    self.reload_from(Some(before));
+                }
                 self.end_preview();
                 self.refresh_settings_window();
                 return Err(message);

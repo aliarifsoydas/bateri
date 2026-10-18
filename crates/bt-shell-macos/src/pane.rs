@@ -1319,9 +1319,6 @@ impl ShellWake {
                 .is_some_and(|kept| kept.load(Ordering::Acquire))
     }
 
-    /// A shell edge: the pane's state goes to the holder on the next
-    /// main-queue turn — `state_blob` takes the ledger's lock and must not
-    /// run here (reader thread, possibly under the `Term` lock).
     /// A command started: the main queue's next turn reads its line into the pane's command
     /// memory ([`bt_core::Session::remember_commands`]) while the rows that carry it are still
     /// on the grid. At most one job waits; a second start folds into it (the memory reads
@@ -1342,6 +1339,9 @@ impl ShellWake {
         });
     }
 
+    /// A shell edge: the pane's state goes to the holder on the next
+    /// main-queue turn — `state_blob` takes the ledger's lock and must not
+    /// run here (reader thread, possibly under the `Term` lock).
     fn push_state_soon(&self) {
         if !self.kept() || self.state_pending.swap(true, Ordering::AcqRel) {
             return;
@@ -2471,7 +2471,8 @@ define_class!(
         }
 
         /// Edit ▸ Copy Last Output: the newest command's output, on the pasteboard — nothing
-        /// (a beep) once its rows have left the history or while a program holds the screen.
+        /// (a beep) once its rows have left the history or when it printed nothing (a program
+        /// that holds the screen has its own screen, not rows to read).
         #[unsafe(method(copyLastOutput:))]
         fn copy_last_output_sent(&self, _sender: Option<&AnyObject>) {
             let output = self.session().and_then(|session| {

@@ -14,11 +14,11 @@
 //! newest first; the same command once, in its latest run. Beside the command: how it ended (✓ and
 //! how long, ✗ and the exit code, or still running), and under it the tab it ran in and when. A
 //! command whose output has left the history can still be written; it has no output to go to.
-//! A pane with a program on the whole screen (vim) has its earlier commands listed all the same,
-//! none with an output to go to until the program closes — the screen their rows are on is out of
-//! reach while it runs, which the shell says by [`CommandFacts::can_show`] — and the tab's
-//! section carries a note ([`FullScreen`]); the commands of the tab's other panes are not
-//! affected.
+//! A pane with a program on the whole screen (vim) has its earlier commands listed all the same.
+//! The screen their rows are on is behind the program while it runs: the output can still be
+//! **copied** from there ([`CommandFacts::can_copy`]) but the window cannot be taken to it
+//! ([`CommandFacts::can_show`]) until the program closes, and the tab's section carries a note
+//! ([`FullScreen`]); the commands of the tab's other panes are not affected.
 //!
 //! **Identity.** A command is `hist.<n>`, `n` its place in [`Commands::items`] — the list the
 //! shell handed in when the palette opened; nothing keeps it between openings ([`super::Recent`]
@@ -58,6 +58,9 @@ pub struct CommandFacts {
     /// Its output is still in the history and can be reached: its row is, and its pane is not
     /// under a program that holds the whole screen.
     pub can_show: bool,
+    /// Its output can be read, which a program on the whole screen does not prevent: the rows
+    /// are behind it. `can_show` implies it.
+    pub can_copy: bool,
     pub tab_title: String,
     /// Which window it is in, counted from 1, when it is not the key window's.
     pub other_window: Option<usize>,
@@ -167,9 +170,10 @@ pub struct Uses {
 /// output and ⌘⏎ does what ⏎ does elsewhere.
 ///
 /// ⏎ writes the line to the pane on screen when it is idle; when it is not, to a new local tab —
-/// except a command that ran on a server, which is copied instead (T10: a tab opened here would
-/// run it on this Mac). ⌥⏎ splits and waits there, a server's command again excepted. ⌘⏎ goes to
-/// the output while there is one to go to.
+/// except a command that ran on a server, which is copied instead (a tab opened here would run
+/// it on this Mac). ⌥⏎ splits and waits there, a server's command again excepted. ⌘⏎ goes to
+/// the output while there is one to go to, and copies it while there is only one to read (under a
+/// program on the whole screen).
 pub fn uses(facts: &CommandFacts, commands: &Commands, jump: bool) -> Uses {
     let line = if commands.free {
         Use::Write
@@ -179,6 +183,9 @@ pub fn uses(facts: &CommandFacts, commands: &Commands, jump: bool) -> Uses {
         Use::NewTab
     };
     let show = facts.can_show.then_some(Use::ShowOutput);
+    // Under a program on the whole screen the window cannot be taken to the output, but it can be
+    // copied from behind the program: ⌘⏎ does that instead.
+    let output = show.or_else(|| facts.can_copy.then_some(Use::CopyOutput));
     let option = (!facts.remote).then_some(Use::SplitRight);
     if jump {
         Uses {
@@ -190,7 +197,7 @@ pub fn uses(facts: &CommandFacts, commands: &Commands, jump: bool) -> Uses {
         Uses {
             enter: Some(line),
             option,
-            command: show,
+            command: output,
         }
     }
 }
@@ -392,7 +399,8 @@ pub fn actions(scope: &Scope, commands: &Commands) -> Vec<Row> {
     .into_iter()
     .filter(|how| match how {
         Use::Write => commands.free,
-        Use::ShowOutput | Use::CopyOutput => facts.can_show,
+        Use::ShowOutput => facts.can_show,
+        Use::CopyOutput => facts.can_copy,
         Use::NewTab | Use::SplitRight => !facts.remote,
         Use::CopyCommand => true,
     })
@@ -525,6 +533,7 @@ mod tests {
             },
             started: Some(started),
             can_show: true,
+            can_copy: true,
             tab_title: format!("tab {tab}"),
             other_window: None,
             here: tab == 1,
@@ -680,6 +689,7 @@ mod tests {
     fn a_command_whose_output_is_gone_has_no_output_to_go_to() {
         let mut gone = facts(1, "yes", 1);
         gone.can_show = false;
+        gone.can_copy = false;
         let all = commands(vec![gone.clone(), facts(1, "ls", 2)]);
         assert_eq!(uses(&gone, &all, false).command, None);
         assert_eq!(
@@ -692,9 +702,10 @@ mod tests {
     }
 
     #[test]
-    fn a_tab_with_a_program_on_its_screen_lists_its_commands_under_a_note_and_has_no_output() {
+    fn a_tab_with_a_program_on_its_screen_lists_its_commands_under_a_note_and_copies_their_output()
+    {
         let mut under = [facts(1, "vim notes", 2), facts(1, "ls", 1)];
-        // The pane under the program has no rows to reach.
+        // The pane under the program has rows to read behind it but none to take the window to.
         under.iter_mut().for_each(|facts| facts.can_show = false);
         let mut sibling = facts(1, "make test", 3);
         sibling.standing = RecordState::Finished {
@@ -714,22 +725,41 @@ mod tests {
         assert_eq!(list.hits.len(), 3);
         let output_key = |id: &str| {
             let hit = list.hits.iter().find(|hit| hit.row.id == id).unwrap();
-            hit.row.hints.iter().any(|(key, _)| *key == "⌘↵")
+            hit.row
+                .hints
+                .iter()
+                .find(|(key, _)| *key == "⌘↵")
+                .map(|(_, verb)| verb.to_string())
         };
-        assert!(
-            !output_key("hist.0") && !output_key("hist.1"),
-            "under the program"
+        assert_eq!(
+            output_key("hist.0"),
+            Some(Use::CopyOutput.verb().to_owned()),
+            "⌘⏎ copies under the program"
         );
-        assert!(output_key("hist.2"), "the tab's other pane is not");
+        assert_eq!(output_key("hist.1"), output_key("hist.0"));
+        assert_eq!(
+            output_key("hist.2"),
+            Some(Use::ShowOutput.verb().to_owned()),
+            "the tab's other pane is gone to"
+        );
+        assert_eq!(
+            run("hist.0", None, Modifier::Command, &all).map(|run| run.how),
+            Some(Use::CopyOutput)
+        );
         let jump: Vec<String> = command_rows(&all, true)
             .into_iter()
             .map(|row| row.id)
             .collect();
         assert_eq!(jump, ["hist.2"], "only what has an output to go to");
         let page = actions(&Scope::HistoryActions("hist.1".to_owned()), &all);
-        assert!(
-            page.iter()
-                .all(|row| row.id != "act.showOutput" && row.id != "act.copyOutput")
+        assert!(page.iter().all(|row| row.id != "act.showOutput"));
+        assert!(page.iter().any(|row| row.id == "act.copyOutput"));
+        let mut unread = all.clone();
+        unread.items[1].can_copy = false;
+        assert_eq!(
+            uses(&unread.items[1], &unread, false).command,
+            None,
+            "a row the program covered and that had already left the history"
         );
     }
 

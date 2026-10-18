@@ -20,8 +20,7 @@ dependencies = [
 [[package]]
 name = "alacritty_terminal"
 version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bda177466b9524d59f1b12f0dd30b68696788e9992a7e959021c4a0ed96fcf59"
+source = "git+https://github.com/bateri/kablo?rev=c13f3fbdf1d28222d6db33dfd4ae06a9b8621b44#c13f3fbdf1d28222d6db33dfd4ae06a9b8621b44"
 dependencies = [
  "base64",
  "bitflags",
@@ -1249,7 +1248,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 [[package]]
 name = "vte"
 version = "0.15.0"
-source = "git+https://github.com/bateri/kablo?rev=991577adbdeab4ad78aa4c3d91925620dceaa613#991577adbdeab4ad78aa4c3d91925620dceaa613"
+source = "git+https://github.com/bateri/kablo?rev=c13f3fbdf1d28222d6db33dfd4ae06a9b8621b44#c13f3fbdf1d28222d6db33dfd4ae06a9b8621b44"
 dependencies = [
  "arrayvec",
  "bitflags",

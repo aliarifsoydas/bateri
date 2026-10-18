@@ -9,13 +9,14 @@
 //!
 //! **Where the text is read from.** Usually the main queue's turn after the `C` mark finds the
 //! prompt's rows on the grid. A program that takes the alternate screen in the same read as the
-//! mark (`vim file`) is on that screen before the main queue looks, and the rows are out of reach;
-//! so the parser's wrapper reads the newest block's text **just before it swaps screens**
-//! ([`newest_block`]) and leaves it with the session (`Adapter::captured`), where the main queue's
-//! turn takes it from.
+//! mark (`vim file`) is on that screen before the main queue looks, and the rows are on the
+//! primary screen behind it, which the turn reads in the same round ([`Rows`]). The parser's
+//! wrapper also reads the newest block's text **just before it swaps screens** ([`newest_block`])
+//! and leaves it with the session (`Adapter::captured`), where the turn takes it from first.
 //!
-//! The reading functions here take the `Term` they read and nothing else, so the caller holds the
-//! lock; none of them writes to it ("Journal-neutral").
+//! The reading functions here take the rows they read and nothing else ([`Rows`]: a `Term`, or the
+//! primary screen's grid behind a full screen program), so the caller holds the lock; none of
+//! them writes to it ("Journal-neutral").
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -26,7 +27,7 @@ use alacritty_terminal::index::Line;
 use alacritty_terminal::term::Term;
 
 use crate::commands::CommandId;
-use crate::session::{block_row_continues, block_text, row_block, row_text};
+use crate::session::{Rows, block_row_continues, block_text, row_block, row_text};
 use crate::shell::{BlockKey, Cursors};
 
 /// How many commands a pane remembers. The oldest go first.
@@ -142,25 +143,30 @@ pub struct CommandRecord {
     /// When it started, seconds since the Unix epoch.
     pub started: Option<u32>,
     /// Its row, rows from the history's top, while the row is still in the history on the primary
-    /// screen: where ⌘⏎ takes the window, and what its output is read from. `None`: scrolled away
-    /// or cleared, or the pane is on the alternate screen.
+    /// screen: where ⌘⏎ takes the window. `None`: scrolled away or cleared, or the pane is on the
+    /// alternate screen (the window cannot be taken there).
     pub depth: Option<u32>,
+    /// Its output can be read ([`crate::Session::command_output`]): its row is still in the
+    /// primary screen's rows, which a program on the whole screen leaves where they were — except
+    /// for the command that is that program, whose output is the screen it draws. `depth` being
+    /// set implies it.
+    pub readable: bool,
 }
 
 /// The depth of each of `wanted`'s start rows, in one pass over the history: `None` for a block
 /// whose row is no longer there. A pass instead of a search per key — the history lists hundreds.
-pub(crate) fn depths<T>(term: &Term<T>, wanted: &[BlockKey], boundary: usize) -> Vec<Option<u32>> {
+pub(crate) fn depths<R: Rows>(rows: &R, wanted: &[BlockKey], boundary: usize) -> Vec<Option<u32>> {
     let mut found = vec![None; wanted.len()];
-    let (top, bottom) = (term.topmost_line().0, term.bottommost_line().0);
-    let history = i64::try_from(term.history_size()).unwrap_or(0);
+    let (top, bottom) = (rows.topmost_line().0, rows.bottommost_line().0);
+    let history = i64::try_from(rows.history_size()).unwrap_or(0);
     for line in top..=bottom {
-        let Some(key) = row_block(term, Line(line)) else {
+        let Some(key) = row_block(rows, Line(line)) else {
             continue;
         };
         let Some(at) = wanted.iter().position(|wanted| *wanted == key) else {
             continue;
         };
-        if found[at].is_none() && !block_row_continues(term, Line(line - 1), key, boundary) {
+        if found[at].is_none() && !block_row_continues(rows, Line(line - 1), key, boundary) {
             found[at] = u32::try_from(i64::from(line) + history).ok();
         }
     }
@@ -168,19 +174,19 @@ pub(crate) fn depths<T>(term: &Term<T>, wanted: &[BlockKey], boundary: usize) ->
 }
 
 /// The blocks a restored screen came back with, oldest first: their start rows' text.
-pub(crate) fn saved_blocks<T>(term: &Term<T>) -> Vec<Remembered> {
+pub(crate) fn saved_blocks<R: Rows>(rows: &R) -> Vec<Remembered> {
     let mut blocks: Vec<Remembered> = Vec::new();
-    let (top, bottom) = (term.topmost_line().0, term.bottommost_line().0);
+    let (top, bottom) = (rows.topmost_line().0, rows.bottommost_line().0);
     for line in top..=bottom {
-        let Some(key @ BlockKey::Saved { .. }) = row_block(term, Line(line)) else {
+        let Some(key @ BlockKey::Saved { .. }) = row_block(rows, Line(line)) else {
             continue;
         };
         if blocks.iter().any(|known| known.key == key)
-            || block_row_continues(term, Line(line - 1), key, 0)
+            || block_row_continues(rows, Line(line - 1), key, 0)
         {
             continue;
         }
-        let text = block_text(term, line, key);
+        let text = block_text(rows, line, key);
         if !text.is_empty() {
             blocks.push(Remembered {
                 key,
@@ -213,20 +219,20 @@ pub(crate) fn newest_block<T>(term: &Term<T>) -> Option<(BlockKey, String)> {
 /// The output of block `key`: the rows after the ones that carry its command, up to the next
 /// anchored row — the next prompt — or the bottom, the end trimmed. At most [`OUTPUT_LIMIT`]
 /// characters, the end of it. `None` when the block's row is no longer in the history.
-pub(crate) fn output_of<T>(term: &Term<T>, key: BlockKey, boundary: usize) -> Option<String> {
-    let (top, bottom) = (term.topmost_line().0, term.bottommost_line().0);
+pub(crate) fn output_of<R: Rows>(rows: &R, key: BlockKey, boundary: usize) -> Option<String> {
+    let (top, bottom) = (rows.topmost_line().0, rows.bottommost_line().0);
     let start = (top..=bottom).rev().find(|&probe| {
-        row_block(term, Line(probe)) == Some(key)
-            && !block_row_continues(term, Line(probe - 1), key, boundary)
+        row_block(rows, Line(probe)) == Some(key)
+            && !block_row_continues(rows, Line(probe - 1), key, boundary)
     })?;
     let mut line = start;
-    while line <= bottom && row_block(term, Line(line)) == Some(key) {
+    while line <= bottom && row_block(rows, Line(line)) == Some(key) {
         line += 1;
     }
     let mut lines: Vec<String> = Vec::new();
     let mut joined = String::new();
-    while line <= bottom && row_block(term, Line(line)).is_none() {
-        let (piece, wrapped) = row_text(term, line);
+    while line <= bottom && row_block(rows, Line(line)).is_none() {
+        let (piece, wrapped) = row_text(rows, line);
         if wrapped {
             joined.push_str(&piece);
         } else {

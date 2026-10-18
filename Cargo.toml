@@ -211,5 +211,14 @@ bt-shell-macos = { path = "crates/bt-shell-macos" }
 # to it unchanged; when it asks for a newer vte the fork is carried over by hand
 # (`FORK.md` says how), and `make audit` fails if the patch stops applying — cargo only
 # warns, then quietly builds the registry's vte.
+#
+# `alacritty_terminal` is a fork too, from the same repository and at the same `rev`
+# (`vendor/alacritty_terminal`, its own `FORK.md`): upstream 0.26.0 plus a read-only way to
+# look at the primary screen while a program holds the alternate one, so the output of the
+# commands that ran before a full screen program can still be copied. It only adds; the name
+# and version are upstream's, so the exact `=0.26.0` pin above resolves to it. User-approved
+# dependency decision (2026-10-17, the command palette): the same care as vte's — `make audit`
+# fails if the patch stops applying, and a newer upstream release is merged by hand.
 [patch.crates-io]
-vte = { git = "https://github.com/bateri/kablo", rev = "991577adbdeab4ad78aa4c3d91925620dceaa613" }
+vte = { git = "https://github.com/bateri/kablo", rev = "c13f3fbdf1d28222d6db33dfd4ae06a9b8621b44" }
+alacritty_terminal = { git = "https://github.com/bateri/kablo", rev = "c13f3fbdf1d28222d6db33dfd4ae06a9b8621b44" }
