@@ -1189,7 +1189,8 @@ pub fn side_width(wanted: f64, window: f64) -> f64 {
 /// way Arc moves its window by an empty part of the page: a press `from_top` points below the
 /// window's top, within the title row's height (`row`), on a part of a pane that draws no text
 /// to aim at (`blank`, the pane's to say: its margin above the first row, the fade the rows
-/// thin away in, or a blank cell no program's mouse claims). A press on text there is the
+/// thin away in, or a blank cell — even on a program's screen that has the mouse, whose glyphs
+/// and coloured cells stay its). A press on text there is the
 /// pane's, so a selection starts on the top line as anywhere else; below the band every part of
 /// a pane stays the pane's, so only the panes along the window's top edge move it, and a pane
 /// lower in a split tab never does. In full screen nothing moves the window.

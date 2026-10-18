@@ -2374,11 +2374,17 @@ impl BateriView {
         // **An empty spot of the pane's top under the title row moves the window** with the
         // tabs in the side column, as the title bar it stands in for would
         // ([`Self::grabs_window`]): the margin above the first row, or a blank cell of the rows
-        // in the band that no program's mouse claims. Before the ledger: the press begins no
-        // gesture of the pane's.
+        // in the band — a program's mouse reporting or not. **Nothing reaches the program**:
+        // `report_button` is never called, so no press goes; the ledger is opened and left
+        // empty ([`Gesture::begin_press`] clears the left button's bits and no `pressed` sets
+        // one), so whatever of this press still reaches the view afterwards — a `mouseUp:`, a
+        // `mouseDragged:` once `performWindowDragWithEvent:`'s own loop lets go — finds no
+        // sent bit and no selection: [`Release::Done`] and [`Drag::Ignore`], no release and no
+        // motion with a button held.
         if button == MouseButton::Left
             && let Some(window) = self.grabs_window(event, session)
         {
+            self.with_gesture(|g| g.begin_press(button));
             crate::tab_bar::title_press(&window, event);
             return;
         }
@@ -2659,9 +2665,12 @@ impl BateriView {
     /// over no text:
     ///
     /// - the margin or the fade above the grid's first row ([`blank_above_grid`]), or
-    /// - a cell of the grid that draws nothing, is not in the selection and is not a program's
-    ///   to report — [`Session::blank_at`], where the mouse mode stays; a program that asked
-    ///   for the mouse (vim, htop, tmux) keeps every press on its screen.
+    /// - a cell of the grid that draws nothing and is not in the selection
+    ///   ([`Session::blank_at`]) — **even while a program has the mouse** (vim, htop, tmux, an
+    ///   agent such as Claude Code that turns reporting on for its whole screen): the program
+    ///   loses only the presses on blank, plain-ground cells of this band, and none of them
+    ///   reaches it ([`Self::button_event`]); a glyph, a coloured cell (a status bar, a
+    ///   header, an agent's own boxes), every press below the band and the wheel stay its.
     ///
     /// Not the dock's input line, which has its own presses. `None` for every other press,
     /// which stays the pane's: with the tabs in the title row, on the top line's text (a

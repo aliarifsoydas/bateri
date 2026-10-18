@@ -26,8 +26,9 @@ of every installed copy. A version without a section is not released.
   press within a title bar's height of the window's top, on no text — the
   margin above the first line or a blank cell — drags the window, and a double
   click there zooms or minimizes as System Settings says, as on the tab
-  column's empty space; a press on text there selects it. A program that asked
-  for the mouse (vim, htop, tmux) keeps every press on its screen.
+  column's empty space; a press on text there selects it. This works even
+  while a program such as vim or an agent has the mouse: a press on text or on
+  a coloured cell there is still the program's.
 
 ## [0.19.0] - 2026-10-18
 

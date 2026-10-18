@@ -8218,25 +8218,23 @@ impl Session {
     }
 
     /// Whether a press at `at` (a cell of the visible window, as the mouse gives it) would land
-    /// on nothing: the press would be the terminal's — no mouse reporting claims it, the
-    /// arbitration of [`Session::mouse_button`] without Shift — and the cell draws nothing
-    /// ([`blank_cell`]) and is not in the selection on screen. `bt-shell` moves the window from
-    /// such a spot of the panes' top band, as from a title bar, with the tabs in the side
-    /// column; a press on anything else there stays the terminal's or the program's.
+    /// on nothing: the cell draws nothing ([`blank_cell`]) and is not in the selection on
+    /// screen. `bt-shell` moves the window from such a spot of the panes' top band, as from a
+    /// title bar, with the tabs in the side column; a press on anything else there stays the
+    /// terminal's or the program's.
     ///
-    /// The mode stays unaskable from outside ([`Session::mouse_button`]'s reason): the answer
-    /// folds it into "the press is nobody's", so a program that asked for the mouse (vim,
-    /// htop, tmux with `mouse on`) keeps every press on its screen, blank or not.
+    /// **The mouse mode is not asked**: a program that turned reporting on for its whole screen
+    /// (vim, htop, tmux, an agent such as Claude Code) still draws nothing on a blank cell, and
+    /// the user chose that such a spot of the band moves the window too. What the program
+    /// keeps — its glyphs, its coloured cells, all of its screen below the band — is told by
+    /// the cell and by `bt-shell`'s band, not by the mode, and the mode stays unaskable from
+    /// outside ([`Session::mouse_button`]'s reason). The cell is read from the screen on show
+    /// (`Term::grid` is the alternate screen while that is active), at the row a report would
+    /// address: the visible window's, lowered by the scroll.
     ///
     /// **Journal-neutral:** reads only; one `Term` lock.
     pub fn blank_at(&self, at: SelectionPoint) -> bool {
         let term = self.term.lock();
-        if !matches!(
-            input::button_route(*term.mode(), false),
-            ButtonRoute::Select
-        ) {
-            return false;
-        }
         let offset = term.grid().display_offset() as i32;
         let point = viewport_point((at.col, at.row), offset);
         if !in_grid(&term, point) || !blank_cell(&term.grid()[point]) {
@@ -24171,10 +24169,11 @@ mod tests {
         }));
     }
 
-    /// The spot a press may move the window from: a blank cell, not in the selection, while no
-    /// program has asked for the mouse — then every press is the program's, blank or not.
+    /// The spot a press may move the window from: a blank cell, not in the selection — on the
+    /// primary screen and on a program's alternate screen with the mouse reported alike; a glyph
+    /// is never one.
     #[test]
-    fn a_blank_spot_is_nobodys_until_a_program_takes_the_mouse() {
+    fn a_blank_spot_is_the_windows_even_while_a_program_has_the_mouse() {
         let (session, _wake) = dump_session(40, "printf 'ab  cd\\033[?2004h'", |mode| {
             mode.contains(TermMode::BRACKETED_PASTE)
         });
@@ -24199,14 +24198,22 @@ mod tests {
         );
         assert!(session.blank_at(at(10, 0, CellHalf::Left)));
 
-        let (mouse, _wake) = dump_session(40, "printf 'ab  cd\\033[?1000h'", |mode| {
-            mode.contains(TermMode::MOUSE_REPORT_CLICK)
-        });
-        assert!(
-            !mouse.blank_at(at(2, 0, CellHalf::Left)),
-            "the program's press"
+        // An agent's screen: the alternate screen, any-motion SGR reporting, its text drawn
+        // there after the switch.
+        let (mouse, _wake) = dump_session(
+            40,
+            "printf '\\033[?1049h\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1006hxy  z'",
+            |mode| mode.contains(TermMode::MOUSE_MOTION | TermMode::ALT_SCREEN),
         );
-        assert!(!mouse.blank_at(at(30, 0, CellHalf::Left)));
+        assert!(
+            !mouse.blank_at(at(0, 0, CellHalf::Left)),
+            "the program's glyph"
+        );
+        assert!(
+            mouse.blank_at(at(2, 0, CellHalf::Left)),
+            "a blank of the alternate screen"
+        );
+        assert!(mouse.blank_at(at(30, 0, CellHalf::Left)));
     }
 
     #[test]
