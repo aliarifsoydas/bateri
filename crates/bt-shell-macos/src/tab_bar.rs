@@ -232,6 +232,8 @@ const CLOSE_RADIUS: f64 = 5.0;
 const CHIP_TEXT: f64 = 12.5;
 const SINGLE_TEXT: f64 = 13.0;
 const HINT_TEXT: f64 = 11.0;
+/// The size of a card row's lines under its title (`[appearance] tab_details`).
+const DETAIL_TEXT: f64 = 11.0;
 const CARD_TEXT: f64 = 11.5;
 
 /// The host line along a chip's top and the dwell line under it (the design's 2 pt), and a
@@ -676,6 +678,103 @@ fn label(mtm: MainThreadMarker) -> Retained<NSTextField> {
     text.setAlignment(NSTextAlignment::Center);
     text.setMaximumNumberOfLines(1);
     text
+}
+
+/// A card row's line under its title ([`Chip::set_details`]): left-aligned, [`DETAIL_TEXT`] in
+/// the system font, at most `lines` lines with the last ending in "…". The column measures its
+/// rows with a pair of the same ([`detail_heights`]), so a row is as tall as its chip draws.
+fn detail_label(mtm: MainThreadMarker, lines: usize) -> Retained<NSTextField> {
+    let text = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
+    text.setAlignment(NSTextAlignment::Left);
+    text.setMaximumNumberOfLines(lines as isize);
+    // Wrapped at words; the last line that fits ends in "…" (a truncating mode here would hold
+    // the text to one line).
+    text.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+    if let Some(cell) = text.cell() {
+        cell.setTruncatesLastVisibleLine(true);
+    }
+    // SAFETY: AppKit's constant font weight.
+    let weight = unsafe { NSFontWeightRegular };
+    text.setFont(Some(&NSFont::systemFontOfSize_weight(DETAIL_TEXT, weight)));
+    text.setSelectable(false);
+    text
+}
+
+/// What a card row's place line is made as: one line, cut in the middle so the folder's end and
+/// the branch's start both stay.
+fn place_label(mtm: MainThreadMarker) -> Retained<NSTextField> {
+    let place = detail_label(mtm, 1);
+    place.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+    place
+}
+
+thread_local! {
+    /// The pair of lines the column measures card rows with ([`detail_heights`]): made as a
+    /// chip's are, never shown.
+    static MEASURE: RefCell<Option<(Retained<NSTextField>, Retained<NSTextField>)>> =
+        const { RefCell::new(None) };
+}
+
+/// How tall `field` draws `text` in `width`, its lines as it was made to wrap and cut them; 0 for
+/// no text.
+fn line_height(field: &NSTextField, text: Option<&str>, width: f64) -> f64 {
+    let Some(text) = text.filter(|text| !text.is_empty()) else {
+        return 0.0;
+    };
+    field.setStringValue(&NSString::from_str(text));
+    field.setPreferredMaxLayoutWidth(width);
+    field.fittingSize().height.ceil()
+}
+
+/// How tall a card row's two parts draw in a box `width` wide (`tabs::Row::details`): what the
+/// tab told, then where it is; 0 for a part it does not say.
+fn detail_heights(mtm: MainThreadMarker, details: &tabs::Details, width: f64) -> (f64, f64) {
+    MEASURE.with(|shared| {
+        let mut shared = shared.borrow_mut();
+        let (status, place) = shared.get_or_insert_with(|| {
+            (
+                detail_label(mtm, tabs::DETAIL_STATUS_LINES),
+                place_label(mtm),
+            )
+        });
+        (
+            line_height(
+                status,
+                details.status.as_ref().map(|(text, _)| text.as_str()),
+                width,
+            ),
+            line_height(place, details.place.as_deref(), width),
+        )
+    })
+}
+
+/// The leading element's width in a side row of `style` for a tab of `emblem`
+/// ([`tabs::Row::of`]'s `lead`): the icon with its deck, or the indicator's room where icons are
+/// off — what [`Chip::set`] gives the row.
+fn side_lead(style: IconStyle, emblem: Option<Emblem>) -> Option<f64> {
+    if style.icons {
+        emblem.map(|emblem| tabs::lead_width(tabs::TILE_WIDTH, emblem.edges))
+    } else {
+        Some(tabs::INDICATOR_SIDE)
+    }
+}
+
+/// How tall each of `labels`' rows is in a column whose rows are `width` wide: a card row as tall
+/// as what it says (`tabs::detailed_height`), a plain one [`CHIP_HEIGHT`].
+pub(crate) fn row_heights(mtm: MainThreadMarker, labels: &[Label], width: f64) -> Vec<f64> {
+    let style = IconStyle::current(mtm);
+    labels
+        .iter()
+        .map(|label| match &label.details {
+            Some(details) => {
+                let lead = side_lead(style, Some(label.emblem));
+                let area = tabs::Row::details(width, tabs::DETAILED_ROW_HEIGHT, lead);
+                let (status, place) = detail_heights(mtm, details, area.width);
+                tabs::detailed_height(status, place)
+            }
+            None => CHIP_HEIGHT,
+        })
+        .collect()
 }
 
 /// A rounded rect `rect` filled with `fill`, its inside edge stroked with
@@ -2722,7 +2821,7 @@ define_class!(
                 );
             }
             if let Some(rgb) = left {
-                let stripe = tabs::Row::of(self.bounds().size.width, None, 0.0, false).host_mark;
+                let stripe = tabs::Row::host_mark_of(self.bounds().size.height);
                 rounded(
                     NSRect::new(
                         NSPoint::new(stripe.x, stripe.y),
@@ -3127,6 +3226,10 @@ pub(crate) struct ChipIvars {
     title: tab_title::Title,
     /// The ⌘ key that reaches the tab, right of the title while ⌘ is held.
     hint: Retained<NSTextField>,
+    /// A card row's lines under its title (`tabs::Details`): what the tab told, in up to
+    /// `tabs::DETAIL_STATUS_LINES` lines, and where it is; hidden in a plain row.
+    status: Retained<NSTextField>,
+    place: Retained<NSTextField>,
     close: Retained<CloseButton>,
     /// The line that fills under the chip while a carried pane waits on it to
     /// open the tab ([`Chip::dwell`]).
@@ -3276,6 +3379,8 @@ impl Chip {
         let glyph = Glyph::new(mtm);
         let title = tab_title::Title::new(mtm, NSTextAlignment::Center);
         let hint = label(mtm);
+        let status = detail_label(mtm, tabs::DETAIL_STATUS_LINES);
+        let place = place_label(mtm);
         let close = CloseButton::new(mtm);
         let this = Self::alloc(mtm).set_ivars(ChipIvars {
             tab: Cell::new(tab),
@@ -3297,6 +3402,8 @@ impl Chip {
             glyph: glyph.clone(),
             title,
             hint: hint.clone(),
+            status: status.clone(),
+            place: place.clone(),
             close: close.clone(),
             dwell: RefCell::new(None),
         });
@@ -3327,9 +3434,16 @@ impl Chip {
         this.addSubview(&glyph);
         this.addSubview(this.ivars().title.view());
         this.addSubview(&hint);
+        this.addSubview(&status);
+        this.addSubview(&place);
         this.addSubview(&close);
         hint.setHidden(true);
         hint.setAccessibilityElement(false);
+        for line in [&status, &place] {
+            line.setHidden(true);
+            // Read through the chip, as the title is: the label says what they say.
+            line.setAccessibilityElement(false);
+        }
         this.setAccessibilityElement(true);
         // SAFETY: AppKit's constant role strings, alive for the process.
         unsafe {
@@ -3489,6 +3603,7 @@ impl Chip {
             lifted,
             ghost,
             side,
+            details,
         } = look;
         let (style, side) = (*style, *side);
         let (selected, hovered, single) = (*selected, *hovered, *single);
@@ -3612,10 +3727,10 @@ impl Chip {
         // Without icons the small indicator takes the place, and only while the tab reports
         // something; with them the icon is always there (a deck widens it).
         let bare = !style.icons;
-        let lead = if bare && side {
+        let lead = if side {
             // A row keeps the indicator's room whether it shows or not, so the title stays put
             // as the indicator comes and goes.
-            Some(tabs::INDICATOR_SIDE)
+            side_lead(style, *emblem)
         } else if bare {
             indicator.map(|_| tabs::INDICATOR_SIDE)
         } else {
@@ -3633,12 +3748,17 @@ impl Chip {
             None => tabs::title_row(inner, natural.width, lead),
         };
         let pad = if row.is_some() { 0.0 } else { pad };
+        // What the title's line is centred in: the whole chip, or a card row's first
+        // `TAB_HEIGHT` — its icon, title, `×` and ⌘ key stand where a plain row has them, and
+        // its lines go under them.
+        let band = if row.is_some() {
+            size.height.min(CHIP_HEIGHT)
+        } else {
+            size.height
+        };
         iv.title.place(
             NSRect::new(
-                NSPoint::new(
-                    pad + text_x,
-                    ((size.height - natural.height) / 2.0).max(0.0),
-                ),
+                NSPoint::new(pad + text_x, ((band - natural.height) / 2.0).max(0.0)),
                 NSSize::new(text_width, natural.height),
             ),
             natural.width,
@@ -3652,7 +3772,7 @@ impl Chip {
         if let (Some(x), Some(lead)) = (glyph_x, lead) {
             let high = tabs::ICON_SIDE + 2.0 * GLYPH_OVERHANG;
             iv.glyph.setFrame(NSRect::new(
-                NSPoint::new(pad + x - GLYPH_LEFT, ((size.height - high) / 2.0).round()),
+                NSPoint::new(pad + x - GLYPH_LEFT, ((band - high) / 2.0).round()),
                 NSSize::new(GLYPH_LEFT + lead + GLYPH_OVERHANG, high),
             ));
         }
@@ -3665,7 +3785,18 @@ impl Chip {
                 down: *down,
             });
         iv.glyph.set(look, *turn, palette, *reduce);
-        self.set_hint(hint, size, palette, row.as_ref().map(|row| row.key));
+        self.set_hint(
+            hint,
+            NSSize::new(size.width, band),
+            palette,
+            row.as_ref().map(|row| row.key),
+        );
+        self.set_details(
+            details.filter(|_| row.is_some() && !single),
+            size,
+            lead,
+            palette,
+        );
         // The ×'s place: the chip's left corner, or a row's right end — where the ⌘ key takes
         // its room, so while the key shows the × does not.
         iv.close.setFrame(match &row {
@@ -3679,11 +3810,69 @@ impl Chip {
         iv.close
             .set(!single && hovered && !keyed, palette, motion.close);
         iv.close.setHidden(single);
-        self.setAccessibilityLabel(Some(&NSString::from_str(spoken)));
+        let spoken = match details.filter(|_| row.is_some()) {
+            Some(details) => [
+                Some(spoken.as_str()),
+                details.status.as_ref().map(|(text, _)| text.as_str()),
+                details.place.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", "),
+            None => spoken.clone(),
+        };
+        self.setAccessibilityLabel(Some(&NSString::from_str(&spoken)));
         let value = NSNumber::numberWithBool(selected);
         // SAFETY: an `NSNumber` is a radio button's accessibility value.
         unsafe { self.setAccessibilityValue(Some(&value)) };
         self.setAccessibilityElement(!single);
+    }
+
+    /// A card row's lines under its title (`tabs::Row::details`): where the tab is on the box's
+    /// last line, in the dim ink, and what it told above it, top-aligned in up to
+    /// `tabs::DETAIL_STATUS_LINES` lines in its tone's ink; a line nobody knows is hidden, and
+    /// both are without `details`. `lead` is the leading element's width, as for the title.
+    fn set_details(
+        &self,
+        details: Option<&tabs::Details>,
+        size: NSSize,
+        lead: Option<f64>,
+        palette: Palette,
+    ) {
+        let iv = self.ivars();
+        let Some(details) = details else {
+            iv.status.setHidden(true);
+            iv.place.setHidden(true);
+            return;
+        };
+        let area = tabs::Row::details(size.width, size.height, lead);
+        // Top-down, as the column measured them (`row_heights`): what the tab told, then where
+        // it is under it, each as tall as it draws and none past the box.
+        let mut at = area.y;
+        let foot = area.y + area.height;
+        let mut put = |field: &NSTextField, text: Option<&str>, rgb: u32| {
+            let high = line_height(field, text, area.width).min((foot - at).max(0.0));
+            field.setTextColor(Some(&Tint::of(rgb, 1.0).color()));
+            field.setFrame(NSRect::new(
+                NSPoint::new(area.x, at),
+                NSSize::new(area.width, high),
+            ));
+            field.setHidden(high <= 0.0);
+            if high > 0.0 {
+                at += high + tabs::DETAIL_GAP;
+            }
+        };
+        let tone = details
+            .status
+            .as_ref()
+            .map_or(palette.dim, |(_, tone)| palette.tone(*tone, palette.dim));
+        put(
+            &iv.status,
+            details.status.as_ref().map(|(text, _)| text.as_str()),
+            tone,
+        );
+        put(&iv.place, details.place.as_deref(), palette.dim);
     }
 
     /// The ⌘ key that reaches the tab, right-aligned in the chip's right
@@ -3765,6 +3954,9 @@ struct Look<'a> {
     /// The chip is a row of the side column: its parts sit where `tabs::Row` puts them, the `×`
     /// and the ⌘ hint at the right end.
     side: bool,
+    /// A card row's lines under the title (`[appearance] tab_details`); `None` for a plain row,
+    /// a chip of the title row and a row being renamed.
+    details: Option<&'a tabs::Details>,
 }
 
 /// What a layout knows that is the same for every chip: the part of a [`Look`] that comes from
@@ -3855,6 +4047,7 @@ impl Seen {
             lifted,
             ghost,
             side,
+            details: label.details.as_ref().filter(|_| side && !naming),
         }
     }
 }
@@ -5107,6 +5300,9 @@ pub(crate) struct Label {
     pub(crate) upload: Option<Upload>,
     /// Its focused pane's marked host (`TerminalTab::host_mark`).
     pub(crate) mark: HostMark,
+    /// What its row says under the title while the column's rows are cards
+    /// (`TerminalTab::details`); `None` for a plain row and in the title row.
+    pub(crate) details: Option<tabs::Details>,
 }
 
 /// One group's header as the bar shows it ([`TabBar::show`]).
@@ -8986,6 +9182,7 @@ mod tests {
             running: None,
             upload: None,
             mark: bt_core::HostMark::None,
+            details: None,
         }
     }
 
@@ -9049,6 +9246,7 @@ mod tests {
                 scroll,
                 warning: false,
                 corner: 20.5,
+                row_height: tabs::TAB_HEIGHT,
             }
             .layout()
         };

@@ -66,7 +66,9 @@ use crate::sheets;
 use crate::split::{Axis, Direction, Placement, Removal, Tree};
 use crate::split_view::SplitView;
 use crate::tab_bar::{Emblem, Upload};
-use crate::tabs::{self, Card, CardCommand, CardPane, Finish, Indicator, Signals, Tally, Unseen};
+use crate::tabs::{
+    self, Card, CardCommand, CardPane, Details, Finish, Indicator, Signals, Tally, Unseen,
+};
 use crate::upload;
 use crate::uploader;
 use crate::window::{TerminalWindow, initial_rect};
@@ -195,9 +197,12 @@ impl PaneHost for TabHost {
         // bateri does not ring or flash: a bell has never shown in its tabs.
     }
 
-    fn program_notification(&self, _pane: u64, _title: Option<&str>, _body: &str) {
-        // A program's own notification is not shown by bateri's tabs (its
-        // notifications are its own: an upload's end, a lost connection).
+    fn program_notification(&self, pane: u64, _title: Option<&str>, body: &str) {
+        // Not posted to Notification Center (bateri's notifications are its own: an upload's
+        // end, a lost connection): kept on the tab, whose detailed row says it.
+        if let Some(tab) = self.tab() {
+            tab.noted(pane, body);
+        }
     }
 
     fn questions_changed(&self, _pane: u64) {
@@ -303,6 +308,73 @@ pub(crate) struct TabIvars {
     /// What the arrangement moment lifted, while it is up
     /// ([`TerminalTab::arrange`]).
     raised: RefCell<Option<Raised>>,
+    /// The newest notification a program in the tab sent ([`TerminalTab::noted`]), until its
+    /// pane's next command edge ([`TerminalTab::details`]).
+    note: RefCell<Option<Note>>,
+    /// The newest command as the detailed row last read it, with the pane and the edges it was
+    /// read at: read again only when they change, not on every title a program sets
+    /// ([`TerminalTab::details`]).
+    told: RefCell<Option<(u64, Edges, Option<CardCommand>)>>,
+}
+
+/// A program's notification kept on its tab ([`TerminalTab::noted`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Note {
+    /// The pane it came from.
+    pane: u64,
+    text: String,
+    /// That pane's command edges when it came: it speaks until they move on.
+    edges: Edges,
+}
+
+/// Where a pane's shell commands stand, in what `Session::activity` counts: one runs or not, and
+/// how many ended. A command starting or ending moves it; a program's title, a notification and
+/// what a program reports of itself do not — an agent that ends its turn (`OSC 9 ; 4` clearing)
+/// is still the same command, and what it said last still speaks for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Edges {
+    running: bool,
+    commands: u64,
+}
+
+impl Edges {
+    fn of(session: &bt_core::Session) -> Self {
+        let activity = session.activity();
+        Self {
+            running: activity.running.is_some(),
+            commands: activity.commands,
+        }
+    }
+}
+
+/// The newest command of `session`, as the summary card and the detailed row tell it: running,
+/// finished or failed; `None` before any, and while it runs under a program that covers its row.
+/// One `Term` round (`Session::last_block_info`): never on the frame path.
+fn newest_command(session: &bt_core::Session) -> Option<CardCommand> {
+    let running = session.activity().running;
+    let block = session.last_block_info();
+    match (running, block) {
+        (Some(elapsed), block) => Some(CardCommand::Running {
+            command: block
+                .filter(|block| block.running)
+                .map(|block| block.command)
+                .unwrap_or_default(),
+            elapsed,
+        }),
+        (None, Some(block)) if block.running => None,
+        (None, Some(block)) => match block.exit {
+            Some(0) => Some(CardCommand::Finished {
+                command: block.command,
+                duration: block.duration,
+            }),
+            Some(exit) => Some(CardCommand::Failed {
+                command: block.command,
+                exit,
+            }),
+            None => None,
+        },
+        (None, None) => None,
+    }
 }
 
 define_class!(
@@ -341,6 +413,8 @@ impl TerminalTab {
             tallies: RefCell::new(Vec::new()),
             ends: RefCell::new(Vec::new()),
             raised: RefCell::new(None),
+            note: RefCell::new(None),
+            told: RefCell::new(None),
         });
         // SAFETY: NSObject's init takes no arguments and the ivars are set.
         unsafe { msg_send![super(this), init] }
@@ -1314,30 +1388,7 @@ impl TerminalTab {
                 .remote_mark()
                 .map(|(host, _)| (host, session.remote_link_directory()))
         });
-        let running = session.and_then(|session| session.activity().running);
-        let block = session.and_then(|session| session.last_block_info());
-        let command = match (running, block) {
-            (Some(elapsed), block) => Some(CardCommand::Running {
-                command: block
-                    .filter(|block| block.running)
-                    .map(|block| block.command)
-                    .unwrap_or_default(),
-                elapsed,
-            }),
-            (None, Some(block)) if block.running => None,
-            (None, Some(block)) => match block.exit {
-                Some(0) => Some(CardCommand::Finished {
-                    command: block.command,
-                    duration: block.duration,
-                }),
-                Some(exit) => Some(CardCommand::Failed {
-                    command: block.command,
-                    exit,
-                }),
-                None => None,
-            },
-            (None, None) => None,
-        };
+        let command = session.and_then(|session| newest_command(session));
         let upload = pane.upload_title_prefix().map(|(arrow, percent)| {
             (
                 pane.upload_flowing_name().unwrap_or_default(),
@@ -1359,6 +1410,66 @@ impl TerminalTab {
                 area.height / area.width
             },
         }
+    }
+
+    /// A program in pane `pane` sent a notification (`OSC 9`, `OSC 777`): the tab keeps it, the
+    /// newest only, and its detailed row says it until that pane's next command edge — a command
+    /// starting or ending, or a reporting program's end ([`Edges`]).
+    pub(crate) fn noted(&self, pane: u64, body: &str) {
+        let Some(edges) = self
+            .panes()
+            .iter()
+            .find(|candidate| candidate.id() == pane)
+            .and_then(|pane| pane.session().map(|session| Edges::of(session)))
+        else {
+            return;
+        };
+        self.ivars().note.replace(Some(Note {
+            pane,
+            text: body.to_owned(),
+            edges,
+        }));
+        if crate::window::tab_details(self.mtm())
+            && let Some(window) = self.window()
+        {
+            window.refresh_bar();
+        }
+    }
+
+    /// What the tab's detailed row says under its title ([`tabs::details`]): the kept
+    /// notification while its pane's commands stand where they stood when it came, else the
+    /// focused pane's newest command; and the branch and folder of that pane. The newest command
+    /// is read again only when the focused pane or its edges change, so a program that retitles
+    /// its tab many times a second costs no `Term` round.
+    pub(crate) fn details(&self) -> Details {
+        let pane = self.focused_pane();
+        let session = pane.session();
+        let note = self.ivars().note.borrow().clone().filter(|note| {
+            self.panes()
+                .iter()
+                .find(|candidate| candidate.id() == note.pane)
+                .and_then(|pane| pane.session().map(|session| Edges::of(session)))
+                == Some(note.edges)
+        });
+        let command = session.and_then(|session| {
+            let edges = Edges::of(session);
+            let mut told = self.ivars().told.borrow_mut();
+            match told.as_ref() {
+                Some((id, at, command)) if *id == pane.id() && *at == edges => command.clone(),
+                _ => {
+                    let command = newest_command(session);
+                    *told = Some((pane.id(), edges, command.clone()));
+                    command
+                }
+            }
+        });
+        let branch = session.and_then(|session| session.branch());
+        tabs::details(
+            note.as_ref().map(|note| note.text.as_str()),
+            command.as_ref(),
+            self.place(),
+            branch.as_deref(),
+        )
     }
 
     /// Where the focused pane's shell is, in words: its directory with the home as `~`, or
