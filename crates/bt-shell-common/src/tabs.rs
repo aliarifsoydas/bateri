@@ -1619,6 +1619,40 @@ pub struct Details {
     pub status: Option<(String, Tone)>,
     /// The branch and the folder: `main · ~/api`; `host:path` in a remote session.
     pub place: Option<String>,
+    /// A split tab's panes, one line each in the order the split tree has them
+    /// ([`PaneLine::text`]); empty for a tab of one pane, whose line is [`Details::status`].
+    pub panes: Vec<PaneLine>,
+}
+
+/// One pane of a split tab on its card row ([`Details::panes`]): its name and what it last
+/// said, on a line of its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaneLine {
+    /// The title its session reports.
+    pub name: String,
+    /// The notification its program sent last, while it speaks for the pane (as
+    /// [`Details::status`] for a tab of one pane); `None` when it has said nothing.
+    pub said: Option<String>,
+    /// The tab's focused pane: its line is in the title's ink, the others dimmed.
+    pub focused: bool,
+}
+
+impl PaneLine {
+    /// The line as the row writes it: `name · what it said`, or the name alone; a blank name
+    /// gives way to what it said.
+    pub fn text(&self) -> String {
+        let name = self.name.trim();
+        let said = self
+            .said
+            .as_deref()
+            .map(str::trim)
+            .filter(|said| !said.is_empty());
+        match (name.is_empty(), said) {
+            (false, Some(said)) => format!("{name} · {said}"),
+            (true, Some(said)) => said.to_owned(),
+            (_, None) => name.to_owned(),
+        }
+    }
 }
 
 /// What a detailed row of a tab says ([`Details`]). `note` is the newest notification a program
@@ -1626,13 +1660,17 @@ pub struct Details {
 /// speaks for the tab before the command does — an agent runs as one long command, and what it
 /// says is what the row is for. `command` is the newest command as the summary card reads it
 /// ([`CardCommand`]): only its end is told, never that it runs. `place` is the folder
-/// ([`place`]) and `branch` its git branch.
+/// ([`place`]) and `branch` its git branch. `panes` are a split tab's lines ([`PaneLine`]):
+/// with two or more, each pane says its own and the tab's own line ([`Details::status`]) is left
+/// out — it would repeat one of them; a tab of one pane passes none.
 pub fn details(
     note: Option<&str>,
     command: Option<&CardCommand>,
     place: Option<String>,
     branch: Option<&str>,
+    panes: Vec<PaneLine>,
 ) -> Details {
+    let panes = if panes.len() > 1 { panes } else { Vec::new() };
     let joined = |parts: &[&str]| {
         parts
             .iter()
@@ -1653,14 +1691,19 @@ pub fn details(
             Some((joined(&[&format!("Exit {exit}"), command]), Tone::Error))
         }
         (None, None) => None,
-    };
+    }
+    .filter(|_| panes.is_empty());
     let branch = branch.map(str::trim).filter(|branch| !branch.is_empty());
     let place = match (branch, place) {
         (Some(branch), Some(place)) => Some(joined(&[branch, &place])),
         (Some(branch), None) => Some(branch.to_owned()),
         (None, place) => place,
     };
-    Details { status, place }
+    Details {
+        status,
+        place,
+        panes,
+    }
 }
 
 /// What a tab's indicator slot shows, left of its title: one glyph, the most urgent of the tab's
@@ -5080,6 +5123,7 @@ mod tests {
             Some(&running),
             Some("~/api".to_owned()),
             Some("main"),
+            Vec::new(),
         );
         assert_eq!(
             told.status,
@@ -5087,7 +5131,13 @@ mod tests {
         );
         assert_eq!(told.place.as_deref(), Some("main · ~/api"));
 
-        let quiet = details(None, Some(&running), Some("~/api".to_owned()), None);
+        let quiet = details(
+            None,
+            Some(&running),
+            Some("~/api".to_owned()),
+            None,
+            Vec::new(),
+        );
         assert_eq!(quiet.status, None, "the ring says a command runs");
         assert_eq!(quiet.place.as_deref(), Some("~/api"));
 
@@ -5096,10 +5146,11 @@ mod tests {
             exit: 2,
         };
         assert_eq!(
-            details(Some("  "), Some(&failed), None, Some("dev")),
+            details(Some("  "), Some(&failed), None, Some("dev"), Vec::new()),
             Details {
                 status: Some(("Exit 2 · make test".to_owned(), Tone::Error)),
                 place: Some("dev".to_owned()),
+                panes: Vec::new(),
             },
             "a blank note is none"
         );
@@ -5108,10 +5159,59 @@ mod tests {
             duration: Some("12s".to_owned()),
         };
         assert_eq!(
-            details(None, Some(&finished), None, None).status,
+            details(None, Some(&finished), None, None, Vec::new()).status,
             Some(("Finished · cargo build · 12s".to_owned(), Tone::Success))
         );
-        assert_eq!(details(None, None, None, None), Details::default());
+        assert_eq!(
+            details(None, None, None, None, Vec::new()),
+            Details::default()
+        );
+    }
+
+    #[test]
+    fn a_split_tab_says_each_pane_on_a_line_of_its_own() {
+        let panes = vec![
+            PaneLine {
+                name: "claude".to_owned(),
+                said: Some("Fixed the login test".to_owned()),
+                focused: true,
+            },
+            PaneLine {
+                name: "npm run dev".to_owned(),
+                said: None,
+                focused: false,
+            },
+        ];
+        let failed = CardCommand::Failed {
+            command: "make".to_owned(),
+            exit: 1,
+        };
+        let split = details(
+            Some("Fixed the login test"),
+            Some(&failed),
+            Some("~/api".to_owned()),
+            Some("main"),
+            panes.clone(),
+        );
+        assert_eq!(split.status, None, "each pane says its own");
+        assert_eq!(split.panes, panes);
+        assert_eq!(split.place.as_deref(), Some("main · ~/api"));
+        assert_eq!(panes[0].text(), "claude · Fixed the login test");
+        assert_eq!(panes[1].text(), "npm run dev");
+        // One pane is no split: its line is the tab's own.
+        let lone = details(None, Some(&failed), None, None, panes[..1].to_vec());
+        assert!(lone.panes.is_empty());
+        assert_eq!(
+            lone.status.map(|(text, _)| text).as_deref(),
+            Some("Exit 1 · make")
+        );
+        // A blank name gives way to what was said.
+        let unnamed = PaneLine {
+            name: " ".to_owned(),
+            said: Some("waiting".to_owned()),
+            focused: false,
+        };
+        assert_eq!(unnamed.text(), "waiting");
     }
 
     #[test]

@@ -727,7 +727,8 @@ fn line_height(field: &NSTextField, text: Option<&str>, width: f64) -> f64 {
 }
 
 /// How tall a card row's two parts draw in a box `width` wide (`tabs::Row::details`): what the
-/// tab told, then where it is; 0 for a part it does not say.
+/// tab told — its own line, or a split tab's line per pane with [`tabs::DETAIL_GAP`] between
+/// them — then where it is; 0 for a part it does not say.
 fn detail_heights(mtm: MainThreadMarker, details: &tabs::Details, width: f64) -> (f64, f64) {
     MEASURE.with(|shared| {
         let mut shared = shared.borrow_mut();
@@ -737,15 +738,32 @@ fn detail_heights(mtm: MainThreadMarker, details: &tabs::Details, width: f64) ->
                 place_label(mtm),
             )
         });
-        (
+        // A pane's line is one line, as the place's: measured in its kind of field.
+        let told = if details.panes.is_empty() {
             line_height(
                 status,
                 details.status.as_ref().map(|(text, _)| text.as_str()),
                 width,
-            ),
-            line_height(place, details.place.as_deref(), width),
-        )
+            )
+        } else {
+            let lines: Vec<f64> = details
+                .panes
+                .iter()
+                .map(|pane| line_height(place, Some(&pane.text()), width))
+                .filter(|high| *high > 0.0)
+                .collect();
+            lines.iter().sum::<f64>() + tabs::DETAIL_GAP * lines.len().saturating_sub(1) as f64
+        };
+        (told, line_height(place, details.place.as_deref(), width))
     })
+}
+
+/// A split tab's line for one pane on its card row ([`Chip::set_details`]): one line that ends in
+/// "…" where it does not fit.
+fn pane_label(mtm: MainThreadMarker) -> Retained<NSTextField> {
+    let line = detail_label(mtm, 1);
+    line.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+    line
 }
 
 /// The leading element's width in a side row of `style` for a tab of `emblem`
@@ -3230,6 +3248,9 @@ pub(crate) struct ChipIvars {
     /// `tabs::DETAIL_STATUS_LINES` lines, and where it is; hidden in a plain row.
     status: Retained<NSTextField>,
     place: Retained<NSTextField>,
+    /// A split tab's card row: a line per pane, made as needed and kept for the next set; the
+    /// ones past the panes it has now are hidden.
+    pane_lines: RefCell<Vec<Retained<NSTextField>>>,
     close: Retained<CloseButton>,
     /// The line that fills under the chip while a carried pane waits on it to
     /// open the tab ([`Chip::dwell`]).
@@ -3404,6 +3425,7 @@ impl Chip {
             hint: hint.clone(),
             status: status.clone(),
             place: place.clone(),
+            pane_lines: RefCell::new(Vec::new()),
             close: close.clone(),
             dwell: RefCell::new(None),
         });
@@ -3811,15 +3833,19 @@ impl Chip {
             .set(!single && hovered && !keyed, palette, motion.close);
         iv.close.setHidden(single);
         let spoken = match details.filter(|_| row.is_some()) {
-            Some(details) => [
-                Some(spoken.as_str()),
-                details.status.as_ref().map(|(text, _)| text.as_str()),
-                details.place.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(", "),
+            Some(details) => {
+                let panes: Vec<String> = details.panes.iter().map(tabs::PaneLine::text).collect();
+                [
+                    Some(spoken.as_str()),
+                    details.status.as_ref().map(|(text, _)| text.as_str()),
+                ]
+                .into_iter()
+                .flatten()
+                .chain(panes.iter().map(String::as_str))
+                .chain(details.place.as_deref())
+                .collect::<Vec<_>>()
+                .join(", ")
+            }
             None => spoken.clone(),
         };
         self.setAccessibilityLabel(Some(&NSString::from_str(&spoken)));
@@ -3844,6 +3870,9 @@ impl Chip {
         let Some(details) = details else {
             iv.status.setHidden(true);
             iv.place.setHidden(true);
+            for line in iv.pane_lines.borrow().iter() {
+                line.setHidden(true);
+            }
             return;
         };
         let area = tabs::Row::details(size.width, size.height, lead);
@@ -3872,6 +3901,28 @@ impl Chip {
             details.status.as_ref().map(|(text, _)| text.as_str()),
             tone,
         );
+        // A split tab's panes, a line each: the focused one in the title's ink.
+        let mut lines = iv.pane_lines.borrow_mut();
+        while lines.len() < details.panes.len() {
+            let line = pane_label(self.mtm());
+            line.setAccessibilityElement(false);
+            self.addSubview(&line);
+            lines.push(line);
+        }
+        for (index, line) in lines.iter().enumerate() {
+            match details.panes.get(index) {
+                Some(pane) => {
+                    let ink = if pane.focused {
+                        palette.title
+                    } else {
+                        palette.dim
+                    };
+                    put(line, Some(&pane.text()), ink);
+                }
+                None => line.setHidden(true),
+            }
+        }
+        drop(lines);
         put(&iv.place, details.place.as_deref(), palette.dim);
     }
 

@@ -308,9 +308,10 @@ pub(crate) struct TabIvars {
     /// What the arrangement moment lifted, while it is up
     /// ([`TerminalTab::arrange`]).
     raised: RefCell<Option<Raised>>,
-    /// The newest notification a program in the tab sent ([`TerminalTab::noted`]), until its
-    /// pane's next command edge ([`TerminalTab::details`]).
-    note: RefCell<Option<Note>>,
+    /// The newest notification each pane's program sent ([`TerminalTab::noted`]), one per pane,
+    /// until that pane's next command edge ([`TerminalTab::details`]); a pane that leaves the
+    /// tab takes its own with it.
+    notes: RefCell<Vec<Note>>,
     /// The newest command as the detailed row last read it, with the pane and the edges it was
     /// read at: read again only when they change, not on every title a program sets
     /// ([`TerminalTab::details`]).
@@ -413,7 +414,7 @@ impl TerminalTab {
             tallies: RefCell::new(Vec::new()),
             ends: RefCell::new(Vec::new()),
             raised: RefCell::new(None),
-            note: RefCell::new(None),
+            notes: RefCell::new(Vec::new()),
             told: RefCell::new(None),
         });
         // SAFETY: NSObject's init takes no arguments and the ivars are set.
@@ -1413,8 +1414,8 @@ impl TerminalTab {
     }
 
     /// A program in pane `pane` sent a notification (`OSC 9`, `OSC 777`): the tab keeps it, the
-    /// newest only, and its detailed row says it until that pane's next command edge — a command
-    /// starting or ending, or a reporting program's end ([`Edges`]).
+    /// newest of each pane, and its detailed row says it until that pane's next shell command
+    /// starts or ends ([`Edges`]).
     pub(crate) fn noted(&self, pane: u64, body: &str) {
         let Some(edges) = self
             .panes()
@@ -1424,11 +1425,14 @@ impl TerminalTab {
         else {
             return;
         };
-        self.ivars().note.replace(Some(Note {
+        let mut notes = self.ivars().notes.borrow_mut();
+        notes.retain(|note| note.pane != pane);
+        notes.push(Note {
             pane,
             text: body.to_owned(),
             edges,
-        }));
+        });
+        drop(notes);
         if crate::window::tab_details(self.mtm())
             && let Some(window) = self.window()
         {
@@ -1436,21 +1440,49 @@ impl TerminalTab {
         }
     }
 
-    /// What the tab's detailed row says under its title ([`tabs::details`]): the kept
-    /// notification while its pane's commands stand where they stood when it came, else the
-    /// focused pane's newest command; and the branch and folder of that pane. The newest command
-    /// is read again only when the focused pane or its edges change, so a program that retitles
-    /// its tab many times a second costs no `Term` round.
+    /// What pane `pane` last said ([`TerminalTab::noted`]), while its commands stand where they
+    /// stood when it came; `None` otherwise.
+    fn said(&self, pane: &TerminalPane) -> Option<String> {
+        let edges = pane.session().map(|session| Edges::of(session))?;
+        self.ivars()
+            .notes
+            .borrow()
+            .iter()
+            .find(|note| note.pane == pane.id() && note.edges == edges)
+            .map(|note| note.text.clone())
+    }
+
+    /// What the tab's detailed row says under its title ([`tabs::details`]). A tab of one pane:
+    /// what that pane last said ([`Self::said`]), else its newest command. A split tab: a line
+    /// per pane in the split tree's order, its name and what it last said. Either way the branch
+    /// and folder of the focused pane. The newest command is read again only when the focused
+    /// pane or its edges change, so a program that retitles its tab many times a second costs no
+    /// `Term` round.
     pub(crate) fn details(&self) -> Details {
         let pane = self.focused_pane();
         let session = pane.session();
-        let note = self.ivars().note.borrow().clone().filter(|note| {
-            self.panes()
-                .iter()
-                .find(|candidate| candidate.id() == note.pane)
-                .and_then(|pane| pane.session().map(|session| Edges::of(session)))
-                == Some(note.edges)
-        });
+        let panes = self.panes();
+        let lines: Vec<tabs::PaneLine> = if panes.len() > 1 {
+            self.container()
+                .tree()
+                .fractions()
+                .into_iter()
+                .filter_map(|(id, _)| {
+                    let each = panes.iter().find(|candidate| candidate.id() == id)?;
+                    Some(tabs::PaneLine {
+                        name: each
+                            .session()
+                            .map(|session| session.title())
+                            .unwrap_or_default(),
+                        said: self.said(each),
+                        focused: id == pane.id(),
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let note = self.said(&pane);
         let command = session.and_then(|session| {
             let edges = Edges::of(session);
             let mut told = self.ivars().told.borrow_mut();
@@ -1465,10 +1497,11 @@ impl TerminalTab {
         });
         let branch = session.and_then(|session| session.branch());
         tabs::details(
-            note.as_ref().map(|note| note.text.as_str()),
+            note.as_deref(),
             command.as_ref(),
             self.place(),
             branch.as_deref(),
+            lines,
         )
     }
 
