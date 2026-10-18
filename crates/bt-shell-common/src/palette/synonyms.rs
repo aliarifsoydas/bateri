@@ -27,6 +27,8 @@ const WORDS: &[(&str, &str)] = &[
     ("detachTab", "window pop out detach"),
     ("mergeWindows", "combine join gather"),
     ("showTabList", "list overview all switch"),
+    ("goToTab", "switch jump recent previous window"),
+    ("moveGroupToNewWindow", "window pop out detach folder"),
     ("showNextTab", "switch"),
     ("showPreviousTab", "switch"),
     ("closeTab", "kill exit quit"),

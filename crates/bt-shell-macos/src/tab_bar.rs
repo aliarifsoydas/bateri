@@ -1607,6 +1607,26 @@ fn list_image(label: &Label, style: IconStyle, palette: Palette) -> Retained<NSI
     listed_image(label.emblem.kind, label.indicator, style, palette)
 }
 
+/// The icon of a tab for a row of the command palette: the Show All Tabs row's, drawn in the
+/// colours of `theme` and the icon settings now, so a tab looks the same in the bar, in that
+/// list and in the palette.
+pub(crate) fn palette_icon(
+    mtm: MainThreadMarker,
+    emblem: Emblem,
+    indicator: Option<Indicator>,
+    theme: &Theme,
+) -> Retained<NSImage> {
+    listed_image(
+        emblem.kind,
+        indicator,
+        IconStyle::current(mtm),
+        Palette::of(theme),
+    )
+}
+
+/// The side of the icon [`palette_icon`] draws, in points.
+pub(crate) const PALETTE_ICON_SIDE: f64 = LIST_SIDE;
+
 /// A program's mark on its tile with what it reports as a dot on the corner, [`LIST_SIDE`]
 /// across: the menu row's icon, and a pane's on the card's map.
 fn listed_image(
@@ -6741,6 +6761,7 @@ impl TabBar {
         }
         add("Rename Group\u{2026}", sel!(renameGroup:));
         add("Ungroup", sel!(ungroupGroup:));
+        add("Move Group to New Window", sel!(moveGroupToNewWindow:));
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         add("Close Group", sel!(closeGroup:));
         Some(menu)

@@ -14,6 +14,8 @@
 //! - [`root_rows`], [`page_rows`] and [`chosen`] — what each page lists and what choosing a
 //!   settings row writes; [`theme_entries`] — the themes with their colours.
 //! - [`Recent`] and [`Visits`] — what was chosen last and which tab was looked at last.
+//! - [`Places`], [`tab_list`] and [`act`] — the tabs and groups of every window, the page ⌘P
+//!   opens, the menu of a row (→) and what choosing does.
 //! - [`synonyms`] — the words a menu command is also found by, keyed by its selector.
 //! - [`PathQuery`] — a path typed in the field.
 //!
@@ -32,6 +34,7 @@ mod rank;
 mod recent;
 mod row;
 mod state;
+mod switch;
 mod synonyms;
 mod themes;
 mod visits;
@@ -44,7 +47,8 @@ pub use list::{
 };
 pub use matching::{Match, score};
 pub use menu::{
-    MenuNode, MenuRow, MenuRows, Modifiers, PALETTE_ACTION, rows as menu_rows, shortcut,
+    GO_TO_TABS_ACTION, MenuNode, MenuRow, MenuRows, Modifiers, PALETTE_ACTION, rows as menu_rows,
+    shortcut,
 };
 pub use pages::{Chosen, Sources, chosen, page_rows, root_rows};
 pub use path::PathQuery;
@@ -55,6 +59,11 @@ pub use rank::{
 pub use recent::{HEADER as RECENT_HEADER, LIMIT as RECENT_LIMIT, Recent};
 pub use row::{Kind, Preview, Row, Scope, Slot, Status, Swatch, Tone, command_id};
 pub use state::{Effect, Key, Modifier, Palette, REST};
+pub use switch::{
+    Act, EARLIER_HEADING, GROUPS_HEADING, GroupFacts, Places, RECENT_TABS, Report, TabFacts, act,
+    actions as tab_actions, actions_heading, group_id, group_key, group_row, group_rows,
+    listing_order, status as tab_status, tab_id, tab_keys, tab_list, tab_row, tab_rows,
+};
 pub use synonyms::for_selector as command_words;
 pub use themes::{Group as ThemeGroup, ThemeEntry, entries as theme_entries};
 pub use visits::Visits;

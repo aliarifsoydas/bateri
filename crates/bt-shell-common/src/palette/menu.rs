@@ -45,6 +45,16 @@ impl Modifiers {
 /// does not list itself: choosing it would close the palette to open it again.
 pub const PALETTE_ACTION: &str = "toggleCommandPalette:";
 
+/// The action of Window ▸ Go to Tab… (⌘P). The palette lists it as the **page** of the tabs
+/// (`scope.tabs`), with the menu item's own shortcut, not as a command that would close the
+/// palette to open it again.
+pub const GO_TO_TABS_ACTION: &str = "goToTab:";
+
+/// The actions of the items Select Tab ▸ and Select Group ▸ hold (⌘1…⌘9, ⌃⌘0…⌃⌘9): the tabs
+/// page lists the tabs and the groups themselves, with these very keys, so listing the items
+/// too would say each twice.
+const LISTED_BY_THE_TABS: [&str; 2] = ["selectTab:", "selectGroup:"];
+
 /// One item of the menu, as the toolkit read it. `token` is the toolkit's own handle on the
 /// item (an index into the list it keeps), which comes back with the row so the item can be run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,7 +267,22 @@ fn walk(
         let Some(selector) = &node.selector else {
             continue;
         };
-        if !node.enabled || node.title.trim().is_empty() || selector == PALETTE_ACTION {
+        if !node.enabled
+            || node.title.trim().is_empty()
+            || selector == PALETTE_ACTION
+            || LISTED_BY_THE_TABS.contains(&selector.as_str())
+        {
+            continue;
+        }
+        if selector == GO_TO_TABS_ACTION {
+            let page = MenuRow {
+                row: tabs_page(node, path),
+                token: None,
+            };
+            if !under_paged && !out.flat.iter().any(|listed| listed.row.id == page.row.id) {
+                out.flat.push(page.clone());
+            }
+            level.push(page);
             continue;
         }
         let base = command_key(node, selector);
@@ -284,6 +309,18 @@ fn walk(
         }
     }
     level
+}
+
+/// The page row of Go to Tab…: the item's title and shortcut, opening the tabs.
+fn tabs_page(node: &MenuNode, path: &[String]) -> Row {
+    let mut row = Row::new(Kind::Scope, "tabs", node.title.clone())
+        .keywords(for_selector(GO_TO_TABS_ACTION))
+        .subtitle(path.join(" › "))
+        .opens(Scope::Tabs, true);
+    if let Some(glyphs) = shortcut(&node.key, node.modifiers) {
+        row = row.shortcut(glyphs);
+    }
+    row
 }
 
 /// The key a menu item's command goes by: its selector, and its tag when it has one.
@@ -633,6 +670,43 @@ mod tests {
         let menu = rows(&twice);
         assert_eq!(menu.flat.len(), 1);
         assert_eq!(menu.flat[0].token, Some(1));
+    }
+
+    #[test]
+    fn go_to_tab_is_the_tabs_page_with_the_items_own_shortcut_and_the_select_items_are_not_listed()
+    {
+        let bar = vec![MenuNode::holder(
+            0,
+            "Window",
+            vec![
+                MenuNode::item(1, "Go to Tab…", GO_TO_TABS_ACTION).shortcut("p", with(&[])),
+                MenuNode::holder(
+                    2,
+                    "Select Tab",
+                    vec![MenuNode::item(3, "Tab 1", "selectTab:").shortcut("1", with(&['c']))],
+                ),
+                MenuNode::holder(
+                    4,
+                    "Select Group",
+                    vec![MenuNode::item(5, "Group 1", "selectGroup:").shortcut("1", with(&['c']))],
+                ),
+                MenuNode::item(6, "Minimize", "performMiniaturize:"),
+            ],
+        )];
+        let menu = rows(&bar);
+        let ids: Vec<&str> = menu
+            .flat
+            .iter()
+            .map(|entry| entry.row.id.as_str())
+            .collect();
+        assert_eq!(ids, ["scope.tabs", "cmd.performMiniaturize"]);
+        let page = &menu.flat[0];
+        assert_eq!(page.row.opens, Some(Scope::Tabs));
+        assert!(page.row.enters);
+        assert_eq!(page.row.shortcut.as_deref(), Some("⌘P"));
+        assert_eq!(page.token, None, "a page runs no menu item");
+        // No Select Tab or Select Group page either: their items are the tabs page's rows.
+        assert!(menu.pages.iter().all(|(key, _)| !key.contains("Select")));
     }
 
     #[test]

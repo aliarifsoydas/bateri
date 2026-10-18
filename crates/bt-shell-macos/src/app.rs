@@ -1077,6 +1077,10 @@ pub(crate) struct Ivars {
     /// the palette opens ([`AppDelegate::palette_recent`]), kept in memory from then on and
     /// written back on a choice ([`AppDelegate::palette_chose`]). `None`: not read yet.
     palette_recent: RefCell<Option<bt_shell_common::palette::Recent>>,
+    /// The order the tabs of every window were looked at, the latest first: ⌘P's order
+    /// ([`AppDelegate::note_visit`], [`AppDelegate::forget_visit`]). In memory only — after a
+    /// restart the tabs are listed in the strip's order until they are looked at.
+    visits: RefCell<bt_shell_common::palette::Visits<u64>>,
     /// What the update's holders gave at launch
     /// ([`arrive`] — taken before this delegate was born); consumed by the
     /// first windows ([`AppDelegate::restore_or_open`]).
@@ -1628,9 +1632,11 @@ define_class!(
                 || item.action() == Some(sel!(newUngroupedTab:))
             {
                 self.key_window().is_some()
-            } else if item.action() == Some(sel!(toggleCommandPalette:)) {
+            } else if item.action() == Some(sel!(toggleCommandPalette:))
+                || item.action() == Some(sel!(goToTab:))
+            {
                 // Grey without a terminal window to open it over, and while a question is up
-                // on it; open, the same item takes it down.
+                // on it; open, the same item takes it down (⇧⌘P) or moves it one tab on (⌘P).
                 self.key_window().is_some_and(|window| {
                     window.root().palette().is_some() || window.palette_may_open()
                 })
@@ -1652,6 +1658,17 @@ define_class!(
         fn toggle_command_palette(&self, _sender: Option<&AnyObject>) {
             if let Some(window) = self.key_window() {
                 window.toggle_palette();
+            }
+        }
+
+        /// Window ▸ Go to Tab… (⌘P): the key window's palette opens on the tabs, the one before
+        /// the tab on screen highlighted; open on the tabs already, the highlight goes one on
+        /// (⌘P ⏎ is back to the tab before, ⌘P P ⏎ the one before that); open elsewhere, it
+        /// comes to the tabs.
+        #[unsafe(method(goToTab:))]
+        fn go_to_tab(&self, _sender: Option<&AnyObject>) {
+            if let Some(window) = self.key_window() {
+                window.go_to_tab();
             }
         }
 
@@ -2569,6 +2586,7 @@ impl AppDelegate {
             }),
             restore_lock: RefCell::new(None),
             palette_recent: RefCell::new(None),
+            visits: RefCell::new(bt_shell_common::palette::Visits::new()),
             arrival: RefCell::new(arrival),
             holder: RefCell::new(None),
             keeper,
@@ -3394,6 +3412,10 @@ impl AppDelegate {
                 .position(|window| window.id() == id)
                 .map(|index| windows.remove(index))
         };
+        // The window's tabs end with it: none keeps a place among the tabs looked at.
+        for tab in removed.iter().flat_map(|window| window.tabs()) {
+            self.forget_visit(tab.id());
+        }
         drop(removed);
         self.forget_undo_of(id);
         self.layout_changed();
@@ -4973,6 +4995,166 @@ impl AppDelegate {
             && let Err(error) = restore::write_recent(lock, &text)
         {
             eprintln!("bateri: could not save the palette's recent commands: {error}");
+        }
+    }
+
+    /// Tab `tab` is on screen in the window the user is in: it is the one looked at last
+    /// ([`TerminalWindow::switch`], a window becoming key).
+    pub(crate) fn note_visit(&self, tab: u64) {
+        self.ivars().visits.borrow_mut().visit(tab);
+    }
+
+    /// Tab `tab` is at its end: it keeps no place. A tab that only moves to another window keeps
+    /// its identity and so its place, and is not forgotten.
+    pub(crate) fn forget_visit(&self, tab: u64) {
+        self.ivars().visits.borrow_mut().forget(&tab);
+    }
+
+    /// The tabs and groups of every window as the palette lists them: the key window's first
+    /// (with the digits that reach its own), the tabs in the order they were looked at, the one
+    /// on screen last ([`bt_shell_common::palette::listing_order`]).
+    pub(crate) fn palette_places(&self) -> bt_shell_common::palette::Places {
+        use bt_shell_common::palette as rules;
+        let windows = self.windows();
+        let key = self.key_window().map(|window| window.id());
+        // The key window first, the others in the order they were opened.
+        let mut walk: Vec<(usize, Retained<TerminalWindow>)> = windows
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(at, window)| (at + 1, window))
+            .collect();
+        walk.sort_by_key(|(_, window)| Some(window.id()) != key);
+        let mut by_tab = std::collections::HashMap::new();
+        let mut strip = Vec::new();
+        let mut places = rules::Places::default();
+        for (number, window) in &walk {
+            let (tabs, groups) = window.palette_facts(Some(window.id()) == key, *number);
+            for facts in tabs {
+                strip.push(facts.tab);
+                by_tab.insert(facts.tab, facts);
+            }
+            places.groups.extend(groups);
+        }
+        let here = walk
+            .iter()
+            .find(|(_, window)| Some(window.id()) == key)
+            .and_then(|(_, window)| window.try_selected_tab())
+            .map(|tab| tab.id());
+        let order = rules::listing_order(&self.ivars().visits.borrow(), &strip, here);
+        places.tabs = order
+            .into_iter()
+            .filter_map(|tab| by_tab.remove(&tab))
+            .collect();
+        places
+    }
+
+    /// What choosing a tab's or a group's row, or an action of its menu, comes to
+    /// ([`bt_shell_common::palette::act`]); the palette is down and the keyboard back with the
+    /// tab on screen. What shows the user something (a name field, a question) brings its window
+    /// forward first.
+    pub(crate) fn palette_act(&self, act: bt_shell_common::palette::Act) {
+        use crate::groups::Target;
+        use crate::moves::Move;
+        use bt_shell_common::palette::Act;
+        let tab_window = |tab: u64| self.tab(tab).and_then(|tab| tab.window().map(|w| (tab, w)));
+        match act {
+            Act::GoToTab(id) => {
+                if let Some((tab, window)) = tab_window(id) {
+                    window.bring_to_front(&tab, &tab.focused_pane());
+                }
+            }
+            Act::GoToGroup { window, group } => {
+                let Some(window) = self.window(window) else {
+                    return;
+                };
+                let of = group.and_then(|number| window.group_numbered(number));
+                if group.is_some() && of.is_none() {
+                    return;
+                }
+                window.reach_cluster(of);
+                window.raise();
+            }
+            Act::RenameTab(id) => {
+                if let Some((_, window)) = tab_window(id) {
+                    window.raise();
+                    if window.select_tab(id) {
+                        window.bar().begin_rename(id);
+                    }
+                }
+            }
+            Act::MoveTabToGroup { tab, group } => {
+                if let Some((_, window)) = tab_window(tab)
+                    && let Some(group) = window.group_numbered(group)
+                {
+                    window.regroup_tab(
+                        tab,
+                        Target::Group {
+                            group,
+                            before: None,
+                        },
+                    );
+                }
+            }
+            Act::MoveTabToNewGroup(id) => {
+                if let Some((_, window)) = tab_window(id) {
+                    window.raise();
+                    window.move_to_new_group(id);
+                }
+            }
+            Act::RemoveTabFromGroup(id) => {
+                if let Some((_, window)) = tab_window(id) {
+                    window.regroup_tab(id, Target::Loose { before: None });
+                }
+            }
+            Act::MoveTabToNewWindow(id) => {
+                self.make_move(Move::TabToNewWindow { tab: id, at: None });
+            }
+            Act::CloseTab(id) => {
+                if let Some((_, window)) = tab_window(id) {
+                    window.raise();
+                    window.close_tab_asking(id);
+                }
+            }
+            Act::NewTabInGroup { window, group } => {
+                if let Some(target) = self.window(window)
+                    && let Some(group) = target.group_numbered(group)
+                {
+                    target.raise();
+                    self.new_tab_seated(window, Seat::Group(group));
+                }
+            }
+            Act::RenameGroup { window, group } => {
+                if let Some(target) = self.window(window)
+                    && let Some(group) = target.group_numbered(group)
+                {
+                    target.reach_cluster(Some(group));
+                    target.raise();
+                    target.bar().begin_group_rename(group, false);
+                }
+            }
+            Act::Ungroup { window, group } => {
+                if let Some(target) = self.window(window)
+                    && let Some(group) = target.group_numbered(group)
+                {
+                    target.ungroup(group);
+                }
+            }
+            Act::MoveGroupToNewWindow { window, group } => {
+                if let Some(target) = self.window(window)
+                    && let Some(group) = target.group_numbered(group)
+                {
+                    target.move_group_to_new_window(group);
+                }
+            }
+            Act::CloseGroup { window, group } => {
+                if let Some(target) = self.window(window)
+                    && let Some(group) = target.group_numbered(group)
+                {
+                    target.raise();
+                    target.close_group(group);
+                }
+            }
         }
     }
 

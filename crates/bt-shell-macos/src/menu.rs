@@ -7,7 +7,7 @@
 //! Find…/Find Next/Find Previous/Use Selection for Find), View (Theme ▸, Tabs ▸,
 //! Bigger, Smaller, Actual Size, Scroll to Top, Scroll to Bottom, Page Up,
 //! Page Down) and Window (Minimize,
-//! Zoom, Show Previous/Next Tab, Select Tab ▸, Show All Tabs, Rename Tab…, splits — Select Previous/Next
+//! Zoom, Show Previous/Next Tab, Go to Tab…, Select Tab ▸, Show All Tabs, Rename Tab…, splits — Select Previous/Next
 //! Split, Select Split ▸, Resize Split ▸, Equalize Splits, Zoom Split —, Move
 //! Tab to New Window, Merge All Windows, Bring All to Front). Settings… (⌘,) opens the settings window
 //! (`settings_window`; it used to open the file in the editor, that job is now
@@ -28,7 +28,8 @@
 //! (`selectPreviousSplit:`, `selectNextSplit:`, `selectSplit:`,
 //! `resizeSplit:`, `equalizeSplits:`, `toggleSplitZoom:`; grey with a single pane)
 //! to the key window's delegate (`window::TerminalWindow`, which carries the
-//! tabs — the tab actions are named apart from `NSWindow`'s own, which the
+//! tabs and their groups (`moveGroupToNewWindow:` beside `renameGroup:`: the group on screen)
+//! — the tab actions are named apart from `NSWindow`'s own, which the
 //! window would answer before its delegate); `performMiniaturize:` and
 //! `performZoom:` to `NSWindow` itself; `mergeWindows:` (Merge All Windows,
 //! grey with a single window) to the app delegate, which reaches every window;
@@ -38,6 +39,8 @@
 //! `toggleHostIntegration:`
 //! (its title, checkmark and grey state in the app delegate's
 //! `validateMenuItem:`, from [`integration_menu`]) and
+//! `toggleCommandPalette:` and `goToTab:` (View ▸ Command Palette… ⇧⌘P, Window ▸ Go to Tab… ⌘P: the
+//! key window's palette; grey while a question is up on it) and
 //! `newWindow:`/`newTab:`/`newLocalTab:`/`quitAndEndPrograms:` to the app delegate
 //! (the same path as the settings record's `settingsDidChange:` — they spread to all
 //! windows or must work even when there is no window);
@@ -694,6 +697,9 @@ pub(crate) fn install(
             // Bigger's `+`).
             item(mtm, "Show Previous Tab", sel!(showPreviousTab:), "{"),
             item(mtm, "Show Next Tab", sel!(showNextTab:), "}"),
+            // The palette's tabs page (⌘P): handled by the app delegate, like the palette's own
+            // item. Open, the same key takes the highlight one tab further.
+            item(mtm, "Go to Tab\u{2026}", sel!(goToTab:), "p"),
             hidden_shortcut(with_modifiers(
                 item(mtm, "Show Previous Tab", sel!(showPreviousTab:), "\t"),
                 NSEventModifierFlags::Control | NSEventModifierFlags::Shift,
@@ -706,6 +712,12 @@ pub(crate) fn install(
             submenu(mtm, "Select Group", &select_group),
             move_to_group.clone(),
             item(mtm, "Rename Group\u{2026}", sel!(renameGroup:), ""),
+            item(
+                mtm,
+                "Move Group to New Window",
+                sel!(moveGroupToNewWindow:),
+                "",
+            ),
             // `|` is the Shift character of `\`: the menu matches ⇧⌘\. Grey with a single
             // tab (`TerminalWindow`'s `validateMenuItem:`).
             item(mtm, "Show All Tabs", sel!(showTabList:), "|"),

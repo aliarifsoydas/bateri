@@ -2072,6 +2072,22 @@ pub enum Tone {
     Mark,
 }
 
+/// Where a tab's shell is, in words: `host:path` in a remote session (the host alone when the
+/// server says no directory), else the shell's directory with the home as `~`; `None` when
+/// nothing is known. The summary card's directory line and the command palette's tab rows both
+/// say it this way.
+pub fn place(
+    remote: Option<(&str, &str)>,
+    directory: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Option<String> {
+    match remote {
+        Some((host, "")) => Some(host.to_owned()),
+        Some((host, dir)) => Some(format!("{host}:{dir}")),
+        None => directory.map(|dir| crate::program::tilde(dir, home)),
+    }
+}
+
 /// The card's lines, top to bottom: the title; the directory (`host:path` in a remote session);
 /// what the newest command did — "Running · {command} · {time}", "Finished · {command} · {time}",
 /// "Exit {n} · {command}"; a flowing transfer; a marked host's kind. A card with a map keeps only
@@ -2080,14 +2096,13 @@ pub enum Tone {
 /// knows is left out rather than shown empty.
 pub fn card_lines(card: &Card) -> Vec<(String, Tone)> {
     let mut lines = vec![(card.title.clone(), Tone::Title)];
-    let directory = match &card.remote {
-        Some((host, dir)) if dir.is_empty() => Some(host.clone()),
-        Some((host, dir)) => Some(format!("{host}:{dir}")),
-        None => card
-            .directory
-            .as_deref()
-            .map(|dir| crate::program::tilde(dir, card.home.as_deref())),
-    };
+    let directory = place(
+        card.remote
+            .as_ref()
+            .map(|(host, dir)| (host.as_str(), dir.as_str())),
+        card.directory.as_deref(),
+        card.home.as_deref(),
+    );
     if let Some(directory) = directory {
         lines.push((directory, Tone::Dim));
     }
@@ -4506,6 +4521,29 @@ mod tests {
     }
 
     /// The card's lines in the design's order and roles; a part nobody knows is left out.
+    #[test]
+    fn a_place_is_the_host_and_directory_remotely_and_the_directory_with_home_as_tilde_here() {
+        use std::path::Path;
+        let home = Path::new("/Users/me");
+        assert_eq!(
+            place(
+                Some(("prod", "/var/www")),
+                Some(Path::new("/x")),
+                Some(home)
+            ),
+            Some("prod:/var/www".to_owned())
+        );
+        assert_eq!(
+            place(Some(("prod", "")), None, None),
+            Some("prod".to_owned())
+        );
+        assert_eq!(
+            place(None, Some(Path::new("/Users/me/src")), Some(home)),
+            Some("~/src".to_owned())
+        );
+        assert_eq!(place(None, None, Some(home)), None);
+    }
+
     #[test]
     fn the_card_tells_the_tabs_story_in_lines() {
         let card = Card {

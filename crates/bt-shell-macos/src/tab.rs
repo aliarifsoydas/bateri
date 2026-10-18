@@ -370,7 +370,7 @@ impl TerminalTab {
     }
 
     /// The tab's window from the list; `None` once it has left it.
-    fn window(&self) -> Option<Retained<TerminalWindow>> {
+    pub(crate) fn window(&self) -> Option<Retained<TerminalWindow>> {
         app::delegate(self.mtm())?.window(self.ivars().window.get())
     }
 
@@ -1327,6 +1327,26 @@ impl TerminalTab {
                 area.height / area.width
             },
         }
+    }
+
+    /// Where the focused pane's shell is, in words: its directory with the home as `~`, or
+    /// `host:directory` in a remote session ([`tabs::place`], the summary card's line); `None`
+    /// while no session says. The command palette's tab rows read it.
+    pub(crate) fn place(&self) -> Option<String> {
+        let pane = self.focused_pane();
+        let session = pane.session()?;
+        let remote = session
+            .remote_mark()
+            .map(|(host, _)| (host, session.remote_link_directory()));
+        let directory = session.working_directory();
+        let home = crate::child::home();
+        tabs::place(
+            remote
+                .as_ref()
+                .map(|(host, directory)| (host.as_str(), directory.as_str())),
+            directory.as_deref(),
+            home.as_deref(),
+        )
     }
 
     /// A picture of each pane the card's map asks for, `(pane id, tile size in points)`, at

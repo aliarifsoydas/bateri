@@ -304,3 +304,16 @@ fn choosing_a_value_from_a_page_is_an_edit_the_settings_model_accepts() {
     let text = Settings::with_edit("[terminal]\ncursor = \"block\" # mine\n", &edit).unwrap();
     assert!(text.contains("cursor = \"underline\" # mine"), "{text}");
 }
+
+#[test]
+fn a_tab_at_the_root_is_as_near_as_it_is_on_its_page() {
+    let tab = |id: &str| Row::new(Kind::Tab, id, "api");
+    let rows = [tab("2"), tab("1")];
+    let recent: Vec<String> = Vec::new();
+    let hits = search(&rows, "api", Nearness::Recent(&recent));
+    assert_eq!(
+        hits.iter().map(|h| h.row.id.as_str()).collect::<Vec<_>>(),
+        ["tab.2", "tab.1"]
+    );
+    assert!((hits[0].score - hits[1].score - VISIT_STEP).abs() < 1e-9);
+}

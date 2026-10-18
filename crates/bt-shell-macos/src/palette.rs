@@ -15,6 +15,14 @@
 //! write path the menus and the settings window use, and anything that closes the palette takes
 //! the preview back. A file that takes no write shows why above the page and previews nothing.
 //!
+//! **Tabs and groups** are rows too ([`bt_shell_common::palette::Places`], read from every window
+//! when the palette opens): ⇧⌘P finds them by what they are called, where they are and which
+//! group they are in; ⌘P ([`go_to_tab`]) opens the palette **on** the tabs — the one before the tab
+//! on screen highlighted — and, open, takes the highlight one tab further. ⏎ goes there, → opens
+//! the row's menu (what the tab's chip and the group's header offer), and what is chosen is done
+//! a turn after the palette is down ([`AppDelegate::palette_act`](crate::app)). A tab's icon is
+//! the one the bar draws ([`palette_icon`]).
+//!
 //! **Running a row** is the menu's own act: the palette closes, the keyboard goes back to the tab
 //! on screen, and only then is the item's action sent — to the item's target, or down the
 //! responder chain from that pane — with the item as the sender, so a tagged item (a direction,
@@ -44,13 +52,15 @@
 mod menu;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ptr::NonNull;
+use std::rc::Rc;
 
 use block2::RcBlock;
 use bt_core::{Settings, Theme};
 use bt_shell_common::palette::{
-    self as rules, Chosen, Effect, Fallbacks, Key, Kind, List, Modifier, Palette, Row, Scope,
-    Sources, Swatch, ThemeEntry,
+    self as rules, Chosen, Effect, Fallbacks, Key, Kind, List, Modifier, Palette, Places, Row,
+    Scope, Sources, Swatch, ThemeEntry,
 };
 use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::Retained;
@@ -61,10 +71,10 @@ use objc2::{
 use objc2_app_kit::{
     NSAnimatablePropertyContainer, NSAnimationContext, NSApplication,
     NSAttributedStringNSStringDrawing, NSAutoresizingMaskOptions, NSBezierPath, NSBorderType,
-    NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSFocusRingType, NSFont,
-    NSFontAttributeName, NSFontWeightMedium, NSFontWeightSemibold, NSForegroundColorAttributeName,
-    NSScrollView, NSShadow, NSStringDrawing, NSTextField, NSTextFieldDelegate, NSTrackingArea,
-    NSTrackingAreaOptions, NSView, NSWindowOrderingMode,
+    NSCompositingOperation, NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags,
+    NSFocusRingType, NSFont, NSFontAttributeName, NSFontWeightMedium, NSFontWeightSemibold,
+    NSForegroundColorAttributeName, NSImage, NSScrollView, NSShadow, NSStringDrawing, NSTextField,
+    NSTextFieldDelegate, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindowOrderingMode,
 };
 use objc2_foundation::{
     NSAttributedString, NSAttributedStringKey, NSDictionary, NSMutableAttributedString,
@@ -74,7 +84,7 @@ use objc2_quartz_core::{CAMediaTimingFunction, kCAMediaTimingFunctionEaseOut};
 
 use self::menu::Snapshot;
 use crate::app;
-use crate::tab_bar::{Tint, inner_line, rounded};
+use crate::tab_bar::{PALETTE_ICON_SIDE, Tint, inner_line, palette_icon, rounded};
 use crate::window::{RootView, TerminalWindow};
 
 // ─── Measures ─────────────────────────────────────────────────────────────
@@ -121,6 +131,8 @@ const SWATCH_WIDTH: f64 = 72.0;
 const SWATCH_HEIGHT: f64 = 18.0;
 const SWATCH_DOT: f64 = 7.0;
 const SWATCH_GAP: f64 = 3.6;
+/// The space between a tab's icon and its title.
+const ICON_GAP: f64 = 9.0;
 
 const RETURN: u16 = 36;
 const ENTER: u16 = 76;
@@ -222,6 +234,8 @@ fn hints(
     if let Some(row) = row {
         let verb = if row.opens.is_some() && row.enters {
             "Open"
+        } else if matches!(row.kind, Kind::Tab | Kind::Group) {
+            "Go to"
         } else if row.kind == Kind::Search {
             "Find"
         } else if matches!(row.kind, Kind::Theme | Kind::Choice) {
@@ -232,6 +246,10 @@ fn hints(
             "Run"
         };
         hints.push(("↵", verb.to_owned()));
+        // A row that does something by ⏎ and keeps a menu of its own behind →.
+        if row.opens.is_some() && !row.enters {
+            hints.push(("→", "Actions".to_owned()));
+        }
         if let Some(appearance) = appearance
             && row.kind == Kind::Theme
             && row.id != "theme.system"
@@ -410,6 +428,9 @@ fn draw_title(
 
 // ─── The list ─────────────────────────────────────────────────────────────
 
+/// The icons of the rows that have one (a tab's, as its chip wears it), by row id.
+type Icons = Rc<HashMap<String, Retained<NSImage>>>;
+
 /// What the list view draws.
 struct Shown {
     list: List,
@@ -419,6 +440,7 @@ struct Shown {
     empty: &'static str,
     /// A heading in the warning colour: why the page cannot be written.
     warning: Option<String>,
+    icons: Icons,
 }
 
 pub(crate) struct ListIvars {
@@ -501,6 +523,7 @@ impl PaletteList {
                 look: None,
                 empty: "",
                 warning: None,
+                icons: Icons::default(),
             }),
             pressed: Cell::new(None),
         });
@@ -546,6 +569,7 @@ impl PaletteList {
         look: Look,
         empty: &'static str,
         warning: Option<String>,
+        icons: &Icons,
     ) -> f64 {
         let (slots, total) = slots(list);
         {
@@ -556,6 +580,7 @@ impl PaletteList {
             shown.look = Some(look);
             shown.empty = empty;
             shown.warning = warning;
+            shown.icons = icons.clone();
         }
         self.setNeedsDisplay(true);
         total
@@ -652,11 +677,30 @@ impl PaletteList {
                 );
             }
             let right = draw_row_end(&hit.row, width - TEXT_INSET, slot, &quiet, &tick, look);
-            let room = right - TEXT_INSET - 14.0;
+            // A tab's icon, the one its chip wears, before its title.
+            let mut left = TEXT_INSET;
+            if let Some(icon) = shown.icons.get(&hit.row.id) {
+                // SAFETY: no hints.
+                unsafe {
+                    icon.drawInRect_fromRect_operation_fraction_respectFlipped_hints(
+                        NSRect::new(
+                            NSPoint::new(left, slot.top + (slot.height - PALETTE_ICON_SIDE) / 2.0),
+                            NSSize::new(PALETTE_ICON_SIDE, PALETTE_ICON_SIDE),
+                        ),
+                        NSRect::ZERO,
+                        NSCompositingOperation::SourceOver,
+                        1.0,
+                        true,
+                        None,
+                    );
+                }
+                left += PALETTE_ICON_SIDE + ICON_GAP;
+            }
+            let room = right - left - 14.0;
             let end = draw_title(
                 &hit.row.title,
                 &hit.marks,
-                TEXT_INSET,
+                left,
                 room,
                 slot.top,
                 &plain,
@@ -773,6 +817,10 @@ struct Open {
     /// The root's rows: the menu's commands and pages, the settings, the themes.
     root: Vec<Row>,
     recent: Vec<String>,
+    /// The tabs and groups of every window, as they were when the palette opened.
+    places: Places,
+    /// The tabs' icons, by row id ([`tab_icons`]).
+    icons: Icons,
     list: List,
     rows: Vec<Row>,
     look: Look,
@@ -784,6 +832,7 @@ impl Open {
             menu: &self.menu.rows,
             settings: &self.settings,
             themes: &self.themes,
+            places: &self.places,
         }
     }
 
@@ -807,8 +856,16 @@ impl Open {
                 },
             );
         };
+        // The tabs page has its own order and headings; the others list their rows.
+        if matches!(scope, Scope::Tabs) {
+            return rules::tab_list(&self.places, query);
+        }
         let rows = rules::page_rows(scope, &self.sources());
         let mut list = rules::page_list(&rows, query);
+        // A tab's or a group's menu says whose it is.
+        if let Some(whose) = rules::actions_heading(scope, &self.places) {
+            list.headings.insert(0, (0, whose));
+        }
         // A page that writes says over its rows why it cannot.
         if let Some(reason) = &self.lock
             && matches!(scope, Scope::Settings | Scope::Theme(_) | Scope::Choices(_))
@@ -1043,7 +1100,12 @@ impl PaletteCard {
     /// Applies `theme` (the window's theme changed while the palette is open).
     fn set_theme(&self, theme: &Theme) {
         let look = Look::of(theme);
-        self.ivars().open.borrow_mut().look = look;
+        {
+            let mut open = self.ivars().open.borrow_mut();
+            open.look = look;
+            // The tabs' icons wear the theme's colours.
+            open.icons = tab_icons(self.mtm(), &open.places, theme);
+        }
         self.restyle(look);
         // The theme a preview shows repaints the card while the pointer is on a row of it: the
         // list must not slide under the pointer.
@@ -1071,7 +1133,7 @@ impl PaletteCard {
     /// [`PaletteCard::refresh`], with the highlighted row scrolled into sight or not.
     fn refresh_scrolling(&self, scroll: bool) {
         let iv = self.ivars();
-        let (list, highlight, empty, look, query, warning) = {
+        let (list, highlight, empty, look, query, warning, icons) = {
             let mut open = iv.open.borrow_mut();
             let list = open.derive();
             let rows = list.rows();
@@ -1086,6 +1148,7 @@ impl PaletteCard {
                 open.look,
                 open.machine.query().to_owned(),
                 open.warning(),
+                open.icons.clone(),
             )
         };
         if iv.field.stringValue().to_string() != query {
@@ -1095,7 +1158,7 @@ impl PaletteCard {
                 editor.setSelectedRange(NSRange::new(length, 0));
             }
         }
-        let total = iv.list.set(&list, highlight, look, empty, warning);
+        let total = iv.list.set(&list, highlight, look, empty, warning, &icons);
         let visible = list_height(total, list.is_empty());
         self.fit(total, visible);
         iv.list.light(highlight, scroll);
@@ -1169,6 +1232,26 @@ impl PaletteCard {
         {
             app.palette_chose(&row.id);
         }
+    }
+
+    /// ⌘P with the palette up: on the tabs the highlight goes one tab on (the keys' ↓, which
+    /// wraps); anywhere else the tabs come, fresh, as when ⌘P opens the palette.
+    fn go_to_tabs(&self) {
+        let _keep = self.retain();
+        let on_tabs = matches!(
+            self.ivars().open.borrow().machine.scope(),
+            Some(Scope::Tabs)
+        );
+        if on_tabs {
+            self.press(Key::Down);
+            return;
+        }
+        let effect = {
+            let mut open = self.ivars().open.borrow_mut();
+            open.notice = None;
+            open.machine.start_on(Scope::Tabs)
+        };
+        self.settle(effect);
     }
 
     /// A key to the machine, and what it asks for done.
@@ -1307,6 +1390,20 @@ impl PaletteCard {
                 open.dark,
             )
         };
+        // A tab, a group, or an action of the menu of one: the palette comes down, the keyboard
+        // goes back to the tab on screen, and a turn later the act is done (a name field, a
+        // question or a new window opens over a window that has its keyboard back).
+        if let Some(act) = rules::act(id, scope.as_ref(), modifier) {
+            self.dismiss();
+            DispatchQueue::main().exec_async(move || {
+                // audit: a block running on the main queue is on the main thread by definition.
+                let mtm = MainThreadMarker::new().expect("the main queue is the main thread");
+                if let Some(app) = app::delegate(mtm) {
+                    app.palette_act(act);
+                }
+            });
+            return;
+        }
         if let Some(chosen) = rules::chosen(id, scope.as_ref(), modifier, &settings, dark) {
             self.write(id, &chosen);
             return;
@@ -1542,11 +1639,43 @@ pub(crate) fn toggle(window: &TerminalWindow) {
     if window.root().palette().is_some() {
         window.close_palette();
     } else if ready(window) {
-        open(window);
+        open(window, None);
     }
 }
 
-fn open(window: &TerminalWindow) {
+/// ⌘P: opens the palette on the tabs, or — open — takes its highlight one tab on
+/// ([`PaletteCard::go_to_tabs`]).
+pub(crate) fn go_to_tab(window: &TerminalWindow) {
+    if let Some(scrim) = window.root().palette() {
+        scrim.ivars().card.go_to_tabs();
+    } else if ready(window) {
+        open(window, Some(Scope::Tabs));
+    }
+}
+
+/// The icon of each tab row of `places`, as its chip wears it, in `theme`'s colours; a tab that
+/// is gone has none.
+fn tab_icons(mtm: MainThreadMarker, places: &Places, theme: &Theme) -> Icons {
+    let Some(app) = app::delegate(mtm) else {
+        return Icons::default();
+    };
+    Rc::new(
+        places
+            .tabs
+            .iter()
+            .filter_map(|facts| {
+                let tab = app.tab(facts.tab)?;
+                let indicator = tab.indicator();
+                let image = palette_icon(mtm, tab.emblem(indicator), indicator, theme);
+                Some((rules::tab_id(facts.tab), image))
+            })
+            .collect(),
+    )
+}
+
+/// Opens the palette over `window`'s content; `start`: on that page, which esc closes from
+/// (⌘P on the tabs) rather than going back to the root.
+fn open(window: &TerminalWindow, start: Option<Scope>) {
     let mtm = window.mtm();
     let Some(app) = app::delegate(mtm) else {
         return;
@@ -1560,6 +1689,8 @@ fn open(window: &TerminalWindow) {
     let themes = app.palette_themes();
     let recent = app.palette_recent();
     let animate = !app.reduce_motion();
+    let places = app.palette_places();
+    let icons = tab_icons(mtm, &places, &theme);
     let mut state = Open {
         machine: Palette::new(),
         root: Vec::new(),
@@ -1570,10 +1701,15 @@ fn open(window: &TerminalWindow) {
         lock: app.palette_lock(),
         notice: None,
         recent,
+        places,
+        icons,
         list: List::default(),
         rows: Vec::new(),
         look,
     };
+    if let Some(page) = start {
+        state.machine.start_on(page);
+    }
     state.rebuild_root();
     state.list = state.derive();
     state.rows = state.list.rows();
@@ -1763,6 +1899,29 @@ mod tests {
         assert_eq!(
             hints(None, 0, None),
             pairs(&[("↑↓", "Move"), ("esc", "Close")])
+        );
+    }
+
+    #[test]
+    fn a_tab_goes_by_enter_and_keeps_its_menu_behind_the_right_arrow() {
+        let tab = Row::new(Kind::Tab, "7", "api").opens(Scope::TabActions("tab.7".into()), false);
+        assert_eq!(
+            hints(Some(&tab), 0, None),
+            pairs(&[
+                ("↵", "Go to"),
+                ("→", "Actions"),
+                ("↑↓", "Move"),
+                ("esc", "Close")
+            ])
+        );
+        // The ungrouped tabs' row has no menu to point at.
+        let loose = Row::new(Kind::Group, "1.0", "Ungrouped");
+        assert_eq!(hints(Some(&loose), 0, None)[0], ("↵", "Go to".to_owned()));
+        assert_eq!(hints(Some(&loose), 0, None).len(), 3);
+        // A page opened on (⌘P) is where esc closes: depth 0 says Close there.
+        assert_eq!(
+            hints(Some(&tab), 0, None).last(),
+            Some(&("esc", "Close".to_owned()))
         );
     }
 

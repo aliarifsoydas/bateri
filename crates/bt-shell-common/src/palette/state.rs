@@ -96,6 +96,9 @@ pub struct Palette {
     query: String,
     highlight: usize,
     stack: Vec<Page>,
+    /// How many of the pages at the bottom of the stack are where the palette was **opened**
+    /// ([`Self::start_on`]): leaving them closes the palette instead of showing the root.
+    home: usize,
     /// Where the highlight lands the next time the list is handed in ([`Self::arrive`]).
     landing: Option<Landing>,
     preview: Option<Preview>,
@@ -122,9 +125,10 @@ impl Palette {
         self.stack.last().map(|page| &page.scope)
     }
 
-    /// How many pages are open above the root.
+    /// How many pages are open above where the palette was opened: the root, or the page
+    /// ([`Self::start_on`]) a shortcut opened it on.
     pub fn depth(&self) -> usize {
-        self.stack.len()
+        self.stack.len().saturating_sub(self.home)
     }
 
     /// The value being shown without being written.
@@ -235,7 +239,7 @@ impl Palette {
                 }
             }
             Key::Escape => {
-                if self.stack.is_empty() {
+                if self.stack.len() <= self.home {
                     self.close()
                 } else {
                     self.pop()
@@ -268,8 +272,26 @@ impl Palette {
         self.unpreview()
     }
 
-    /// Leaves the page on top. At the root nothing happens.
+    /// Opens the palette **on** a page (⌘P on the tabs): the page is its home, so esc closes it
+    /// from there and ⌫ or ← on an empty field leave it as they would at the root. Any pages
+    /// and text from before are dropped; the caller takes back a preview that was showing
+    /// ([`Effect::Close`]'s `revert`, returned by the first call).
+    pub fn start_on(&mut self, scope: Scope) -> Effect {
+        let closed = self.close();
+        self.push(scope, None);
+        self.home = self.stack.len();
+        match closed {
+            Effect::Close { revert: true } => Effect::Preview(None),
+            _ => Effect::None,
+        }
+    }
+
+    /// Leaves the page on top. At the root, or on the page the palette was opened on, nothing
+    /// happens.
     pub fn pop(&mut self) -> Effect {
+        if self.stack.len() <= self.home {
+            return Effect::None;
+        }
         let Some(page) = self.stack.pop() else {
             return Effect::None;
         };
@@ -284,6 +306,7 @@ impl Palette {
         let revert = self.preview.take().is_some();
         self.query.clear();
         self.stack.clear();
+        self.home = 0;
         self.highlight = 0;
         self.landing = None;
         Effect::Close { revert }
@@ -481,6 +504,45 @@ mod tests {
         q.key(Key::Down, &rows);
         q.commit_preview();
         assert_eq!(q.close(), Effect::Close { revert: false });
+    }
+
+    #[test]
+    fn a_palette_opened_on_a_page_closes_from_it_and_a_page_above_it_goes_back_to_it() {
+        let tab = Row::new(Kind::Tab, "7", "api").opens(Scope::TabActions("tab.7".into()), false);
+        let rows = [tab];
+        let mut p = Palette::new();
+        p.push(Scope::Settings, None);
+        // Where the shortcut opens it, whatever was before is dropped; it is the home.
+        assert_eq!(p.start_on(Scope::Tabs), Effect::None);
+        assert_eq!(p.scope(), Some(&Scope::Tabs));
+        assert_eq!(
+            p.depth(),
+            0,
+            "the page it opened on is not a page above anything"
+        );
+        // ⌫ and ← on an empty field have nowhere to go back to; esc closes.
+        assert_eq!(p.key(Key::Backspace, &rows), Effect::None);
+        assert_eq!(p.key(Key::Left, &rows), Effect::None);
+        assert_eq!(p.scope(), Some(&Scope::Tabs));
+        // The row's own menu is a page above the home: esc goes back to the tabs, then closes.
+        p.key(Key::Right { at_end: true }, &rows);
+        assert_eq!(p.scope(), Some(&Scope::TabActions("tab.7".into())));
+        assert_eq!(p.depth(), 1);
+        p.key(Key::Escape, &rows);
+        assert_eq!(p.scope(), Some(&Scope::Tabs));
+        assert_eq!(p.key(Key::Escape, &rows), Effect::Close { revert: false });
+        assert_eq!(p.scope(), None);
+        assert_eq!(p.depth(), 0);
+    }
+
+    #[test]
+    fn opening_on_a_page_takes_back_a_preview_that_was_showing() {
+        let rows = [theme("nord")];
+        let mut p = Palette::new();
+        p.key(Key::Down, &rows);
+        assert!(p.preview().is_some());
+        assert_eq!(p.start_on(Scope::Tabs), Effect::Preview(None));
+        assert!(p.preview().is_none());
     }
 
     #[test]

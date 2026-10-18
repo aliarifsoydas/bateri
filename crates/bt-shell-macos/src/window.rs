@@ -708,6 +708,7 @@ define_class!(
             let Some(tab) = self.try_selected_tab() else {
                 return;
             };
+            self.note_visit(&tab);
             if tab.key_to_sheet() {
                 return;
             }
@@ -1319,6 +1320,17 @@ define_class!(
         fn ungroup_group_action(&self, sender: Option<&AnyObject>) {
             if let Some(group) = self.menu_group(sender) {
                 self.later(move |window| window.ungroup(group));
+            }
+        }
+
+        /// Window ▸ Move Group to New Window (the group on screen) and a header menu's (the
+        /// header's): the group becomes a window of its own, a turn later like the tab's.
+        #[unsafe(method(moveGroupToNewWindow:))]
+        fn move_group_to_new_window_action(&self, sender: Option<&AnyObject>) {
+            if let Some(group) = self.menu_group(sender) {
+                self.later(move |window| {
+                    window.move_group_to_new_window(group);
+                });
             }
         }
 
@@ -2297,7 +2309,7 @@ impl TerminalWindow {
         if action == sel!(moveTabToNewGroup:) {
             return Some(true);
         }
-        if action == sel!(renameGroup:) {
+        if action == sel!(renameGroup:) || action == sel!(moveGroupToNewWindow:) {
             // The group of the tab on screen, or the header's own: none for an ungrouped tab.
             return Some(self.menu_group_of(item));
         }
@@ -2622,6 +2634,12 @@ impl TerminalWindow {
     /// it down.
     pub(crate) fn toggle_palette(&self) {
         palette::toggle(self);
+    }
+
+    /// Window ▸ Go to Tab… (⌘P): the palette on the tabs, or its highlight one tab on
+    /// ([`palette::go_to_tab`]).
+    pub(crate) fn go_to_tab(&self) {
+        palette::go_to_tab(self);
     }
 
     /// Whether the palette may open now: not while a question is up on the window or on the
@@ -3700,6 +3718,12 @@ impl TerminalWindow {
     /// Keeps a closed tab's object until the next main-queue turn
     /// ([`Self::close_tab_now`]).
     pub(crate) fn retire(&self, tab: Retained<TerminalTab>) {
+        // The tab object is at its end (closed, folded into another, its panes taken out): it
+        // keeps no place among the tabs looked at. A tab that moves to another window is not
+        // retired — it keeps its identity and with it its place ([`Self::release_tab`]).
+        if let Some(app) = app::delegate(self.mtm()) {
+            app.forget_visit(tab.id());
+        }
         self.ivars().retired.borrow_mut().push(tab);
         let id = self.id();
         DispatchQueue::main().exec_async(move || {
@@ -3740,6 +3764,12 @@ impl TerminalWindow {
             if key {
                 pane.rehover_footer();
             }
+        }
+        // The tab on screen in the window the user is in has been looked at: ⌘P's order. A
+        // window that is not key records it when it becomes key (`windowDidBecomeKey:`), so a
+        // tab that came up in the background is not a visit.
+        if key {
+            self.note_visit(&new);
         }
         // The keyboard to the tab's focused pane — the one it had when it
         // left the screen; the old tab's responder is hidden now.
@@ -4242,6 +4272,129 @@ impl TerminalWindow {
             .collect()
     }
 
+    /// `tab` is on screen in this window while it is key: ⌘P's order puts it first
+    /// ([`app::AppDelegate::note_visit`]).
+    fn note_visit(&self, tab: &TerminalTab) {
+        if let Some(app) = app::delegate(self.mtm()) {
+            app.note_visit(tab.id());
+        }
+    }
+
+    /// What the command palette is told of this window's tabs and groups
+    /// ([`app::AppDelegate::palette_places`]): in strip order, with the ⌘ and ⌃⌘ digits only when
+    /// this is the key window (they reach this window's tabs and groups alone), and "Window
+    /// `number`" for the tabs of any other. The ungrouped tabs are a row of their own only in a
+    /// window that has groups.
+    pub(crate) fn palette_facts(
+        &self,
+        key: bool,
+        number: usize,
+    ) -> (
+        Vec<bt_shell_common::palette::TabFacts>,
+        Vec<bt_shell_common::palette::GroupFacts>,
+    ) {
+        use bt_shell_common::palette as rules;
+        let other_window = (!key).then_some(number);
+        let order = self.ivars().order.borrow();
+        let groups = self.ivars().groups.borrow();
+        let keys = if key {
+            rules::tab_keys(&groups, &order, self.listing())
+        } else {
+            Vec::new()
+        };
+        let selected = order.selected();
+        let tabs = order
+            .ids()
+            .iter()
+            .filter_map(|&id| self.tab(id))
+            .map(|tab| {
+                let indicator = tab.indicator();
+                let group = groups
+                    .group_of(tab.id())
+                    .and_then(|id| groups.group(id).map(|group| (id.get(), group.name.clone())));
+                rules::TabFacts {
+                    tab: tab.id(),
+                    window: self.id(),
+                    title: tab.session_title().unwrap_or_else(|| "bateri".to_owned()),
+                    report: indicator.map(|indicator| rules::Report {
+                        indicator,
+                        running: tab
+                            .running_for()
+                            .filter(|_| indicator == tabs::Indicator::Running),
+                    }),
+                    place: tab.place(),
+                    group,
+                    other_window,
+                    key: keys
+                        .iter()
+                        .find(|(listed, _)| *listed == tab.id())
+                        .map(|(_, hint)| hint.clone()),
+                    here: key && selected == Some(tab.id()),
+                }
+            })
+            .collect();
+        let mut places = Vec::new();
+        if !groups.is_empty() {
+            let shown = groups.shown(&order);
+            let mut push = |of: Option<GroupId>, name: String, position: Option<usize>| {
+                let members = groups.cluster(&order, of);
+                places.push(rules::GroupFacts {
+                    window: self.id(),
+                    group: of.map(GroupId::get),
+                    name,
+                    key: key
+                        .then(|| rules::group_key(position, groups.len()))
+                        .flatten(),
+                    indicator: self.cluster_indicator(&members),
+                    tabs: members.len(),
+                    back_to: groups
+                        .resident(of)
+                        .and_then(|tab| self.tab(tab))
+                        .and_then(|tab| tab.session_title()),
+                    shown: shown == of,
+                    other_window,
+                });
+            };
+            push(None, "Ungrouped".to_owned(), None);
+            for (at, group) in groups.groups().iter().enumerate() {
+                push(Some(group.id), group.name.clone(), Some(at));
+            }
+        }
+        (tabs, places)
+    }
+
+    /// The group of this window the palette's row names by its number ([`GroupId::get`]).
+    pub(crate) fn group_numbered(&self, number: u64) -> Option<GroupId> {
+        self.ivars()
+            .groups
+            .borrow()
+            .groups()
+            .iter()
+            .map(|group| group.id)
+            .find(|id| id.get() == number)
+    }
+
+    /// The window comes forward and is key, deminiaturized (what `bateri://` does to a window
+    /// before it selects a tab).
+    pub(crate) fn raise(&self) {
+        let window = &self.ivars().window;
+        if window.isMiniaturized() {
+            window.deminiaturize(None);
+        }
+        window.makeKeyAndOrderFront(None);
+        NSApplication::sharedApplication(self.mtm()).activate();
+    }
+
+    /// Move Group to New Window: group `group` becomes a window of its own with its name
+    /// ([`Move::GroupToNewWindow`]); a window that is only that group stays.
+    pub(crate) fn move_group_to_new_window(&self, group: GroupId) -> bool {
+        self.make_move(Move::GroupToNewWindow {
+            window: self.id(),
+            group,
+            at: None,
+        })
+    }
+
     /// A transfer of tab `tab` ended as `finish` says (`TerminalTab::upload_ended`): the bar plays
     /// the end of the tab's fill, once, in the layout this starts.
     pub(crate) fn transfer_ended(&self, tab: u64, finish: Finish) {
@@ -4622,6 +4775,50 @@ mod tests {
                 "{applier} leaves the record to the plan"
             );
         }
+    }
+
+    /// The guard of ⌘P's order: the tab looked at is written where a tab comes on screen — the
+    /// applier's one switch (a selection, a new tab, a neighbour taking over from a closed one)
+    /// and a window becoming key (a window that was not key when its tab came up) — and forgotten
+    /// where a tab object ends (`retire`), never where a tab only moves to another window
+    /// (`release_tab`, whose tab keeps its identity and so its place). A source scan: the paths
+    /// are AppKit's, with no window to try them in.
+    #[test]
+    fn the_tab_looked_at_is_written_on_the_screen_and_forgotten_at_its_end() {
+        let source = include_str!("window.rs");
+        let code = &source[..source.find("#[cfg(test)]").expect("the tests follow")];
+        let body = |signature: &str| {
+            let start = code.find(signature).expect("the method is in this file");
+            let rest = &code[start + signature.len()..];
+            let end = ["\n    pub(crate) fn ", "\n    fn ", "\n        fn "]
+                .iter()
+                .filter_map(|next| rest.find(next))
+                .min()
+                .unwrap_or(rest.len());
+            &rest[..end]
+        };
+        assert!(
+            body("    fn switch(&self, old: Option<&TerminalTab>)").contains("self.note_visit(")
+        );
+        assert!(body("fn window_did_become_key(&self").contains("self.note_visit("));
+        assert!(body("pub(crate) fn retire(").contains("forget_visit("));
+        for mover in ["pub(crate) fn release_tab(", "pub(crate) fn adopt_tab("] {
+            assert!(
+                !body(mover).contains("forget_visit("),
+                "{mover} keeps the tab's place: it only changes window"
+            );
+        }
+        // The only writers of the order are these.
+        assert_eq!(code.matches("app.note_visit(").count(), 1);
+        let app_source = include_str!("app.rs");
+        let app_code = &app_source[..app_source.find("#[cfg(test)]").expect("tests follow")];
+        let closing = &app_code[app_code
+            .find("pub(crate) fn forget_window(")
+            .expect("the window's end")..];
+        assert!(
+            closing[..closing.find("\n    }\n").expect("its end")].contains("forget_visit("),
+            "a window's closing ends its tabs"
+        );
     }
 
     #[test]

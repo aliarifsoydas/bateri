@@ -15,6 +15,7 @@ use super::catalog::{self, Control};
 use super::menu::MenuRows;
 use super::row::{Kind, Row, Scope, Slot};
 use super::state::Modifier;
+use super::switch::{self, Places};
 use super::themes::{self, ThemeEntry};
 
 /// The key of the View ▸ Theme ▸ page in the menu rows: the themes are the palette's own rows
@@ -27,6 +28,8 @@ pub struct Sources<'a> {
     /// The settings the file holds: the values rows show and the ✓ they carry.
     pub settings: &'a Settings,
     pub themes: &'a [ThemeEntry],
+    /// The tabs and the groups of every window.
+    pub places: &'a Places,
 }
 
 /// The pages the root offers beside what a query finds.
@@ -64,11 +67,15 @@ pub fn root_rows(src: &Sources<'_>) -> Vec<Row> {
     }
     rows.extend(catalog::rows(src.settings));
     rows.extend(themes::rows(Slot::Active, src.themes, src.settings));
+    rows.extend(switch::tab_rows(src.places));
+    rows.extend(switch::group_rows(src.places));
     rows.extend(go_to());
     rows
 }
 
 /// The rows of the page `scope` names. A page that lists something later phases bring is empty.
+/// (The tabs page lists them in the order of [`switch::tab_list`]'s empty field; its headings
+/// and its clusters are that function's.)
 pub fn page_rows(scope: &Scope, src: &Sources<'_>) -> Vec<Row> {
     match scope {
         Scope::Menu(key) => src
@@ -81,6 +88,11 @@ pub fn page_rows(scope: &Scope, src: &Sources<'_>) -> Vec<Row> {
         Scope::Choices(key) => catalog::find(key)
             .map(|setting| setting.choice_rows(src.settings))
             .unwrap_or_default(),
+        Scope::Tabs => switch::tab_rows(src.places)
+            .into_iter()
+            .chain(switch::group_rows(src.places))
+            .collect(),
+        Scope::TabActions(_) | Scope::GroupActions(_) => switch::actions(scope, src.places),
         _ => Vec::new(),
     }
 }
@@ -193,6 +205,7 @@ mod tests {
             menu: &menu,
             settings: &settings,
             themes: &themes,
+            places: &Places::default(),
         });
         let ids = ids(&rows);
         assert!(ids.contains(&"cmd.makeFontBigger"));
@@ -213,10 +226,12 @@ mod tests {
     #[test]
     fn a_page_lists_its_own_thing() {
         let (menu, settings, themes) = (menu(), Settings::default(), entries());
+        let places = Places::default();
         let src = Sources {
             menu: &menu,
             settings: &settings,
             themes: &themes,
+            places: &places,
         };
         assert_eq!(page_rows(&Scope::Settings, &src).len(), 34);
         let themed = page_rows(&Scope::Theme(Slot::Active), &src);

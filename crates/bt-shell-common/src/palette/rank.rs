@@ -47,7 +47,8 @@ pub struct Cluster {
 pub enum Nearness<'a> {
     /// Nothing: the score alone.
     None,
-    /// The ids in Recent, the latest first.
+    /// The ids in Recent, the latest first; and the tab rows, if any, are in the order the tabs
+    /// were visited ([`Nearness::Visits`]).
     Recent(&'a [String]),
     /// The tab rows are in the order the tabs were visited, the latest first.
     Visits,
@@ -67,11 +68,11 @@ pub fn search(rows: &[Row], query: &str, nearness: Nearness<'_>) -> Vec<Hit> {
                 tab_place - 1
             });
             let Match { score: base, marks } = score(row, query)?;
+            let visited = |place: usize| (VISIT_BONUS - place as f64 * VISIT_STEP).max(0.0);
             let bonus = match (nearness, place) {
                 (Nearness::Recent(ids), _) if ids.contains(&row.id) => RECENT_BONUS,
-                (Nearness::Visits, Some(place)) => {
-                    (VISIT_BONUS - place as f64 * VISIT_STEP).max(0.0)
-                }
+                // The root lists the tabs too, and a tab there is as near as it is on its page.
+                (Nearness::Recent(_) | Nearness::Visits, Some(place)) => visited(place),
                 _ => 0.0,
             };
             Some(Hit {
@@ -91,6 +92,11 @@ pub fn search(rows: &[Row], query: &str, nearness: Nearness<'_>) -> Vec<Hit> {
 /// hits in a cluster by score, each cluster cut to its limit. Rows of a kind with no heading are
 /// left out.
 pub fn cluster(hits: Vec<Hit>) -> Vec<Cluster> {
+    clusters_of(hits, true)
+}
+
+/// [`cluster`], with each cluster cut to its limit or — `limited` false — whole.
+fn clusters_of(hits: Vec<Hit>, limited: bool) -> Vec<Cluster> {
     let mut clusters: Vec<Cluster> = Vec::new();
     for hit in hits {
         let title = hit.row.kind.cluster();
@@ -112,7 +118,9 @@ pub fn cluster(hits: Vec<Hit>) -> Vec<Cluster> {
         } else {
             CLUSTER_LIMIT
         };
-        cluster.hits.truncate(limit);
+        if limited {
+            cluster.hits.truncate(limit);
+        }
     }
     clusters.sort_by(|a, b| best(b).total_cmp(&best(a)));
     clusters
@@ -131,9 +139,10 @@ pub fn root(rows: &[Row], query: &str, recent: &[String]) -> Vec<Cluster> {
 }
 
 /// The tab page's search: tabs by score and visit order, groups beside them, the cluster with
-/// the better best row first.
+/// the better best row first. **Not cut** to [`CLUSTER_LIMIT`]: the page is the place to reach
+/// every tab a query finds (a root search shows the first few of them and the page the rest).
 pub fn tabs(rows: &[Row], query: &str) -> Vec<Cluster> {
-    cluster(search(rows, query, Nearness::Visits))
+    clusters_of(search(rows, query, Nearness::Visits), false)
 }
 
 /// "Find … in This Pane" and "Search Command History for …", for the trimmed query.
