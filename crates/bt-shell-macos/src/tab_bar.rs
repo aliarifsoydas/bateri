@@ -708,11 +708,17 @@ fn place_label(mtm: MainThreadMarker) -> Retained<NSTextField> {
     place
 }
 
+/// The fields the column measures card rows with ([`detail_heights`]), made as a chip's are and
+/// never shown: what a tab of one pane told, where it is, a pane's name and what a pane said.
+struct Measure {
+    status: Retained<NSTextField>,
+    place: Retained<NSTextField>,
+    name: Retained<NSTextField>,
+    said: Retained<NSTextField>,
+}
+
 thread_local! {
-    /// The pair of lines the column measures card rows with ([`detail_heights`]): made as a
-    /// chip's are, never shown.
-    static MEASURE: RefCell<Option<(Retained<NSTextField>, Retained<NSTextField>)>> =
-        const { RefCell::new(None) };
+    static MEASURE: RefCell<Option<Measure>> = const { RefCell::new(None) };
 }
 
 /// How tall `field` draws `text` in `width`, its lines as it was made to wrap and cut them; 0 for
@@ -727,43 +733,80 @@ fn line_height(field: &NSTextField, text: Option<&str>, width: f64) -> f64 {
 }
 
 /// How tall a card row's two parts draw in a box `width` wide (`tabs::Row::details`): what the
-/// tab told — its own line, or a split tab's line per pane with [`tabs::DETAIL_GAP`] between
-/// them — then where it is; 0 for a part it does not say.
+/// tab told — its own lines, or a split tab's small card per pane ([`pane_height`]) with
+/// [`tabs::PANE_GAP`] between them — then where it is; 0 for a part it does not say.
 fn detail_heights(mtm: MainThreadMarker, details: &tabs::Details, width: f64) -> (f64, f64) {
     MEASURE.with(|shared| {
         let mut shared = shared.borrow_mut();
-        let (status, place) = shared.get_or_insert_with(|| {
-            (
-                detail_label(mtm, tabs::DETAIL_STATUS_LINES),
-                place_label(mtm),
-            )
+        let measure = shared.get_or_insert_with(|| Measure {
+            status: detail_label(mtm, tabs::DETAIL_STATUS_LINES),
+            place: place_label(mtm),
+            name: pane_name_label(mtm),
+            said: detail_label(mtm, tabs::PANE_SAID_LINES),
         });
-        // A pane's line is one line, as the place's: measured in its kind of field.
         let told = if details.panes.is_empty() {
             line_height(
-                status,
+                &measure.status,
                 details.status.as_ref().map(|(text, _)| text.as_str()),
                 width,
             )
         } else {
-            let lines: Vec<f64> = details
+            let cards: Vec<f64> = details
                 .panes
                 .iter()
-                .map(|pane| line_height(place, Some(&pane.text()), width))
+                .map(|pane| pane_height(&measure.name, &measure.said, pane, width))
                 .filter(|high| *high > 0.0)
                 .collect();
-            lines.iter().sum::<f64>() + tabs::DETAIL_GAP * lines.len().saturating_sub(1) as f64
+            cards.iter().sum::<f64>() + tabs::PANE_GAP * cards.len().saturating_sub(1) as f64
         };
-        (told, line_height(place, details.place.as_deref(), width))
+        (
+            told,
+            line_height(&measure.place, details.place.as_deref(), width),
+        )
     })
 }
 
-/// A split tab's line for one pane on its card row ([`Chip::set_details`]): one line that ends in
-/// "…" where it does not fit.
-fn pane_label(mtm: MainThreadMarker) -> Retained<NSTextField> {
-    let line = detail_label(mtm, 1);
-    line.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-    line
+/// How tall one pane's small card draws in `width`: its name, then what it said under it with
+/// [`tabs::DETAIL_GAP`] between them; 0 for a pane with neither.
+fn pane_height(name: &NSTextField, said: &NSTextField, pane: &tabs::PaneLine, width: f64) -> f64 {
+    let named = line_height(name, Some(pane.name.trim()), width);
+    let told = line_height(said, pane.said.as_deref().map(str::trim), width);
+    let gap = if named > 0.0 && told > 0.0 {
+        tabs::DETAIL_GAP
+    } else {
+        0.0
+    };
+    named + gap + told
+}
+
+/// A split tab's pane name on its card row ([`Chip::set_details`]): one line, a little heavier
+/// than the lines under it — the small card's own title — ending in "…" where it does not fit.
+fn pane_name_label(mtm: MainThreadMarker) -> Retained<NSTextField> {
+    let name = detail_label(mtm, 1);
+    name.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+    // SAFETY: AppKit's constant font weight.
+    let weight = unsafe { NSFontWeightMedium };
+    name.setFont(Some(&NSFont::systemFontOfSize_weight(DETAIL_TEXT, weight)));
+    name
+}
+
+/// Puts `field` with `text` in `rgb` at `at` in a box from `x`, `width` wide, down to `foot`: as
+/// tall as it draws and none past `foot`, hidden with nothing to show; `at` moves past it and
+/// [`tabs::DETAIL_GAP`]. How a card row lays its lines top-down ([`Chip::set_details`]).
+fn put_line(
+    field: &NSTextField,
+    text: Option<&str>,
+    rgb: u32,
+    (x, width, foot): (f64, f64, f64),
+    at: &mut f64,
+) {
+    let high = line_height(field, text, width).min((foot - *at).max(0.0));
+    field.setTextColor(Some(&Tint::of(rgb, 1.0).color()));
+    field.setFrame(NSRect::new(NSPoint::new(x, *at), NSSize::new(width, high)));
+    field.setHidden(high <= 0.0);
+    if high > 0.0 {
+        *at += high + tabs::DETAIL_GAP;
+    }
 }
 
 /// The leading element's width in a side row of `style` for a tab of `emblem`
@@ -3250,7 +3293,7 @@ pub(crate) struct ChipIvars {
     place: Retained<NSTextField>,
     /// A split tab's card row: a line per pane, made as needed and kept for the next set; the
     /// ones past the panes it has now are hidden.
-    pane_lines: RefCell<Vec<Retained<NSTextField>>>,
+    pane_lines: RefCell<Vec<(Retained<NSTextField>, Retained<NSTextField>)>>,
     close: Retained<CloseButton>,
     /// The line that fills under the chip while a carried pane waits on it to
     /// open the tab ([`Chip::dwell`]).
@@ -3855,10 +3898,11 @@ impl Chip {
         self.setAccessibilityElement(!single);
     }
 
-    /// A card row's lines under its title (`tabs::Row::details`): where the tab is on the box's
-    /// last line, in the dim ink, and what it told above it, top-aligned in up to
-    /// `tabs::DETAIL_STATUS_LINES` lines in its tone's ink; a line nobody knows is hidden, and
-    /// both are without `details`. `lead` is the leading element's width, as for the title.
+    /// A card row's lines under its title (`tabs::Row::details`), top-down: what the tab told,
+    /// in up to `tabs::DETAIL_STATUS_LINES` lines in its tone's ink — or, for a split tab, a
+    /// small card per pane, its name and what it said — then where it is, dimmed. A line nobody
+    /// knows is hidden, and all are without `details`. `lead` is the leading element's width, as
+    /// for the title.
     fn set_details(
         &self,
         details: Option<&tabs::Details>,
@@ -3870,60 +3914,77 @@ impl Chip {
         let Some(details) = details else {
             iv.status.setHidden(true);
             iv.place.setHidden(true);
-            for line in iv.pane_lines.borrow().iter() {
-                line.setHidden(true);
+            for (name, said) in iv.pane_lines.borrow().iter() {
+                name.setHidden(true);
+                said.setHidden(true);
             }
             return;
         };
         let area = tabs::Row::details(size.width, size.height, lead);
         // Top-down, as the column measured them (`row_heights`): what the tab told, then where
         // it is under it, each as tall as it draws and none past the box.
+        let bounds = (area.x, area.width, area.y + area.height);
         let mut at = area.y;
-        let foot = area.y + area.height;
-        let mut put = |field: &NSTextField, text: Option<&str>, rgb: u32| {
-            let high = line_height(field, text, area.width).min((foot - at).max(0.0));
-            field.setTextColor(Some(&Tint::of(rgb, 1.0).color()));
-            field.setFrame(NSRect::new(
-                NSPoint::new(area.x, at),
-                NSSize::new(area.width, high),
-            ));
-            field.setHidden(high <= 0.0);
-            if high > 0.0 {
-                at += high + tabs::DETAIL_GAP;
-            }
-        };
         let tone = details
             .status
             .as_ref()
             .map_or(palette.dim, |(_, tone)| palette.tone(*tone, palette.dim));
-        put(
+        put_line(
             &iv.status,
             details.status.as_ref().map(|(text, _)| text.as_str()),
             tone,
+            bounds,
+            &mut at,
         );
-        // A split tab's panes, a line each: the focused one in the title's ink.
-        let mut lines = iv.pane_lines.borrow_mut();
-        while lines.len() < details.panes.len() {
-            let line = pane_label(self.mtm());
-            line.setAccessibilityElement(false);
-            self.addSubview(&line);
-            lines.push(line);
+        // A split tab's panes, each a small card: its name in the title's ink, what it said
+        // under it — in the title's ink for the focused pane, dimmed for the others — and
+        // `tabs::PANE_GAP` between two.
+        let mut cards = iv.pane_lines.borrow_mut();
+        while cards.len() < details.panes.len() {
+            let name = pane_name_label(self.mtm());
+            let said = detail_label(self.mtm(), tabs::PANE_SAID_LINES);
+            for field in [&name, &said] {
+                field.setAccessibilityElement(false);
+                self.addSubview(field);
+            }
+            cards.push((name, said));
         }
-        for (index, line) in lines.iter().enumerate() {
-            match details.panes.get(index) {
-                Some(pane) => {
-                    let ink = if pane.focused {
-                        palette.title
-                    } else {
-                        palette.dim
-                    };
-                    put(line, Some(&pane.text()), ink);
-                }
-                None => line.setHidden(true),
+        let mut shown = 0;
+        for (index, (name, said)) in cards.iter().enumerate() {
+            let Some(pane) = details.panes.get(index) else {
+                name.setHidden(true);
+                said.setHidden(true);
+                continue;
+            };
+            if shown > 0 {
+                at += tabs::PANE_GAP - tabs::DETAIL_GAP;
+            }
+            let before = at;
+            put_line(name, Some(pane.name.trim()), palette.title, bounds, &mut at);
+            let ink = if pane.focused {
+                palette.title
+            } else {
+                palette.dim
+            };
+            put_line(
+                said,
+                pane.said.as_deref().map(str::trim),
+                ink,
+                bounds,
+                &mut at,
+            );
+            if at > before {
+                shown += 1;
             }
         }
-        drop(lines);
-        put(&iv.place, details.place.as_deref(), palette.dim);
+        drop(cards);
+        put_line(
+            &iv.place,
+            details.place.as_deref(),
+            palette.dim,
+            bounds,
+            &mut at,
+        );
     }
 
     /// The ⌘ key that reaches the tab, right-aligned in the chip's right

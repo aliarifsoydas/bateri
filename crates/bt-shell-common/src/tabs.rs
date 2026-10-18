@@ -1589,6 +1589,14 @@ pub const DETAIL_STATUS_LINES: usize = 3;
 /// Space between what the tab told and the line of where it is.
 pub const DETAIL_GAP: f64 = 2.0;
 
+/// Space between two panes of a split tab on its card row ([`Details::panes`]): each pane is a
+/// small card of its own there — its name, then what it said — and the space sets them apart.
+pub const PANE_GAP: f64 = 6.0;
+
+/// How many lines a split tab's pane gives what it said, under its name; fewer than a tab of one
+/// pane ([`DETAIL_STATUS_LINES`]), as several share the row.
+pub const PANE_SAID_LINES: usize = 2;
+
 /// How tall a card row is for lines `status` and `place` high, as the shell measured them in the
 /// row's width (0 for a line it does not show): the title's line, then the lines from
 /// [`DETAIL_TOP`] down with [`DETAIL_GAP`] between them, and [`DETAIL_BOTTOM`] under the last. A

@@ -1153,10 +1153,10 @@ tab_details = false
   own turn, an `OSC 9 ; 4` progress that clears, does not count); otherwise
   how its newest command ended — `Finished · cargo build · 12s` or `Exit 2 ·
   make test`, in the colors of the summary card. A command that still runs
-  adds no line: the icon's ring says it. A split tab says each of its panes
-  on a line of its own instead, in the split's order — the pane's title and
-  what it last said, `claude · Fixed the login test` — the focused pane's in
-  the title's ink. The last line is the branch and the folder, dimmed, `main · ~/api` (`host:path` in a remote session). A part
+  adds no line: the icon's ring says it. A split tab shows each of its panes
+  instead, in the split's order, as a small card of its own: the pane's title,
+  and under it what it last said in up to two lines — bright for the focused
+  pane, dimmed for the others — with a little space between two panes. The last line is the branch and the folder, dimmed, `main · ~/api` (`host:path` in a remote session). A part
   nobody knows is left out, and a row is as tall as what it says: one with
   nothing to say keeps a plain row's height. The notifications are not
   posted to Notification Center; they stay on the tab. The title row's chips
