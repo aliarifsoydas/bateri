@@ -5322,6 +5322,10 @@ struct Dragging {
     /// list — the gap opens over a group's header or under it, and a drop puts the row in the
     /// group that was shown ([`TabBar::release`]).
     grouped: bool,
+    /// A row of the side column resting on the middle of another row's tab, or lit there: let go
+    /// lit, the held tab joins that tab as a split instead of taking a place
+    /// ([`TabBar::rest_on_row`]).
+    split: Option<tabs::RowDwell<u64>>,
 }
 
 pub(crate) struct BarIvars {
@@ -6074,6 +6078,9 @@ impl TabBar {
         iv.drag.set(drag);
         // The tabs in the order the strip shows them now: the dragged one at its place — in the
         // column of a window with groups, with each header over the row it would stand over.
+        // A row lit for a split leaves the others where they stood: the held row hovers over the
+        // lit one, not in a place of the list.
+        let lit = drag.is_some_and(|drag| drag.split.is_some_and(|split| split.armed));
         if let Some(Dragging {
             tab,
             at: Some((_, to)),
@@ -6081,6 +6088,7 @@ impl TabBar {
             grouped,
             ..
         }) = drag
+            && !lit
         {
             let selected = shown.tabs.get(shown.selected).map(|label| label.tab);
             if grouped {
@@ -7034,6 +7042,7 @@ impl TabBar {
                     && self
                         .terminal_window()
                         .is_some_and(|window| window.has_groups()),
+                split: None,
             }));
         }
     }
@@ -7116,7 +7125,10 @@ impl TabBar {
             Drag::Press => iv.drag.set(Some(drag)),
             Drag::Reorder { left, to } => {
                 let first = drag.at.is_none();
-                let same_place = drag.at.is_some_and(|(_, place)| place == to);
+                // A row lit for a split, or no longer lit, changes the whole column: the others
+                // stand where they stood before the drag while it is lit ([`Self::rest_on_row`]).
+                let relit = upright && !drag.multi && self.rest_on_row(&mut drag, point.y);
+                let same_place = drag.at.is_some_and(|(_, place)| place == to) && !relit;
                 drag.at = Some((left, to));
                 iv.drag.set(Some(drag));
                 let chip = self.chip(tab);
@@ -7140,6 +7152,9 @@ impl TabBar {
                 if self.tear_off(tab, drag.multi, event) {
                     drag.at = None;
                     drag.torn = true;
+                    if drag.split.take().is_some_and(|split| split.armed) {
+                        iv.target.set(None);
+                    }
                     iv.drag.set(Some(drag));
                     iv.glide.set(true);
                     self.lay_out();
@@ -7191,9 +7206,10 @@ impl TabBar {
             image.as_deref(),
             size,
         ));
-        // The block of one tab can be merged into panes with ⌥⌘; several tabs have none.
+        // The block of one tab can be merged into panes with ⌥⌘ — or, out of the side column,
+        // into its own window's panes without them; several tabs have none.
         if let Some(tab) = lone {
-            app.tab_merge_begin(tab);
+            app.tab_merge_begin(tab, self.is_side());
         }
         true
     }
@@ -7251,6 +7267,17 @@ impl TabBar {
             return;
         }
         iv.drag.set(None);
+        if let Some(split) = drag.split.filter(|split| split.armed) {
+            // Let go on a lit row: the held tab joins that row's tab as a split on its right, a
+            // turn later (this chip goes with its tab); until then it glides back to its place.
+            iv.target.set(None);
+            iv.glide.set(true);
+            self.lay_out();
+            if let Some(window) = self.terminal_window() {
+                window.split_tab_into(tab, split.row);
+            }
+            return;
+        }
         if drag.multi {
             // A press on a picked row that never pulled them: the plain click it would have been,
             // which opens the tab and lets the picks go.

@@ -16,6 +16,10 @@
 //! (the slop, the place and the tear-off distance are decided here once), [`Strip::slot_at`]
 //! says which slot of a strip is under a point, and [`landing`] what letting go
 //! comes to — a place in its own strip, a place in another window's, or a window of its own.
+//! Two rules turn a dragged tab into splits: [`Pull`] says what a tab pulled out of its list
+//! comes to over a window's panes (with ⌥⌘, or a side column's row over its own window's, a block
+//! of panes; otherwise a window), and [`RowDwell`] when a row slid along the side column rests on
+//! another row long enough to be split into it.
 //!
 //! **A carried pane** is read here too: [`Strip::pane_over`] says whether a point over the strip
 //! means "into this tab" or "a new tab at this place", and the pane operations of [`Tabs`]
@@ -1083,6 +1087,131 @@ impl Strip {
     }
 }
 
+/// How long a row dragged along the side column rests on the middle of another row before that
+/// row is lit as the one it would split into ([`RowDwell`]). Longer than [`SPRING_DELAY`]: a row
+/// slid one place along and held there before it is let go rests with the pointer over the middle
+/// of the row that made room for it — where the rows stood before the drag — so a pause at the
+/// end of a reorder must not become a merge. Waiting this long is asking, not stumbling into it.
+/// A design constant.
+pub const ROW_SPLIT_DELAY: Duration = Duration::from_millis(800);
+
+/// A row dragged along the side column, resting on the middle of row `row` (an identity of the
+/// shell's choosing: the row's place in the list, or its tab) since the pointer stood at `from`
+/// along the column. After [`ROW_SPLIT_DELAY`] it is `armed`: the row is lit, the others stand
+/// where they stood before the drag, and letting go splits the held tab into that row's tab
+/// (Split Right) instead of putting it in a place of the list.
+///
+/// **What a row's middle is** is read on the column as it stood before the drag
+/// ([`Column::split_over`]): the held row's neighbours slide out of its way as it goes, so the row
+/// a pointer moves onto is never under it in the column as drawn — the place it would take is.
+/// The wait is for the pointer to rest: it starts again when the pointer moves on by more than
+/// [`DRAG_SLOP`], so a row slid past others is not lit on the way. Once lit, the row stays lit for
+/// as long as the pointer is over its middle; off it, the slide goes on as if nothing waited.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RowDwell<K> {
+    pub row: K,
+    /// Where along the column the wait began.
+    pub from: f64,
+    pub armed: bool,
+}
+
+impl<K: Copy + PartialEq> RowDwell<K> {
+    /// The wait after the pointer moved to `at` along the column, over the middle of `over`
+    /// (`None`: no row's middle, or the held row's own). The same row's wait goes on — lit, it
+    /// stays lit; not yet, it goes on while the pointer rests within [`DRAG_SLOP`] of where it
+    /// began, and begins again further on. Another row begins its own; no row ends it.
+    pub fn follow(now: Option<Self>, over: Option<K>, at: f64) -> Option<Self> {
+        let row = over?;
+        match now {
+            Some(dwell)
+                if dwell.row == row && (dwell.armed || (at - dwell.from).abs() <= DRAG_SLOP) =>
+            {
+                Some(dwell)
+            }
+            _ => Some(Self {
+                row,
+                from: at,
+                armed: false,
+            }),
+        }
+    }
+
+    /// The wait is over: the row is lit.
+    pub fn arm(self) -> Self {
+        Self {
+            armed: true,
+            ..self
+        }
+    }
+
+    /// Whether a wait that began as `began` is the same one still: the timer that ends it counts
+    /// only then (the pointer has not moved on, nor to another row, since it was set).
+    pub fn same_wait(now: Option<Self>, began: Self) -> bool {
+        now.is_some_and(|now| now.row == began.row && now.from == began.from && !now.armed)
+    }
+}
+
+/// What is under a tab carried out of its list, read where the pointer is ([`Pull::comes_to`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Under {
+    /// A window's bar — the title row, or the side column: a drop there is the bar's (a place of
+    /// the list, a group, another window's list).
+    List,
+    /// A window's panes, anywhere off its bar.
+    Panes,
+    /// No window of ours.
+    Away,
+}
+
+/// A tab carried out of its list (one tab: rows picked together and a group have no panes to
+/// lend), and where the pointer has it ([`Pull::comes_to`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pull {
+    pub over: Under,
+    /// ⌥⌘ are held: the tab is a block of panes over any window's panes, as it has been since
+    /// panes could be moved.
+    pub keys: bool,
+    /// The tab was pulled out of a side column: over its own window's panes it is a block of panes
+    /// without the keys, the way a browser's sidebar splits its view.
+    pub side: bool,
+    /// The pointer is over the window the tab was pulled out of.
+    pub own: bool,
+    /// There is a tab to land in: the tab on screen in the window under the pointer, or, in the
+    /// tab's own window, the one that was on screen before the press that took it (a press
+    /// selects). None when the carried tab is that tab itself.
+    pub host: bool,
+}
+
+/// What letting go of a carried tab would come to ([`Pull::comes_to`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pulled {
+    /// The bar under the pointer takes it — or, over no bar, it becomes a window where it is let
+    /// go: the drag session's own end.
+    Session,
+    /// Its panes join the host as splits, where the regions painted over the host's panes say.
+    Splits,
+    /// It is over the panes it is itself: nothing to split into. Said over the panes, and letting
+    /// go there leaves the tab where it was — not a window, which is not what was pointed at.
+    Itself,
+}
+
+impl Pull {
+    /// The rule. Over a bar, the bar's; over no window, the session's (a window of its own). Over
+    /// panes with ⌥⌘ held a tab with a host lands in it as splits — and without one the session
+    /// goes on as before the column came, to a window. Over its own window's panes without the
+    /// keys, a row pulled out of the side column lands in the host as splits too, and is refused
+    /// where it is its own host. Anything else over panes — a chip of the title row, whose pull
+    /// down has always meant a window, or any tab over another window's panes — is the session's.
+    pub fn comes_to(self) -> Pulled {
+        match self.over {
+            Under::List | Under::Away => Pulled::Session,
+            Under::Panes if self.host && (self.keys || (self.side && self.own)) => Pulled::Splits,
+            Under::Panes if !self.keys && self.side && self.own => Pulled::Itself,
+            Under::Panes => Pulled::Session,
+        }
+    }
+}
+
 /// The layout's place for the tab at `index` when room is made at `gap` (a tab on its way in):
 /// the tabs from the gap on take the next place.
 pub fn seat(index: usize, gap: Option<usize>) -> usize {
@@ -1456,6 +1585,19 @@ impl Column {
     /// new tab at the place the point stands between ([`Run::pane_over`]).
     pub fn pane_over(&self, y: f64) -> PaneOver {
         self.run().pane_over(y)
+    }
+
+    /// The row a row held at place `held` and dragged along the column would split into at `y`:
+    /// the row whose middle ([`TAB_CORE_FROM`] to [`TAB_CORE_TO`] of its height, both ends in) is
+    /// under the pointer — read on this column as it stood before the drag, the same reading as a
+    /// carried pane's ([`Column::pane_over`]) — and not the held row itself. `None` between rows,
+    /// over a row's edge, and over a header: a group's header, open or closed, is no tab to split
+    /// into ([`RowDwell`]).
+    pub fn split_over(&self, y: f64, held: usize) -> Option<usize> {
+        match self.pane_over(y) {
+            PaneOver::OnTab { index } if index != held => Some(index),
+            _ => None,
+        }
     }
 
     /// Where the line that marks "a new tab here" runs (the window's space): in the [`GAP`] above
@@ -5389,6 +5531,128 @@ mod tests {
             "under the last"
         );
         assert_eq!(column.pane_over(590.0), PaneOver::Between { gap: 4 });
+    }
+
+    #[test]
+    fn a_held_row_splits_into_the_row_whose_middle_it_rests_on() {
+        let column = side(600.0, 4).layout();
+        // Row 1 spans 76..104: the middle 64% is 81.04..98.96, as for a carried pane.
+        assert_eq!(column.split_over(90.0, 0), Some(1));
+        assert_eq!(column.split_over(81.2, 3), Some(1));
+        assert_eq!(column.split_over(81.0, 0), None, "the row's edge reorders");
+        assert_eq!(column.split_over(99.1, 0), None);
+        assert_eq!(column.split_over(75.0, 0), None, "the gap");
+        assert_eq!(column.split_over(90.0, 1), None, "the held row's own place");
+        assert_eq!(column.split_over(590.0, 0), None, "under the last row");
+
+        // In a column with groups a header is no row: neither its upper half nor its lower.
+        let headed = headed();
+        assert_eq!(headed.split_over(120.0, 0), None, "a header's upper half");
+        assert_eq!(headed.split_over(136.0, 0), None, "a header's lower half");
+        assert_eq!(
+            headed.split_over(156.0, 0),
+            Some(2),
+            "a row of another group"
+        );
+        assert_eq!(headed.split_over(252.0, 2), Some(4), "and of the last one");
+        assert_eq!(headed.split_over(60.0, 1), Some(0), "or of the same");
+    }
+
+    #[test]
+    fn a_row_is_lit_for_a_split_only_where_the_pointer_rests() {
+        let begun = RowDwell::follow(None, Some(1), 90.0).unwrap();
+        assert_eq!(
+            begun,
+            RowDwell {
+                row: 1,
+                from: 90.0,
+                armed: false
+            }
+        );
+        assert_eq!(RowDwell::<usize>::follow(None, None, 90.0), None);
+        // Resting within the slop, the same wait goes on.
+        assert_eq!(
+            RowDwell::follow(Some(begun), Some(1), 90.0 + DRAG_SLOP),
+            Some(begun)
+        );
+        assert!(RowDwell::same_wait(Some(begun), begun));
+        // Moving on over the same row begins it again, from there.
+        let again = RowDwell::follow(Some(begun), Some(1), 95.0).unwrap();
+        assert_eq!(again.from, 95.0);
+        assert!(
+            !RowDwell::same_wait(Some(again), begun),
+            "the old timer does not count"
+        );
+        // Another row, or none, ends it.
+        assert_eq!(
+            RowDwell::follow(Some(begun), Some(2), 120.0).unwrap().row,
+            2
+        );
+        assert_eq!(RowDwell::follow(Some(begun), None, 100.0), None);
+        assert!(!RowDwell::same_wait(None, begun));
+
+        // Lit, the row stays lit wherever the pointer goes over its middle, and off it goes out.
+        let lit = begun.arm();
+        assert!(lit.armed);
+        assert_eq!(RowDwell::follow(Some(lit), Some(1), 98.0), Some(lit));
+        assert_eq!(RowDwell::follow(Some(lit), None, 100.0), None);
+        assert!(!RowDwell::follow(Some(lit), Some(2), 120.0).unwrap().armed);
+        assert!(
+            !RowDwell::same_wait(Some(lit), begun),
+            "a lit row is not lit twice"
+        );
+    }
+
+    #[test]
+    fn a_split_is_waited_for_longer_than_a_tab_opens_under_a_pane() {
+        // A reorder's pause rests on the row that made room: it must not become a merge.
+        assert!(ROW_SPLIT_DELAY > SPRING_DELAY);
+        assert_eq!(ROW_SPLIT_DELAY, Duration::from_millis(800));
+    }
+
+    #[test]
+    fn a_row_pulled_onto_its_windows_panes_splits_without_keys() {
+        let pull = |over, keys, side, own, host| {
+            Pull {
+                over,
+                keys,
+                side,
+                own,
+                host,
+            }
+            .comes_to()
+        };
+        // A row of the side column over its own window's panes: splits into the tab that was on
+        // screen, with or without the keys.
+        assert_eq!(pull(Under::Panes, false, true, true, true), Pulled::Splits);
+        assert_eq!(pull(Under::Panes, true, true, true, true), Pulled::Splits);
+        // It is the tab on screen: refused there, not a window.
+        assert_eq!(pull(Under::Panes, false, true, true, false), Pulled::Itself);
+        // Over another window's panes without the keys: a window, as before.
+        assert_eq!(
+            pull(Under::Panes, false, true, false, true),
+            Pulled::Session
+        );
+        // The title row's chip pulled down without the keys: a window, as it always was.
+        assert_eq!(
+            pull(Under::Panes, false, false, true, true),
+            Pulled::Session
+        );
+        // With the keys, any tab over any window's panes with a host; without one, a window.
+        assert_eq!(pull(Under::Panes, true, false, true, true), Pulled::Splits);
+        assert_eq!(pull(Under::Panes, true, false, false, true), Pulled::Splits);
+        assert_eq!(
+            pull(Under::Panes, true, false, true, false),
+            Pulled::Session
+        );
+        assert_eq!(pull(Under::Panes, true, true, true, false), Pulled::Session);
+        // A bar and no window are the session's, keys or not.
+        for keys in [false, true] {
+            for side in [false, true] {
+                assert_eq!(pull(Under::List, keys, side, true, true), Pulled::Session);
+                assert_eq!(pull(Under::Away, keys, side, false, false), Pulled::Session);
+            }
+        }
     }
 
     #[test]

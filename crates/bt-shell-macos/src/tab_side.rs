@@ -47,6 +47,19 @@
 //! and the column answers the pointer with a line at the place (`TabBar::aim`) — over its own
 //! column as over another window's, where a row dragged out of its own window is answered the
 //! same way.
+//!
+//! **A row is split into a tab two ways, without keys.** Pulled out of the column onto its own
+//! window's panes, a row is the block of panes ⌥⌘ makes of a chip: the panes paint where it would
+//! land with its name (Left, Right, Above, Below) and letting go merges the tab into the one that
+//! was on screen before the press ([`crate::tab_merge`]) — out of the window it is still a window
+//! of its own, back over the column still the column's. And slid along the column, a row that
+//! rests on the middle of another row ([`tabs::TAB_CORE_FROM`] to [`tabs::TAB_CORE_TO`] of its
+//! height) for [`tabs::ROW_SPLIT_DELAY`] lights it as a row a carried pane lights; the others go
+//! back to where they stood before the drag, and letting go there joins the held tab to the lit
+//! one on its right, the lit tab coming up on screen (`TabBar::rest_on_row`,
+//! `TerminalWindow::split_tab_into`). Moved off that row's middle first, the slide goes on as it
+//! always did. Both are one move, and Undo Move takes either back. The title row keeps its pull:
+//! a chip pulled down out of it without the keys is a window, as it always was.
 
 use std::cell::{Cell, RefCell};
 
@@ -591,6 +604,70 @@ impl TabBar {
         let count = shown.tabs.len();
         let entries = side_entries(&shown.headings, count, None, room);
         (count > 0).then(|| self.side_for(top, count + room).layout_with(&entries))
+    }
+
+    /// A row held and slid along the column, `drag`, with the pointer at `y` (the bar's space): the
+    /// wait for a split on the row whose middle the pointer rests on ([`tabs::RowDwell`]), read on
+    /// the column as it stood before the drag ([`Column::split_over`]) — the held row's neighbours
+    /// slide out of its way, so the row a pointer is moved onto is never under it as drawn. A new
+    /// wait sets a timer of [`tabs::ROW_SPLIT_DELAY`]; when it runs out with the pointer still
+    /// resting there, the row is lit ([`Self::split_ready`]). `true` when a row was lit and no
+    /// longer is: the column is laid out whole again, the slide going on from where the pointer
+    /// is.
+    pub(super) fn rest_on_row(&self, drag: &mut Dragging, y: f64) -> bool {
+        let iv = self.ivars();
+        let over = {
+            let shown = iv.shown.borrow();
+            let held = shown.tabs.iter().position(|label| label.tab == drag.tab);
+            held.and_then(|held| {
+                self.column_with_room(0)?
+                    .split_over(y, held)
+                    .and_then(|index| shown.tabs.get(index))
+                    .map(|label| label.tab)
+            })
+        };
+        let before = drag.split;
+        let now = tabs::RowDwell::follow(before, over, y);
+        drag.split = now;
+        if let Some(wait) = now.filter(|now| !now.armed && Some(*now) != before) {
+            let (window, tab) = (iv.window, drag.tab);
+            crate::arrange::after(tabs::ROW_SPLIT_DELAY, move |app| {
+                if let Some(window) = app.window(window) {
+                    window.bar().split_ready(tab, wait);
+                }
+            });
+        }
+        let was_lit = before.is_some_and(|before| before.armed);
+        let lit = now.is_some_and(|now| now.armed);
+        if was_lit && !lit {
+            iv.target.set(None);
+            iv.glide.set(true);
+            return true;
+        }
+        false
+    }
+
+    /// The wait `wait` for a split of the held tab `tab` ran out: if the pointer still rests where
+    /// it began ([`tabs::RowDwell::same_wait`]) the row is lit, as a row a carried pane is over
+    /// is, and the others go back to where they stood before the drag, so the held row hovers
+    /// over it. Let go now, the held tab joins it ([`TabBar::release`]).
+    pub(crate) fn split_ready(&self, tab: u64, wait: tabs::RowDwell<u64>) {
+        let iv = self.ivars();
+        let Some(mut drag) = iv
+            .drag
+            .get()
+            .filter(|drag| drag.tab == tab && !drag.torn && drag.at.is_some())
+        else {
+            return;
+        };
+        if !tabs::RowDwell::same_wait(drag.split, wait) {
+            return;
+        }
+        drag.split = Some(wait.arm());
+        iv.drag.set(Some(drag));
+        iv.target.set(Some(wait.row));
+        iv.glide.set(true);
+        self.lay_out();
     }
 
     /// Puts the name field over `row` (the bar's space), in the type the selected row's title
