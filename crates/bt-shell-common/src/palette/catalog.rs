@@ -241,6 +241,14 @@ pub fn find(key: &str) -> Option<&'static Setting> {
     CATALOG.iter().find(|setting| setting.key == key)
 }
 
+/// The setting that holds the theme of `slot`.
+pub(super) fn theme_setting(slot: Slot) -> &'static Setting {
+    CATALOG
+        .iter()
+        .find(|setting| setting.control == Control::Theme(slot))
+        .unwrap_or(&CATALOG[0])
+}
+
 /// A row per setting.
 pub fn rows(settings: &Settings) -> Vec<Row> {
     CATALOG

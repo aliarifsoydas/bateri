@@ -1,4 +1,4 @@
-//! Main menu: the app menu (About, Check for Updates…, Settings…, Hide, Quit
+//! Main menu: the app menu (About, Check for Updates…, Settings…, Open settings.toml, Hide, Quit
 //! and — ⌥ held, under `keep_running = "quit"` only — Quit and End Programs), Shell (New
 //! Window, New Tab, New Local Tab, Mark Host as ▸, Shell Integration on Host,
 //! Forget Password, Cancel Upload, Open Port ▸, Split
@@ -415,6 +415,7 @@ pub(crate) fn install(
     app_items.extend([
         NSMenuItem::separatorItem(mtm),
         item(mtm, "Settings…", sel!(openSettings:), ","),
+        item(mtm, "Open settings.toml", sel!(openSettingsFile:), ""),
         NSMenuItem::separatorItem(mtm),
         item(mtm, "Hide bateri", sel!(hide:), "h"),
         with_modifiers(
@@ -802,7 +803,7 @@ fn mark_holder(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
 /// Builds Theme ▸ from scratch: "Match System", then the embedded themes in
 /// their groups ([`Theme::embedded_groups`]: bateri's own, the adapted dark
 /// palettes, the light ones) and (if any) the user themes, a separator before
-/// each group. `selected` is the `theme` value in the settings; the matching
+/// each group, and last "Open Themes Folder". `selected` is the `theme` value in the settings; the matching
 /// item is checked.
 ///
 /// An embedded theme's item shows its title (`Catppuccin Mocha`), a user
@@ -848,6 +849,15 @@ pub(crate) fn fill_themes(
     for name in user {
         menu.addItem(&theme(name, name));
     }
+    // Where a user's theme files go; the item is the same action wherever the menu is read
+    // (the palette lists it as a command of its own).
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    menu.addItem(&item(
+        mtm,
+        "Open Themes Folder",
+        sel!(openThemesFolder:),
+        "",
+    ));
 }
 
 /// The theme name a Theme ▸ item carries ([`fill_themes`]).

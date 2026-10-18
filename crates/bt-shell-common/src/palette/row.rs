@@ -108,6 +108,14 @@ pub struct Preview {
     pub token: String,
 }
 
+/// What a theme looks like in a row: its ground and six of its colours (the ANSI red, green,
+/// yellow, blue, magenta and cyan), as `0xRRGGBB`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Swatch {
+    pub ground: u32,
+    pub dots: [u32; 6],
+}
+
 /// Whose appearance a theme page chooses for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slot {
@@ -184,6 +192,8 @@ pub struct Row {
     pub completion: Option<String>,
     /// Shown, not written, while the row is highlighted.
     pub preview: Option<Preview>,
+    /// A theme's colours, for the row to show beside its title.
+    pub swatch: Option<Swatch>,
 }
 
 impl Row {
@@ -204,6 +214,7 @@ impl Row {
             enters: false,
             completion: None,
             preview: None,
+            swatch: None,
         }
     }
 
@@ -262,6 +273,11 @@ impl Row {
             key: key.into(),
             token: token.into(),
         });
+        self
+    }
+
+    pub fn swatch(mut self, swatch: Swatch) -> Row {
+        self.swatch = Some(swatch);
         self
     }
 

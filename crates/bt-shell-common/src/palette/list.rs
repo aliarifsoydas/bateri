@@ -10,6 +10,8 @@ use super::row::{Kind, Row};
 
 /// The heading above Recent at the root.
 pub const RECENT_HEADING: &str = "Recent";
+/// The heading above the pages the empty root offers.
+pub const GO_TO_HEADING: &str = "Go to";
 
 /// What the closing "Find … in This Pane" / "Search Command History for …" rows may offer: a
 /// fallback whose target does not exist yet is left out.
@@ -57,16 +59,31 @@ impl List {
     }
 }
 
-/// The root: Recent while the field is empty, then the clusters of what the query finds with
-/// the fallbacks `offer` closing them.
+/// The root: while the field is empty Recent and then the pages that are not a menu's (Themes…,
+/// All Settings…); with a query, the clusters of what it finds with the fallbacks `offer` closing
+/// them.
 pub fn root(rows: &[Row], query: &str, recent: &[String], offer: Fallbacks) -> List {
     let mut list = List::default();
     if query.trim().is_empty() {
-        let rows = recent_rows(recent, rows);
-        if !rows.is_empty() {
+        let recent = recent_rows(recent, rows);
+        if !recent.is_empty() {
             list.headings.push((0, RECENT_HEADING.to_owned()));
         }
-        list.hits = rows.into_iter().map(unscored).collect();
+        let pages: Vec<Row> = rows
+            .iter()
+            .filter(|row| {
+                row.kind == Kind::Scope
+                    && !row.id.starts_with("scope.menu.")
+                    && !recent.iter().any(|seen| seen.id == row.id)
+            })
+            .cloned()
+            .collect();
+        list.hits = recent.into_iter().map(unscored).collect();
+        if !pages.is_empty() {
+            list.headings
+                .push((list.hits.len(), GO_TO_HEADING.to_owned()));
+            list.hits.extend(pages.into_iter().map(unscored));
+        }
         return list;
     }
     for cluster in clustered(rows, query, recent) {
@@ -133,6 +150,25 @@ mod tests {
         assert_eq!(list.heading_before(0), Some(RECENT_HEADING));
         assert_eq!(list.heading_before(1), None);
         assert!(root(&rows(), "", &[], Fallbacks::ALL).is_empty());
+    }
+
+    #[test]
+    fn an_empty_field_also_offers_the_pages_that_are_not_a_menus_once() {
+        let mut pool = rows();
+        pool.push(Row::new(Kind::Scope, "themes", "Themes…"));
+        pool.push(Row::new(Kind::Scope, "settings", "All Settings…"));
+        pool.push(Row::new(Kind::Scope, "menu.Edit", "Edit"));
+        let list = root(&pool, "", &[], Fallbacks::ALL);
+        let ids: Vec<_> = list.hits.iter().map(|hit| hit.row.id.as_str()).collect();
+        assert_eq!(ids, ["scope.themes", "scope.settings"]);
+        assert_eq!(list.heading_before(0), Some(GO_TO_HEADING));
+        // A page Recent already shows is not listed twice.
+        let recent = vec!["scope.themes".to_owned()];
+        let list = root(&pool, "", &recent, Fallbacks::ALL);
+        let ids: Vec<_> = list.hits.iter().map(|hit| hit.row.id.as_str()).collect();
+        assert_eq!(ids, ["scope.themes", "scope.settings"]);
+        assert_eq!(list.heading_before(0), Some(RECENT_HEADING));
+        assert_eq!(list.heading_before(1), Some(GO_TO_HEADING));
     }
 
     #[test]

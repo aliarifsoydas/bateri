@@ -998,6 +998,10 @@ pub(crate) struct Ivars {
     /// this. An unusable save does **not change** it: the next appearance
     /// change chooses with the last good settings.
     settings: RefCell<Settings>,
+    /// The setting a preview shows over the file's, while the palette's highlight is on one
+    /// ([`AppDelegate::preview_edit`]); then [`Ivars::settings`] holds what is shown and this
+    /// holds what the file says.
+    preview: RefCell<Option<settings::Preview>>,
     /// The settings directory's sources: the root, `themes/`, `settings.toml`
     /// ([`settings::watched_paths`]). Never set up in a timed run nor when the
     /// home directory cannot be resolved.
@@ -1411,7 +1415,8 @@ define_class!(
             };
             let embedded = Theme::embedded_groups();
             let user = settings::user_theme_names(&root);
-            let settings = self.ivars().settings.borrow();
+            // The file's theme is the checked one, whatever a preview shows.
+            let settings = self.file_settings();
             crate::menu::fill_themes(self.mtm(), menu, &settings.theme, &embedded, &user);
         }
 
@@ -1608,6 +1613,17 @@ define_class!(
                         config_root: Some(_)
                     }
                 )
+            } else if item.action() == Some(sel!(openSettingsFile:))
+                || item.action() == Some(sel!(openThemesFolder:))
+            {
+                // They open files of the user's world: nothing to open in a timed run or
+                // without a home directory.
+                matches!(
+                    self.inputs(),
+                    Inputs::User {
+                        config_root: Some(_)
+                    }
+                )
             } else if item.action() == Some(sel!(newGroup:))
                 || item.action() == Some(sel!(newUngroupedTab:))
             {
@@ -1693,6 +1709,19 @@ define_class!(
         #[unsafe(method(openSettings:))]
         fn open_settings(&self, _sender: Option<&AnyObject>) {
             self.show_settings_window();
+        }
+
+        /// bateri ▸ Open settings.toml: the settings window's button of the same name, from the
+        /// menu (and so from the palette).
+        #[unsafe(method(openSettingsFile:))]
+        fn open_settings_file(&self, _sender: Option<&AnyObject>) {
+            self.edit_settings();
+        }
+
+        /// View ▸ Theme ▸ Open Themes Folder: `themes/` in Finder, made if it is not there yet.
+        #[unsafe(method(openThemesFolder:))]
+        fn open_themes_folder(&self, _sender: Option<&AnyObject>) {
+            self.show_themes_folder();
         }
 
         /// View ▸ Theme ▸ {name}: the item's title is the theme's name
@@ -2518,6 +2547,7 @@ impl AppDelegate {
             background: Cell::new(None),
             notices: RefCell::new(Notices::default()),
             settings: RefCell::new(Settings::default()),
+            preview: RefCell::new(None),
             config_watch: RefCell::new(None),
             theme_watch: RefCell::new(None),
             stats,
@@ -4946,6 +4976,34 @@ impl AppDelegate {
         }
     }
 
+    /// The themes the palette lists, with their colours: the embedded ones and the files in
+    /// `themes/`. A timed run has no user's themes to list.
+    pub(crate) fn palette_themes(&self) -> Vec<bt_shell_common::palette::ThemeEntry> {
+        let root = match self.inputs() {
+            Inputs::User { config_root } => config_root,
+            Inputs::Hermetic => None,
+        };
+        bt_shell_common::palette::theme_entries(root.as_deref())
+    }
+
+    /// Why the palette's settings rows cannot be written, in the words of the settings window's
+    /// subtitle: the file cannot be read or parsed (`None` when it can), or there is no file to
+    /// write at all (a timed run).
+    pub(crate) fn palette_lock(&self) -> Option<String> {
+        if !matches!(
+            self.inputs(),
+            Inputs::User {
+                config_root: Some(_)
+            }
+        ) {
+            return Some(format!("{} is not available", settings::FILE_NAME));
+        }
+        match &*self.ivars().settings_state.borrow() {
+            settings::FileState::Locked(reason) => Some(reason.clone()),
+            _ => None,
+        }
+    }
+
     /// The current settings — the path windows read. The borrow must be kept short:
     /// while the save-time path writes (`replace`), an open borrow ends in a panic.
     pub(crate) fn settings(&self) -> Ref<'_, Settings> {
@@ -5197,6 +5255,13 @@ impl AppDelegate {
     /// No coalescing: one save yields several events (directory + file) and the
     /// later ones give an empty diff.
     fn reload_settings(&self) {
+        self.reload_from(None);
+    }
+
+    /// [`AppDelegate::reload_settings`], for a caller that knows what the file held **before**
+    /// the change this read brings (`before`): a write that ended a preview, whose slot holds
+    /// the previewed settings, not the file's. The point-size rule compares against the file's.
+    fn reload_from(&self, before: Option<Settings>) {
         let Inputs::User {
             config_root: Some(root),
         } = self.inputs()
@@ -5208,171 +5273,198 @@ impl AppDelegate {
         // are set up inside `didFinishLaunching`, the event can land on the main queue only when that
         // returns), the methods look at their own slots and silently
         // return; this guards against a change of order.
-        let windows = self.windows();
-        let panes = self.all_panes();
         self.watch_config(&root);
-        // A value that is not accepted comes from the current settings (`load_keeping`): a `scrollback`
-        // saved with the wrong type must not truncate the history.
-        let loaded = settings::load_keeping(&root, &self.ivars().settings.borrow());
+        let file_before = before.unwrap_or_else(|| self.file_settings());
+        // A value that is not accepted comes from the file's last settings (`load_keeping`): a
+        // `scrollback` saved with the wrong type must not truncate the history.
+        let loaded = settings::load_keeping(&root, &file_before);
         self.ivars().settings_state.replace(loaded.state());
         let (loaded, messages) = loaded.live();
         self.post_notices(Source::Settings, messages);
-        if let Some(new) = loaded {
-            let changes = {
-                let old = self.ivars().settings.borrow();
-                // The point-size delta is **per pane**
-                // and is reset in every pane with the same rule.
-                for pane in &panes {
-                    pane.zoom_after_reload(&old.font, &new.font);
-                }
-                old.changes(&new)
-            };
-            if changes.terminal {
-                for pane in &panes {
-                    pane.set_terminal_options(&new);
-                }
+        if let Some(file) = loaded {
+            // The point-size delta is **per pane** and is reset in every pane with the same
+            // rule — against the file's size, so a size a preview showed does not count as the
+            // size the delta was made over.
+            for pane in &self.all_panes() {
+                pane.zoom_after_reload(&file_before.font, &file.font);
             }
-            if changes.remote {
-                for window in &windows {
-                    window.set_host_marks(&new);
-                }
-            }
-            // The load indicator's form and interval: `off`
-            // hides it at once, another form redraws the last value.
-            if changes.stats {
-                for pane in &panes {
-                    pane.set_stats_settings(&new.remote_stats);
-                }
-            }
-            // The text's contrast floor: every pane's session draws its next
-            // frame with it.
-            if changes.contrast {
-                for pane in &panes {
-                    pane.set_minimum_contrast(new.minimum_contrast);
-                }
-            }
-            // The listening ports start or stop at once in every pane.
-            if changes.ports {
-                for pane in &panes {
-                    pane.set_ports_shown(new.shell_ports);
-                }
-            }
-            // The active environment's parts come and go at once in every pane.
-            if changes.environment {
-                let wants = crate::environment::Wants {
-                    python: new.shell_python_env,
-                    node: new.shell_node_version,
-                };
-                for pane in &panes {
-                    pane.set_environment_shown(wants);
-                }
-            }
-            // The style and the dock's typing effects go to the link, not the session:
-            // they change not which frame we draw but **how** we draw it.
-            // The link is born inside `start_session` and this path runs after
-            // it, but the order is not a contract: if the slot is empty the
-            // launch call will give the same value anyway.
-            let motion_changed = changes.motion;
-            if motion_changed {
-                for pane in &panes {
-                    pane.set_cursor_motion(&new);
-                }
-            }
-            // The cursor's drawing numbers go to the link too, for the same reason: they change
-            // **how** we draw, not which frame we draw.
-            // `Changes::caret` is a separate field, because these do not go into
-            // `TerminalOptions` and had they piggybacked on `changes.terminal`, a radius
-            // change would have rebuilt the session from scratch.
-            if changes.caret {
-                for pane in &panes {
-                    pane.apply_caret(&new);
-                }
-            }
-            // `keep_running` is read when quitting; its live part is the
-            // bound holder's birth or departure, from the old and new value.
-            let before = self.settings().keep_running;
-            let switch = keeper::switch(before, new.keep_running);
-            let ask = keeper::asks_notification_permission(Some(before), new.keep_running);
-            crate::menu::set_end_programs_visible(self.mtm(), new.keep_running);
-            self.ivars().settings.replace(new);
-            self.switch_keeper(switch);
-            if ask {
-                crate::uploader::request_notification_permission();
-            }
-            // **After** the settings are written: `apply_reduce_motion` is the shared path of
-            // three callers and reads the value from the slot, not from the `new` in hand.
-            // The style's path stayed separate because it takes the link directly;
-            // merging the two would tie this path to `new` and make it
-            // uncallable from the system notification.
-            if motion_changed {
-                self.apply_reduce_motion();
-            }
-            // **After** the delta is written: the pane applies the font with the new delta.
-            if changes.font {
-                let font = self.settings().font.clone();
-                for pane in &panes {
-                    pane.set_font(&font);
-                }
-            }
-            // The scroll bar's form, by `apply_reduce_motion`'s reasoning: the
-            // shared path reads the slot. Its note in the settings window is
-            // refreshed at the end. A save that changes the font **and** moves
-            // to or from `"always"` resizes the grid twice (each path is its
-            // own geometry refresh); only a hand edit does that — the window
-            // writes one key at a time.
-            if changes.scrollbar {
-                self.apply_scrollbar();
-            }
-            // The top edge's mode goes to every **window** — each tab's panes
-            // and its container's line together (`TerminalTab::set_content_edge`).
-            // A save that also changes the font resizes the grid twice, the
-            // scroll bar's case above.
-            if changes.content_edge {
-                let edge = self.settings().content_edge;
-                for window in &windows {
-                    window.set_content_edge(edge);
-                }
-            }
-            // The veil over unfocused splits: each tab reads the choice again.
-            if changes.dim_splits {
-                for window in &windows {
-                    window.refresh_split_look();
-                }
-            }
-            // Cards or lines: every split tab is laid out again.
-            if changes.split_style {
-                for window in &windows {
-                    window.apply_split_style();
-                }
-            }
-            // The tabs in the title row or in the side column: every window places them again.
-            if changes.tab_position {
-                for window in &windows {
-                    window.apply_tab_position();
-                }
-            }
-            // Turned on, every window takes the step its next drag would:
-            // fitted to its lone pane's cells at once (a no-op when off).
-            if changes.resize_in_steps {
-                for window in &windows {
-                    window.fit_to_cells();
-                }
-            }
-            // The tab icons' look or colors: every tab bar draws its chips again.
-            if changes.tab_icons {
-                for window in &windows {
-                    window.refresh_bar();
-                }
-            }
+            let font_reset = file_before.font.size != file.font.size;
+            let shown = self.shown_over(&root, &file);
+            let old = self.settings().clone();
+            self.apply_settings(&old, shown, font_reset);
             self.post_notices(Source::Write, Vec::new());
         }
+        self.apply_theme(&root);
+        // The file may have changed from outside too (vnode): an open settings window
+        // shows the file's state on every run.
+        self.refresh_settings_window();
+    }
+
+    /// Applies the settings `new` where `old` was: the **one** way settings reach the screen —
+    /// the file's read ([`AppDelegate::reload_from`]) and the palette's preview both come here,
+    /// and neither of them is a write. Every applier reads `new` (or the slot, which holds it
+    /// from the line below that replaces it), never the file.
+    ///
+    /// `font_reset`: the point-size delta was reset by the file's rule, so the panes are given
+    /// their font again even if `old` and `new` agree on it.
+    ///
+    /// The theme is not here: it is resolved from a name and a file of its own
+    /// ([`AppDelegate::apply_theme`]).
+    fn apply_settings(&self, old: &Settings, new: Settings, font_reset: bool) {
+        // Every application goes to **every window**, see [`AppDelegate::reload_from`].
+        let windows = self.windows();
+        let panes = self.all_panes();
+        let changes = old.changes(&new);
+        if changes.terminal {
+            for pane in &panes {
+                pane.set_terminal_options(&new);
+            }
+        }
+        if changes.remote {
+            for window in &windows {
+                window.set_host_marks(&new);
+            }
+        }
+        // The load indicator's form and interval: `off`
+        // hides it at once, another form redraws the last value.
+        if changes.stats {
+            for pane in &panes {
+                pane.set_stats_settings(&new.remote_stats);
+            }
+        }
+        // The text's contrast floor: every pane's session draws its next
+        // frame with it.
+        if changes.contrast {
+            for pane in &panes {
+                pane.set_minimum_contrast(new.minimum_contrast);
+            }
+        }
+        // The listening ports start or stop at once in every pane.
+        if changes.ports {
+            for pane in &panes {
+                pane.set_ports_shown(new.shell_ports);
+            }
+        }
+        // The active environment's parts come and go at once in every pane.
+        if changes.environment {
+            let wants = crate::environment::Wants {
+                python: new.shell_python_env,
+                node: new.shell_node_version,
+            };
+            for pane in &panes {
+                pane.set_environment_shown(wants);
+            }
+        }
+        // The style and the dock's typing effects go to the link, not the session:
+        // they change not which frame we draw but **how** we draw it.
+        // The link is born inside `start_session` and this path runs after
+        // it, but the order is not a contract: if the slot is empty the
+        // launch call will give the same value anyway.
+        let motion_changed = changes.motion;
+        if motion_changed {
+            for pane in &panes {
+                pane.set_cursor_motion(&new);
+            }
+        }
+        // The cursor's drawing numbers go to the link too, for the same reason: they change
+        // **how** we draw, not which frame we draw.
+        // `Changes::caret` is a separate field, because these do not go into
+        // `TerminalOptions` and had they piggybacked on `changes.terminal`, a radius
+        // change would have rebuilt the session from scratch.
+        if changes.caret {
+            for pane in &panes {
+                pane.apply_caret(&new);
+            }
+        }
+        // `keep_running` is read when quitting; its live part is the
+        // bound holder's birth or departure, from the old and new value.
+        let before = old.keep_running;
+        let switch = keeper::switch(before, new.keep_running);
+        let ask = keeper::asks_notification_permission(Some(before), new.keep_running);
+        crate::menu::set_end_programs_visible(self.mtm(), new.keep_running);
+        self.ivars().settings.replace(new.clone());
+        self.switch_keeper(switch);
+        if ask {
+            crate::uploader::request_notification_permission();
+        }
+        // **After** the settings are written: `apply_reduce_motion` is the shared path of
+        // three callers and reads the value from the slot, not from the `new` in hand.
+        // The style's path stayed separate because it takes the link directly;
+        // merging the two would tie this path to `new` and make it
+        // uncallable from the system notification.
+        if motion_changed {
+            self.apply_reduce_motion();
+        }
+        // **After** the delta is written: the pane applies the font with the new delta.
+        if changes.font || font_reset {
+            for pane in &panes {
+                pane.set_font(&new.font);
+            }
+        }
+        // The scroll bar's form, by `apply_reduce_motion`'s reasoning: the
+        // shared path reads the slot. Its note in the settings window is
+        // refreshed at the end. A save that changes the font **and** moves
+        // to or from `"always"` resizes the grid twice (each path is its
+        // own geometry refresh); only a hand edit does that — the window
+        // writes one key at a time.
+        if changes.scrollbar {
+            self.apply_scrollbar();
+        }
+        // The top edge's mode goes to every **window** — each tab's panes
+        // and its container's line together (`TerminalTab::set_content_edge`).
+        // A save that also changes the font resizes the grid twice, the
+        // scroll bar's case above.
+        if changes.content_edge {
+            let edge = new.content_edge;
+            for window in &windows {
+                window.set_content_edge(edge);
+            }
+        }
+        // The veil over unfocused splits: each tab reads the choice again.
+        if changes.dim_splits {
+            for window in &windows {
+                window.refresh_split_look();
+            }
+        }
+        // Cards or lines: every split tab is laid out again.
+        if changes.split_style {
+            for window in &windows {
+                window.apply_split_style();
+            }
+        }
+        // The tabs in the title row or in the side column: every window places them again.
+        if changes.tab_position {
+            for window in &windows {
+                window.apply_tab_position();
+            }
+        }
+        // Turned on, every window takes the step its next drag would:
+        // fitted to its lone pane's cells at once (a no-op when off).
+        if changes.resize_in_steps {
+            for window in &windows {
+                window.fit_to_cells();
+            }
+        }
+        // The tab icons' look or colors: every tab bar draws its chips again.
+        if changes.tab_icons {
+            for window in &windows {
+                window.refresh_bar();
+            }
+        }
+    }
+
+    /// Resolves the theme the slot's settings select for the appearance and swaps it into every
+    /// window; an unusable one is not swapped in, the on-screen one stays. Runs on every file
+    /// event (the theme's own file is a separate source) and when a preview changes the name.
+    fn apply_theme(&self, root: &Path) {
+        let windows = self.windows();
         // The borrow is dropped before `set_theme`; the calls inside do not touch
         // `settings` (the pattern of `apply_appearance`).
         let theme = {
             let settings = self.ivars().settings.borrow();
             let name = settings.theme_for(self.dark_appearance());
-            self.watch_theme(Some(&root), name);
-            let (theme, messages) = settings::load_theme(Some(&root), name).or_current();
+            self.watch_theme(Some(root), name);
+            let (theme, messages) = settings::load_theme(Some(root), name).or_current();
             self.post_notices(Source::Theme, messages);
             theme
         };
@@ -5381,9 +5473,87 @@ impl AppDelegate {
                 window.set_theme(theme);
             }
         }
-        // The file may have changed from outside too (vnode): an open settings window
-        // shows the file's state on every run.
-        self.refresh_settings_window();
+    }
+
+    /// The settings the file holds: the slot's, except while a preview is up, when the slot holds
+    /// what the preview shows and the file's are the ones the preview sits on. Whatever asks what
+    /// the file says (the next read's fallback, the values the palette's rows show, the settings
+    /// window) asks here; the windows read the slot.
+    pub(crate) fn file_settings(&self) -> Settings {
+        match self.ivars().preview.borrow().as_ref() {
+            Some(held) => held.file().clone(),
+            None => self.settings().clone(),
+        }
+    }
+
+    /// What the screen shows once the file reads `file`: `file` itself, or — while a preview is
+    /// up — the preview over it (the preview's base moves to `file`). A file that no longer takes
+    /// the preview's edit ends the preview.
+    fn shown_over(&self, root: &Path, file: &Settings) -> Settings {
+        let mut preview = self.ivars().preview.borrow_mut();
+        let Some(held) = preview.as_mut() else {
+            return file.clone();
+        };
+        match held.rebase(root, file) {
+            Some(shown) => shown,
+            None => {
+                *preview = None;
+                file.clone()
+            }
+        }
+    }
+
+    /// Shows `edit` on every window **without writing it** (`None`: takes back whatever was
+    /// shown) — the palette's highlight on a setting's value. The file, its watcher and its
+    /// comments are not touched; [`AppDelegate::end_preview`], a write
+    /// ([`AppDelegate::save_edits`]) or the file's own change ends it. A file that takes no write
+    /// takes no preview. The temporary point-size delta stays: it is the file's rule to reset it.
+    pub(crate) fn preview_edit(&self, edit: Option<&SettingsEdit>) {
+        let Inputs::User {
+            config_root: Some(root),
+        } = self.inputs()
+        else {
+            return;
+        };
+        let Some(edit) = edit else {
+            self.end_preview();
+            return;
+        };
+        let Ok((held, shown)) = settings::Preview::show(&root, self.file_settings(), edit.clone())
+        else {
+            self.end_preview();
+            return;
+        };
+        let old = self.settings().clone();
+        self.ivars().preview.replace(Some(held));
+        self.show(&root, &old, shown);
+    }
+
+    /// Takes back whatever a preview shows; the file's settings are on screen again. Nothing
+    /// to do without one.
+    pub(crate) fn end_preview(&self) {
+        let Some(held) = self.ivars().preview.take() else {
+            return;
+        };
+        let Inputs::User {
+            config_root: Some(root),
+        } = self.inputs()
+        else {
+            return;
+        };
+        let old = self.settings().clone();
+        self.show(&root, &old, held.into_file());
+    }
+
+    /// Puts `new` on screen over `old` for a preview's sake: the settings, and the theme when its
+    /// name changed with them.
+    fn show(&self, root: &Path, old: &Settings, new: Settings) {
+        let dark = self.dark_appearance();
+        let theme_moved = old.theme_for(dark) != new.theme_for(dark);
+        self.apply_settings(old, new, false);
+        if theme_moved {
+            self.apply_theme(root);
+        }
     }
 
     /// The settings window's "Open settings.toml" button (it was once
@@ -5431,6 +5601,36 @@ impl AppDelegate {
         }
     }
 
+    /// View ▸ Theme ▸ Open Themes Folder: shows `themes/` under the settings directory in
+    /// Finder. The folder is made if it is not there (the menu item is the way a user finds
+    /// where theme files go); a folder that cannot be made, or shown, goes to the write slot
+    /// like the settings file's own failures.
+    pub(crate) fn show_themes_folder(&self) {
+        let Inputs::User {
+            config_root: Some(root),
+        } = self.inputs()
+        else {
+            return;
+        };
+        let folder = root.join(settings::THEMES_DIR);
+        let problem = match std::fs::create_dir_all(&folder) {
+            Err(err) => Some(format!(
+                "{} could not be created: {err}",
+                settings::THEMES_DIR
+            )),
+            Ok(()) if !open_in_editor(&folder) => Some(format!(
+                "{} could not be shown; it is at {}",
+                settings::THEMES_DIR,
+                folder.display()
+            )),
+            Ok(()) => None,
+        };
+        if let Some(problem) = problem {
+            self.post_notices(Source::Write, vec![problem]);
+            self.refresh_settings_window();
+        }
+    }
+
     /// The View ▸ Theme ▸ choice: writes `theme` to the file
     /// ([`settings::write_edit`]) and applies it through **the path that reads the file**
     /// ([`AppDelegate::reload_settings`]) — the menu has no application path of its own,
@@ -5452,22 +5652,37 @@ impl AppDelegate {
     /// window returns to the file's value: the control must not show a value that could
     /// not be written.
     pub(crate) fn save_edit(&self, edit: &SettingsEdit) {
+        let _ = self.save_edits(std::slice::from_ref(edit));
+    }
+
+    /// [`AppDelegate::save_edit`] for several keys, in order, applied by **one** read — a
+    /// choice that writes two keys (a theme for this appearance, and Match System) must not
+    /// show the half between them. The first key that cannot be written stops the run; its
+    /// message goes to the write slot and comes back.
+    ///
+    /// A preview ends here: the file says it now, or the write failed and the screen returns to
+    /// the file's settings. The read that follows compares the point size against what the file
+    /// held before, not against what the preview showed.
+    pub(crate) fn save_edits(&self, edits: &[SettingsEdit]) -> Result<(), String> {
         let Inputs::User {
             config_root: Some(root),
         } = self.inputs()
         else {
-            return;
+            return Err(format!("{} is not available", settings::FILE_NAME));
         };
-        match settings::write_edit(&root, edit) {
-            Ok(()) => {
-                self.post_notices(Source::Write, Vec::new());
-                self.reload_settings();
-            }
-            Err(message) => {
-                self.post_notices(Source::Write, vec![message]);
+        let before = self.file_settings();
+        for edit in edits {
+            if let Err(message) = settings::write_edit(&root, edit) {
+                self.post_notices(Source::Write, vec![message.clone()]);
+                self.end_preview();
                 self.refresh_settings_window();
+                return Err(message);
             }
         }
+        self.ivars().preview.replace(None);
+        self.post_notices(Source::Write, Vec::new());
+        self.reload_from(Some(before));
+        Ok(())
     }
 
     /// bateri ▸ Settings…: spawns the settings window (the first time), fills it with the
@@ -5520,7 +5735,7 @@ impl AppDelegate {
         else {
             return;
         };
-        let settings = self.ivars().settings.borrow().clone();
+        let settings = self.file_settings();
         let state = self.ivars().settings_state.borrow().clone();
         let write = self.ivars().notices.borrow().get(Source::Write).to_vec();
         let embedded = Theme::embedded_groups();
@@ -5990,7 +6205,7 @@ impl AppDelegate {
     /// "is it dark" — comparing names would count the high-contrast dark
     /// appearance (`NSAppearanceNameAccessibilityHighContrastDarkAqua`) as
     /// light.
-    fn dark_appearance(&self) -> bool {
+    pub(crate) fn dark_appearance(&self) -> bool {
         let appearance = NSApplication::sharedApplication(self.mtm()).effectiveAppearance();
         // SAFETY: two constant `NSString`s AppKit exposes; they live for the process
         // and are only read (the precedent of `NSRunLoopCommonModes`).

@@ -8,6 +8,13 @@
 //! heading, and what the keys do to the highlight and the pages are `bt-shell-common`'s
 //! ([`rules`]): this module draws the rows and feeds the machine ([`Palette`]) its keys.
 //!
+//! **Settings and themes** are rows of their own beside the menu's commands: a switch flips where
+//! it stands and the list stays, a setting with values and the themes open a page whose
+//! highlighted row is **shown** on every window as it is reached (`Effect::Preview` →
+//! [`AppDelegate::preview_edit`](crate::app)), ⏎ writes it to `settings.toml` through the one
+//! write path the menus and the settings window use, and anything that closes the palette takes
+//! the preview back. A file that takes no write shows why above the page and previews nothing.
+//!
 //! **Running a row** is the menu's own act: the palette closes, the keyboard goes back to the tab
 //! on screen, and only then is the item's action sent — to the item's target, or down the
 //! responder chain from that pane — with the item as the sender, so a tagged item (a direction,
@@ -40,10 +47,12 @@ use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 
 use block2::RcBlock;
-use bt_core::Theme;
+use bt_core::{Settings, Theme};
 use bt_shell_common::palette::{
-    self as rules, Effect, Fallbacks, Key, Kind, List, Modifier, Palette, Row, Scope,
+    self as rules, Chosen, Effect, Fallbacks, Key, Kind, List, Modifier, Palette, Row, Scope,
+    Sources, Swatch, ThemeEntry,
 };
+use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{
@@ -106,6 +115,12 @@ const FOOTER_SIZE: f64 = 11.5;
 const APPEAR_SECS: f64 = 0.18;
 /// How far above its place the card begins.
 const SLIDE: f64 = 6.0;
+
+/// A theme's colours beside its title: a rounded patch of its ground with six dots on it.
+const SWATCH_WIDTH: f64 = 72.0;
+const SWATCH_HEIGHT: f64 = 18.0;
+const SWATCH_DOT: f64 = 7.0;
+const SWATCH_GAP: f64 = 3.6;
 
 const RETURN: u16 = 36;
 const ENTER: u16 = 76;
@@ -196,21 +211,36 @@ fn slot_of(slots: &[Slot], index: usize) -> Option<Slot> {
         .copied()
 }
 
-/// The keys the bottom band names for the highlighted `row`, at page `depth`.
-fn hints(row: Option<&Row>, depth: usize) -> Vec<(&'static str, &'static str)> {
+/// The keys the bottom band names for the highlighted `row`, at page `depth`. `appearance`: the
+/// system's, when ⌥⏎ on a theme row writes the theme for it only.
+fn hints(
+    row: Option<&Row>,
+    depth: usize,
+    appearance: Option<&'static str>,
+) -> Vec<(&'static str, String)> {
     let mut hints = Vec::new();
     if let Some(row) = row {
         let verb = if row.opens.is_some() && row.enters {
             "Open"
         } else if row.kind == Kind::Search {
             "Find"
+        } else if matches!(row.kind, Kind::Theme | Kind::Choice) {
+            "Use"
+        } else if row.toggle.is_some() {
+            "Switch"
         } else {
             "Run"
         };
-        hints.push(("↵", verb));
+        hints.push(("↵", verb.to_owned()));
+        if let Some(appearance) = appearance
+            && row.kind == Kind::Theme
+            && row.id != "theme.system"
+        {
+            hints.push(("⌥↵", format!("Use for {appearance}")));
+        }
     }
-    hints.push(("↑↓", "Move"));
-    hints.push(("esc", if depth > 0 { "Back" } else { "Close" }));
+    hints.push(("↑↓", "Move".to_owned()));
+    hints.push(("esc", if depth > 0 { "Back" } else { "Close" }.to_owned()));
     hints
 }
 
@@ -387,6 +417,8 @@ struct Shown {
     highlight: usize,
     look: Option<Look>,
     empty: &'static str,
+    /// A heading in the warning colour: why the page cannot be written.
+    warning: Option<String>,
 }
 
 pub(crate) struct ListIvars {
@@ -468,6 +500,7 @@ impl PaletteList {
                 highlight: 0,
                 look: None,
                 empty: "",
+                warning: None,
             }),
             pressed: Cell::new(None),
         });
@@ -506,7 +539,14 @@ impl PaletteList {
     }
 
     /// Shows `list` with row `highlight` lit; returns the height its slots take.
-    fn set(&self, list: &List, highlight: usize, look: Look, empty: &'static str) -> f64 {
+    fn set(
+        &self,
+        list: &List,
+        highlight: usize,
+        look: Look,
+        empty: &'static str,
+        warning: Option<String>,
+    ) -> f64 {
         let (slots, total) = slots(list);
         {
             let mut shown = self.ivars().shown.borrow_mut();
@@ -515,6 +555,7 @@ impl PaletteList {
             shown.highlight = highlight;
             shown.look = Some(look);
             shown.empty = empty;
+            shown.warning = warning;
         }
         self.setNeedsDisplay(true);
         total
@@ -568,6 +609,10 @@ impl PaletteList {
             &NSFont::systemFontOfSize_weight(TITLE_SIZE, semibold),
             look.accent,
         );
+        let warning = attributes(
+            &NSFont::systemFontOfSize_weight(HEADING_SIZE, medium),
+            look.warning,
+        );
         if shown.list.is_empty() {
             let message = attributes(&NSFont::systemFontOfSize(DIM_SIZE + 0.5), look.dim);
             let at = draw_width_centered(shown.empty, width, &message);
@@ -584,13 +629,12 @@ impl PaletteList {
                 Line::Row(index) => index,
                 Line::Heading(over) => {
                     if let Some(title) = shown.list.heading_before(over) {
-                        draw_text(
-                            title,
-                            TEXT_INSET,
-                            slot.top + 2.0,
-                            slot.height - 2.0,
-                            &heading,
-                        );
+                        let attrs = if shown.warning.as_deref() == Some(title) {
+                            &warning
+                        } else {
+                            &heading
+                        };
+                        draw_text(title, TEXT_INSET, slot.top + 2.0, slot.height - 2.0, attrs);
                     }
                     continue;
                 }
@@ -634,8 +678,38 @@ fn draw_width_centered(text: &str, width: f64, attributes: &Attributes) -> f64 {
     ((width - text_width(text, attributes)) / 2.0).max(TEXT_INSET)
 }
 
-/// The right-hand side of a row, from `right` inward: the › of a page, the status, the value,
-/// the shortcut and the ✓. Returns the x where it begins.
+/// A theme's patch, ending at `right`: its ground, edged, with its six colours in a row on it.
+/// Returns the x where it begins.
+fn draw_swatch(swatch: &Swatch, right: f64, slot: &Slot, look: Look) -> f64 {
+    let left = right - SWATCH_WIDTH;
+    let top = slot.top + (slot.height - SWATCH_HEIGHT) / 2.0;
+    rounded(
+        NSRect::new(
+            NSPoint::new(left, top),
+            NSSize::new(SWATCH_WIDTH, SWATCH_HEIGHT),
+        ),
+        6.0,
+        Tint::of(swatch.ground, 1.0),
+        Some(look.line),
+    );
+    let row = SWATCH_DOT * 6.0 + SWATCH_GAP * 5.0;
+    let start = left + (SWATCH_WIDTH - row) / 2.0;
+    for (n, dot) in swatch.dots.iter().enumerate() {
+        let rect = NSRect::new(
+            NSPoint::new(
+                start + n as f64 * (SWATCH_DOT + SWATCH_GAP),
+                top + (SWATCH_HEIGHT - SWATCH_DOT) / 2.0,
+            ),
+            NSSize::new(SWATCH_DOT, SWATCH_DOT),
+        );
+        Tint::of(*dot, 1.0).color().setFill();
+        NSBezierPath::bezierPathWithOvalInRect(rect).fill();
+    }
+    left
+}
+
+/// The right-hand side of a row, from `right` inward: the theme's patch, the › of a page, the
+/// status, the value, a switch's state, the shortcut and the ✓. Returns the x where it begins.
 fn draw_row_end(
     row: &Row,
     right: f64,
@@ -645,6 +719,9 @@ fn draw_row_end(
     look: Look,
 ) -> f64 {
     let mut x = right;
+    if let Some(swatch) = &row.swatch {
+        x = draw_swatch(swatch, x, slot, look) - 12.0;
+    }
     if row.opens.is_some() && row.shortcut.is_none() {
         x = draw_text_right("›", x, slot.top, slot.height, quiet) - 12.0;
     }
@@ -663,6 +740,10 @@ fn draw_row_end(
     if let Some(value) = &row.value {
         x = draw_text_right(value, x, slot.top, slot.height, quiet) - 12.0;
     }
+    if let Some(on) = row.toggle {
+        let (text, attrs) = if on { ("On", tick) } else { ("Off", quiet) };
+        x = draw_text_right(text, x, slot.top, slot.height, attrs) - 12.0;
+    }
     if let Some(shortcut) = &row.shortcut {
         x = draw_text_right(shortcut, x, slot.top, slot.height, quiet) - 12.0;
     }
@@ -678,7 +759,18 @@ fn draw_row_end(
 struct Open {
     machine: Palette,
     menu: Snapshot,
-    /// The root's rows: every command and page of the menu.
+    /// What the file says, as the rows show it (values, ✓): taken when the palette opens and
+    /// after each write, never from what a preview shows.
+    settings: Settings,
+    themes: Vec<ThemeEntry>,
+    /// The system's appearance: ⌥⏎ on a theme writes the theme for it.
+    dark: bool,
+    /// Why nothing can be written ([`AppDelegate::palette_lock`](crate::app)), shown over the
+    /// pages of settings.
+    lock: Option<String>,
+    /// What the last refused or failed write said, in the bottom band until the next key.
+    notice: Option<String>,
+    /// The root's rows: the menu's commands and pages, the settings, the themes.
     root: Vec<Row>,
     recent: Vec<String>,
     list: List,
@@ -687,11 +779,24 @@ struct Open {
 }
 
 impl Open {
+    fn sources(&self) -> Sources<'_> {
+        Sources {
+            menu: &self.menu.rows,
+            settings: &self.settings,
+            themes: &self.themes,
+        }
+    }
+
+    /// The root's rows afresh, after the settings they show changed.
+    fn rebuild_root(&mut self) {
+        self.root = rules::root_rows(&self.sources());
+    }
+
     /// The list the machine's field and page ask for.
     fn derive(&self) -> List {
         let query = self.machine.query();
-        match self.machine.scope() {
-            None => rules::root_list(
+        let Some(scope) = self.machine.scope() else {
+            return rules::root_list(
                 &self.root,
                 query,
                 &self.recent,
@@ -700,18 +805,35 @@ impl Open {
                     find: true,
                     history: false,
                 },
-            ),
-            Some(Scope::Menu(key)) => {
-                let page: Vec<Row> = self
-                    .menu
-                    .rows
-                    .page(key)
-                    .map(|rows| rows.iter().map(|entry| entry.row.clone()).collect())
-                    .unwrap_or_default();
-                rules::page_list(&page, query)
-            }
-            Some(_) => List::default(),
+            );
+        };
+        let rows = rules::page_rows(scope, &self.sources());
+        let mut list = rules::page_list(&rows, query);
+        // A page that writes says over its rows why it cannot.
+        if let Some(reason) = &self.lock
+            && matches!(scope, Scope::Settings | Scope::Theme(_) | Scope::Choices(_))
+        {
+            list.headings.insert(0, (0, reason.clone()));
         }
+        list
+    }
+
+    /// The text of the heading that says why the page cannot be written.
+    fn warning(&self) -> Option<String> {
+        let page = matches!(
+            self.machine.scope(),
+            Some(Scope::Settings | Scope::Theme(_) | Scope::Choices(_))
+        );
+        self.lock.clone().filter(|_| page)
+    }
+
+    /// The appearance ⌥⏎ writes a theme for, on a page where it does.
+    fn appearance(&self) -> Option<&'static str> {
+        matches!(
+            self.machine.scope(),
+            None | Some(Scope::Theme(rules::Slot::Active))
+        )
+        .then_some(if self.dark { "Dark" } else { "Light" })
     }
 }
 
@@ -778,8 +900,13 @@ define_class!(
                 return;
             }
             let text = self.ivars().field.stringValue().to_string();
-            let effect = self.ivars().open.borrow_mut().machine.typed(&text);
+            let effect = {
+                let mut open = self.ivars().open.borrow_mut();
+                open.notice = None;
+                open.machine.typed(&text)
+            };
             self.settle(effect);
+            self.rest_later(text);
         }
 
         /// The keyboard went somewhere else (a click in a pane, another field): the palette is
@@ -918,7 +1045,9 @@ impl PaletteCard {
         let look = Look::of(theme);
         self.ivars().open.borrow_mut().look = look;
         self.restyle(look);
-        self.refresh();
+        // The theme a preview shows repaints the card while the pointer is on a row of it: the
+        // list must not slide under the pointer.
+        self.refresh_scrolling(false);
     }
 
     /// The colours the AppKit views carry: the field's text and the shadow.
@@ -942,7 +1071,7 @@ impl PaletteCard {
     /// [`PaletteCard::refresh`], with the highlighted row scrolled into sight or not.
     fn refresh_scrolling(&self, scroll: bool) {
         let iv = self.ivars();
-        let (list, highlight, empty, look, query) = {
+        let (list, highlight, empty, look, query, warning) = {
             let mut open = iv.open.borrow_mut();
             let list = open.derive();
             let rows = list.rows();
@@ -956,6 +1085,7 @@ impl PaletteCard {
                 empty_message(open.machine.depth(), open.machine.query()),
                 open.look,
                 open.machine.query().to_owned(),
+                open.warning(),
             )
         };
         if iv.field.stringValue().to_string() != query {
@@ -965,7 +1095,7 @@ impl PaletteCard {
                 editor.setSelectedRange(NSRange::new(length, 0));
             }
         }
-        let total = iv.list.set(&list, highlight, look, empty);
+        let total = iv.list.set(&list, highlight, look, empty, warning);
         let visible = list_height(total, list.is_empty());
         self.fit(total, visible);
         iv.list.light(highlight, scroll);
@@ -1044,6 +1174,7 @@ impl PaletteCard {
     /// A key to the machine, and what it asks for done.
     fn press(&self, key: Key) {
         let _keep = self.retain();
+        self.ivars().open.borrow_mut().notice = None;
         if key == Key::Enter(Modifier::None) {
             let row = {
                 let open = self.ivars().open.borrow();
@@ -1071,7 +1202,11 @@ impl PaletteCard {
             effect
         };
         match effect {
-            Effect::None | Effect::Preview(_) => self.refresh_scrolling(false),
+            Effect::None => self.refresh_scrolling(false),
+            Effect::Preview(preview) => {
+                self.preview(preview);
+                self.refresh_scrolling(false);
+            }
             other => self.settle(other),
         }
     }
@@ -1094,9 +1229,59 @@ impl PaletteCard {
     /// What a call on the machine asked for.
     fn settle(&self, effect: Effect) {
         match effect {
-            Effect::None | Effect::Preview(_) => self.refresh(),
+            Effect::None => self.refresh(),
+            Effect::Preview(preview) => {
+                self.preview(preview);
+                self.refresh();
+            }
+            // The preview comes down with the palette, whichever way it closes.
             Effect::Close { .. } => self.dismiss(),
             Effect::Activate { id, modifier } => self.activate(&id, modifier),
+        }
+    }
+
+    /// Shows the setting value the highlight reached on every window, or takes back what was
+    /// shown. Nothing is written; a value the catalog cannot read is no preview.
+    fn preview(&self, preview: Option<rules::Preview>) {
+        let edit = preview.and_then(|shown| rules::setting(&shown.key)?.edit(&shown.token));
+        if let Some(app) = app::delegate(self.mtm()) {
+            app.preview_edit(edit.as_ref());
+        }
+    }
+
+    /// The letters have rested for [`rules::REST`]: a highlighted theme shows itself, as if an
+    /// arrow had landed on it.
+    fn rest_later(&self, seen: String) {
+        let Ok(when) = DispatchTime::try_from(rules::REST) else {
+            return;
+        };
+        let window = self.ivars().window;
+        let _ = DispatchQueue::main().after(when, move || {
+            // audit: a block running on the main queue is on the main thread by definition.
+            let mtm = MainThreadMarker::new().expect("the main queue is the main thread");
+            if let Some(app) = app::delegate(mtm)
+                && let Some(window) = app.window(window)
+                && let Some(scrim) = window.root().palette()
+            {
+                scrim.ivars().card.rested(&seen);
+            }
+        });
+    }
+
+    fn rested(&self, seen: &str) {
+        if self.ivars().closing.get() {
+            return;
+        }
+        let effect = {
+            let mut open = self.ivars().open.borrow_mut();
+            let rows = std::mem::take(&mut open.rows);
+            let effect = open.machine.rested(seen, &rows);
+            open.rows = rows;
+            effect
+        };
+        if let Effect::Preview(preview) = effect {
+            self.preview(preview);
+            self.refresh_scrolling(false);
         }
     }
 
@@ -1112,6 +1297,18 @@ impl PaletteCard {
             if let Some(window) = self.owner() {
                 window.find_in_focused_pane(&query);
             }
+            return;
+        }
+        let (scope, settings, dark) = {
+            let open = self.ivars().open.borrow();
+            (
+                open.machine.scope().cloned(),
+                open.settings.clone(),
+                open.dark,
+            )
+        };
+        if let Some(chosen) = rules::chosen(id, scope.as_ref(), modifier, &settings, dark) {
+            self.write(id, &chosen);
             return;
         }
         // Only the plain ⏎ and a press run a command; ⌘⏎ and ⌥⏎ belong to the rows that use
@@ -1144,6 +1341,44 @@ impl PaletteCard {
                 target.as_deref(),
                 Some(sender),
             );
+        }
+    }
+
+    /// A settings row was chosen: its edits go to the file through the one write path, and the
+    /// preview that showed them is the file's now. A file that takes no write, or a write that
+    /// fails, leaves the palette open with the reason in the bottom band. A switch stays where it
+    /// is, flipped; anything else closes the palette.
+    fn write(&self, id: &str, chosen: &Chosen) {
+        let Some(app) = app::delegate(self.mtm()) else {
+            return;
+        };
+        let lock = self.ivars().open.borrow().lock.clone();
+        let outcome = match lock {
+            Some(reason) => Err(reason),
+            None => app.save_edits(&chosen.edits),
+        };
+        match outcome {
+            Ok(()) => {
+                // A setting row is a choice like a command: it goes to Recent.
+                if id.starts_with(Kind::Setting.prefix()) {
+                    app.palette_chose(id);
+                }
+                {
+                    let mut open = self.ivars().open.borrow_mut();
+                    open.machine.commit_preview();
+                    open.settings = app.file_settings();
+                    open.rebuild_root();
+                }
+                if chosen.close {
+                    self.dismiss();
+                } else {
+                    self.refresh();
+                }
+            }
+            Err(reason) => {
+                self.ivars().open.borrow_mut().notice = Some(reason);
+                self.refresh();
+            }
         }
     }
 
@@ -1187,22 +1422,39 @@ impl PaletteCard {
         self.paint_hints(look, band);
     }
 
-    /// The keys the bottom band names for the highlighted row.
+    /// The keys the bottom band names for the highlighted row; or, after a refused or failed
+    /// write, why, until the next key.
     fn paint_hints(&self, look: Look, band: NSRect) {
-        let (row, depth) = {
+        let (row, depth, appearance, notice) = {
             let open = self.ivars().open.borrow();
             let at = open.machine.cursor(open.rows.len());
-            (open.rows.get(at).cloned(), open.machine.depth())
+            (
+                open.rows.get(at).cloned(),
+                open.machine.depth(),
+                open.appearance(),
+                open.notice.clone(),
+            )
         };
         let font = NSFont::systemFontOfSize(FOOTER_SIZE);
+        if let Some(notice) = notice {
+            let warning = attributes(&font, look.warning);
+            draw_text(
+                &notice,
+                TEXT_INSET,
+                band.origin.y,
+                band.size.height,
+                &warning,
+            );
+            return;
+        }
         // SAFETY: AppKit's constant font weight.
         let bold = NSFont::systemFontOfSize_weight(FOOTER_SIZE, unsafe { NSFontWeightMedium });
         let key = attributes(&bold, look.text);
         let verb = attributes(&font, look.dim);
         let mut x = TEXT_INSET;
-        for (keys, name) in hints(row.as_ref(), depth) {
+        for (keys, name) in hints(row.as_ref(), depth, appearance) {
             x = draw_text(keys, x, band.origin.y, band.size.height, &key) + 6.0;
-            x = draw_text(name, x, band.origin.y, band.size.height, &verb) + 18.0;
+            x = draw_text(&name, x, band.origin.y, band.size.height, &verb) + 18.0;
         }
     }
 }
@@ -1304,18 +1556,25 @@ fn open(window: &TerminalWindow) {
     let look = Look::of(&theme);
     // Before the field takes the keyboard: the menu is validated against the pane's.
     let menu = Snapshot::take(mtm);
-    let rows = menu.rows.root_rows();
+    let settings = app.file_settings();
+    let themes = app.palette_themes();
     let recent = app.palette_recent();
     let animate = !app.reduce_motion();
     let mut state = Open {
         machine: Palette::new(),
+        root: Vec::new(),
         menu,
-        root: rows,
+        settings,
+        themes,
+        dark: app.dark_appearance(),
+        lock: app.palette_lock(),
+        notice: None,
         recent,
         list: List::default(),
         rows: Vec::new(),
         look,
     };
+    state.rebuild_root();
     state.list = state.derive();
     state.rows = state.list.rows();
     let card = PaletteCard::new(mtm, window.id(), state);
@@ -1365,6 +1624,11 @@ pub(crate) fn close(root: &RootView) {
     scrim.ivars().card.ivars().closing.set(true);
     root.seat_palette(None);
     scrim.removeFromSuperview();
+    // Whatever the highlight was showing goes back to what the file says (a write has ended the
+    // preview already, and then this does nothing).
+    if let Some(app) = app::delegate(root.mtm()) {
+        app.end_preview();
+    }
 }
 
 #[cfg(test)]
@@ -1476,20 +1740,53 @@ mod tests {
         assert_eq!(list_height(2.0 * LIST_PAD, true), EMPTY_BAND);
     }
 
+    fn pairs(hints: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
+        hints
+            .iter()
+            .map(|(keys, verb)| (*keys, (*verb).to_owned()))
+            .collect()
+    }
+
     #[test]
     fn the_bottom_band_names_the_keys_of_the_highlighted_row() {
         let command = Row::new(Kind::Command, "newTab", "New Tab");
         assert_eq!(
-            hints(Some(&command), 0),
-            [("↵", "Run"), ("↑↓", "Move"), ("esc", "Close")]
+            hints(Some(&command), 0, None),
+            pairs(&[("↵", "Run"), ("↑↓", "Move"), ("esc", "Close")])
         );
         let page =
             Row::new(Kind::Scope, "menu.Edit", "Edit").opens(Scope::Menu("Edit".into()), true);
-        assert_eq!(hints(Some(&page), 1)[0], ("↵", "Open"));
-        assert_eq!(hints(Some(&page), 1)[2], ("esc", "Back"));
+        assert_eq!(hints(Some(&page), 1, None)[0], ("↵", "Open".to_owned()));
+        assert_eq!(hints(Some(&page), 1, None)[2], ("esc", "Back".to_owned()));
         let find = Row::new(Kind::Search, "find", "Find");
-        assert_eq!(hints(Some(&find), 0)[0], ("↵", "Find"));
-        assert_eq!(hints(None, 0), [("↑↓", "Move"), ("esc", "Close")]);
+        assert_eq!(hints(Some(&find), 0, None)[0], ("↵", "Find".to_owned()));
+        assert_eq!(
+            hints(None, 0, None),
+            pairs(&[("↑↓", "Move"), ("esc", "Close")])
+        );
+    }
+
+    #[test]
+    fn a_theme_names_its_third_use_for_the_appearance_the_system_has() {
+        let theme = Row::new(Kind::Theme, "nord", "Nord");
+        assert_eq!(
+            hints(Some(&theme), 1, Some("Dark")),
+            pairs(&[
+                ("↵", "Use"),
+                ("⌥↵", "Use for Dark"),
+                ("↑↓", "Move"),
+                ("esc", "Back")
+            ])
+        );
+        // Match System has no appearance to pin; a page that is not the one theme's has no
+        // third use to name.
+        let system = Row::new(Kind::Theme, "system", "Match System");
+        assert_eq!(hints(Some(&system), 1, Some("Light")).len(), 3);
+        assert_eq!(hints(Some(&theme), 1, None).len(), 3);
+        let switch = Row::new(Kind::Setting, "shell.ports", "Show Ports").toggle(true);
+        assert_eq!(hints(Some(&switch), 0, None)[0], ("↵", "Switch".to_owned()));
+        let choice = Row::new(Kind::Choice, "beam", "Beam");
+        assert_eq!(hints(Some(&choice), 1, None)[0], ("↵", "Use".to_owned()));
     }
 
     #[test]

@@ -31,7 +31,7 @@ use bt_core::{Diagnostic, Parsed, Settings, SettingsEdit, Theme};
 pub const FILE_NAME: &str = "settings.toml";
 
 /// The directory of user themes, under the root.
-const THEMES_DIR: &str = "themes";
+pub const THEMES_DIR: &str = "themes";
 
 /// The root in production: `{home}/.config/bateri/`.
 ///
@@ -136,6 +136,76 @@ pub fn write_edit(root: &Path, edit: &SettingsEdit) -> Result<(), String> {
     };
     let written = Settings::with_edit(&text, edit).map_err(|d| not_saved(notice(&d)))?;
     std::fs::write(&path, written).map_err(|err| format!("{FILE_NAME} could not be written: {err}"))
+}
+
+/// The settings a **preview** of `edit` shows: what the file would hold if `edit` were written
+/// now, read as the live reload reads it (a value the file holds that is not accepted keeps
+/// `base`'s). Nothing is written — the file is not even created, and the palette's highlight can
+/// move over a hundred values without the watcher seeing a thing.
+///
+/// A file that cannot be read or parsed has no preview, for the same reason it takes no write
+/// ([`write_edit`]): the reason is the same sentence.
+pub fn previewed(root: &Path, base: &Settings, edit: &SettingsEdit) -> Result<Settings, String> {
+    let text = match read_text(&root.join(FILE_NAME)) {
+        Text::Read(text) => text,
+        Text::Missing => String::new(),
+        Text::Unreadable(err) => return Err(format!("{FILE_NAME} could not be read: {err}")),
+    };
+    previewed_text(&text, base, edit)
+}
+
+/// [`previewed`] over the file's text.
+pub fn previewed_text(
+    text: &str,
+    base: &Settings,
+    edit: &SettingsEdit,
+) -> Result<Settings, String> {
+    let written = Settings::with_edit(text, edit).map_err(|d| notice(&d))?;
+    Settings::parse_keeping(&written, base)
+        .map(|parsed| parsed.settings)
+        .map_err(|d| notice(&d))
+}
+
+/// A setting shown over the file's, and the file's settings it sits on — the palette's
+/// highlight on a value, while it lasts. It owns no screen: the caller applies what
+/// [`Preview::show`] and [`Preview::rebase`] return and, to end it, applies [`Preview::into_file`]
+/// where the preview was.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Preview {
+    file: Settings,
+    edit: SettingsEdit,
+}
+
+impl Preview {
+    /// Starts showing `edit` over `file`; returns the preview and the settings it shows. A file
+    /// that takes no write takes no preview ([`previewed`]).
+    pub fn show(
+        root: &Path,
+        file: Settings,
+        edit: SettingsEdit,
+    ) -> Result<(Preview, Settings), String> {
+        let shown = previewed(root, &file, &edit)?;
+        Ok((Preview { file, edit }, shown))
+    }
+
+    /// The file now reads `file` (it was edited, or another key was written): the preview moves
+    /// onto it and the settings it shows are returned. `None` when the file no longer takes the
+    /// edit — the preview is over and `file` is what should be shown.
+    pub fn rebase(&mut self, root: &Path, file: &Settings) -> Option<Settings> {
+        let shown = previewed(root, file, &self.edit).ok()?;
+        self.file.clone_from(file);
+        Some(shown)
+    }
+
+    /// What the file holds.
+    pub fn file(&self) -> &Settings {
+        &self.file
+    }
+
+    /// Ends the preview: the settings to show again are the file's.
+    pub fn into_file(self) -> Settings {
+        self.file
+    }
 }
 
 /// The user themes in View ▸ Theme ▸: the names of `{root}/themes/*.toml`, in
@@ -993,6 +1063,99 @@ mod tests {
             notices[0].starts_with("settings.toml: line 4: `appearance.theme`"),
             "{notices:?}"
         );
+    }
+
+    #[test]
+    fn a_preview_is_the_file_with_the_edit_applied_and_nothing_is_written() {
+        let root = TempRoot::new("preview");
+        let path = root.0.join(FILE_NAME);
+        let text = "# mine\n[terminal]\nscrollback = 5\n";
+        std::fs::write(&path, text).expect("write failed");
+        let base = Settings::parse(text).expect("parses").settings;
+        let shown =
+            previewed(&root.0, &base, &SettingsEdit::Theme("nord".to_owned())).expect("a preview");
+        assert_eq!(shown.theme, "nord");
+        // The rest of the file is what the file says.
+        assert_eq!(shown.scrollback, 5);
+        // The file is as it was, byte for byte, and the base is untouched.
+        assert_eq!(std::fs::read_to_string(&path).expect("read failed"), text);
+        assert_ne!(base.theme, "nord");
+        // Undoing the preview is applying the base again: the change back is the change forth.
+        let big = previewed_text(text, &base, &SettingsEdit::FontSize(18.0)).expect("a preview");
+        assert!(base.changes(&big).font && big.changes(&base).font);
+        assert!(!base.changes(&shown).font);
+        assert_eq!(
+            previewed_text(text, &base, &SettingsEdit::Theme(base.theme.clone()))
+                .expect("a preview"),
+            base
+        );
+    }
+
+    #[test]
+    fn ending_a_preview_gives_back_the_files_settings() {
+        let root = TempRoot::new("preview-end");
+        std::fs::write(root.0.join(FILE_NAME), "[appearance]\ntheme = \"nord\"\n").expect("write");
+        let file = Settings::parse("[appearance]\ntheme = \"nord\"\n")
+            .expect("parses")
+            .settings;
+        let (held, shown) =
+            Preview::show(&root.0, file.clone(), SettingsEdit::FontSize(20.0)).expect("a preview");
+        assert_eq!(shown.font.size, 20.0);
+        assert_eq!(held.file(), &file);
+        // The screen goes back by applying the file's settings over the shown ones: the
+        // difference is the same one in both directions.
+        let back = held.into_file();
+        assert_eq!(back, file);
+        assert!(shown.changes(&back).font && back.changes(&shown).font);
+    }
+
+    #[test]
+    fn a_file_change_during_a_preview_moves_the_base_and_keeps_the_preview_on_top() {
+        let root = TempRoot::new("preview-rebase");
+        let path = root.0.join(FILE_NAME);
+        std::fs::write(&path, "[terminal]\nscrollback = 5\n").expect("write failed");
+        let file = load(&root.0).live().0.expect("a usable file");
+        let (mut held, _) =
+            Preview::show(&root.0, file, SettingsEdit::FontSize(20.0)).expect("a preview");
+        // Edited elsewhere while the preview is up.
+        std::fs::write(&path, "[terminal]\nscrollback = 99\n").expect("write failed");
+        let reread = load(&root.0).live().0.expect("a usable file");
+        let shown = held.rebase(&root.0, &reread).expect("still takes the edit");
+        assert_eq!(shown.scrollback, 99);
+        assert_eq!(shown.font.size, 20.0);
+        assert_eq!(held.file().scrollback, 99);
+    }
+
+    #[test]
+    fn a_file_that_no_longer_takes_the_edit_ends_the_preview() {
+        let root = TempRoot::new("preview-gone");
+        let file = Settings::default();
+        let (mut held, _) =
+            Preview::show(&root.0, file.clone(), SettingsEdit::FontSize(20.0)).expect("a preview");
+        std::fs::write(root.0.join(FILE_NAME), "[terminal\n").expect("write failed");
+        assert_eq!(held.rebase(&root.0, &file), None);
+    }
+
+    #[test]
+    fn a_missing_file_previews_from_nothing_and_stays_missing() {
+        let root = TempRoot::new("preview-missing");
+        let base = Settings::default();
+        let shown = previewed(&root.0, &base, &SettingsEdit::FontSize(16.0)).expect("a preview");
+        assert_eq!(shown.font.size, 16.0);
+        assert!(!root.0.join(FILE_NAME).exists());
+    }
+
+    #[test]
+    fn a_file_that_takes_no_write_takes_no_preview() {
+        let root = TempRoot::new("preview-locked");
+        std::fs::write(root.0.join(FILE_NAME), "[terminal\n").expect("write failed");
+        let base = Settings::default();
+        let edit = SettingsEdit::Theme("nord".to_owned());
+        let refused = previewed(&root.0, &base, &edit).expect_err("an unparseable file");
+        assert!(refused.starts_with("settings.toml: line 1: "), "{refused}");
+        // The write is refused in the same words.
+        let write = write_edit(&root.0, &edit).expect_err("refused");
+        assert!(write.contains(&refused), "{write}");
     }
 
     #[test]
