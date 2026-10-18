@@ -12,6 +12,13 @@ of every installed copy. A version without a section is not released.
 
 ## [Unreleased]
 
+### Changed
+
+- **The command palette fades out as it closes**, the way it came in and like
+  the find panel, instead of vanishing at once. The keys and the pointer are the
+  tab's from the moment it starts to go, so what you type or click right after
+  ⏎ or esc is not lost. With Reduce Motion it still goes at once.
+
 ## [0.19.0] - 2026-10-18
 
 ### Added

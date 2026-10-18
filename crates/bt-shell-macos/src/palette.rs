@@ -45,8 +45,9 @@
 //!
 //! **How it looks** comes from the theme's own arithmetic: the surface is the dock's plate
 //! ([`Theme::dock_ground_srgb`]), the bottom band the step above it ([`Theme::band_srgb`]), the
-//! highlight and the letters the query matched the accent. It opens in [`APPEAR_SECS`] on the
-//! search panel's curve — at once under Reduce Motion — and closes at once.
+//! highlight and the letters the query matched the accent. It opens and closes in
+//! [`APPEAR_SECS`] on the search panel's curves — at once under Reduce Motion; while it fades out
+//! the keyboard and the pointer are the tab's already.
 //!
 //! **The keyboard** is the field's: `control:textView:doCommandBySelector:` carries the arrows
 //! (⌃P and ⌃N are `moveUp:` and `moveDown:` too), ⏎, esc, ⇥, → at the end of the text, and ← and ⌫
@@ -91,7 +92,9 @@ use objc2_foundation::{
     NSAttributedString, NSAttributedStringKey, NSDictionary, NSMutableAttributedString,
     NSNotification, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, NSString,
 };
-use objc2_quartz_core::{CAMediaTimingFunction, kCAMediaTimingFunctionEaseOut};
+use objc2_quartz_core::{
+    CAMediaTimingFunction, kCAMediaTimingFunctionEaseIn, kCAMediaTimingFunctionEaseOut,
+};
 
 use self::menu::Snapshot;
 use crate::app::{self, Origin};
@@ -132,9 +135,10 @@ const HEADING_SIZE: f64 = 11.0;
 const FIELD_SIZE: f64 = 16.0;
 const FOOTER_SIZE: f64 = 11.5;
 
-/// The duration of the opening, in seconds: the search panel's (`search_bar::APPEAR_SECS`).
+/// The duration of the opening and of the closing, in seconds: the search panel's
+/// (`search_bar::APPEAR_SECS`).
 const APPEAR_SECS: f64 = 0.18;
-/// How far above its place the card begins.
+/// How far above its place the card begins, and rises to as it goes.
 const SLIDE: f64 = 6.0;
 
 /// A theme's colours beside its title: a rounded patch of its ground with six dots on it.
@@ -1122,6 +1126,10 @@ fn held_modifier() -> Modifier {
 impl PaletteCard {
     /// ⌘⏎ ([`PaletteCard::perform_key_equivalent`]).
     fn equivalent(&self, event: &NSEvent) -> bool {
+        // A card fading out is still in the window, and the keys are the tab's again.
+        if self.ivars().closing.get() {
+            return false;
+        }
         let code = event.keyCode();
         let flags = event.modifierFlags();
         if (code == RETURN || code == ENTER)
@@ -1444,6 +1452,9 @@ impl PaletteCard {
 
     /// A key to the machine, and what it asks for done.
     fn press(&self, key: Key) {
+        if self.ivars().closing.get() {
+            return;
+        }
         let _keep = self.retain();
         self.ivars().open.borrow_mut().notice = None;
         if key == Key::Enter(Modifier::None) {
@@ -1465,6 +1476,10 @@ impl PaletteCard {
 
     /// The pointer moved over row `row`.
     fn pointer_over(&self, row: usize) {
+        // The list's tracking area still reports moves while the card fades out.
+        if self.ivars().closing.get() {
+            return;
+        }
         let effect = {
             let mut open = self.ivars().open.borrow_mut();
             let rows = std::mem::take(&mut open.rows);
@@ -1484,6 +1499,9 @@ impl PaletteCard {
 
     /// A press on row `row`.
     fn clicked(&self, row: usize) {
+        if self.ivars().closing.get() {
+            return;
+        }
         let _keep = self.retain();
         let pressed = self.ivars().open.borrow().rows.get(row).cloned();
         self.note_page(pressed.as_ref());
@@ -1859,6 +1877,17 @@ define_class!(
             false
         }
 
+        /// While the card fades out, a press goes to what is under it.
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> Option<Retained<NSView>> {
+            if self.ivars().card.ivars().closing.get() {
+                None
+            } else {
+                // SAFETY: `NSView`'s `hitTest:` takes a point in the superview's space.
+                unsafe { msg_send![super(self), hitTest: point] }
+            }
+        }
+
         /// A press away from the card closes the palette and is taken by it.
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, _event: &NSEvent) {
@@ -2061,19 +2090,41 @@ fn open(window: &TerminalWindow, start: Option<Scope>) {
     }
 }
 
-/// Takes the palette down. The keyboard is the caller's to give back.
+/// Takes the palette down: the window has no palette from here on and presses go through it, and
+/// the card leaves the way it came, fading and rising over the opening's time (at once with
+/// Reduce Motion), over whatever ⏎ did. The keyboard is the caller's to give back.
 pub(crate) fn close(root: &RootView) {
     let Some(scrim) = root.palette() else {
         return;
     };
-    scrim.ivars().card.ivars().closing.set(true);
+    let card = scrim.ivars().card.clone();
+    card.ivars().closing.set(true);
     root.seat_palette(None);
-    scrim.removeFromSuperview();
+    let app = app::delegate(root.mtm());
     // Whatever the highlight was showing goes back to what the file says (a write has ended the
-    // preview already, and then this does nothing).
-    if let Some(app) = app::delegate(root.mtm()) {
+    // preview already, and then this does nothing). The card keeps its own look: the window no
+    // longer passes its theme on.
+    if let Some(app) = &app {
         app.end_preview();
     }
+    if app.is_none_or(|app| app.reduce_motion()) {
+        scrim.removeFromSuperview();
+        return;
+    }
+    let origin = card.frame().origin;
+    let changes = RcBlock::new(move |context: NonNull<NSAnimationContext>| {
+        // SAFETY: AppKit gives the block a live context, for the block's duration.
+        let context = unsafe { context.as_ref() };
+        context.setDuration(APPEAR_SECS);
+        // SAFETY: a constant name QuartzCore exposes, it lives for the whole process.
+        let curve = unsafe { kCAMediaTimingFunctionEaseIn };
+        context.setTimingFunction(Some(&CAMediaTimingFunction::functionWithName(curve)));
+        let animator = card.animator();
+        animator.setAlphaValue(0.0);
+        animator.setFrameOrigin(NSPoint::new(origin.x, origin.y - SLIDE));
+    });
+    let done = RcBlock::new(move || scrim.removeFromSuperview());
+    NSAnimationContext::runAnimationGroup_completionHandler(&changes, Some(&done));
 }
 
 #[cfg(test)]
