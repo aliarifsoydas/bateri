@@ -5124,6 +5124,13 @@ impl TerminalPane {
         self.open_search(true);
     }
 
+    /// Opens the panel with `text` as the query ("Find … in This Pane" in the command palette):
+    /// the field is focused with the text selected, and the matches are shown.
+    pub(crate) fn find_text(&self, text: &str) {
+        self.search_bar().set_text(text);
+        self.open_search(true);
+    }
+
     /// Edit ▸ Find ▸ Find Next (⌘G): the previous, **older** match.
     pub(crate) fn find_next(&self) {
         self.search_step(SearchDirection::Older);

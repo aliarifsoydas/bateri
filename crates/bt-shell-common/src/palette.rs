@@ -7,6 +7,8 @@
 //! - [`Row`], [`Kind`], [`Scope`] — a line of the list, as data.
 //! - [`matching`] and [`rank`] — letters in order and word starts, keywords and second lines;
 //!   the nearness of Recent and of the tab just left; the clusters and their fallbacks.
+//! - [`menu_rows`] — the application menu read as commands, and [`root_list`] / [`page_list`] — the
+//!   list a query leaves on a page, under its headings.
 //! - [`Palette`] — the field, the highlight, the page stack and the preview, driven by [`Key`]s.
 //! - [`catalog`] — the settings the palette changes, each value an edit the settings model owns.
 //! - [`Recent`] and [`Visits`] — what was chosen last and which tab was looked at last.
@@ -19,7 +21,9 @@
 
 mod catalog;
 mod fold;
+mod list;
 mod matching;
+mod menu;
 mod path;
 mod rank;
 mod recent;
@@ -31,7 +35,11 @@ mod visits;
 pub use catalog::{
     Choice, Control, Section, Setting, all as settings, find as setting, rows as setting_rows,
 };
+pub use list::{Fallbacks, List, RECENT_HEADING, page as page_list, root as root_list};
 pub use matching::{Match, score};
+pub use menu::{
+    MenuNode, MenuRow, MenuRows, Modifiers, PALETTE_ACTION, rows as menu_rows, shortcut,
+};
 pub use path::PathQuery;
 pub use rank::{
     CLUSTER_LIMIT, Cluster, Hit, Nearness, RECENT_BONUS, THEME_LIMIT, VISIT_BONUS, VISIT_STEP,

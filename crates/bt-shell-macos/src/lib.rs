@@ -57,6 +57,7 @@ mod launch;
 mod locale;
 mod menu;
 mod pacer;
+mod palette;
 mod pane;
 mod pane_drag;
 mod password_sheet;

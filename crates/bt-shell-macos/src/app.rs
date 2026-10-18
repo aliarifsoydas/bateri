@@ -1069,6 +1069,10 @@ pub(crate) struct Ivars {
     /// `None`: a timed run, an unbundled process, or another instance of the
     /// same bundle holds it — this one neither restores nor saves.
     restore_lock: RefCell<Option<restore::Lock>>,
+    /// What the command palette's Recent holds: read from the session directory the first time
+    /// the palette opens ([`AppDelegate::palette_recent`]), kept in memory from then on and
+    /// written back on a choice ([`AppDelegate::palette_chose`]). `None`: not read yet.
+    palette_recent: RefCell<Option<bt_shell_common::palette::Recent>>,
     /// What the update's holders gave at launch
     /// ([`arrive`] — taken before this delegate was born); consumed by the
     /// first windows ([`AppDelegate::restore_or_open`]).
@@ -1608,6 +1612,12 @@ define_class!(
                 || item.action() == Some(sel!(newUngroupedTab:))
             {
                 self.key_window().is_some()
+            } else if item.action() == Some(sel!(toggleCommandPalette:)) {
+                // Grey without a terminal window to open it over, and while a question is up
+                // on it; open, the same item takes it down.
+                self.key_window().is_some_and(|window| {
+                    window.root().palette().is_some() || window.palette_may_open()
+                })
             } else if item.action() == Some(sel!(mergeWindows:)) {
                 // Merging needs a second window to take tabs from.
                 self.windows().len() > 1
@@ -1618,6 +1628,14 @@ define_class!(
                 ready
             } else {
                 true
+            }
+        }
+
+        /// View ▸ Command Palette… (⇧⌘P): the key window's palette opens, or closes.
+        #[unsafe(method(toggleCommandPalette:))]
+        fn toggle_command_palette(&self, _sender: Option<&AnyObject>) {
+            if let Some(window) = self.key_window() {
+                window.toggle_palette();
             }
         }
 
@@ -2520,6 +2538,7 @@ impl AppDelegate {
                 bash_wrapper_dir: child::bash_wrapper_dir(),
             }),
             restore_lock: RefCell::new(None),
+            palette_recent: RefCell::new(None),
             arrival: RefCell::new(arrival),
             holder: RefCell::new(None),
             keeper,
@@ -4422,7 +4441,9 @@ impl AppDelegate {
         let lock = self.restore_lock()?;
         let saved = match self.settings().restore_windows {
             RestoreWindows::Off => {
+                // "off writes nothing and deletes what was saved": the palette's Recent too.
                 let _ = restore::clear(&lock);
+                let _ = restore::clear_recent(&lock);
                 None
             }
             RestoreWindows::All => restore::take(&lock, histories),
@@ -4879,6 +4900,50 @@ impl AppDelegate {
             eprintln!("bateri: the smoke run's measured tab did not open");
         }
         self.arm_deadline(run);
+    }
+
+    /// The ids the command palette chose last, the latest first ([`bt_shell_common::palette::Recent`]).
+    /// The file is read once, from the session directory's lock this process holds; without one
+    /// (a timed run, an unbundled process, another instance holds it) or under
+    /// `restore_windows = "off"` Recent lives in memory only.
+    pub(crate) fn palette_recent(&self) -> Vec<String> {
+        let mut slot = self.ivars().palette_recent.borrow_mut();
+        let recent = slot.get_or_insert_with(|| {
+            let kept = self.settings().restore_windows != RestoreWindows::Off;
+            let text = kept
+                .then(|| {
+                    self.ivars()
+                        .restore_lock
+                        .borrow()
+                        .as_ref()
+                        .and_then(restore::read_recent)
+                })
+                .flatten();
+            text.map(|text| bt_shell_common::palette::Recent::decode(&text))
+                .unwrap_or_default()
+        });
+        recent.ids().to_vec()
+    }
+
+    /// The palette ran the row `id`: Recent keeps it if it is one of the kinds Recent keeps, and
+    /// the file is written when `restore_windows` lets anything be.
+    pub(crate) fn palette_chose(&self, id: &str) {
+        // Reads the file first if it was not read yet, so a first choice does not replace the
+        // saved ones.
+        let _ = self.palette_recent();
+        let mut slot = self.ivars().palette_recent.borrow_mut();
+        let Some(recent) = slot.as_mut() else {
+            return;
+        };
+        if !recent.choose(id) || self.settings().restore_windows == RestoreWindows::Off {
+            return;
+        }
+        let text = recent.encode();
+        if let Some(lock) = self.ivars().restore_lock.borrow().as_ref()
+            && let Err(error) = restore::write_recent(lock, &text)
+        {
+            eprintln!("bateri: could not save the palette's recent commands: {error}");
+        }
     }
 
     /// The current settings — the path windows read. The borrow must be kept short:

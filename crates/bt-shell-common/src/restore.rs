@@ -40,7 +40,10 @@
 //! halfway leaves the previous layout readable. [`take`] reads the layout and **deletes** it
 //! before anything is replayed (a layout that crashes the launch must not come back on the next
 //! one); [`history`] reads and deletes one pane's history; [`clear`] removes everything.
-//! Histories no layout names, and leftover temporaries, are swept. [`save_layout`] writes the
+//! Histories no layout names, and leftover temporaries, are swept — the palette's Recent
+//! ([`read_recent`], [`write_recent`], [`clear_recent`]) is application state that lives in the
+//! directory without being part of the layout, so the sweep and the layout's clears leave it, and
+//! `restore_windows = "off"` removes it. [`save_layout`] writes the
 //! layout alone, without histories, while bateri runs — the way back after a crash nobody held
 //! the programs through (no holder, or `keep_running = "update"`).
 //!
@@ -93,6 +96,11 @@ const LAYOUT: &str = "layout";
 const LOCK: &str = "lock";
 /// A history file's extension: `{PaneUuid}.vt`.
 const HISTORY_EXT: &str = "vt";
+
+/// The palette's Recent: what the user chose last in the command palette. Application state
+/// that lives beside the layout without being part of it, so the layout's saves and sweeps leave
+/// it alone and only [`clear_recent`] removes it.
+const RECENT: &str = "palette-recent";
 /// The temporary-name suffix; anything ending in it is a leftover of an interrupted write.
 const TEMP_SUFFIX: &str = ".tmp";
 
@@ -1004,7 +1012,7 @@ fn sweep(lock: &Lock, keep: &HashSet<String>) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name == LOCK || name == LAYOUT || keep.contains(name) {
+        if name == LOCK || name == LAYOUT || name == RECENT || keep.contains(name) {
             continue;
         }
         if entry.file_type().is_ok_and(|kind| kind.is_file()) {
@@ -1071,6 +1079,26 @@ pub fn save_layout(lock: &Lock, saved: &Saved) -> io::Result<()> {
         pane.history = false;
     }
     write_atomic(&path, layout.render().as_bytes())
+}
+
+/// The palette's Recent text; missing or unreadable is `None`.
+pub fn read_recent(lock: &Lock) -> Option<String> {
+    fs::read_to_string(lock.dir.join(RECENT)).ok()
+}
+
+/// Writes the palette's Recent through a temporary name and a `rename`.
+pub fn write_recent(lock: &Lock, text: &str) -> io::Result<()> {
+    write_atomic(&lock.dir.join(RECENT), text.as_bytes())
+}
+
+/// Removes the palette's Recent (`restore_windows = "off"` deletes what was saved). A layout
+/// that is cleared because no window is left does not: the user's last commands are not a
+/// window.
+pub fn clear_recent(lock: &Lock) -> io::Result<()> {
+    match fs::remove_file(lock.dir.join(RECENT)) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
+        _ => Ok(()),
+    }
 }
 
 /// Removes the layout and every history (`restore_windows = "off"`, no windows at quit).
@@ -2004,6 +2032,39 @@ mod tests {
             pane.history = false;
         }
         assert_eq!(taken, expected);
+    }
+
+    #[test]
+    fn the_palettes_recent_lives_beside_the_layout_and_outlasts_its_saves() {
+        let root = TempRoot::new("restore-recent");
+        let lock = lock(&root.0.join("s")).expect("lock");
+        assert_eq!(read_recent(&lock), None);
+        write_recent(&lock, "bateri-palette-recent 1\ncmd.newTab\n").expect("write");
+        assert_eq!(
+            read_recent(&lock).as_deref(),
+            Some("bateri-palette-recent 1\ncmd.newTab\n")
+        );
+        // Neither a save, a take, a sweep nor a clear of the layout touches it.
+        save(&lock, &rich(), &[(id(A), b"x".to_vec())]).expect("save");
+        let _ = take(&lock, true);
+        clear(&lock).expect("clear");
+        save(
+            &lock,
+            &Saved {
+                windows: Vec::new(),
+            },
+            &[],
+        )
+        .expect("empty save");
+        assert!(read_recent(&lock).is_some());
+        assert_eq!(
+            names(lock.dir()),
+            vec!["lock".to_owned(), "palette-recent".to_owned()]
+        );
+        // Only its own removal deletes it, and removing what is not there is not an error.
+        clear_recent(&lock).expect("clear recent");
+        clear_recent(&lock).expect("again");
+        assert_eq!(read_recent(&lock), None);
     }
 
     #[test]

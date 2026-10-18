@@ -5803,6 +5803,12 @@ impl TabBar {
         self.lay_out();
     }
 
+    /// The theme the bar wears: the window's (the bar is the first thing painted with it). The
+    /// embedded base before any is set.
+    pub(crate) fn theme(&self) -> Theme {
+        self.ivars().theme.get().unwrap_or(Theme::BATERI)
+    }
+
     /// The theme changed: every part repaints in its roles.
     pub(crate) fn set_theme(&self, theme: &Theme) {
         self.ivars().palette.set(Some(Palette::of(theme)));

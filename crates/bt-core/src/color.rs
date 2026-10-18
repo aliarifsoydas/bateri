@@ -826,19 +826,20 @@ impl Theme {
         linear_rgba(self.band_rgb())
     }
 
-    /// The folder row's tone, as **sRGB** bytes (`[r, g, b]`), for the tests
-    /// to read the colour as a person writes it; the path to the GPU is
+    /// The folder row's tone, as **sRGB** bytes (`[r, g, b]`): the tests read
+    /// the colour as a person writes it, and a toolkit that paints with sRGB
+    /// (the command palette's bottom band) takes the tone from here instead of
+    /// stepping the ground again. The path to the GPU is
     /// [`Theme::band_linear`], both from the same value.
-    #[cfg(test)]
-    pub(crate) const fn band_srgb(&self) -> [u8; 3] {
+    pub const fn band_srgb(&self) -> [u8; 3] {
         let Rgb { r, g, b } = self.band_rgb();
         [r, g, b]
     }
 
-    /// The dock's ground as **sRGB** bytes, the tests' reading of
-    /// [`Theme::dock_ground_linear`].
-    #[cfg(test)]
-    pub(crate) const fn dock_ground_srgb(&self) -> [u8; 3] {
+    /// The dock's ground as **sRGB** bytes, the other reading of
+    /// [`Theme::dock_ground_linear`]: the surface a toolkit view that wants to
+    /// stand like the dock's plate (the command palette) is filled with.
+    pub const fn dock_ground_srgb(&self) -> [u8; 3] {
         let Rgb { r, g, b } = self.dock_ground_rgb();
         [r, g, b]
     }

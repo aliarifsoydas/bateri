@@ -128,6 +128,7 @@ use crate::groups::{
 use crate::jobs::Foreground;
 use crate::launch::Closing;
 use crate::moves::{self, Joins, Move};
+use crate::palette::{self, PaletteScrim};
 use crate::pane::TerminalPane;
 use crate::pointer;
 use crate::preview::beep;
@@ -721,6 +722,9 @@ define_class!(
             // application ⌘-Tab brings forward: the tabs' key hints and the
             // summary card go now, not at an event we never see.
             self.bar().resigned();
+            // The palette is the window's while the window is key: a question opened over it,
+            // another application in front, and it goes.
+            self.close_palette();
             // A lifted tab (⌥⌘ held) is set down with them.
             if let Some(app) = app::delegate(self.mtm()) {
                 app.key_window_resigned();
@@ -1435,6 +1439,9 @@ pub(crate) struct RootIvars {
     side_width: Cell<f64>,
     /// The title row's last measured height; `0` until the window reports one.
     row: Cell<f64>,
+    /// The command palette while it is open: over everything the window holds, the side
+    /// column's edge included ([`crate::palette`]).
+    palette: RefCell<Option<Retained<PaletteScrim>>>,
 }
 
 /// Whether `[appearance] tab_position` puts the tabs in the side column. One answer for every
@@ -1468,6 +1475,10 @@ define_class!(
         fn resize_subviews(&self, _old: NSSize) {
             self.place(self.ivars().row.get());
             self.setNeedsLayout(true);
+            // The palette keeps its place while it is open, but not the window's old size.
+            if let Some(palette) = self.palette() {
+                palette.refit(self.content());
+            }
         }
 
         /// AppKit's layout pass: the window's chrome is settled, so the row
@@ -1502,6 +1513,7 @@ impl RootView {
             edge: edge.clone(),
             side_width: Cell::new(side_width),
             row: Cell::new(0.0),
+            palette: RefCell::new(None),
         });
         // SAFETY: `initWithFrame:` is NSView's designated initializer and the
         // ivars are set.
@@ -1656,8 +1668,9 @@ impl RootView {
         let bar = &self.ivars().bar;
         let claim = &self.ivars().claim;
         let side = tabs_at_side(self.mtm());
-        let (bar_frame, below) = if side {
-            let column = self.column_for(bounds.size.width);
+        let column = side.then(|| self.column_for(bounds.size.width));
+        let below = content_frame(bounds.size, row, column);
+        let bar_frame = if let Some(column) = column {
             self.ivars().edge.setFrame(NSRect::new(
                 NSPoint::new((column - EDGE_GRIP).max(0.0), 0.0),
                 NSSize::new(EDGE_GRIP.min(column), bounds.size.height),
@@ -1666,21 +1679,9 @@ impl RootView {
                 NSPoint::new(column, 0.0),
                 NSSize::new(bounds.size.width - column, row),
             ));
-            (
-                NSRect::new(NSPoint::ZERO, NSSize::new(column, bounds.size.height)),
-                NSRect::new(
-                    NSPoint::new(column, 0.0),
-                    NSSize::new(bounds.size.width - column, bounds.size.height),
-                ),
-            )
+            NSRect::new(NSPoint::ZERO, NSSize::new(column, bounds.size.height))
         } else {
-            (
-                NSRect::new(NSPoint::ZERO, NSSize::new(bounds.size.width, row)),
-                NSRect::new(
-                    NSPoint::new(0.0, row),
-                    NSSize::new(bounds.size.width, bounds.size.height - row),
-                ),
-            )
+            NSRect::new(NSPoint::ZERO, NSSize::new(bounds.size.width, row))
         };
         claim.setHidden(!side);
         self.ivars().edge.setHidden(!side);
@@ -1709,12 +1710,48 @@ impl RootView {
         self.sync_ground();
     }
 
+    /// The part of the window the tabs' containers fill, in this view's (flipped) space: all
+    /// of it below the title row, or what is right of the side column. Where the command
+    /// palette stands is measured from it ([`crate::palette`]).
+    pub(crate) fn content(&self) -> NSRect {
+        let size = self.bounds().size;
+        let row = self.ivars().row.get().min(size.height);
+        let column = tabs_at_side(self.mtm()).then(|| self.column_for(size.width));
+        content_frame(size, row, column)
+    }
+
+    /// The command palette, while it is open.
+    pub(crate) fn palette(&self) -> Option<Retained<PaletteScrim>> {
+        self.ivars().palette.borrow().clone()
+    }
+
+    /// Seats the palette that was put up, or clears the seat when it is taken down.
+    pub(crate) fn seat_palette(&self, palette: Option<Retained<PaletteScrim>>) {
+        self.ivars().palette.replace(palette);
+    }
+
     /// A tab's container joins under the bar, at the content's frame; under the title row's
     /// claim too, which stays the top of the stack.
     fn add_container(&self, container: &SplitView) {
         let claim: &NSView = &self.ivars().claim;
         self.addSubview_positioned_relativeTo(container, NSWindowOrderingMode::Below, Some(claim));
         self.lay_out();
+    }
+}
+
+/// The rectangle the tabs' containers fill in a window `size` big, with the title row `row`
+/// tall: all of the window under the row, or — with the tabs in the side column, `column` wide —
+/// what is right of it, from the window's top.
+pub(crate) fn content_frame(size: NSSize, row: f64, column: Option<f64>) -> NSRect {
+    match column {
+        Some(column) => NSRect::new(
+            NSPoint::new(column, 0.0),
+            NSSize::new(size.width - column, size.height),
+        ),
+        None => NSRect::new(
+            NSPoint::new(0.0, row),
+            NSSize::new(size.width, size.height - row),
+        ),
     }
 }
 
@@ -2573,6 +2610,46 @@ impl TerminalWindow {
     /// not part of what a name replaces.
     pub(crate) fn tab_title(&self, id: u64) -> Option<String> {
         self.tab(id)?.session_title()
+    }
+
+    /// The window's root view: the bar, the tabs' containers and, while it is open, the
+    /// command palette.
+    pub(crate) fn root(&self) -> &RootView {
+        &self.ivars().root
+    }
+
+    /// View ▸ Command Palette… (⇧⌘P): opens the palette over the window's content, or takes
+    /// it down.
+    pub(crate) fn toggle_palette(&self) {
+        palette::toggle(self);
+    }
+
+    /// Whether the palette may open now: not while a question is up on the window or on the
+    /// tab on screen — it would sit over a sheet it cannot answer — and not on a window with no
+    /// tab to give the keyboard back to.
+    pub(crate) fn palette_may_open(&self) -> bool {
+        if sheets::window_asks(&self.ivars().window) {
+            return false;
+        }
+        self.try_selected_tab()
+            .is_some_and(|tab| sheets::question_bottom(tab.container()).is_none())
+    }
+
+    /// Takes the palette down (a choice, esc, a press outside, the window no longer key) and gives
+    /// the keyboard back to the tab on screen. A no-op while it is not open.
+    pub(crate) fn close_palette(&self) {
+        if self.ivars().root.palette().is_none() {
+            return;
+        }
+        palette::close(&self.ivars().root);
+        self.focus_selected_tab();
+    }
+
+    /// Opens the find panel of the focused pane with `text` in it ("Find … in This Pane").
+    pub(crate) fn find_in_focused_pane(&self, text: &str) {
+        if let Some(tab) = self.try_selected_tab() {
+            tab.focused_pane().find_text(text);
+        }
     }
 
     /// The keyboard goes back to the selected tab's focused pane — from the
@@ -4218,6 +4295,10 @@ impl TerminalWindow {
         }
         self.apply_chrome(&theme);
         self.bar().set_theme(&theme);
+        // An open palette wears the new theme too (a theme shown while the palette is up).
+        if let Some(palette) = self.ivars().root.palette() {
+            palette.set_theme(&theme);
+        }
     }
 
     /// Gives what the content does at the panes' top edge (`[appearance]
@@ -4395,6 +4476,23 @@ impl TerminalWindow {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn the_content_is_what_the_tabs_leave() {
+        let window = NSSize::new(1000.0, 738.0);
+        // The tabs in the title row: everything under it.
+        assert_eq!(
+            content_frame(window, 38.0, None),
+            NSRect::new(NSPoint::new(0.0, 38.0), NSSize::new(1000.0, 700.0))
+        );
+        // The tabs in the side column: what is right of it, from the window's top.
+        assert_eq!(
+            content_frame(window, 38.0, Some(240.0)),
+            NSRect::new(NSPoint::new(240.0, 0.0), NSSize::new(760.0, 738.0))
+        );
+    }
+
     /// The guard of "selecting does not drop Undo Move": nothing but the source
     /// can tell, since the applier is AppKit's. The record is a picture that
     /// carries the selection and puts it back; a `forget_undo` in the

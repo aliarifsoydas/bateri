@@ -112,7 +112,7 @@ const MOVE_TO_GROUP_TITLE: &str = "Move Tab to Group";
 
 /// The `tag` of the Shell ▸ Mark … as ▸ holder: [`ShellMenuDelegate`] finds it in
 /// the Shell menu with this.
-const MARK_HOLDER_TAG: isize = 37;
+pub(crate) const MARK_HOLDER_TAG: isize = 37;
 
 /// The `tag` of Shell ▸ Forget Password for “{host}”:
 /// [`ShellMenuDelegate`] writes the host into its title.
@@ -120,7 +120,7 @@ const FORGET_TAG: isize = 47;
 
 /// The `tag` of the Shell ▸ Open Port ▸ holder: [`ShellMenuDelegate`] fills
 /// its submenu with the focused pane's listening ports.
-const PORTS_HOLDER_TAG: isize = 58;
+pub(crate) const PORTS_HOLDER_TAG: isize = 58;
 
 /// The `tag` of bateri ▸ Quit and End Programs: [`set_end_programs_visible`]
 /// finds it in the app menu with this.
@@ -492,6 +492,19 @@ pub(crate) fn install(
         mtm,
         "View",
         &[
+            // The palette lists this very menu: a command exists in it exactly when it is
+            // here. Handled by the app delegate, which opens the key window's palette; its
+            // validation is the delegate's too.
+            with_modifiers(
+                item(
+                    mtm,
+                    "Command Palette\u{2026}",
+                    sel!(toggleCommandPalette:),
+                    "p",
+                ),
+                command | NSEventModifierFlags::Shift,
+            ),
+            NSMenuItem::separatorItem(mtm),
             theme_menu,
             // Where the window's tabs sit: the check and the grey state come from the app
             // delegate's `validateMenuItem:`, not from a delegate of the submenu's own (one

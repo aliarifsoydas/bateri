@@ -135,6 +135,9 @@ pub enum Scope {
     },
     /// The themes, for one slot.
     Theme(Slot),
+    /// The items of a submenu of the application menu, by the key of its page row
+    /// (`Window.Resize-Split`, [`super::menu`]).
+    Menu(String),
     /// The choices of the setting with this dotted key.
     Choices(String),
     /// Actions on one tab / group / history entry / host, by its row id.
