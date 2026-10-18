@@ -766,8 +766,8 @@ impl TerminalTab {
         }
     }
 
-    /// The palette's ⌥⏎ on a command: Split Right with `start`'s line left on the new pane's
-    /// prompt — beside the focused pane, below it when beside does not fit
+    /// The palette's ⌥⏎ on a command or a server: Split Right with `start`'s line on the new
+    /// pane's prompt, left waiting or (a server's `ssh`) run — beside the focused pane, below it when beside does not fit
     /// ([`bt_shell_common::palette::beside`]). `false` when neither fits: the caller opens a tab
     /// instead.
     pub(crate) fn split_with_line(&self, start: &app::Start) -> bool {

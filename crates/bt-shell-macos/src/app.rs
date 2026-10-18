@@ -389,16 +389,19 @@ fn initial_line(opening: Opening, remote_line: Option<String>) -> Option<String>
     }
 }
 
-/// Where a new pane starts and what waits on its line when the palette chose rather than the pane
-/// it grows from: a folder to be born in, a line left ready (`cd '…'`'s sibling `ssh host`). A pane
-/// with a `Start` is **local**: it inherits nothing of the source's remote session, whatever the
-/// source is ([`first_input`]).
+/// Where a new pane starts and what is on its line when the palette chose rather than the pane it
+/// grows from: a folder to be born in, a line left ready (a command from the history) or run (a
+/// server's `ssh host`). A pane with a `Start` is **local**: it inherits nothing of the source's
+/// remote session, whatever the source is ([`first_input`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Start {
     /// The folder the shell starts in; `None`: the source's, as without a `Start`.
     pub(crate) directory: Option<PathBuf>,
-    /// The line left on the input line, **not run**; the user's ⏎ runs it.
+    /// The line put on the input line; the user's ⏎ runs it unless `run`.
     pub(crate) line: Option<String>,
+    /// Whether `line` runs as the shell's first command: a server the user chose to connect to,
+    /// in the tab or split the choice opened. A command from the history never does.
+    pub(crate) run: bool,
 }
 
 /// Where a command the palette lists ran, in the same order as the list the palette was handed
@@ -421,15 +424,22 @@ pub(crate) struct Origin {
 /// The new pane's first input and the remote line it inherits (the `ssh` start folder is asked
 /// about the second only, never about a line the palette wrote — the folder is the source's
 /// server's and the line may name another). A `Start` makes the pane local: nothing inherited,
-/// its line waits ([`InitialInput::ready`]); without one ⌘T's rule ([`initial_line`]) runs the
-/// source's remote line.
+/// its line waits ([`InitialInput::ready`]) or, for a server, runs; without one ⌘T's rule
+/// ([`initial_line`]) runs the source's remote line.
 fn first_input(
     opening: Opening,
     remote_line: Option<String>,
     start: Option<&Start>,
 ) -> (Option<InitialInput>, Option<String>) {
     match start {
-        Some(start) => (start.line.clone().map(InitialInput::ready), None),
+        Some(start) => (
+            start.line.clone().map(if start.run {
+                InitialInput::run
+            } else {
+                InitialInput::ready
+            }),
+            None,
+        ),
         None => {
             let inherited = initial_line(opening, remote_line);
             (inherited.clone().map(InitialInput::run), inherited)
@@ -5272,23 +5282,27 @@ impl AppDelegate {
 
     /// What choosing a folder or a server row, or ⌥⏎ or ⌘⏎ on a folder, comes to
     /// ([`bt_shell_common::palette::go`]) in window `window`, the palette's; the palette is down
-    /// and the keyboard back with the tab on screen. **No byte is sent to a shell that runs**: a folder opens a tab *in* it, a server
-    /// a local tab with `ssh host` left on its line, and ⌥⏎ pastes `cd '…'` — Enter is the user's.
+    /// and the keyboard back with the tab on screen. A folder opens a tab *in* it and ⌥⏎ pastes
+    /// `cd '…'` on the line, where Enter is the user's; a server opens a local tab (⌥⏎: a split
+    /// beside the pane on screen) whose shell runs `ssh host` first — the choice was to connect,
+    /// and that shell is a new one, so the line cannot land anywhere else.
     pub(crate) fn palette_go(&self, window: u64, go: bt_shell_common::palette::Go) {
         use bt_shell_common::palette::{self as rules, Go};
         // The palette's own window: it was the key window when a row was chosen.
         let Some(window) = self.window(window) else {
             return;
         };
+        let beside = matches!(go, Go::SplitHost(_));
         match go {
             Go::OpenFolder(path) => {
                 let start = Start {
                     directory: Some(PathBuf::from(path)),
                     line: None,
+                    run: false,
                 };
                 self.new_tab_started(window.id(), Seat::Beside, Some(&start));
             }
-            Go::OpenHost(name) => {
+            Go::OpenHost(name) | Go::SplitHost(name) => {
                 let Some(line) = rules::ssh_line(&name) else {
                     crate::preview::beep();
                     return;
@@ -5296,8 +5310,15 @@ impl AppDelegate {
                 let start = Start {
                     directory: None,
                     line: Some(line),
+                    run: true,
                 };
-                self.new_tab_started(window.id(), Seat::Beside, Some(&start));
+                let split = beside
+                    && window
+                        .try_selected_tab()
+                        .is_some_and(|tab| tab.split_with_line(&start));
+                if !split {
+                    self.new_tab_started(window.id(), Seat::Beside, Some(&start));
+                }
             }
             Go::TypeCd(path) => {
                 let pane = window.try_selected_tab().map(|tab| tab.focused_pane());
@@ -5576,6 +5597,7 @@ impl AppDelegate {
             origin.line.clone().map(|line| Start {
                 directory: origin.directory.clone().filter(|dir| dir.is_dir()),
                 line: Some(line),
+                run: false,
             })
         };
         match how {
@@ -8532,22 +8554,35 @@ mod tests {
         let folder = Start {
             directory: Some(PathBuf::from("/Users/a/api")),
             line: None,
+            run: false,
         };
         assert_eq!(
             first_input(Opening::Tab, remote(), Some(&folder)),
             (None, None)
         );
-        let server = Start {
+        let history = Start {
             directory: None,
-            line: Some("ssh db-1".to_owned()),
+            line: Some("make test".to_owned()),
+            run: false,
         };
-        let (input, inherited) = first_input(Opening::Tab, remote(), Some(&server));
-        assert_eq!(input, Some(InitialInput::ready("ssh db-1")));
+        let (input, inherited) = first_input(Opening::Tab, remote(), Some(&history));
+        assert_eq!(input, Some(InitialInput::ready("make test")));
         assert!(
             !input.is_some_and(|input| input.run),
             "the user's ⏎ runs it"
         );
         assert_eq!(inherited, None);
+        // A server the user chose to connect to runs in the tab the choice opened, still local:
+        // nothing of the source's session is inherited.
+        let server = Start {
+            directory: None,
+            line: Some("ssh db-1".to_owned()),
+            run: true,
+        };
+        assert_eq!(
+            first_input(Opening::Tab, remote(), Some(&server)),
+            (Some(InitialInput::run("ssh db-1")), None)
+        );
         // A split started the same way.
         assert_eq!(
             first_input(Opening::Split, remote(), Some(&folder)),

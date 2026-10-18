@@ -285,8 +285,13 @@ fn hints(
             Kind::Folder => {
                 hints.push(("⌥↵", "Type cd".to_owned()));
                 hints.push(("⌘↵", "Show in Finder".to_owned()));
-                hints.push(("⇥", "Go inside".to_owned()));
+                // The folder the field is already inside (`~/Desktop/`'s own row) has nowhere
+                // for ⇥ to step.
+                if row.completion.is_some() {
+                    hints.push(("⇥", "Go inside".to_owned()));
+                }
             }
+            Kind::Host => hints.push(("⌥↵", "ssh in Split".to_owned())),
             Kind::Port => hints.push(("⌘↵", "Copy URL".to_owned())),
             _ => {}
         }
@@ -888,10 +893,10 @@ fn path_in(scope: Option<&Scope>, query: &str) -> Option<PathQuery> {
 }
 
 /// A directory a typed path is listing: the base as typed (`~/Projects`) and, once the background
-/// read is back, the directories inside it.
+/// read is back, the directories inside it — `None` inside when the directory cannot be read.
 struct Listing {
     base: String,
-    names: Option<Vec<String>>,
+    names: Option<Option<Vec<String>>>,
 }
 
 /// The serial queue directories are listed on.
@@ -943,7 +948,9 @@ impl Open {
                 Some(Listing {
                     base,
                     names: Some(names),
-                }) if *base == path.base => rules::path_list(&path, names, &self.targets.home),
+                }) if *base == path.base => {
+                    rules::path_list(&path, names.as_deref(), &self.targets.home)
+                }
                 _ => List::default(),
             };
         }
@@ -1406,7 +1413,7 @@ impl PaletteCard {
     }
 
     /// The names inside `base` are read. Late news about a folder the field has left is dropped.
-    fn listed(&self, base: &str, names: Vec<String>) {
+    fn listed(&self, base: &str, names: Option<Vec<String>>) {
         if self.ivars().closing.get() {
             return;
         }
@@ -2244,7 +2251,7 @@ mod tests {
 
     #[test]
     fn a_folder_names_the_keys_it_answers_and_a_server_and_a_port_theirs() {
-        let folder = Row::new(Kind::Folder, "/Users/a/api", "api");
+        let folder = Row::new(Kind::Folder, "/Users/a/api", "api").completion("~/api/");
         assert_eq!(
             hints(Some(&folder), 0, None),
             pairs(&[
@@ -2261,7 +2268,18 @@ mod tests {
             hints(Some(&host), 0, None)[0],
             ("↵", "ssh in New Tab".to_owned())
         );
-        assert_eq!(hints(Some(&host), 0, None).len(), 3);
+        assert_eq!(
+            hints(Some(&host), 0, None)[1],
+            ("⌥↵", "ssh in Split".to_owned())
+        );
+        assert_eq!(hints(Some(&host), 0, None).len(), 4);
+        // The folder a path ending in a slash points into: ⇥ has nowhere to step.
+        let here = Row::new(Kind::Folder, "/Users/a/api", "~/api");
+        assert!(
+            !hints(Some(&here), 0, None)
+                .iter()
+                .any(|(key, _)| *key == "⇥")
+        );
         let port = Row::new(Kind::Port, "3000", "localhost:3000");
         assert_eq!(
             hints(Some(&port), 0, None),

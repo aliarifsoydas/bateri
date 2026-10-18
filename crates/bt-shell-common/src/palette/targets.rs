@@ -313,25 +313,40 @@ pub fn port_rows(targets: &Targets) -> Vec<Row> {
 // ─── A typed path ─────────────────────────────────────────────────────────
 
 /// The directories inside `dir`, by name; blocking, so off the main thread. A directory that
-/// cannot be read lists nothing. A symbolic link counts when it points at a directory. At most
-/// [`READ_LIMIT`] entries are looked at.
-pub fn list_dirs(dir: &Path) -> Vec<String> {
-    let Ok(listing) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    listing
-        .filter_map(Result::ok)
-        .take(READ_LIMIT)
-        .filter(|entry| std::fs::metadata(entry.path()).is_ok_and(|meta| meta.is_dir()))
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .collect()
+/// cannot be read is `None`, unlike an empty one: only a folder that is there is offered as a
+/// place to go. A symbolic link counts when it points at a directory. At most [`READ_LIMIT`]
+/// entries are looked at.
+pub fn list_dirs(dir: &Path) -> Option<Vec<String>> {
+    let listing = std::fs::read_dir(dir).ok()?;
+    Some(
+        listing
+            .filter_map(Result::ok)
+            .take(READ_LIMIT)
+            .filter(|entry| std::fs::metadata(entry.path()).is_ok_and(|meta| meta.is_dir()))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect(),
+    )
 }
 
 /// The list a typed path leaves: the directory's entries that begin with the stem (case and
 /// accents aside), sorted by name, hidden ones only when the stem itself begins with a dot, at
 /// most [`ENTRY_LIMIT`]. A row's title is the path as typed so far completed (`~/Projects`), and
 /// the typed part is what is marked; ⇥ on a row puts its path and a slash in the field.
-pub fn path_list(query: &PathQuery, names: &[String], home: &str) -> List {
+///
+/// A path that ends in a slash (`~/Desktop/`, what ⇥ leaves) lists the folder itself first, so
+/// ⏎ goes where the field points rather than into its first entry; `names` is `None` when that
+/// folder cannot be read, and then nothing is listed.
+pub fn path_list(query: &PathQuery, names: Option<&[String]>, home: &str) -> List {
+    let Some(names) = names else {
+        return List::default();
+    };
+    let here = query.stem.is_empty().then(|| Hit {
+        // No completion: the field is already inside it, so ⇥ has nowhere to step.
+        row: Row::new(Kind::Folder, &expand(&query.base, home), query.base.clone())
+            .subtitle("This folder"),
+        score: 0.0,
+        marks: (0..query.base.chars().count()).collect(),
+    });
     let hidden = query.stem.starts_with('.');
     let mut kept: Vec<&String> = names
         .iter()
@@ -341,9 +356,9 @@ pub fn path_list(query: &PathQuery, names: &[String], home: &str) -> List {
     kept.truncate(ENTRY_LIMIT);
     let marks = query.marks();
     List {
-        hits: kept
+        hits: here
             .into_iter()
-            .map(|name| {
+            .chain(kept.into_iter().map(|name| {
                 let shown = query.path_of(name);
                 let path = expand(&shown, home);
                 Hit {
@@ -352,7 +367,7 @@ pub fn path_list(query: &PathQuery, names: &[String], home: &str) -> List {
                     score: 0.0,
                     marks: marks.clone(),
                 }
-            })
+            }))
             .collect(),
         headings: Vec::new(),
     }
@@ -370,8 +385,13 @@ pub enum Go {
     TypeCd(String),
     /// ⌘⏎ on a folder: shown in Finder.
     ShowFolder(String),
-    /// ⏎ on a server: a new local tab with `ssh name` left on its line.
+    /// ⏎ on a server: a new local tab that connects — `ssh name` runs as its shell's first
+    /// command. Unlike a command from the history it is run, not left waiting: the tab is a fresh
+    /// one the choice itself opens, so there is no other line it could land on.
     OpenHost(String),
+    /// ⌥⏎ on a server: the same beside the pane on screen — a split to its right, below it when
+    /// that does not fit, a new tab when neither does ([`beside`]).
+    SplitHost(String),
     /// ⏎ on a port: its address in the browser (the port's key).
     OpenPort(String),
     /// ⌘⏎ on a port: its address to the pasteboard (the port's key).
@@ -390,7 +410,12 @@ pub fn go(id: &str, modifier: Modifier) -> Option<Go> {
         });
     }
     if let Some(name) = id.strip_prefix(Kind::Host.prefix()) {
-        return (modifier == Modifier::None).then(|| Go::OpenHost(name.to_owned()));
+        let name = name.to_owned();
+        return match modifier {
+            Modifier::None => Some(Go::OpenHost(name)),
+            Modifier::Option => Some(Go::SplitHost(name)),
+            Modifier::Command => None,
+        };
     }
     if let Some(key) = id.strip_prefix(Kind::Port.prefix()) {
         let key = key.to_owned();
@@ -601,30 +626,75 @@ mod tests {
         .map(String::from)
         .to_vec();
         let q = PathQuery::parse("~/pro").unwrap();
-        let list = path_list(&q, &entries, HOME);
+        let list = path_list(&q, Some(&entries), HOME);
         assert_eq!(names(&list), ["~/Projects", "~/projects-old"]);
         assert_eq!(list.hits[0].row.id, "dir./Users/a/Projects");
         assert_eq!(list.hits[0].row.completion.as_deref(), Some("~/Projects/"));
         assert_eq!(list.hits[0].marks, q.marks());
-        // Everything, in name order, hidden ones left out.
-        let all = path_list(&PathQuery::parse("~/").unwrap(), &entries, HOME);
+        // Everything, in name order, hidden ones left out, after the folder itself.
+        let all = path_list(&PathQuery::parse("~/").unwrap(), Some(&entries), HOME);
         assert_eq!(
             names(&all),
-            ["~/Documents", "~/Pictures", "~/Projects", "~/projects-old"]
+            [
+                "~",
+                "~/Documents",
+                "~/Pictures",
+                "~/Projects",
+                "~/projects-old"
+            ]
         );
         // A stem that begins with a dot asks for them.
-        let dot = path_list(&PathQuery::parse("~/.c").unwrap(), &entries, HOME);
+        let dot = path_list(&PathQuery::parse("~/.c").unwrap(), Some(&entries), HOME);
         assert_eq!(names(&dot), ["~/.config"]);
         // The root has no prefix to double.
-        let root = path_list(&PathQuery::parse("/u").unwrap(), &["usr".to_owned()], HOME);
+        let root = path_list(
+            &PathQuery::parse("/u").unwrap(),
+            Some(&["usr".to_owned()]),
+            HOME,
+        );
         assert_eq!(names(&root), ["/usr"]);
         assert_eq!(root.hits[0].row.id, "dir./usr");
     }
 
     #[test]
+    fn a_path_ending_in_a_slash_offers_the_folder_itself_first() {
+        let entries: Vec<String> = ["Screenshots", "Notes"].map(String::from).to_vec();
+        // What ⇥ leaves in the field: ⏎ goes to the folder, not into its first entry.
+        let q = PathQuery::parse("~/Desktop/").unwrap();
+        let list = path_list(&q, Some(&entries), HOME);
+        assert_eq!(
+            names(&list),
+            ["~/Desktop", "~/Desktop/Notes", "~/Desktop/Screenshots"]
+        );
+        assert_eq!(list.hits[0].row.id, "dir./Users/a/Desktop");
+        assert_eq!(list.hits[0].row.completion, None);
+        assert_eq!(
+            list.hits[0].marks,
+            (0.."~/Desktop".len()).collect::<Vec<_>>()
+        );
+        // An empty folder is still a place to go; one that cannot be read is not.
+        assert_eq!(names(&path_list(&q, Some(&[]), HOME)), ["~/Desktop"]);
+        assert!(path_list(&q, None, HOME).hits.is_empty());
+        // The root is its own row.
+        let root = path_list(
+            &PathQuery::parse("/").unwrap(),
+            Some(&["usr".to_owned()]),
+            HOME,
+        );
+        assert_eq!(names(&root), ["/", "/usr"]);
+        // With letters after the slash only the entries are listed.
+        let typed = path_list(
+            &PathQuery::parse("~/Desktop/n").unwrap(),
+            Some(&entries),
+            HOME,
+        );
+        assert_eq!(names(&typed), ["~/Desktop/Notes"]);
+    }
+
+    #[test]
     fn a_long_directory_lists_a_bounded_number_of_entries() {
         let many: Vec<String> = (0..ENTRY_LIMIT + 50).map(|n| format!("d{n:04}")).collect();
-        let list = path_list(&PathQuery::parse("~/").unwrap(), &many, HOME);
+        let list = path_list(&PathQuery::parse("~/d").unwrap(), Some(&many), HOME);
         assert_eq!(list.len(), ENTRY_LIMIT);
     }
 
@@ -636,10 +706,11 @@ mod tests {
         std::fs::write(dir.join("file.txt"), "x").unwrap();
         std::os::unix::fs::symlink(dir.join("sub"), dir.join("link")).unwrap();
         std::os::unix::fs::symlink(dir.join("file.txt"), dir.join("filelink")).unwrap();
-        let mut found = list_dirs(&dir);
+        let mut found = list_dirs(&dir).unwrap();
         found.sort();
         assert_eq!(found, ["link", "sub"]);
-        assert!(list_dirs(&dir.join("missing")).is_empty());
+        assert_eq!(list_dirs(&dir.join("sub")), Some(Vec::new()));
+        assert_eq!(list_dirs(&dir.join("missing")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -650,7 +721,7 @@ mod tests {
         assert_eq!(go("dir./a/b", Alt), Some(Go::TypeCd("/a/b".into())));
         assert_eq!(go("dir./a/b", Command), Some(Go::ShowFolder("/a/b".into())));
         assert_eq!(go("host.db-1", Plain), Some(Go::OpenHost("db-1".into())));
-        assert_eq!(go("host.db-1", Alt), None);
+        assert_eq!(go("host.db-1", Alt), Some(Go::SplitHost("db-1".into())));
         assert_eq!(go("host.db-1", Command), None);
         assert_eq!(go("port.3000", Plain), Some(Go::OpenPort("3000".into())));
         assert_eq!(

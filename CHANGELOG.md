@@ -20,9 +20,8 @@ of every installed copy. A version without a section is not released.
   shortcut, and greyed as the menu would be), every setting and theme, the tabs
   and groups of all windows, folders, servers, ports and the commands your open
   panes ran. ⏎ does it, → opens the row's menu or page, esc steps back and
-  closes, and what you chose last comes first. Nothing it offers runs a command
-  on its own: a command from the history or an `ssh` host is written on a
-  prompt and waits for your own ⏎.
+  closes, and what you chose last comes first. A command from the history is
+  never run for you: it is written on a prompt and waits for your own ⏎.
   - **Themes and settings try themselves out.** A theme, and the font family
     and size, the line spacing, the cursor shape, the split style, the veil over
     a window that lost focus, where the tabs sit and the tab icons and colours,
@@ -39,9 +38,9 @@ of every installed copy. A version without a section is not released.
   - **⌘O goes to a folder.** The folders your tabs have been in, newest first;
     type a path (`~/Pro`) and it lists what is inside, ⇥ steps in. ⏎ opens a
     new tab there. Servers come from the `Host` lines of `~/.ssh/config` and
-    the ones you reached: ⏎ opens a new tab with `ssh host` waiting on its
-    line. Ports listed by the panes open in the browser. Shell ▸ Copy Folder
-    Path and Show Folder in Finder are menu commands now.
+    the ones you reached: ⏎ connects in a new tab, ⌥⏎ in a split beside the
+    pane you are in. Ports listed by the panes open in the browser. Shell ▸
+    Copy Folder Path and Show Folder in Finder are menu commands now.
   - **Command History** lists what the open panes ran, where and how each
     ended. ⏎ writes the command on the prompt of the tab in front when it is
     idle, and otherwise in a new tab in the command's folder; ⌥⏎ does it in a
