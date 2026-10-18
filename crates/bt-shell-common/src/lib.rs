@@ -23,7 +23,8 @@
 //! process table (`jobs`), which program reads the keyboard and its guide
 //! bar (`program`), the active Python environment and Node version the dock
 //! shows (`environment`), the drawing that stands for a program in a tab (`icon`),
-//! the shell's birth (`child`) and file watching (`watch`).
+//! the shell's birth (`child`), file watching (`watch`) and the command palette's rules —
+//! its rows, matching, pages, preview and the settings it can change (`palette`).
 //!
 //! **The boundary:** no AppKit, Foundation, Quartz or notification centre —
 //! whatever needs the toolkit stays in the platform shell (`bt-shell-macos` on
@@ -53,6 +54,7 @@ pub mod moves;
 pub mod notices;
 #[cfg(test)]
 mod outward_contract;
+pub mod palette;
 pub mod port_forward;
 pub mod ports;
 pub mod preview_cache;
