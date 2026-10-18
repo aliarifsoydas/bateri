@@ -47,7 +47,9 @@ Theme ▸** writes the `[appearance] theme` line (see [View ▸ Theme
 **Shell ▸ Mark “host” as ▸** and **Shell ▸ Shell
 Integration on “host”** write that host's entry in `[remote] hosts` (see
 [`[remote]`](#remote)), the **settings window** writes the line of the
-setting you changed, and so does **`bateri config set`** and **`reset`** from
+setting you changed (as does the welcome window's setup page, see [`bateri
+help` and the welcome](#bateri-help-and-the-welcome)), and so does **`bateri
+config set`** and **`reset`** from
 a shell (see [From the command line](#from-the-command-line)) — through the
 same writer as the window. No other line of an existing file — comments,
 order, keys it does not recognize — is touched.
@@ -203,6 +205,41 @@ binary inside the app, or link it onto your `PATH` once:
 /Applications/bateri.app/Contents/MacOS/bateri config list
 ln -s /Applications/bateri.app/Contents/MacOS/bateri /usr/local/bin/bateri
 ```
+
+### `bateri help` and the welcome
+
+`bateri help` (also `bateri --help` and `bateri -h`) prints a short guide in
+the terminal: the most useful shortcuts — tabs, splits, the command palette,
+find — exactly as the menus have them, where the side column is, how
+settings work (this file, `bateri config`, the window) and where these docs
+are. Like `bateri config` it needs no window, so it works over ssh; piped or
+with `NO_COLOR` set it prints plain text.
+
+**The welcome window.** The first time bateri opens on a Mac, a small window
+comes up over the first terminal window: four pages — what bateri is, the
+keys you will reach for (the menus' own shortcuts), a quick setup and where to
+go next. It is driven from the keyboard alone, whatever the Full Keyboard
+Access setting: ⏎ goes on, esc or ⌘W closes it, ⇥ and ⇧⇥, ⌘] and ⌘[ (or ⌘→
+and ⌘←) move between the pages on every page — ← → too outside the setup page,
+and ⌫ goes back — and ⌘1–⌘4 jump to one. On the setup page ↑ ↓
+move a highlight between its rows and ← → change the highlighted row's value
+at once; on the theme row each step shows the theme on every window, letters
+jump to a theme by its name, ␣ opens the list, and the file is written once
+the keys stop. A line under each page names its keys. The mouse works as
+well. The setup page writes `[appearance] tab_position`, `split_style` and `theme`
+through the same writer as the settings window, so a choice is one changed
+line in this file and applies to every window at once, the welcome included.
+It wears the theme in use, light or dark, and changes nothing about the
+terminal windows. When the launch brings back a saved session it comes to the
+front without taking the keyboard, so nothing typed into a pane lands in it.
+
+It opens by itself once: whether it has is the empty file
+`~/Library/Application Support/bateri/welcomed`, created by that launch
+(delete it to see the welcome at the next launch). Open it again any time from
+**Help ▸ Welcome to bateri**, from the command palette ("welcome"), or with
+`bateri help --welcome`, which asks the running bateri to show it (through the
+`bateri://welcome` address); over ssh, or with no bateri running, that command
+prints the guide instead.
 
 ### Template
 
